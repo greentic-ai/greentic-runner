@@ -1,10 +1,10 @@
 [package]
-name = "host-tests"
-version = "0.1.0"
-edition = "2021"
+name = "greentic-runner-tests"
+version.workspace = true
+edition.workspace = true
 publish = false
 
-[dependencies]
+[dev-dependencies]
 anyhow.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true

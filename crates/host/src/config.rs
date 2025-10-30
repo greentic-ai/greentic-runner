@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use greentic_mcp::{ExecConfig, RuntimePolicy, ToolStore, VerifyPolicy};
 use serde::Deserialize;
 use serde_yaml_bw as serde_yaml;
 
@@ -143,6 +146,12 @@ impl HostConfig {
     pub fn mcp_retry_config(&self) -> McpRetryConfig {
         self.mcp.retry.clone().unwrap_or_default()
     }
+
+    pub fn mcp_exec_config(&self) -> Result<ExecConfig> {
+        self.mcp
+            .to_exec_config(self.bindings_path.parent())
+            .context("failed to build MCP exec configuration")
+    }
 }
 
 impl SecretsPolicy {
@@ -212,6 +221,86 @@ impl TimerBinding {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum StoreBinding {
+    #[serde(rename = "http-single")]
+    HttpSingle {
+        name: String,
+        url: String,
+        #[serde(default)]
+        cache_dir: Option<String>,
+    },
+    #[serde(rename = "local-dir")]
+    LocalDir { path: String },
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RuntimeBinding {
+    #[serde(default)]
+    max_memory_mb: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    fuel: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SecurityBinding {
+    #[serde(default)]
+    require_signature: bool,
+    #[serde(default)]
+    required_digests: HashMap<String, String>,
+    #[serde(default)]
+    trusted_signers: Vec<String>,
+}
+
+impl McpConfig {
+    fn to_exec_config(&self, base_dir: Option<&Path>) -> Result<ExecConfig> {
+        let store_cfg: StoreBinding = serde_yaml::from_value(self.store.clone())
+            .context("invalid MCP store configuration")?;
+        let runtime_cfg: RuntimeBinding =
+            serde_yaml::from_value(self.runtime.clone()).unwrap_or_default();
+        let security_cfg: SecurityBinding =
+            serde_yaml::from_value(self.security.clone()).unwrap_or_default();
+
+        let store = match store_cfg {
+            StoreBinding::HttpSingle {
+                name,
+                url,
+                cache_dir,
+            } => ToolStore::HttpSingleFile {
+                name,
+                url,
+                cache_dir: resolve_optional_path(base_dir, cache_dir)
+                    .unwrap_or_else(|| default_cache_dir(base_dir)),
+            },
+            StoreBinding::LocalDir { path } => {
+                ToolStore::LocalDir(resolve_required_path(base_dir, path))
+            }
+        };
+
+        let runtime = RuntimePolicy {
+            fuel: runtime_cfg.fuel,
+            max_memory: runtime_cfg.max_memory_mb.map(|mb| mb * 1024 * 1024),
+            wallclock_timeout: Duration::from_millis(runtime_cfg.timeout_ms.unwrap_or(30_000)),
+        };
+
+        let security = VerifyPolicy {
+            allow_unverified: !security_cfg.require_signature,
+            required_digests: security_cfg.required_digests,
+            trusted_signers: security_cfg.trusted_signers,
+        };
+
+        Ok(ExecConfig {
+            store,
+            security,
+            runtime,
+            http_enabled: self.http_enabled.unwrap_or(false),
+        })
+    }
+}
+
 impl Default for McpRetryConfig {
     fn default() -> Self {
         Self {
@@ -227,4 +316,29 @@ fn default_mcp_retry_attempts() -> u32 {
 
 fn default_mcp_retry_base_delay_ms() -> u64 {
     250
+}
+
+fn resolve_required_path(base: Option<&Path>, value: String) -> PathBuf {
+    let candidate = PathBuf::from(&value);
+    if candidate.is_absolute() {
+        candidate
+    } else if let Some(base) = base {
+        base.join(candidate)
+    } else {
+        PathBuf::from(value)
+    }
+}
+
+fn resolve_optional_path(base: Option<&Path>, value: Option<String>) -> Option<PathBuf> {
+    value.map(|v| resolve_required_path(base, v))
+}
+
+fn default_cache_dir(base: Option<&Path>) -> PathBuf {
+    if let Some(dir) = env::var_os("GREENTIC_CACHE_DIR") {
+        PathBuf::from(dir)
+    } else if let Some(base) = base {
+        base.join(".greentic/tool-cache")
+    } else {
+        env::temp_dir().join("greentic-tool-cache")
+    }
 }

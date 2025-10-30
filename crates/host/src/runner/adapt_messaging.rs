@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -150,6 +150,10 @@ fn extract_text_response(value: &serde_json::Value) -> Option<String> {
 }
 
 async fn send_telegram_message(state: &ServerState, chat_id: i64, text: &str) -> Result<()> {
+    if !state.messaging_rate.lock().try_acquire() {
+        bail!("messaging send rate exceeded");
+    }
+
     let token = state.get_secret("TELEGRAM_BOT_TOKEN")?;
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
     let body = json!({

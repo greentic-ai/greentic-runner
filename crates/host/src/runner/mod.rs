@@ -6,6 +6,7 @@ pub mod engine;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use axum::http::StatusCode;
@@ -36,7 +37,7 @@ impl HostServer {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         let http_client = Client::builder().build()?;
         let engine = Arc::new(
-            engine::FlowEngine::new(Arc::clone(&pack))
+            engine::FlowEngine::new(Arc::clone(&pack), Arc::clone(&config))
                 .await
                 .context("failed to prime flow engine")?,
         );
@@ -45,12 +46,18 @@ impl HostServer {
         let webhook_capacity =
             NonZeroUsize::new(WEBHOOK_CACHE_CAPACITY).expect("webhook cache capacity must be > 0");
 
+        let rate_limiter = RateLimiter::new(
+            config.rate_limits.messaging_send_qps,
+            config.rate_limits.messaging_burst,
+        );
+
         let state = Arc::new(ServerState {
             config: Arc::clone(&config),
             engine: Arc::clone(&engine),
             telegram_cache: Mutex::new(LruCache::new(telegram_capacity)),
             webhook_cache: Mutex::new(LruCache::new(webhook_capacity)),
             http_client,
+            messaging_rate: Mutex::new(rate_limiter),
         });
         let router = Router::new()
             .route(
@@ -92,6 +99,7 @@ pub struct ServerState {
     pub telegram_cache: Mutex<LruCache<i64, StatusCode>>,
     pub webhook_cache: Mutex<LruCache<String, Value>>,
     pub http_client: Client,
+    pub messaging_rate: Mutex<RateLimiter>,
 }
 
 impl ServerState {
@@ -110,3 +118,56 @@ impl ServerState {
 
 const TELEGRAM_CACHE_CAPACITY: usize = 1024;
 const WEBHOOK_CACHE_CAPACITY: usize = 256;
+
+pub(crate) struct RateLimiter {
+    allowance: f64,
+    rate: f64,
+    burst: f64,
+    last_check: Instant,
+}
+
+impl RateLimiter {
+    fn new(qps: u32, burst: u32) -> Self {
+        let rate = qps.max(1) as f64;
+        let burst = burst.max(1) as f64;
+        Self {
+            allowance: burst,
+            rate,
+            burst,
+            last_check: Instant::now(),
+        }
+    }
+
+    fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_check).as_secs_f64();
+        self.last_check = now;
+        self.allowance += elapsed * self.rate;
+        if self.allowance > self.burst {
+            self.allowance = self.burst;
+        }
+        if self.allowance < 1.0 {
+            false
+        } else {
+            self.allowance -= 1.0;
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    #[test]
+    fn rate_limiter_allows_burst_and_refills() {
+        let mut limiter = RateLimiter::new(1, 2);
+        assert!(limiter.try_acquire());
+        assert!(limiter.try_acquire());
+        assert!(!limiter.try_acquire());
+        sleep(Duration::from_millis(1200));
+        assert!(limiter.try_acquire());
+    }
+}
