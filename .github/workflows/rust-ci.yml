@@ -3,7 +3,7 @@ name: Rust CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
 
 env:
