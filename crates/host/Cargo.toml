@@ -1,8 +1,15 @@
 [package]
-name = "host"
-version = "0.1.0"
+name = "greentic-host"
+version.workspace = true
 edition = "2021"
 license = "MIT"
+description = "Wasm pack runner for Greentic agent flows with MCP, telemetry, and adapter support."
+repository = "https://github.com/greentic-ai/greentic-runner"
+homepage = "https://github.com/greentic-ai/greentic-runner"
+documentation = "https://docs.rs/greentic-host"
+readme = "../../README.md"
+keywords = ["greentic", "runner", "agent", "wasm", "mcp"]
+categories = ["wasm", "command-line-utilities", "network-programming"]
 
 [dependencies]
 anyhow.workspace = true

@@ -1247,6 +1247,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "chrono",
+ "clap",
+ "cron",
+ "ed25519-dalek",
+ "futures",
+ "greentic-flow",
+ "greentic-interfaces",
+ "greentic-telemetry",
+ "hex",
+ "lru",
+ "mcp-exec",
+ "once_cell",
+ "parking_lot",
+ "rand 0.9.2",
+ "reqwest 0.12.24",
+ "serde",
+ "serde_json",
+ "serde_yaml_bw",
+ "sha2",
+ "thiserror 2.0.17",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "wasmparser 0.240.0",
+ "wasmtime",
+ "wasmtime-wasi",
+]
+
+[[package]]
 name = "greentic-interfaces"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1364,43 +1401,6 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
-
-[[package]]
-name = "host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.7.9",
- "chrono",
- "clap",
- "cron",
- "ed25519-dalek",
- "futures",
- "greentic-flow",
- "greentic-interfaces",
- "greentic-telemetry",
- "hex",
- "lru",
- "mcp-exec",
- "once_cell",
- "parking_lot",
- "rand 0.9.2",
- "reqwest 0.12.24",
- "serde",
- "serde_json",
- "serde_yaml_bw",
- "sha2",
- "thiserror 2.0.17",
- "time",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-subscriber",
- "wasmparser 0.240.0",
- "wasmtime",
- "wasmtime-wasi",
-]
 
 [[package]]
 name = "host-tests"
