@@ -1,0 +1,35 @@
+tenant: acme
+flow_type_bindings:
+  messaging:
+    adapter: telegram
+    config:
+      public_base_url: "https://<your-ngrok-or-domain>"
+      route: "/messaging/telegram/webhook"
+    secrets:
+      - TELEGRAM_BOT_TOKEN
+  webhook:
+    adapter: generic
+    config:
+      allow_paths:
+        - "/webhook/"
+mcp:
+  store:
+    kind: http-single
+    name: weather_api
+    url: https://github.com/greentic-ai/greentic/raw/refs/heads/main/greentic/plugins/tools/weather_api.wasm
+  security:
+    require_signature: false
+  runtime:
+    max_memory_mb: 128
+    timeout_ms: 8000
+    fuel: 50000000
+  http_enabled: true
+  retry:
+    max_attempts: 5
+    base_delay_ms: 250
+rate_limits:
+  messaging_send_qps: 10
+  messaging_burst: 20
+timers:
+  - flow_id: nightly_weather
+    cron: "0 5 * * *"
