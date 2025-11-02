@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::runtime_wasmtime::{Component, Engine, Linker, Store, WasmResult};
 use anyhow::{bail, Context, Result};
 use greentic_interfaces::host_import_v0_2::greentic::host_import::imports::{
     HttpRequest, HttpResponse, IfaceError, TenantCtx,
@@ -14,8 +15,6 @@ use reqwest::blocking::Client as BlockingClient;
 use serde::{Deserialize, Serialize};
 use serde_json::{self, Value};
 use serde_yaml_bw as serde_yaml;
-use wasmtime::component::{Component, Linker};
-use wasmtime::{Engine, Store};
 
 use crate::imports;
 
@@ -74,18 +73,14 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
         &mut self,
         key: String,
         _ctx: Option<TenantCtx>,
-    ) -> wasmtime::Result<Result<String, IfaceError>> {
+    ) -> WasmResult<Result<String, IfaceError>> {
         Ok(self.get_secret(&key).map_err(|err| {
             tracing::warn!(secret = %key, error = %err, "secret lookup denied");
             IfaceError::Denied
         }))
     }
 
-    fn telemetry_emit(
-        &mut self,
-        span_json: String,
-        _ctx: Option<TenantCtx>,
-    ) -> wasmtime::Result<()> {
+    fn telemetry_emit(&mut self, span_json: String, _ctx: Option<TenantCtx>) -> WasmResult<()> {
         tracing::info!(span = %span_json, "telemetry emit from pack");
         Ok(())
     }
@@ -96,7 +91,7 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
         action: String,
         args_json: String,
         ctx: Option<TenantCtx>,
-    ) -> wasmtime::Result<Result<String, IfaceError>> {
+    ) -> WasmResult<Result<String, IfaceError>> {
         let exec_config = match &self.exec_config {
             Some(cfg) => cfg.clone(),
             None => {
@@ -146,7 +141,7 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
         &mut self,
         req: HttpRequest,
         _ctx: Option<TenantCtx>,
-    ) -> wasmtime::Result<Result<HttpResponse, IfaceError>> {
+    ) -> WasmResult<Result<HttpResponse, IfaceError>> {
         if !self.config.http_enabled {
             tracing::warn!(url = %req.url, "http fetch denied by policy");
             return Ok(Err(IfaceError::Denied));

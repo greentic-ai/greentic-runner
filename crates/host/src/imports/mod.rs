@@ -1,5 +1,6 @@
 use anyhow::Result;
-use wasmtime::component::Linker;
+
+use crate::runtime_wasmtime::Linker;
 
 use crate::pack::HostState;
 
