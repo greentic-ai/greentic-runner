@@ -39,6 +39,16 @@ cargo run -p greentic-runner --bin greentic-runner-cli --no-default-features --f
 
 `sample_flows.json` is a JSON array of flow definitions that the new runner ingests. Each definition declares summaries, schemas, and a linear set of steps. Adapter steps reference registry names such as `demo.adapter`.
 
+## Telemetry
+
+Telemetry initialises automatically through the `greentic_types::telemetry::main` macro. Configure exporters and logging via environment variables:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+RUST_LOG=info
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=dev
+```
+
 ## Runner API Usage
 
 ```rust
@@ -54,7 +64,7 @@ use greentic_runner::glue::{FnSecretsHost, FnTelemetryHost};
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use std::sync::Arc;
 
-#[tokio::main]
+#[greentic_types::telemetry::main(service_name = "example-runner")]
 async fn main() -> anyhow::Result<()> {
     let secrets = Arc::new(FnSecretsHost::new(|name| std::env::var(name).map_err(|err| err.into())));
     let telemetry = Arc::new(FnTelemetryHost::new(|span, fields| {
@@ -83,17 +93,9 @@ async fn main() -> anyhow::Result<()> {
     for flow in flows { builder = builder.with_flow(flow); }
     let runner = builder.build()?;
 
-    let tenant = TenantCtx {
-        env: EnvId::from("dev"),
-        tenant: TenantId::from("acme"),
-        team: None,
-        user: None,
-        trace_id: None,
-        correlation_id: None,
-        deadline: None,
-        attempt: 0,
-        idempotency_key: None,
-    };
+    let tenant = TenantCtx::new(EnvId::from("dev"), TenantId::from("acme"))
+        .with_provider("example-runner")
+        .with_flow("flow.test");
 
     let response = runner.run_flow(RunFlowRequest {
         tenant,

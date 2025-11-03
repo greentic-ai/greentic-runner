@@ -4,17 +4,19 @@ use crate::newrunner::host::{
     HostBundle, OutboxKey, SessionKey, SessionOutboxEntry, SessionSnapshot, SpanContext, WaitState,
 };
 use crate::newrunner::policy::retry_with_jitter;
-use crate::newrunner::policy::{policy_violation, Policy};
+use crate::newrunner::policy::{Policy, policy_violation};
 use crate::newrunner::registry::{AdapterCall, AdapterRegistry};
 use greentic_types::TenantCtx;
 use parking_lot::RwLock;
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+
+const PROVIDER_ID: &str = "greentic-runner";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FlowDefinition {
@@ -87,6 +89,15 @@ impl StateMachine {
         session_hint: Option<String>,
         input: Value,
     ) -> GResult<Value> {
+        let mut telemetry_ctx = tenant
+            .clone()
+            .with_provider(PROVIDER_ID.to_string())
+            .with_flow(flow_id.to_string());
+        if let Some(hint) = session_hint.as_ref() {
+            telemetry_ctx = telemetry_ctx.with_session(hint.clone());
+        }
+        greentic_types::telemetry::set_current_tenant_ctx(&telemetry_ctx);
+
         let flow = {
             let guard = self.flows.read();
             guard
@@ -106,7 +117,7 @@ impl StateMachine {
             None => {
                 let session_id = key
                     .stable_session_id()
-                    .unwrap_or_else(|| Self::generate_session_id());
+                    .unwrap_or_else(Self::generate_session_id);
                 SessionSnapshot::new(key.clone(), session_id)
             }
         };
@@ -330,8 +341,8 @@ impl StateMachine {
     }
 
     fn generate_session_id() -> String {
-        let mut rng = thread_rng();
-        let value: u128 = rng.gen();
+        let mut rng = rng();
+        let value: u128 = rng.random();
         format!("sess-{value:032x}")
     }
 }

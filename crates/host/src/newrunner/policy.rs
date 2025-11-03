@@ -1,5 +1,5 @@
 use crate::newrunner::error::{GResult, RunnerError};
-use rand::{thread_rng, Rng};
+use rand::{Rng, rng};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -62,15 +62,16 @@ where
 fn backoff_with_jitter(policy: &RetryPolicy, attempt: u32) -> Duration {
     let capped_attempt = attempt.min(10);
     let initial_ms = policy.initial_backoff.as_millis().max(1) as u64;
-    let multiplier = 1u64.saturating_shl(capped_attempt);
+    let multiplier = 1u64 << capped_attempt;
     let mut base_ms = initial_ms.saturating_mul(multiplier);
     let max_ms = policy.max_backoff.as_millis().max(1) as u64;
     if base_ms > max_ms {
         base_ms = max_ms;
     }
     let base = Duration::from_millis(base_ms);
-    let mut rng = thread_rng();
-    let jitter_ms = rng.gen_range(0..=(base.as_millis().max(1) as u64));
+    let mut rng = rng();
+    let jitter_cap = base.as_millis().max(1) as u64;
+    let jitter_ms = rng.random_range(0..=jitter_cap);
     base + Duration::from_millis(jitter_ms)
 }
 

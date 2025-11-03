@@ -11,23 +11,13 @@ use greentic_runner::newrunner::policy::{Policy, RetryPolicy};
 use greentic_runner::newrunner::registry::{Adapter, AdapterCall, AdapterRegistry};
 use greentic_runner::newrunner::shims::{InMemorySessionHost, InMemoryStateHost};
 use greentic_runner::newrunner::state_machine::{FlowDefinition, FlowStep};
-use greentic_runner::newrunner::{FlowSummary, RunnerError};
+use greentic_runner::newrunner::{FlowSummary, RunnerApi, RunnerError};
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use serde_json::json;
 use tokio::sync::Mutex;
 
 fn tenant() -> TenantCtx {
-    TenantCtx {
-        env: EnvId::from("dev"),
-        tenant: TenantId::from("acme"),
-        team: None,
-        user: None,
-        trace_id: None,
-        correlation_id: None,
-        deadline: None,
-        attempt: 0,
-        idempotency_key: None,
-    }
+    TenantCtx::new(EnvId::from("dev"), TenantId::from("acme"))
 }
 
 fn host_bundle() -> HostBundle {
@@ -74,7 +64,7 @@ impl MockAdapter {
 }
 
 #[async_trait]
-impl Adapter for Arc<MockAdapter> {
+impl Adapter for MockAdapter {
     async fn call(&self, _call: &AdapterCall) -> Result<serde_json::Value, RunnerError> {
         let mut count = self.counter.lock().await;
         *count += 1;
@@ -94,7 +84,7 @@ async fn adapter_flow_runs_and_returns_response() {
     let mut adapters = AdapterRegistry::default();
     adapters.register_arc("demo.adapter", Arc::new(MockAdapter::new(0)));
 
-    let mut runner = RunnerBuilder::new()
+    let runner = RunnerBuilder::new()
         .with_host(host_bundle())
         .with_adapters(adapters)
         .with_policy(Policy::default())
@@ -131,7 +121,7 @@ async fn retry_applies_until_success() {
         ..Policy::default()
     };
 
-    let mut runner = RunnerBuilder::new()
+    let runner = RunnerBuilder::new()
         .with_host(host_bundle())
         .with_adapters(adapters)
         .with_policy(policy)
@@ -160,7 +150,7 @@ async fn idempotent_outbox_skips_duplicate() {
     adapters.register_arc("demo.adapter", adapter.clone());
 
     let host = host_bundle();
-    let mut runner = RunnerBuilder::new()
+    let runner = RunnerBuilder::new()
         .with_host(host)
         .with_adapters(adapters)
         .with_policy(Policy::default())

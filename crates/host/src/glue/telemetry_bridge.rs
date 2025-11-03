@@ -3,8 +3,10 @@ use crate::newrunner::host::{SpanContext, TelemetryHost};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+type TelemetryFn = dyn Fn(&SpanContext, &[(&str, &str)]) -> GResult<()> + Send + Sync;
+
 pub struct FnTelemetryHost {
-    inner: Arc<dyn Fn(&SpanContext, &[(&str, &str)]) -> GResult<()> + Send + Sync>,
+    inner: Arc<TelemetryFn>,
 }
 
 impl FnTelemetryHost {

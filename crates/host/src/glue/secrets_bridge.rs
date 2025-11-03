@@ -3,8 +3,10 @@ use crate::newrunner::host::SecretsHost;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+type SecretsFn = dyn Fn(&str) -> GResult<String> + Send + Sync;
+
 pub struct FnSecretsHost {
-    inner: Arc<dyn Fn(&str) -> GResult<String> + Send + Sync>,
+    inner: Arc<SecretsFn>,
 }
 
 impl FnSecretsHost {

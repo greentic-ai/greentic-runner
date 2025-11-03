@@ -46,19 +46,10 @@ impl SessionKey {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionCursor {
     pub position: usize,
     pub outbox_seq: u64,
-}
-
-impl Default for SessionCursor {
-    fn default() -> Self {
-        Self {
-            position: 0,
-            outbox_seq: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -103,7 +94,7 @@ impl SessionSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboxKey {
     seq: u64,
     hash: String,

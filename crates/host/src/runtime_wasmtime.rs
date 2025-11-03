@@ -1,9 +1,6 @@
 #![allow(dead_code)]
 
-#[cfg(all(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
-compile_error!("Enable only one of stable-wasmtime or nightly-wasmtime.");
-
-#[cfg(feature = "stable-wasmtime")]
+#[cfg(all(feature = "stable-wasmtime", not(feature = "nightly-wasmtime")))]
 mod stable {
     pub use wasmtime_stable::component::{Component, Linker};
     pub use wasmtime_stable::{Engine, Result as WasmResult, Store};
@@ -15,8 +12,8 @@ mod nightly {
     pub use wasmtime_nightly::{Engine, Result as WasmResult, Store};
 }
 
-#[cfg(feature = "stable-wasmtime")]
-pub use stable::*;
-
-#[cfg(all(not(feature = "stable-wasmtime"), feature = "nightly-wasmtime"))]
+#[cfg(feature = "nightly-wasmtime")]
 pub use nightly::*;
+
+#[cfg(all(feature = "stable-wasmtime", not(feature = "nightly-wasmtime")))]
+pub use stable::*;

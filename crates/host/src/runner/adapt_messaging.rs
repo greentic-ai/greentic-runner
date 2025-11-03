@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{engine::FlowContext, ServerState};
+use super::{ServerState, engine::FlowContext};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TelegramUpdate {
@@ -90,6 +90,8 @@ pub async fn telegram_webhook(
                 node_id: None,
                 tool: None,
                 action: Some("messaging"),
+                session_id: None,
+                provider_id: None,
                 retry_config: state.config.mcp_retry_config().into(),
             },
             payload,
@@ -97,22 +99,17 @@ pub async fn telegram_webhook(
         .await
     {
         Ok(response) => {
-            if let Some(outgoing_text) = extract_text_response(&response) {
-                if let Err(err) =
+            if let Some(outgoing_text) = extract_text_response(&response)
+                && let Err(err) =
                     send_telegram_message(state.as_ref(), message.chat.id, &outgoing_text).await
-                {
-                    tracing::error!(
-                        flow_id = %flow.id,
-                        update_id = update.update_id,
-                        error = %err,
-                        "failed to send telegram message"
-                    );
-                    return remember_status(
-                        state.as_ref(),
-                        update.update_id,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                }
+            {
+                tracing::error!(
+                    flow_id = %flow.id,
+                    update_id = update.update_id,
+                    error = %err,
+                    "failed to send telegram message"
+                );
+                return remember_status(state.as_ref(), update.update_id, StatusCode::BAD_GATEWAY);
             }
             tracing::info!(
                 flow_id = %flow.id,

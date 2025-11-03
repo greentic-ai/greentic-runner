@@ -32,7 +32,6 @@ greentic-interfaces.workspace = true
 greentic-mcp.workspace = true
 greentic-session = { version = "0.1", default-features = true, optional = true }
 greentic-state = { version = "0.1", default-features = true, optional = true }
-greentic-telemetry.workspace = true
 greentic-types.workspace = true
 async-trait = "0.1"
 handlebars.workspace = true
@@ -52,14 +51,13 @@ tokio.workspace = true
 tokio-util.workspace = true
 tower.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 wasmparser.workspace = true
 cron.workspace = true
 greentic-interfaces-wasmtime = { version = "0.1", optional = true }
-wasmtime_stable = { package = "wasmtime", version = ">=29,<38", optional = true }
-wasmtime_wasi_stable = { package = "wasmtime-wasi", version = ">=29,<38", optional = true }
-wasmtime_nightly = { package = "wasmtime", version = ">=29,<38", optional = true }
-wasmtime_wasi_nightly = { package = "wasmtime-wasi", version = ">=29,<38", optional = true }
+wasmtime_stable = { package = "wasmtime", version = ">=38,<39", optional = true }
+wasmtime_wasi_stable = { package = "wasmtime-wasi", version = ">=38,<39", optional = true }
+wasmtime_nightly = { package = "wasmtime", version = ">=38,<39", optional = true }
+wasmtime_wasi_nightly = { package = "wasmtime-wasi", version = ">=38,<39", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

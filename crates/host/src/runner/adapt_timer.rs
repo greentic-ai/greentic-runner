@@ -9,7 +9,7 @@ use serde_json::json;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use super::{engine::FlowContext, ServerState};
+use super::{ServerState, engine::FlowContext};
 
 pub fn spawn_timers(state: Arc<ServerState>) -> Result<Vec<JoinHandle<()>>> {
     let mut handles = Vec::new();
@@ -56,6 +56,8 @@ pub fn spawn_timers(state: Arc<ServerState>) -> Result<Vec<JoinHandle<()>>> {
                             node_id: None,
                             tool: None,
                             action: Some("timer"),
+                            session_id: Some(schedule_id.as_str()),
+                            provider_id: None,
                             retry_config: shared_state.config.mcp_retry_config().into(),
                         },
                         payload,

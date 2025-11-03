@@ -8,10 +8,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::http::StatusCode;
 use axum::routing::{any, post};
-use axum::{serve, Router};
+use axum::{Router, serve};
 use lru::LruCache;
 use parking_lot::Mutex;
 use reqwest::Client;

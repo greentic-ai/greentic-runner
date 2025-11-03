@@ -10,7 +10,7 @@ mod verify;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use clap::Parser;
 use tokio::signal;
 
@@ -34,15 +34,21 @@ struct Cli {
     port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[greentic_types::telemetry::main(service_name = "greentic-runner")]
+async fn main() {
+    if let Err(err) = run().await {
+        tracing::error!(error = %err, "runner failed");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let host_config = Arc::new(
         HostConfig::load_from_path(&cli.bindings).context("failed to load host bindings")?,
     );
 
-    telemetry::init(&host_config)?;
     tracing::info!(
         tenant = %host_config.tenant,
         bindings_path = %host_config.bindings_path.display(),

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::runtime_wasmtime::{Component, Engine, Linker, Store, WasmResult};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use greentic_interfaces::host_import_v0_2::greentic::host_import::imports::{
     HttpRequest, HttpResponse, IfaceError, TenantCtx,
 };
@@ -155,16 +155,12 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
             match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(headers_json) {
                 Ok(map) => {
                     for (key, value) in map {
-                        if let Some(val) = value.as_str() {
-                            if let Ok(header) =
+                        if let Some(val) = value.as_str()
+                            && let Ok(header) =
                                 reqwest::header::HeaderName::from_bytes(key.as_bytes())
-                            {
-                                if let Ok(header_value) =
-                                    reqwest::header::HeaderValue::from_str(val)
-                                {
-                                    builder = builder.header(header, header_value);
-                                }
-                            }
+                            && let Ok(header_value) = reqwest::header::HeaderValue::from_str(val)
+                        {
+                            builder = builder.header(header, header_value);
                         }
                     }
                 }

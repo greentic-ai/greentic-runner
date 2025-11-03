@@ -6,6 +6,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+type AdapterFuture = dyn Future<Output = GResult<Value>> + Send;
+type AdapterInvoker = dyn Fn(AdapterCall) -> Pin<Box<AdapterFuture>> + Send + Sync;
+
 #[async_trait]
 pub trait AdapterBridge: Send + Sync {
     async fn invoke(&self, call: AdapterCall) -> GResult<Value>;
@@ -22,9 +25,7 @@ where
 }
 
 pub struct FnAdapterBridge {
-    inner: Arc<
-        dyn Fn(AdapterCall) -> Pin<Box<dyn Future<Output = GResult<Value>> + Send>> + Send + Sync,
-    >,
+    inner: Arc<AdapterInvoker>,
 }
 
 impl FnAdapterBridge {
@@ -33,12 +34,11 @@ impl FnAdapterBridge {
         F: Send + Sync + 'static + Fn(AdapterCall) -> Fut,
         Fut: Future<Output = GResult<Value>> + Send + 'static,
     {
-        Self {
-            inner: Arc::new(move |call: AdapterCall| {
-                let fut = func(call);
-                Box::pin(fut)
-            }),
-        }
+        let invoker: Arc<AdapterInvoker> = Arc::new(move |call: AdapterCall| {
+            let fut = func(call);
+            Box::pin(fut) as Pin<Box<AdapterFuture>>
+        });
+        Self { inner: invoker }
     }
 }
 

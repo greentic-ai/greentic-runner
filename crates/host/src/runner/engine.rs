@@ -3,19 +3,21 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use greentic_flow::ir::{FlowIR, NodeIR};
 use greentic_mcp::{ExecConfig, ExecRequest};
-use greentic_types::{EnvId, TenantCtx as TypesTenantCtx, TenantId};
+use greentic_types::TenantCtx as TypesTenantCtx;
 use handlebars::Handlebars;
 use parking_lot::RwLock;
 use serde::Deserialize;
-use serde_json::{json, Map as JsonMap, Value};
+use serde_json::{Map as JsonMap, Value, json};
 use tokio::task;
 
 use crate::config::{HostConfig, McpRetryConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
-use crate::telemetry::{annotate_span, backoff_delay_ms, set_flow_context, FlowSpanAttributes};
+use crate::telemetry::{
+    FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context, tenant_context,
+};
 
 pub struct FlowEngine {
     pack: Arc<PackRuntime>,
@@ -104,7 +106,14 @@ impl FlowEngine {
                 action: ctx.action,
             },
         );
-        set_flow_context(ctx.tenant, Some(ctx.flow_id));
+        set_flow_context(
+            &self.default_env,
+            ctx.tenant,
+            ctx.flow_id,
+            ctx.node_id,
+            ctx.provider_id,
+            ctx.session_id,
+        );
         let retry_config = ctx.retry_config;
         let original_input = input;
         async move {
@@ -388,9 +397,14 @@ fn render_template(
 }
 
 fn types_tenant_ctx(ctx: &FlowContext<'_>, default_env: &str) -> TypesTenantCtx {
-    let env_id = EnvId::from(default_env);
-    let tenant_id = TenantId::from(ctx.tenant);
-    TypesTenantCtx::new(env_id, tenant_id)
+    tenant_context(
+        default_env,
+        ctx.tenant,
+        Some(ctx.flow_id),
+        ctx.node_id,
+        ctx.provider_id,
+        ctx.session_id,
+    )
 }
 
 #[cfg(test)]
@@ -439,6 +453,8 @@ pub struct FlowContext<'a> {
     pub node_id: Option<&'a str>,
     pub tool: Option<&'a str>,
     pub action: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
     pub retry_config: RetryConfig,
 }
 

@@ -1,15 +1,15 @@
 use std::sync::Arc;
 
+use axum::BoxError;
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Response as AxumResponse, StatusCode, Uri,
 };
 use axum::response::IntoResponse;
-use axum::BoxError;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use super::{engine::FlowContext, ServerState};
+use super::{ServerState, engine::FlowContext};
 
 pub async fn dispatch(
     Path(flow_id): Path<String>,
@@ -43,16 +43,16 @@ pub async fn dispatch(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
 
-    if let Some(key) = idempotency_key.as_ref() {
-        if let Some(cached) = {
+    if let Some(key) = idempotency_key.as_ref()
+        && let Some(cached) = {
             let mut cache = state.webhook_cache.lock();
             cache.get(key).cloned()
-        } {
-            tracing::debug!(flow_id = %flow.id, idempotency_key = key, "webhook cache hit");
-            return build_response(cached).map_err(|_| {
-                build_error(StatusCode::INTERNAL_SERVER_ERROR, "cached response invalid")
-            });
         }
+    {
+        tracing::debug!(flow_id = %flow.id, idempotency_key = key, "webhook cache hit");
+        return build_response(cached).map_err(|_| {
+            build_error(StatusCode::INTERNAL_SERVER_ERROR, "cached response invalid")
+        });
     }
 
     let normalized = normalize_request(&method, &uri, &headers, &body);
@@ -65,6 +65,8 @@ pub async fn dispatch(
                 node_id: None,
                 tool: None,
                 action: Some("webhook"),
+                session_id: None,
+                provider_id: None,
                 retry_config: state.config.mcp_retry_config().into(),
             },
             normalized,
@@ -141,12 +143,11 @@ fn build_response(value: Value) -> Result<AxumResponse<Body>, BoxError> {
             }
             if let Some(headers_value) = map.get("headers").and_then(|h| h.as_object()) {
                 for (key, value) in headers_value {
-                    if let Some(value_str) = value.as_str() {
-                        if let Ok(header_name) = key.parse::<HeaderName>() {
-                            if let Ok(header_value) = HeaderValue::from_str(value_str) {
-                                headers.insert(header_name, header_value);
-                            }
-                        }
+                    if let Some(value_str) = value.as_str()
+                        && let Ok(header_name) = key.parse::<HeaderName>()
+                        && let Ok(header_value) = HeaderValue::from_str(value_str)
+                    {
+                        headers.insert(header_name, header_value);
                     }
                 }
             }

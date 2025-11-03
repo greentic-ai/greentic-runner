@@ -1,43 +1,9 @@
-use anyhow::Result;
-use once_cell::sync::OnceCell;
-use parking_lot::RwLock;
-use rand::{rng, Rng};
-use std::sync::Arc;
+use greentic_types::telemetry::set_current_tenant_ctx;
+use greentic_types::{EnvId, TenantCtx, TenantId};
+use rand::{Rng, rng};
 use tracing::Span;
-use tracing_subscriber::prelude::*;
 
-use greentic_telemetry::{init_telemetry, CtxLayer, TelemetryConfig, TelemetryCtx};
-
-use crate::config::HostConfig;
-
-static FLOW_CONTEXT: OnceCell<Arc<RwLock<TelemetryCtx>>> = OnceCell::new();
-
-pub fn init(_config: &HostConfig) -> Result<()> {
-    init_telemetry(TelemetryConfig {
-        service_name: "greentic-runner".to_string(),
-    })?;
-
-    let store = FLOW_CONTEXT
-        .get_or_init(|| Arc::new(RwLock::new(TelemetryCtx::default())))
-        .clone();
-    let ctx_layer = CtxLayer::new({
-        let store = Arc::clone(&store);
-        move || store.read().clone()
-    });
-
-    if !tracing::dispatcher::has_been_set() {
-        let _ = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer())
-            .with(ctx_layer)
-            .try_init();
-    } else {
-        tracing::trace!(
-            "tracing subscriber already configured; skipping telemetry subscriber init"
-        );
-    }
-
-    Ok(())
-}
+pub const PROVIDER_ID: &str = "greentic-runner";
 
 #[derive(Debug, Clone)]
 pub struct FlowSpanAttributes<'a> {
@@ -62,12 +28,41 @@ pub fn annotate_span(span: &Span, attrs: &FlowSpanAttributes<'_>) {
     }
 }
 
-pub fn set_flow_context(tenant: &str, flow_id: Option<&str>) {
-    let store = FLOW_CONTEXT.get_or_init(|| Arc::new(RwLock::new(TelemetryCtx::default())));
-    let mut guard = store.write();
-    let mut ctx = TelemetryCtx::default().with_tenant(tenant.to_string());
-    ctx = ctx.with_flow_opt(flow_id.map(|id| id.to_string()));
-    *guard = ctx;
+pub fn tenant_context(
+    env: &str,
+    tenant: &str,
+    flow_id: Option<&str>,
+    node_id: Option<&str>,
+    provider_id: Option<&str>,
+    session_id: Option<&str>,
+) -> TenantCtx {
+    let env_id = EnvId::from(env);
+    let tenant_id = TenantId::from(tenant);
+    let mut ctx = TenantCtx::new(env_id, tenant_id);
+    let provider = provider_id.unwrap_or(PROVIDER_ID);
+    ctx = ctx.with_provider(provider.to_string());
+    if let Some(flow) = flow_id {
+        ctx = ctx.with_flow(flow.to_string());
+    }
+    if let Some(node) = node_id {
+        ctx = ctx.with_node(node.to_string());
+    }
+    if let Some(session) = session_id {
+        ctx = ctx.with_session(session.to_string());
+    }
+    ctx
+}
+
+pub fn set_flow_context(
+    env: &str,
+    tenant: &str,
+    flow_id: &str,
+    node_id: Option<&str>,
+    provider_id: Option<&str>,
+    session_id: Option<&str>,
+) {
+    let ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+    set_current_tenant_ctx(&ctx);
 }
 
 pub fn backoff_delay_ms(base: u64, attempt: u32) -> u64 {

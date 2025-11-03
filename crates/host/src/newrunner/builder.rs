@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use greentic_types::TenantCtx;
 use std::sync::Arc;
 
+#[derive(Default)]
 pub struct RunnerBuilder {
     host: Option<HostBundle>,
     adapters: Option<AdapterRegistry>,
@@ -17,12 +18,7 @@ pub struct RunnerBuilder {
 
 impl RunnerBuilder {
     pub fn new() -> Self {
-        Self {
-            host: None,
-            adapters: None,
-            policy: None,
-            flows: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn with_host(mut self, host: HostBundle) -> Self {
@@ -51,7 +47,7 @@ impl RunnerBuilder {
         })?;
         let adapters = self.adapters.unwrap_or_default();
         let policy = self.policy.unwrap_or_default();
-        let mut state_machine = StateMachine::new(Arc::new(host), adapters, policy);
+        let state_machine = StateMachine::new(Arc::new(host), adapters, policy);
         for flow in self.flows {
             state_machine.register_flow(flow);
         }

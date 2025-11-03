@@ -3,15 +3,15 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use greentic_runner::glue::{FnSecretsHost, FnTelemetryHost};
 use greentic_runner::newrunner::builder::RunnerBuilder;
 use greentic_runner::newrunner::policy::Policy;
 use greentic_runner::newrunner::shims::{InMemorySessionHost, InMemoryStateHost};
 use greentic_runner::newrunner::{
-    api::RunFlowRequest, host::HostBundle, registry::AdapterRegistry,
-    state_machine::FlowDefinition, Runner, RunnerError,
+    Runner, RunnerApi, RunnerError, api::RunFlowRequest, host::HostBundle,
+    registry::AdapterRegistry, state_machine::FlowDefinition,
 };
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use serde_json::Value;
@@ -52,8 +52,15 @@ enum Commands {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[greentic_types::telemetry::main(service_name = "greentic-runner-cli")]
+async fn main() {
+    if let Err(err) = run_cli().await {
+        eprintln!("greentic-runner-cli: {err:?}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_cli() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::ListFlows { manifest } => {
@@ -94,7 +101,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn build_runner(manifest: &PathBuf) -> Result<Runner> {
+async fn build_runner(manifest: &PathBuf) -> anyhow::Result<Runner> {
     let flows = load_flows(manifest).await?;
     let secrets = Arc::new(FnSecretsHost::new(|name| {
         std::env::var(name).map_err(|err| RunnerError::Secrets {
@@ -120,7 +127,7 @@ async fn build_runner(manifest: &PathBuf) -> Result<Runner> {
     Ok(builder.build()?)
 }
 
-async fn load_flows(path: &PathBuf) -> Result<Vec<FlowDefinition>> {
+async fn load_flows(path: &PathBuf) -> anyhow::Result<Vec<FlowDefinition>> {
     let bytes = tokio::fs::read(path)
         .await
         .context("failed to read manifest")?;
@@ -130,15 +137,5 @@ async fn load_flows(path: &PathBuf) -> Result<Vec<FlowDefinition>> {
 }
 
 fn default_tenant() -> TenantCtx {
-    TenantCtx {
-        env: EnvId::from("cli"),
-        tenant: TenantId::from("local"),
-        team: None,
-        user: None,
-        trace_id: None,
-        correlation_id: None,
-        deadline: None,
-        attempt: 0,
-        idempotency_key: None,
-    }
+    TenantCtx::new(EnvId::from("cli"), TenantId::from("local"))
 }
