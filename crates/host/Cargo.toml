@@ -15,8 +15,8 @@ categories = ["wasm", "command-line-utilities", "network-programming"]
 default = ["legacy-host", "stable-wasmtime"]
 legacy-host = []
 new-runner = []
-stable-wasmtime = ["wasmtime_stable", "wasmtime_wasi_stable"]
-nightly-wasmtime = ["greentic-interfaces-wasmtime", "wasmtime_nightly", "wasmtime_wasi_nightly"]
+stable-wasmtime = ["dep:wasmtime"]
+nightly-wasmtime = ["greentic-interfaces-wasmtime", "dep:wasmtime"]
 redis = []
 schema = []
 
@@ -54,10 +54,7 @@ tracing.workspace = true
 wasmparser.workspace = true
 cron.workspace = true
 greentic-interfaces-wasmtime = { version = "0.1", optional = true }
-wasmtime_stable = { package = "wasmtime", version = ">=38,<39", optional = true }
-wasmtime_wasi_stable = { package = "wasmtime-wasi", version = ">=38,<39", optional = true }
-wasmtime_nightly = { package = "wasmtime", version = ">=38,<39", optional = true }
-wasmtime_wasi_nightly = { package = "wasmtime-wasi", version = ">=38,<39", optional = true }
+wasmtime = { version = ">=38,<39", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true
