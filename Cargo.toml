@@ -38,7 +38,5 @@ tokio-util = "0.7"
 tower = "0.5"
 tracing = "0.1"
 wasmparser = "0.240"
-wasmtime = { version = "38", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-wasmtime-wasi = { version = "38", default-features = false, features = ["p1"] }
 cron = "0.15"
 handlebars = "6"
