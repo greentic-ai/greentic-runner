@@ -388,17 +388,9 @@ fn render_template(
 }
 
 fn types_tenant_ctx(ctx: &FlowContext<'_>, default_env: &str) -> TypesTenantCtx {
-    TypesTenantCtx {
-        env: EnvId::from(default_env),
-        tenant: TenantId::from(ctx.tenant),
-        team: None,
-        user: None,
-        trace_id: None,
-        correlation_id: None,
-        deadline: None,
-        attempt: 0,
-        idempotency_key: None,
-    }
+    let env_id = EnvId::from(default_env);
+    let tenant_id = TenantId::from(ctx.tenant);
+    TypesTenantCtx::new(env_id, tenant_id)
 }
 
 #[cfg(test)]

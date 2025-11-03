@@ -1,0 +1,99 @@
+package greentic:oauth@0.1.0;
+
+interface broker {
+    record header {
+        name: string,
+        value: string,
+    }
+
+    enum owner-kind {
+        user,
+        service,
+    }
+
+    enum visibility {
+        private,
+        team,
+        tenant,
+    }
+
+    record initiate-request {
+        flow-id: string,
+        owner-kind: owner-kind,
+        owner-id: string,
+        scopes: list<string>,
+        redirect-uri: option<string>,
+        visibility: option<visibility>,
+    }
+
+    record initiate-response {
+        flow-id: string,
+        redirect-url: string,
+        state: string,
+    }
+
+    record flow-result {
+        flow-id: string,
+        env: string,
+        tenant: string,
+        team: option<string>,
+        provider: string,
+        storage-path: string,
+        token-handle-claims-json: string,
+    }
+
+    record signed-fetch-request {
+        token-handle: string,
+        method: string,
+        url: string,
+        headers: list<header>,
+        body: option<string>,
+        body-encoding: string,
+    }
+
+    record signed-fetch-response {
+        status: u16,
+        headers: list<header>,
+        body: string,
+        body-encoding: string,
+    }
+
+    record access-token-response {
+        access-token: string,
+        expires-at: u64,
+    }
+
+    health-check: func() -> string;
+    initiate-auth: func(request: initiate-request) -> initiate-response;
+    await-result: func(flow-id: string, timeout-ms: option<u64>) -> flow-result;
+    get-access-token: func(token-handle: string, force-refresh: bool) -> access-token-response;
+    signed-fetch: func(request: signed-fetch-request) -> signed-fetch-response;
+}
+
+interface discovery {
+    list-providers: func() -> list<string>;
+    get-descriptor: func(
+        tenant: string,
+        provider: string,
+        team: option<string>,
+        user: option<string>,
+    ) -> string;
+    get-requirements: func(
+        tenant: string,
+        provider: string,
+        team: option<string>,
+        user: option<string>,
+    ) -> string;
+    start-flow: func(
+        tenant: string,
+        provider: string,
+        grant-type: string,
+        team: option<string>,
+        user: option<string>,
+    ) -> string;
+}
+
+world oauth {
+    export broker;
+    export discovery;
+}

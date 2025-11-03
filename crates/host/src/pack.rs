@@ -288,15 +288,11 @@ fn map_tenant_ctx(ctx: TenantCtx, default_env: &str) -> TypesTenantCtx {
         .runtime
         .unwrap_or_else(|| default_env.to_string());
 
-    TypesTenantCtx {
-        env: EnvId::from(env.as_str()),
-        tenant: TenantId::from(ctx.tenant.as_str()),
-        team: ctx.team.map(|t| TeamId::from(t.as_str())),
-        user: ctx.user.map(|u| UserId::from(u.as_str())),
-        trace_id: ctx.trace_id,
-        correlation_id: None,
-        deadline: None,
-        attempt: 0,
-        idempotency_key: None,
-    }
+    let env_id = EnvId::from(env.as_str());
+    let tenant_id = TenantId::from(ctx.tenant.as_str());
+    let mut tenant_ctx = TypesTenantCtx::new(env_id, tenant_id);
+    tenant_ctx = tenant_ctx.with_team(ctx.team.map(|t| TeamId::from(t.as_str())));
+    tenant_ctx = tenant_ctx.with_user(ctx.user.map(|u| UserId::from(u.as_str())));
+    tenant_ctx.trace_id = ctx.trace_id;
+    tenant_ctx
 }

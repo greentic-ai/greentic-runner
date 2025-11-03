@@ -1,0 +1,78 @@
+package greentic:types-core@0.2.0;
+
+interface shared {
+  /// Unique identifier for a flow definition.
+  type flow-id = string;
+
+  /// Identifiers for tenant-scoped access control.
+  type tenant-id = string;
+  type team-id = string;
+  type user-id = string;
+
+  /// Supported cloud providers.
+  variant cloud { aws, gcp, azure, hetzner, local, other }
+
+  /// Supported runtime platforms.
+  variant platform { k8s, nomad, systemd, cfworkers, lambda, baremetal, other }
+
+  /// Deployment information where the flow executes.
+  record deployment-ctx {
+    cloud: cloud,
+    region: option<string>,
+    platform: platform,
+    runtime: option<string>,
+  }
+
+  /// Tenant identity and invocation metadata.
+  record tenant-ctx {
+    tenant: tenant-id,
+    team: option<team-id>,
+    user: option<user-id>,
+    deployment: deployment-ctx,
+    trace-id: option<string>,
+  }
+
+  /// Describes a flow that can be invoked by the pack.
+  record flow-info {
+    id: flow-id,
+    profile: string,
+    version: string,
+    flow-type: string,
+    private: bool,
+  }
+
+  /// Runtime configuration when executing a flow.
+  record run-opts {
+    tenant: option<tenant-ctx>,
+    timeout-ms: option<u32>,
+    fuel-units: option<u64>,
+  }
+
+  /// Schema description for flow inputs and outputs.
+  record schema-doc {
+    input-jsonschema: string,
+    output-jsonschema: string,
+  }
+
+  /// Result returned from executing a flow.
+  record run-result {
+    status: string,
+    output-json: option<string>,
+    error: option<string>,
+    logs-json: option<string>,
+    metrics-json: option<string>,
+  }
+
+  /// Candidate returned from an A2A search.
+  record a2a-candidate {
+    flow: flow-id,
+    score: f32,
+  }
+
+  /// Standard error codes returned by host services.
+  variant iface-error { invalid-arg, not-found, denied, unavailable, internal }
+}
+
+world core {
+  export shared;
+}

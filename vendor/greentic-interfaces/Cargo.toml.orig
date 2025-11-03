@@ -1,0 +1,60 @@
+[package]
+name = "greentic-interfaces"
+version = "0.4.12"
+edition = "2021"
+build = "build.rs"
+license = "MIT"
+repository = "https://github.com/greentic-ai/greentic-interfaces"
+description = "Greentic ABI: WIT contracts, generated bindings, thin mappers"
+readme = "README.md"
+documentation = "https://docs.rs/greentic-interfaces"
+keywords = ["greentic", "wit", "wasm", "component"]
+categories = ["wasm", "api-bindings"]
+
+[features]
+default = [
+    "bindings-rust",
+    "component-v0-4",
+    "pack-export-v0-4",
+    "types-core-v0-4",
+    "host-import-v0-4",
+    "host-import-v0-2",
+    "pack-export-v0-2",
+    "types-core-v0-2",
+    "secrets-v0-1",
+    "wasix-mcp-v0-0-5",
+    "oauth-v0-1"
+]
+bindings-rust = ["dep:wit-bindgen"]
+component-v0-4 = []
+pack-export-v0-4 = []
+types-core-v0-4 = []
+host-import-v0-4 = []
+host-import-v0-2 = []
+pack-export-v0-2 = []
+types-core-v0-2 = []
+secrets-v0-1 = []
+wasix-mcp-v0-0-5 = []
+oauth-v0-1 = []
+host-import-compat = ["host-import-v0-4", "host-import-v0-2"]
+schema = ["dep:schemars", "greentic-types/schemars"]
+
+[dependencies]
+greentic-types = { workspace = true }
+semver = "1"
+time = "0.3"
+serde = { workspace = true, optional = true }
+schemars = { version = "1", features = ["derive"], optional = true }
+wit-bindgen = { version = "0.47", optional = true }
+anyhow = "1"
+thiserror = "2"
+wasmtime = { version = ">=18, <999", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+
+[build-dependencies]
+wit-bindgen-core = "0.47"
+wit-bindgen-rust = "0.47"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+insta = { version = "1", features = ["json"] }
+wit-parser = "0.240"

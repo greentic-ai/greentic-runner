@@ -1,29 +1,42 @@
 use anyhow::Result;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use rand::{rng, Rng};
+use std::sync::Arc;
 use tracing::Span;
+use tracing_subscriber::prelude::*;
 
-use greentic_telemetry::{CloudCtx, TelemetryInit};
+use greentic_telemetry::{init_telemetry, CtxLayer, TelemetryConfig, TelemetryCtx};
 
 use crate::config::HostConfig;
 
-const CONTEXT_KEYS: &[&str] = &["action", "tool", "node_id"];
+static FLOW_CONTEXT: OnceCell<Arc<RwLock<TelemetryCtx>>> = OnceCell::new();
 
 pub fn init(_config: &HostConfig) -> Result<()> {
-    let init = TelemetryInit {
-        service_name: "greentic-runner",
-        service_version: env!("CARGO_PKG_VERSION"),
-        deployment_env: deployment_env(),
-    };
+    init_telemetry(TelemetryConfig {
+        service_name: "greentic-runner".to_string(),
+    })?;
 
-    greentic_telemetry::init(init, CONTEXT_KEYS)?;
+    let store = FLOW_CONTEXT
+        .get_or_init(|| Arc::new(RwLock::new(TelemetryCtx::default())))
+        .clone();
+    let ctx_layer = CtxLayer::new({
+        let store = Arc::clone(&store);
+        move || store.read().clone()
+    });
+
+    if !tracing::dispatcher::has_been_set() {
+        let _ = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer())
+            .with(ctx_layer)
+            .try_init();
+    } else {
+        tracing::trace!(
+            "tracing subscriber already configured; skipping telemetry subscriber init"
+        );
+    }
+
     Ok(())
-}
-
-fn deployment_env() -> &'static str {
-    static ENV: OnceCell<String> = OnceCell::new();
-    ENV.get_or_init(|| std::env::var("DEPLOYMENT_ENV").unwrap_or_else(|_| "dev".to_owned()))
-        .as_str()
 }
 
 #[derive(Debug, Clone)]
@@ -50,12 +63,11 @@ pub fn annotate_span(span: &Span, attrs: &FlowSpanAttributes<'_>) {
 }
 
 pub fn set_flow_context(tenant: &str, flow_id: Option<&str>) {
-    greentic_telemetry::set_context(CloudCtx {
-        tenant: Some(tenant),
-        team: None,
-        flow: flow_id,
-        run_id: None,
-    });
+    let store = FLOW_CONTEXT.get_or_init(|| Arc::new(RwLock::new(TelemetryCtx::default())));
+    let mut guard = store.write();
+    let mut ctx = TelemetryCtx::default().with_tenant(tenant.to_string());
+    ctx = ctx.with_flow_opt(flow_id.map(|id| id.to_string()));
+    *guard = ctx;
 }
 
 pub fn backoff_delay_ms(base: u64, attempt: u32) -> u64 {

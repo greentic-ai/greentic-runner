@@ -1,0 +1,74 @@
+package greentic:pack-export@0.2.0;
+
+interface exports {
+  variant cloud { aws, gcp, azure, hetzner, local, other }
+  variant platform { k8s, nomad, systemd, cfworkers, lambda, baremetal, other }
+
+  type flow-id = string;
+  type tenant-id = string;
+  type team-id = string;
+  type user-id = string;
+
+  record deployment-ctx {
+    cloud: cloud,
+    region: option<string>,
+    platform: platform,
+    runtime: option<string>,
+  }
+
+  record tenant-ctx {
+    tenant: tenant-id,
+    team: option<team-id>,
+    user: option<user-id>,
+    deployment: deployment-ctx,
+    trace-id: option<string>,
+  }
+
+  record flow-info {
+    id: flow-id,
+    profile: string,
+    version: string,
+    flow-type: string,
+    private: bool,
+  }
+
+  record run-opts {
+    tenant: option<tenant-ctx>,
+    timeout-ms: option<u32>,
+    fuel-units: option<u64>,
+  }
+
+  record schema-doc {
+    input-jsonschema: string,
+    output-jsonschema: string,
+  }
+
+  record run-result {
+    status: string,
+    output-json: option<string>,
+    error: option<string>,
+    logs-json: option<string>,
+    metrics-json: option<string>,
+  }
+
+  record a2a-candidate {
+    flow: flow-id,
+    score: f32,
+  }
+
+  variant iface-error { invalid-arg, not-found, denied, unavailable, internal }
+
+  list-flows: func() -> result<list<flow-info>, iface-error>;
+  get-flow-schema: func(flow: flow-id) -> result<schema-doc, iface-error>;
+  flow-metadata: func(flow: flow-id) -> result<string, iface-error>;
+  run-flow: func(flow: flow-id, input-json: string, opts: option<run-opts>)
+    -> result<run-result, iface-error>;
+  prepare-flow: func(flow: flow-id, hints-json: option<string>)
+    -> result<string, iface-error>;
+  a2a-search: func(model: string, query-embedding: list<f32>, k: u32)
+    -> result<list<a2a-candidate>, iface-error>;
+}
+
+world pack-exports {
+  export exports;
+}

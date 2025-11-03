@@ -3,7 +3,6 @@ name = "greentic-runner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 description = "Greentic pack runner with Telegram messaging adapter and node dispatcher."
 homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"
@@ -59,8 +58,8 @@ cron.workspace = true
 greentic-interfaces-wasmtime = { version = "0.1", optional = true }
 wasmtime_stable = { package = "wasmtime", version = ">=29,<38", optional = true }
 wasmtime_wasi_stable = { package = "wasmtime-wasi", version = ">=29,<38", optional = true }
-wasmtime_nightly = { package = "wasmtime", version = "38", optional = true }
-wasmtime_wasi_nightly = { package = "wasmtime-wasi", version = "38", optional = true }
+wasmtime_nightly = { package = "wasmtime", version = ">=29,<38", optional = true }
+wasmtime_wasi_nightly = { package = "wasmtime-wasi", version = ">=29,<38", optional = true }
 
 [dev-dependencies]
 anyhow.workspace = true

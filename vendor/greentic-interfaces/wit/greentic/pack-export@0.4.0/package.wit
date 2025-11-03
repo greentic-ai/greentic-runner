@@ -1,0 +1,34 @@
+package greentic:pack-export@0.4.0;
+
+/// discovery-related queries exposed by packs
+interface pack-queries {
+  use greentic:types-core/types@0.4.0.{flow-id, flow-info, schema-doc, iface-error};
+
+  list-flows: func() -> result<list<flow-info>, iface-error>;
+  get-flow-schema: func(flow: flow-id) -> result<schema-doc, iface-error>;
+  /// opaque JSON metadata blob
+  flow-metadata: func(flow: flow-id) -> result<string, iface-error>;
+}
+
+/// execution lifecycle APIs exposed by packs
+interface pack-exec {
+  use greentic:types-core/types@0.4.0.{flow-id, run-opts, run-result, iface-error};
+
+  run-flow: func(flow: flow-id, input-json: string, opts: option<run-opts>)
+    -> result<run-result, iface-error>;
+  prepare-flow: func(flow: flow-id, hints-json: option<string>) -> result<string, iface-error>;
+}
+
+/// A2A search capabilities
+interface pack-a2a {
+  use greentic:types-core/types@0.4.0.{a2a-candidate, iface-error};
+
+  a2a-search: func(model: string, query-embedding: list<f32>, k: u32)
+    -> result<list<a2a-candidate>, iface-error>;
+}
+
+world pack-exports {
+  export pack-queries;
+  export pack-exec;
+  export pack-a2a;
+}

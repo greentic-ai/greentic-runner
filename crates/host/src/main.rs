@@ -2,6 +2,8 @@ mod config;
 mod imports;
 mod pack;
 mod runner;
+#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
+mod runtime_wasmtime;
 mod telemetry;
 mod verify;
 

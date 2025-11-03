@@ -1,0 +1,17 @@
+package greentic:interfaces-pack@0.1.0;
+
+use greentic:interfaces-provider/provider@0.1.0;
+use greentic:interfaces-types/types@0.1.0;
+
+interface component-api {
+  use greentic:interfaces-provider/provider@0.1.0.{provider-meta};
+  use greentic:interfaces-types/types@0.1.0.{tenant-ctx, outcome};
+
+  meta: func() -> provider-meta;
+  invoke: func(input: string, tenant: tenant-ctx) -> outcome;
+}
+
+world component {
+  import greentic:interfaces-host/imports@0.1.0;
+  export component-api;
+}

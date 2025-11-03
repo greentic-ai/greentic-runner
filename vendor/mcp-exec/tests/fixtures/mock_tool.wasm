@@ -1,0 +1,15 @@
+{
+  "_mock_mcp_exec": true,
+  "responses": {
+    "capabilities": ["describe", "noop"],
+    "noop": { "ok": true },
+    "list_secrets": [],
+    "config_schema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "city": { "type": "string" }
+      }
+    }
+  }
+}

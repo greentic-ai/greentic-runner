@@ -1,0 +1,79 @@
+package greentic:types-core@0.4.0;
+
+interface types {
+  /// identifiers
+  type flow-id = string;
+  type tenant-id = string;
+  type team-id = string;
+  type user-id = string;
+
+  /// clouds & platforms (keep enums stable; add variants only in minor bumps)
+  enum cloud { aws, gcp, azure, hetzner, local, other }
+  enum platform { k8s, nomad, systemd, cfworkers, lambda, baremetal, other }
+
+  /// flow deployment context supplied by hosts
+  record deployment-ctx {
+    cloud: cloud,
+    region: option<string>,
+    platform: platform,
+    runtime: option<string>,
+  }
+
+  /// tenant identity and invocation metadata
+  record tenant-ctx {
+    tenant: tenant-id,
+    team: option<team-id>,
+    user: option<user-id>,
+    deployment: deployment-ctx,
+    trace-id: option<string>,
+  }
+
+  /// flow registration information
+  record flow-info {
+    id: flow-id,
+    /// human-readable name
+    profile: string,
+    /// semver identifier
+    version: string,
+    /// "messaging" | "webhook" | "timer" | ...
+    %type: string,
+    private: bool,
+  }
+
+  /// execution modifiers supplied when running a flow
+  record run-opts {
+    tenant: option<tenant-ctx>,
+    timeout-ms: option<u32>,
+    /// Wasm "fuel" if host enforces
+    fuel-units: option<u64>,
+  }
+
+  /// JSON schema documents describing flow IO
+  record schema-doc {
+    input-jsonschema: string,
+    output-jsonschema: string,
+  }
+
+  /// result returned by a flow execution
+  record run-result {
+    /// "ok" | "error" | "deferred"
+    status: string,
+    output-json: option<string>,
+    error: option<string>,
+    logs-json: option<string>,
+    metrics-json: option<string>,
+  }
+
+  /// A2A search candidate
+  record a2a-candidate {
+    flow: flow-id,
+    score: f32,
+  }
+
+  /// standardized interface errors
+  enum iface-error { invalid-arg, not-found, denied, unavailable, internal }
+}
+
+world core {
+  export types;
+}
