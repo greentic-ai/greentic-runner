@@ -16,7 +16,7 @@ default = ["legacy-host", "stable-wasmtime"]
 legacy-host = []
 new-runner = []
 stable-wasmtime = ["dep:wasmtime"]
-nightly-wasmtime = ["greentic-interfaces-wasmtime", "dep:wasmtime"]
+nightly-wasmtime = ["dep:wasmtime"]
 redis = []
 schema = []
 
@@ -53,7 +53,6 @@ tower.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 cron.workspace = true
-greentic-interfaces-wasmtime = { version = "0.1", optional = true }
 wasmtime = { version = ">=38,<39", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 
 [dev-dependencies]
