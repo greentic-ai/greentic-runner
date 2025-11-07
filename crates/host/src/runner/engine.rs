@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value, json};
 use tokio::task;
 
+use super::mocks::MockLayer;
 use crate::config::{HostConfig, McpRetryConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
 use crate::telemetry::{
@@ -167,9 +169,34 @@ impl FlowEngine {
                 &node.payload_expr,
                 &context_value,
             )?;
-            let output = self
+            let observed_payload = payload.clone();
+            let node_id = current.clone();
+            let event = NodeEvent {
+                context: ctx,
+                node_id: &node_id,
+                node,
+                payload: &observed_payload,
+            };
+            if let Some(observer) = ctx.observer {
+                observer.on_node_start(&event);
+            }
+            let dispatch = self
                 .dispatch_node(ctx, &current, node, &state, payload)
-                .await?;
+                .await;
+            let output = match dispatch {
+                Ok(output) => {
+                    if let Some(observer) = ctx.observer {
+                        observer.on_node_end(&event, &output.payload);
+                    }
+                    output
+                }
+                Err(err) => {
+                    if let Some(observer) = ctx.observer {
+                        observer.on_node_error(&event, err.as_ref());
+                    }
+                    return Err(err);
+                }
+            };
 
             state.nodes.insert(current.clone(), output.clone());
 
@@ -219,6 +246,13 @@ impl FlowEngine {
 
         let payload: McpPayload =
             serde_json::from_value(payload).context("invalid payload for mcp.exec node")?;
+
+        if let Some(mocks) = ctx.mocks
+            && let Some(result) = mocks.tool_short_circuit(&payload.component, &payload.action)
+        {
+            let value = result.map_err(|err| anyhow!(err))?;
+            return Ok(NodeOutput::new(value));
+        }
 
         let request = ExecRequest {
             component: payload.component,
@@ -272,6 +306,19 @@ impl FlowEngine {
             .iter()
             .find(|descriptor| descriptor.id == flow_id)
     }
+}
+
+pub trait ExecutionObserver: Send + Sync {
+    fn on_node_start(&self, event: &NodeEvent<'_>);
+    fn on_node_end(&self, event: &NodeEvent<'_>, output: &Value);
+    fn on_node_error(&self, event: &NodeEvent<'_>, error: &dyn StdError);
+}
+
+pub struct NodeEvent<'a> {
+    pub context: &'a FlowContext<'a>,
+    pub node_id: &'a str,
+    pub node: &'a NodeIR,
+    pub payload: &'a Value,
 }
 
 struct ExecutionState {
@@ -456,6 +503,8 @@ pub struct FlowContext<'a> {
     pub session_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
     pub retry_config: RetryConfig,
+    pub observer: Option<&'a dyn ExecutionObserver>,
+    pub mocks: Option<&'a MockLayer>,
 }
 
 #[derive(Copy, Clone)]

@@ -67,6 +67,7 @@ pub struct RateLimits {
 #[derive(Debug, Clone)]
 pub struct SecretsPolicy {
     allowed: HashSet<String>,
+    allow_all: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,11 +162,32 @@ impl SecretsPolicy {
             .values()
             .flat_map(|binding| binding.secrets.iter().cloned())
             .collect::<HashSet<_>>();
-        Self { allowed }
+        Self {
+            allowed,
+            allow_all: false,
+        }
     }
 
     pub fn is_allowed(&self, key: &str) -> bool {
-        self.allowed.contains(key)
+        self.allow_all || self.allowed.contains(key)
+    }
+
+    pub fn allow_all() -> Self {
+        Self {
+            allowed: HashSet::new(),
+            allow_all: true,
+        }
+    }
+
+    pub fn from_allowed<I, S>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            allowed: iter.into_iter().map(Into::into).collect(),
+            allow_all: false,
+        }
     }
 }
 

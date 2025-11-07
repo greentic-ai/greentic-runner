@@ -9,7 +9,7 @@ use serde_json::json;
 use super::{ServerState, engine::FlowContext};
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct TelegramUpdate {
+pub struct TelegramUpdate {
     update_id: i64,
     #[serde(default)]
     message: Option<TelegramMessage>,
@@ -93,6 +93,8 @@ pub async fn telegram_webhook(
                 session_id: None,
                 provider_id: None,
                 retry_config: state.config.mcp_retry_config().into(),
+                observer: None,
+                mocks: None,
             },
             payload,
         )

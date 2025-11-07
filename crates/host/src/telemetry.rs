@@ -1,6 +1,7 @@
 use greentic_types::telemetry::set_current_tenant_ctx;
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use rand::{Rng, rng};
+use std::str::FromStr;
 use tracing::Span;
 
 pub const PROVIDER_ID: &str = "greentic-runner";
@@ -36,8 +37,8 @@ pub fn tenant_context(
     provider_id: Option<&str>,
     session_id: Option<&str>,
 ) -> TenantCtx {
-    let env_id = EnvId::from(env);
-    let tenant_id = TenantId::from(tenant);
+    let env_id = EnvId::from_str(env).expect("invalid env id");
+    let tenant_id = TenantId::from_str(tenant).expect("invalid tenant id");
     let mut ctx = TenantCtx::new(env_id, tenant_id);
     let provider = provider_id.unwrap_or(PROVIDER_ID);
     ctx = ctx.with_provider(provider.to_string());

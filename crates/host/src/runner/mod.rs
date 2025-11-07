@@ -2,6 +2,7 @@ pub mod adapt_messaging;
 pub mod adapt_timer;
 pub mod adapt_webhook;
 pub mod engine;
+pub mod mocks;
 
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -119,7 +120,7 @@ impl ServerState {
 const TELEGRAM_CACHE_CAPACITY: usize = 1024;
 const WEBHOOK_CACHE_CAPACITY: usize = 256;
 
-pub(crate) struct RateLimiter {
+pub struct RateLimiter {
     allowance: f64,
     rate: f64,
     burst: f64,

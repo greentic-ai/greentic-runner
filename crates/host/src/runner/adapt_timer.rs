@@ -59,6 +59,8 @@ pub fn spawn_timers(state: Arc<ServerState>) -> Result<Vec<JoinHandle<()>>> {
                             session_id: Some(schedule_id.as_str()),
                             provider_id: None,
                             retry_config: shared_state.config.mcp_retry_config().into(),
+                            observer: None,
+                            mocks: None,
                         },
                         payload,
                     )

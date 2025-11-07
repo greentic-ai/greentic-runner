@@ -121,6 +121,22 @@ async fn main() -> anyhow::Result<()> {
 - **Testing:** `cargo test --workspace --all-features` exercises the new state machine (requires enabling `new-runner`). Redis-backed tests will attach once the external crates land.
 - **Session/state shims:** Temporary in-memory implementations live under `src/newrunner/shims/` and provide CAS semantics plus TTL. Replace them with `greentic-session` / `greentic-state` once published.
 
+## Local Checks
+
+Run the local CI mirror before pushing:
+
+```bash
+ci/local_check.sh
+```
+
+Toggles:
+
+- `LOCAL_CHECK_ONLINE=1` – enable steps that need the network.
+- `LOCAL_CHECK_STRICT=1` – treat missing tools as fatal and run all optional checks.
+- `LOCAL_CHECK_VERBOSE=1` – print every command.
+
+The script installs a lightweight `pre-push` hook on first run so pushes stay green.
+
 ## Releases & Publishing
 
 - Crate versions come directly from each crate's `Cargo.toml`.

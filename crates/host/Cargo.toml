@@ -30,9 +30,10 @@ futures.workspace = true
 greentic-flow.workspace = true
 greentic-interfaces.workspace = true
 greentic-mcp.workspace = true
-greentic-session = { version = "0.1", default-features = true, optional = true }
-greentic-state = { version = "0.1", default-features = true, optional = true }
+greentic-session = { workspace = true, optional = true }
+greentic-state = { workspace = true, optional = true }
 greentic-types.workspace = true
+greentic-pack.workspace = true
 async-trait = "0.1"
 handlebars.workspace = true
 hex.workspace = true
@@ -44,6 +45,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_bw.workspace = true
+serde_cbor.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -54,6 +56,10 @@ tracing.workspace = true
 wasmparser.workspace = true
 cron.workspace = true
 wasmtime = { version = ">=38,<39", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
+uuid.workspace = true
+url.workspace = true
+zip.workspace = true
+indexmap.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true

@@ -68,6 +68,8 @@ pub async fn dispatch(
                 session_id: None,
                 provider_id: None,
                 retry_config: state.config.mcp_retry_config().into(),
+                observer: None,
+                mocks: None,
             },
             normalized,
         )

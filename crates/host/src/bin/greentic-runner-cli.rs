@@ -15,6 +15,7 @@ use greentic_runner::newrunner::{
 };
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use serde_json::Value;
+use std::str::FromStr;
 
 #[derive(Debug, Parser)]
 #[command(name = "greentic-runner-cli")]
@@ -137,5 +138,8 @@ async fn load_flows(path: &PathBuf) -> anyhow::Result<Vec<FlowDefinition>> {
 }
 
 fn default_tenant() -> TenantCtx {
-    TenantCtx::new(EnvId::from("cli"), TenantId::from("local"))
+    TenantCtx::new(
+        EnvId::from_str("cli").expect("env id"),
+        TenantId::from_str("local").expect("tenant id"),
+    )
 }

@@ -1,12 +1,3 @@
-mod config;
-mod imports;
-mod pack;
-mod runner;
-#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
-mod runtime_wasmtime;
-mod telemetry;
-mod verify;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,9 +5,9 @@ use anyhow::Context;
 use clap::Parser;
 use tokio::signal;
 
-use crate::config::HostConfig;
-use crate::pack::PackRuntime;
-use crate::runner::HostServer;
+use greentic_runner::config::HostConfig;
+use greentic_runner::pack::PackRuntime;
+use greentic_runner::runner::HostServer;
 
 #[derive(Debug, Parser)]
 #[command(name = "greentic-runner")]
@@ -71,7 +62,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     let pack = Arc::new(
-        PackRuntime::load(&cli.pack, Arc::clone(&host_config))
+        PackRuntime::load(&cli.pack, Arc::clone(&host_config), None, None)
             .await
             .with_context(|| format!("failed to load pack {:?}", cli.pack))?,
     );

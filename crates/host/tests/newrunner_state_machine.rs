@@ -14,10 +14,14 @@ use greentic_runner::newrunner::state_machine::{FlowDefinition, FlowStep};
 use greentic_runner::newrunner::{FlowSummary, RunnerApi, RunnerError};
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use serde_json::json;
+use std::str::FromStr;
 use tokio::sync::Mutex;
 
 fn tenant() -> TenantCtx {
-    TenantCtx::new(EnvId::from("dev"), TenantId::from("acme"))
+    TenantCtx::new(
+        EnvId::from_str("dev").expect("env id"),
+        TenantId::from_str("acme").expect("tenant id"),
+    )
 }
 
 fn host_bundle() -> HostBundle {
