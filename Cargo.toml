@@ -17,13 +17,13 @@ clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 futures = "0.3"
-greentic-flow = "0.3.3"
-greentic-interfaces = "0.4.20"
-greentic-mcp = { package = "mcp-exec", version = "0.3.0" }
-greentic-types = { version = "0.3.0", features = ["telemetry-autoinit"] }
-greentic-pack = { version = "0.3.0" }
-greentic-session = { version = "0.2.0", default-features = true }
-greentic-state = { version = "0.2.1", default-features = true }
+greentic-flow = "0.3"
+greentic-interfaces = "0.4"
+greentic-mcp = { package = "mcp-exec", version = "0.3" }
+greentic-types = { version = "0.3", features = ["telemetry-autoinit"] }
+greentic-pack = { version = "0.3" }
+greentic-session = { version = "0.3", default-features = true }
+greentic-state = { version = "0.3", default-features = true }
 hex = "0.4"
 lru = "0.16"
 once_cell = "1.18"
@@ -49,11 +49,3 @@ url = "2"
 zip = { version = "0.6", default-features = false, features = ["deflate"] }
 indexmap = "2"
 
-[patch.crates-io]
-greentic-flow = { path = "../greentic-flow" }
-greentic-interfaces = { path = "../greentic-interfaces/crates/greentic-interfaces" }
-greentic-types = { path = "../greentic-types" }
-greentic-types-macros = { path = "../greentic-types/greentic-types-macros" }
-greentic-pack = { path = "../greentic-pack/crates/greentic-pack" }
-greentic-session = { path = "../greentic-session" }
-greentic-state = { path = "../greentic-state" }

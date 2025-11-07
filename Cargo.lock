@@ -1082,7 +1082,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1334,6 +1334,8 @@ dependencies = [
 [[package]]
 name = "greentic-flow"
 version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96b518ad68ba68dc2927b9f71ec9a022edb11d6623c77a6ffd4ce98ca9f4ee0a"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1355,6 +1357,8 @@ dependencies = [
 [[package]]
 name = "greentic-interfaces"
 version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "638378c4256f585ae53c8d07fc8e9e0f663aa9a82d39a82990992d3acb7e7ba8"
 dependencies = [
  "anyhow",
  "greentic-types",
@@ -1370,6 +1374,8 @@ dependencies = [
 [[package]]
 name = "greentic-pack"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1009f12dc3458b24eb7ee6f831c6e26688c0b7edf10ae720dbb59299a637f2e0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1446,7 +1452,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-session"
-version = "0.2.0"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "efe6b4b5dac3a48752f6ac39b3f57e0d1cd9b15408a59e0479c49a78e8104614"
 dependencies = [
  "dashmap",
  "greentic-types",
@@ -1465,7 +1473,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-state"
-version = "0.2.1"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97af8705dae7fe6b426b11e86cdb6b0885a254d6c60d18bcb0d4593a35c4e8ef"
 dependencies = [
  "dashmap",
  "greentic-interfaces",
@@ -1500,6 +1510,8 @@ dependencies = [
 [[package]]
 name = "greentic-types"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6362e86ec9aa970380ae6815a2704cbcf208b6cc8f5405bdca4b0fb8446a805"
 dependencies = [
  "greentic-telemetry",
  "greentic-types-macros",
@@ -1517,6 +1529,8 @@ dependencies = [
 [[package]]
 name = "greentic-types-macros"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d42290f1262dcc2064019a46675e86bfc368211d986ce46ebedfa6be4b63bc3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2658,7 +2672,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2959,7 +2973,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.11.0",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4207,7 +4221,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
