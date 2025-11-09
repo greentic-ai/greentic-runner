@@ -1,0 +1,20 @@
+[package]
+name = "greentic-runner-new"
+version = "0.3.0"
+edition = "2024"
+description = "New Greentic runner state machine, adapters, and CLI glue"
+license = "MIT"
+repository = "https://github.com/greentic-ai/greentic-runner"
+
+[dependencies]
+async-trait = "0.1"
+greentic-types.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.0", features = ["mcp"] }

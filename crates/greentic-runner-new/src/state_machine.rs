@@ -1,11 +1,11 @@
-use crate::newrunner::api::{FlowSchema, FlowSummary};
-use crate::newrunner::error::{GResult, RunnerError};
-use crate::newrunner::host::{
+use crate::api::{FlowSchema, FlowSummary};
+use crate::error::{GResult, RunnerError};
+use crate::host::{
     HostBundle, OutboxKey, SessionKey, SessionOutboxEntry, SessionSnapshot, SpanContext, WaitState,
 };
-use crate::newrunner::policy::retry_with_jitter;
-use crate::newrunner::policy::{Policy, policy_violation};
-use crate::newrunner::registry::{AdapterCall, AdapterRegistry};
+use crate::policy::retry_with_jitter;
+use crate::policy::{Policy, policy_violation};
+use crate::registry::{AdapterCall, AdapterRegistry};
 use greentic_types::TenantCtx;
 use parking_lot::RwLock;
 use rand::{Rng, rng};

@@ -1189,7 +1189,6 @@ checksum = "65bc07b1a8bc7c85c5f2e110c476c7389b4554ba72af57d8445ea63a576b0876"
 dependencies = [
  "futures-channel",
  "futures-core",
- "futures-executor",
  "futures-io",
  "futures-sink",
  "futures-task",
@@ -1258,7 +1257,6 @@ version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fa08315bb612088cc391249efdc3bc77536f16c91f6cf495e6fbe85b20a4a81"
 dependencies = [
- "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -1384,41 +1382,34 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
- "async-trait",
- "axum",
- "chrono",
  "clap",
- "cron",
- "ed25519-dalek",
- "futures",
+ "greentic-runner-desktop",
+ "greentic-runner-host",
+ "greentic-runner-new",
+ "greentic-types",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "greentic-runner-desktop"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
  "greentic-pack",
  "greentic-runner-host",
- "greentic-types",
- "handlebars",
- "hex",
- "indexmap",
- "lru",
- "once_cell",
  "parking_lot",
- "rand 0.9.2",
- "reqwest",
  "serde",
- "serde_cbor",
  "serde_json",
  "serde_yaml_bw",
- "sha2",
- "thiserror",
  "time",
  "tokio",
- "tokio-util",
- "tower",
  "tracing",
- "url",
  "uuid",
- "wasmparser 0.240.0",
  "zip 6.0.0",
 ]
 
@@ -1457,8 +1448,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "greentic-runner-new"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "greentic-runner-host",
+ "greentic-types",
+ "hex",
+ "parking_lot",
+ "rand 0.9.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "greentic-runner-tests"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "reqwest",

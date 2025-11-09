@@ -1,14 +1,14 @@
-use crate::config::{
-    HostConfig, McpConfig, McpRetryConfig, RateLimits, SecretsPolicy, WebhookPolicy,
-};
-use crate::pack::{PackMetadata, PackRuntime};
-use crate::runner::engine::{ExecutionObserver, FlowContext, FlowEngine, NodeEvent};
-pub use crate::runner::mocks::{
-    HttpMock, HttpMockMode, KvMock, MocksConfig, SecretsMock, TelemetryMock, TimeMock, ToolsMock,
-};
-use crate::runner::mocks::{MockEventSink, MockLayer};
 use anyhow::{Context, Result, anyhow};
 use greentic_pack::reader::{PackLoad, open_pack};
+use greentic_runner_host::config::{
+    HostConfig, McpConfig, McpRetryConfig, RateLimits, SecretsPolicy, WebhookPolicy,
+};
+use greentic_runner_host::pack::{FlowDescriptor, PackMetadata, PackRuntime};
+use greentic_runner_host::runner::engine::{ExecutionObserver, FlowContext, FlowEngine, NodeEvent};
+pub use greentic_runner_host::runner::mocks::{
+    HttpMock, HttpMockMode, KvMock, MocksConfig, SecretsMock, TelemetryMock, TimeMock, ToolsMock,
+};
+use greentic_runner_host::runner::mocks::{MockEventSink, MockLayer};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
@@ -371,7 +371,7 @@ fn prepare_run_dirs(root_override: Option<PathBuf>) -> Result<RunDirectories> {
 fn resolve_entry_flow(
     override_id: Option<String>,
     metadata: &PackMetadata,
-    flows: &[crate::pack::FlowDescriptor],
+    flows: &[FlowDescriptor],
 ) -> Result<String> {
     if let Some(flow) = override_id {
         return Ok(flow);

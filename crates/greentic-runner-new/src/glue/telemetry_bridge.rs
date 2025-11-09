@@ -1,5 +1,5 @@
-use crate::newrunner::error::GResult;
-use crate::newrunner::host::{SpanContext, TelemetryHost};
+use crate::error::GResult;
+use crate::host::{SpanContext, TelemetryHost};
 use async_trait::async_trait;
 use std::sync::Arc;
 

@@ -1,4 +1,4 @@
-use crate::newrunner::error::GResult;
+use crate::error::GResult;
 use async_trait::async_trait;
 use greentic_types::TenantCtx;
 use serde::{Deserialize, Serialize};

@@ -1,5 +1,5 @@
-use crate::newrunner::error::GResult;
-use crate::newrunner::registry::{Adapter, AdapterCall};
+use crate::error::GResult;
+use crate::registry::{Adapter, AdapterCall};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::future::Future;

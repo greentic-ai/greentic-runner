@@ -1,5 +1,5 @@
-use super::super::error::GResult;
-use super::super::host::{SessionHost, SessionKey, SessionSnapshot};
+use crate::error::GResult;
+use crate::host::{SessionHost, SessionKey, SessionSnapshot};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;

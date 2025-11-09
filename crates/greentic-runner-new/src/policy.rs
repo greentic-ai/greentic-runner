@@ -1,4 +1,4 @@
-use crate::newrunner::error::{GResult, RunnerError};
+use crate::error::{GResult, RunnerError};
 use rand::{Rng, rng};
 use std::time::Duration;
 use tokio::time::sleep;

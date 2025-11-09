@@ -1,5 +1,5 @@
-use crate::newrunner::error::GResult;
-use crate::newrunner::host::SecretsHost;
+use crate::error::GResult;
+use crate::host::SecretsHost;
 use async_trait::async_trait;
 use std::sync::Arc;
 

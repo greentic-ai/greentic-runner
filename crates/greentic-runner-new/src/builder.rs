@@ -1,9 +1,9 @@
-use crate::newrunner::api::{RunFlowRequest, RunFlowResult, RunnerApi};
-use crate::newrunner::error::{GResult, RunnerError};
-use crate::newrunner::host::HostBundle;
-use crate::newrunner::policy::Policy;
-use crate::newrunner::registry::AdapterRegistry;
-use crate::newrunner::state_machine::{FlowDefinition, StateMachine};
+use crate::api::{RunFlowRequest, RunFlowResult, RunnerApi};
+use crate::error::{GResult, RunnerError};
+use crate::host::HostBundle;
+use crate::policy::Policy;
+use crate::registry::AdapterRegistry;
+use crate::state_machine::{FlowDefinition, StateMachine};
 use async_trait::async_trait;
 use greentic_types::TenantCtx;
 use std::sync::Arc;
@@ -75,10 +75,7 @@ impl Runner {
 
 #[async_trait]
 impl RunnerApi for Runner {
-    async fn list_flows(
-        &self,
-        _tenant: &TenantCtx,
-    ) -> GResult<Vec<crate::newrunner::api::FlowSummary>> {
+    async fn list_flows(&self, _tenant: &TenantCtx) -> GResult<Vec<crate::api::FlowSummary>> {
         Ok(self.sm.list_flows())
     }
 
@@ -86,7 +83,7 @@ impl RunnerApi for Runner {
         &self,
         _tenant: &TenantCtx,
         flow_id: &str,
-    ) -> GResult<crate::newrunner::api::FlowSchema> {
+    ) -> GResult<crate::api::FlowSchema> {
         self.sm.get_flow_schema(flow_id)
     }
 
