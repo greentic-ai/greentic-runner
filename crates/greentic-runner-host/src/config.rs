@@ -1,10 +1,13 @@
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "mcp")]
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "mcp")]
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "mcp")]
 use greentic_mcp::{ExecConfig, RuntimePolicy, ToolStore, VerifyPolicy};
 use serde::Deserialize;
 use serde_yaml_bw as serde_yaml;
@@ -148,6 +151,7 @@ impl HostConfig {
         self.mcp.retry.clone().unwrap_or_default()
     }
 
+    #[cfg(feature = "mcp")]
     pub fn mcp_exec_config(&self) -> Result<ExecConfig> {
         self.mcp
             .to_exec_config(self.bindings_path.parent())
@@ -243,6 +247,7 @@ impl TimerBinding {
     }
 }
 
+#[cfg(feature = "mcp")]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 enum StoreBinding {
@@ -257,6 +262,7 @@ enum StoreBinding {
     LocalDir { path: String },
 }
 
+#[cfg(feature = "mcp")]
 #[derive(Debug, Default, Deserialize)]
 struct RuntimeBinding {
     #[serde(default)]
@@ -267,6 +273,7 @@ struct RuntimeBinding {
     fuel: Option<u64>,
 }
 
+#[cfg(feature = "mcp")]
 #[derive(Debug, Default, Deserialize)]
 struct SecurityBinding {
     #[serde(default)]
@@ -277,6 +284,7 @@ struct SecurityBinding {
     trusted_signers: Vec<String>,
 }
 
+#[cfg(feature = "mcp")]
 impl McpConfig {
     fn to_exec_config(&self, base_dir: Option<&Path>) -> Result<ExecConfig> {
         let store_cfg: StoreBinding = serde_yaml::from_value(self.store.clone())
@@ -340,6 +348,7 @@ fn default_mcp_retry_base_delay_ms() -> u64 {
     250
 }
 
+#[cfg(feature = "mcp")]
 fn resolve_required_path(base: Option<&Path>, value: String) -> PathBuf {
     let candidate = PathBuf::from(&value);
     if candidate.is_absolute() {
@@ -351,10 +360,12 @@ fn resolve_required_path(base: Option<&Path>, value: String) -> PathBuf {
     }
 }
 
+#[cfg(feature = "mcp")]
 fn resolve_optional_path(base: Option<&Path>, value: Option<String>) -> Option<PathBuf> {
     value.map(|v| resolve_required_path(base, v))
 }
 
+#[cfg(feature = "mcp")]
 fn default_cache_dir(base: Option<&Path>) -> PathBuf {
     if let Some(dir) = env::var_os("GREENTIC_CACHE_DIR") {
         PathBuf::from(dir)

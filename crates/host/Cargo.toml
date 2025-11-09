@@ -12,11 +12,11 @@ keywords = ["greentic", "agent", "runner", "wasm", "mcp"]
 categories = ["wasm", "command-line-utilities", "network-programming"]
 
 [features]
-default = ["legacy-host", "stable-wasmtime"]
+default = ["legacy-host"]
 legacy-host = []
 new-runner = []
-stable-wasmtime = ["dep:wasmtime"]
-nightly-wasmtime = ["dep:wasmtime"]
+stable-wasmtime = []
+nightly-wasmtime = []
 redis = []
 schema = []
 
@@ -27,13 +27,9 @@ clap.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 futures.workspace = true
-greentic-flow.workspace = true
-greentic-interfaces.workspace = true
-greentic-mcp.workspace = true
-greentic-session = { workspace = true, optional = true }
-greentic-state = { workspace = true, optional = true }
 greentic-types.workspace = true
 greentic-pack.workspace = true
+greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.0", features = ["mcp"] }
 async-trait = "0.1"
 handlebars.workspace = true
 hex.workspace = true
@@ -55,7 +51,6 @@ tower.workspace = true
 tracing.workspace = true
 wasmparser.workspace = true
 cron.workspace = true
-wasmtime = { version = ">=38,<39", default-features = false, features = ["component-model", "cranelift", "runtime", "std"], optional = true }
 uuid.workspace = true
 url.workspace = true
 zip.workspace = true

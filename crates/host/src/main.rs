@@ -1,13 +1,11 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::Parser;
 use tokio::signal;
 
 use greentic_runner::config::HostConfig;
-use greentic_runner::pack::PackRuntime;
-use greentic_runner::runner::HostServer;
+use greentic_runner::{HostBuilder, HostServer};
 
 #[derive(Debug, Parser)]
 #[command(name = "greentic-runner")]
@@ -36,9 +34,9 @@ async fn main() {
 async fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let host_config = Arc::new(
-        HostConfig::load_from_path(&cli.bindings).context("failed to load host bindings")?,
-    );
+    let host_config =
+        HostConfig::load_from_path(&cli.bindings).context("failed to load host bindings")?;
+    let tenant_id = host_config.tenant.clone();
 
     tracing::info!(
         tenant = %host_config.tenant,
@@ -61,13 +59,17 @@ async fn run() -> anyhow::Result<()> {
         tracing::info!(adapter = %binding.adapter, "messaging adapter configured");
     }
 
-    let pack = Arc::new(
-        PackRuntime::load(&cli.pack, Arc::clone(&host_config), None, None)
-            .await
-            .with_context(|| format!("failed to load pack {:?}", cli.pack))?,
-    );
+    let host = HostBuilder::new().with_config(host_config).build()?;
+    host.start().await?;
+    host.load_pack(&tenant_id, &cli.pack)
+        .await
+        .with_context(|| format!("failed to load pack {:?}", cli.pack))?;
+    let tenant_handle = host
+        .tenant(&tenant_id)
+        .await
+        .context("tenant handle missing after load")?;
 
-    let server = HostServer::new(host_config, pack, cli.port).await?;
+    let server = HostServer::new(tenant_handle.config(), tenant_handle.pack(), cli.port).await?;
 
     tokio::select! {
         result = server.serve() => {
@@ -77,6 +79,8 @@ async fn run() -> anyhow::Result<()> {
             tracing::info!("received shutdown signal");
         }
     }
+
+    host.stop().await?;
 
     Ok(())
 }

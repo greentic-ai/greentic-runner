@@ -38,3 +38,29 @@ jobs:
           ignore-unpublished-changes: true
           check-repo: true
           dry-run: false
+
+  publish-runner-host:
+    if: github.event_name == 'push'
+    needs: build-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build greentic-runner-host (minimal)
+        run: cargo build -p greentic-runner-host --no-default-features
+      - name: Build greentic-runner-host (all features)
+        run: cargo build -p greentic-runner-host --all-features
+      - name: Dry-run publish greentic-runner-host
+        if: startsWith(github.ref, 'refs/tags/runner-host-v')
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p greentic-runner-host --dry-run
+      - name: Publish greentic-runner-host
+        if: github.ref == 'refs/tags/runner-host-v0.3.0'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p greentic-runner-host

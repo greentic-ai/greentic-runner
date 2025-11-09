@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
-use std::env;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "mcp")]
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -14,7 +14,9 @@ use greentic_interfaces::host_import_v0_2::greentic::host_import::imports::{
 };
 use greentic_interfaces::pack_export_v0_2;
 use greentic_interfaces::pack_export_v0_2::exports::greentic::pack_export::exports::FlowInfo;
+#[cfg(feature = "mcp")]
 use greentic_mcp::{ExecConfig, ExecError, ExecRequest};
+#[cfg(feature = "mcp")]
 use greentic_types::{EnvId, TeamId, TenantCtx as TypesTenantCtx, TenantId, UserId};
 use indexmap::IndexMap;
 use reqwest::blocking::Client as BlockingClient;
@@ -56,7 +58,9 @@ pub struct FlowDescriptor {
 pub struct HostState {
     config: Arc<HostConfig>,
     http_client: BlockingClient,
+    #[cfg(feature = "mcp")]
     exec_config: Option<ExecConfig>,
+    #[cfg(feature = "mcp")]
     default_env: String,
     mocks: Option<Arc<MockLayer>>,
 }
@@ -64,12 +68,16 @@ pub struct HostState {
 impl HostState {
     pub fn new(config: Arc<HostConfig>, mocks: Option<Arc<MockLayer>>) -> Result<Self> {
         let http_client = BlockingClient::builder().build()?;
+        #[cfg(feature = "mcp")]
         let exec_config = config.mcp_exec_config().ok();
-        let default_env = env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+        #[cfg(feature = "mcp")]
+        let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
         Ok(Self {
             config,
             http_client,
+            #[cfg(feature = "mcp")]
             exec_config,
+            #[cfg(feature = "mcp")]
             default_env,
             mocks,
         })
@@ -120,62 +128,72 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
         args_json: String,
         ctx: Option<TenantCtx>,
     ) -> WasmResult<Result<String, IfaceError>> {
-        let exec_config = match &self.exec_config {
-            Some(cfg) => cfg.clone(),
-            None => {
-                tracing::warn!(%tool, %action, "exec config unavailable for tool invoke");
-                return Ok(Err(IfaceError::Unavailable));
-            }
-        };
-
-        let args: Value = match serde_json::from_str(&args_json) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::warn!(error = %err, "invalid args for tool invoke");
-                return Ok(Err(IfaceError::InvalidArg));
-            }
-        };
-
-        let tenant = ctx.map(|ctx| map_tenant_ctx(ctx, &self.default_env));
-
-        let request = ExecRequest {
-            component: tool.clone(),
-            action: action.clone(),
-            args,
-            tenant,
-        };
-
-        if let Some(mock) = &self.mocks
-            && let Some(result) = mock.tool_short_circuit(&tool, &action)
+        #[cfg(not(feature = "mcp"))]
         {
-            return match result.and_then(|value| {
-                serde_json::to_string(&value)
-                    .map_err(|err| anyhow!("failed to serialise mock tool output: {err}"))
-            }) {
-                Ok(body) => Ok(Ok(body)),
-                Err(err) => {
-                    tracing::error!(error = %err, "mock tool execution failed");
-                    Ok(Err(IfaceError::Internal))
-                }
-            };
+            let _ = (tool, action, args_json, ctx);
+            tracing::warn!("tool invoke requested but crate built without `mcp` feature");
+            return Ok(Err(IfaceError::Unavailable));
         }
 
-        match greentic_mcp::exec(request, &exec_config) {
-            Ok(value) => match serde_json::to_string(&value) {
-                Ok(body) => Ok(Ok(body)),
-                Err(err) => {
-                    tracing::error!(error = %err, "failed to serialise tool result");
-                    Ok(Err(IfaceError::Internal))
+        #[cfg(feature = "mcp")]
+        {
+            let exec_config = match &self.exec_config {
+                Some(cfg) => cfg.clone(),
+                None => {
+                    tracing::warn!(%tool, %action, "exec config unavailable for tool invoke");
+                    return Ok(Err(IfaceError::Unavailable));
                 }
-            },
-            Err(err) => {
-                tracing::warn!(%tool, %action, error = %err, "tool invoke failed");
-                let iface_err = match err {
-                    ExecError::NotFound { .. } => IfaceError::NotFound,
-                    ExecError::Tool { .. } => IfaceError::Denied,
-                    _ => IfaceError::Unavailable,
+            };
+
+            let args: Value = match serde_json::from_str(&args_json) {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::warn!(error = %err, "invalid args for tool invoke");
+                    return Ok(Err(IfaceError::InvalidArg));
+                }
+            };
+
+            let tenant = ctx.map(|ctx| map_tenant_ctx(ctx, &self.default_env));
+
+            let request = ExecRequest {
+                component: tool.clone(),
+                action: action.clone(),
+                args,
+                tenant,
+            };
+
+            if let Some(mock) = &self.mocks
+                && let Some(result) = mock.tool_short_circuit(&tool, &action)
+            {
+                return match result.and_then(|value| {
+                    serde_json::to_string(&value)
+                        .map_err(|err| anyhow!("failed to serialise mock tool output: {err}"))
+                }) {
+                    Ok(body) => Ok(Ok(body)),
+                    Err(err) => {
+                        tracing::error!(error = %err, "mock tool execution failed");
+                        Ok(Err(IfaceError::Internal))
+                    }
                 };
-                Ok(Err(iface_err))
+            }
+
+            match greentic_mcp::exec(request, &exec_config) {
+                Ok(value) => match serde_json::to_string(&value) {
+                    Ok(body) => Ok(Ok(body)),
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to serialise tool result");
+                        Ok(Err(IfaceError::Internal))
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(%tool, %action, error = %err, "tool invoke failed");
+                    let iface_err = match err {
+                        ExecError::NotFound { .. } => IfaceError::NotFound,
+                        ExecError::Tool { .. } => IfaceError::Denied,
+                        _ => IfaceError::Unavailable,
+                    };
+                    Ok(Err(iface_err))
+                }
             }
         }
     }
@@ -412,6 +430,7 @@ impl PackRuntime {
     }
 }
 
+#[cfg(feature = "mcp")]
 fn map_tenant_ctx(ctx: TenantCtx, default_env: &str) -> TypesTenantCtx {
     let env = ctx
         .deployment
@@ -571,7 +590,7 @@ impl PackMetadata {
         })
     }
 
-    pub(crate) fn fallback(path: &Path) -> Self {
+    pub fn fallback(path: &Path) -> Self {
         let pack_id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())

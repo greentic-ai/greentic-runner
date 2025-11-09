@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
-pub mod config;
-pub mod imports;
+pub use greentic_runner_host::{
+    self as host, Activity, ActivityKind, HostBuilder, HostServer, RunnerHost, TenantHandle,
+    config, imports, pack, runner, runtime_wasmtime, telemetry, verify,
+};
 
 #[cfg(feature = "new-runner")]
 pub mod glue;
@@ -9,17 +11,4 @@ pub mod glue;
 #[cfg(feature = "new-runner")]
 pub mod newrunner;
 
-#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
-pub mod pack;
-
-#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
-pub mod runner;
-
-#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
-pub mod runtime_wasmtime;
-
-#[cfg(any(feature = "stable-wasmtime", feature = "nightly-wasmtime"))]
 pub mod desktop;
-
-pub mod telemetry;
-pub mod verify;

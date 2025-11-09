@@ -4,9 +4,13 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "mcp")]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use greentic_flow::ir::{FlowIR, NodeIR};
+#[cfg(feature = "mcp")]
 use greentic_mcp::{ExecConfig, ExecRequest};
+#[cfg(feature = "mcp")]
 use greentic_types::TenantCtx as TypesTenantCtx;
 use handlebars::Handlebars;
 use parking_lot::RwLock;
@@ -17,14 +21,15 @@ use tokio::task;
 use super::mocks::MockLayer;
 use crate::config::{HostConfig, McpRetryConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
-use crate::telemetry::{
-    FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context, tenant_context,
-};
+#[cfg(feature = "mcp")]
+use crate::telemetry::tenant_context;
+use crate::telemetry::{FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context};
 
 pub struct FlowEngine {
     pack: Arc<PackRuntime>,
     flows: Vec<FlowDescriptor>,
     flow_ir: RwLock<HashMap<String, FlowIR>>,
+    #[cfg(feature = "mcp")]
     exec_config: ExecConfig,
     template_engine: Arc<Handlebars<'static>>,
     default_env: String,
@@ -32,11 +37,14 @@ pub struct FlowEngine {
 
 impl FlowEngine {
     pub async fn new(pack: Arc<PackRuntime>, config: Arc<HostConfig>) -> Result<Self> {
+        #[cfg(not(feature = "mcp"))]
+        let _ = &config;
         let flows = pack.list_flows().await?;
         for flow in &flows {
             tracing::info!(flow_id = %flow.id, flow_type = %flow.flow_type, "registered flow");
         }
 
+        #[cfg(feature = "mcp")]
         let exec_config = config
             .mcp_exec_config()
             .context("failed to build MCP executor config")?;
@@ -66,6 +74,7 @@ impl FlowEngine {
             pack,
             flows,
             flow_ir: RwLock::new(ir_map),
+            #[cfg(feature = "mcp")]
             exec_config,
             template_engine: Arc::new(handlebars),
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
@@ -236,38 +245,48 @@ impl FlowEngine {
     }
 
     async fn execute_mcp(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
-        #[derive(Deserialize)]
-        struct McpPayload {
-            component: String,
-            action: String,
-            #[serde(default)]
-            args: Value,
-        }
-
-        let payload: McpPayload =
-            serde_json::from_value(payload).context("invalid payload for mcp.exec node")?;
-
-        if let Some(mocks) = ctx.mocks
-            && let Some(result) = mocks.tool_short_circuit(&payload.component, &payload.action)
+        #[cfg(not(feature = "mcp"))]
         {
-            let value = result.map_err(|err| anyhow!(err))?;
-            return Ok(NodeOutput::new(value));
+            let _ = (ctx, payload);
+            bail!("crate built without `mcp` feature; mcp.exec nodes are unavailable");
         }
 
-        let request = ExecRequest {
-            component: payload.component,
-            action: payload.action,
-            args: payload.args,
-            tenant: Some(types_tenant_ctx(ctx, &self.default_env)),
-        };
+        #[cfg(feature = "mcp")]
+        {
+            #[derive(Deserialize)]
+            struct McpPayload {
+                component: String,
+                action: String,
+                #[serde(default)]
+                args: Value,
+            }
 
-        let exec_config = self.exec_config.clone();
-        let exec_result = task::spawn_blocking(move || greentic_mcp::exec(request, &exec_config))
-            .await
-            .context("failed to join mcp.exec")?;
-        let value = exec_result.map_err(|err| anyhow!(err))?;
+            let payload: McpPayload =
+                serde_json::from_value(payload).context("invalid payload for mcp.exec node")?;
 
-        Ok(NodeOutput::new(value))
+            if let Some(mocks) = ctx.mocks
+                && let Some(result) = mocks.tool_short_circuit(&payload.component, &payload.action)
+            {
+                let value = result.map_err(|err| anyhow!(err))?;
+                return Ok(NodeOutput::new(value));
+            }
+
+            let request = ExecRequest {
+                component: payload.component,
+                action: payload.action,
+                args: payload.args,
+                tenant: Some(types_tenant_ctx(ctx, &self.default_env)),
+            };
+
+            let exec_config = self.exec_config.clone();
+            let exec_result =
+                task::spawn_blocking(move || greentic_mcp::exec(request, &exec_config))
+                    .await
+                    .context("failed to join mcp.exec")?;
+            let value = exec_result.map_err(|err| anyhow!(err))?;
+
+            Ok(NodeOutput::new(value))
+        }
     }
 
     fn execute_template(&self, state: &ExecutionState, payload: Value) -> Result<NodeOutput> {
@@ -443,6 +462,7 @@ fn render_template(
         .with_context(|| "failed to render template")
 }
 
+#[cfg(feature = "mcp")]
 fn types_tenant_ctx(ctx: &FlowContext<'_>, default_env: &str) -> TypesTenantCtx {
     tenant_context(
         default_env,
