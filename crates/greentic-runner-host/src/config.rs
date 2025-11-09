@@ -107,9 +107,9 @@ impl HostConfig {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read bindings file {:?}", path))?;
+            .with_context(|| format!("failed to read bindings file {path:?}"))?;
         let bindings: BindingsFile = serde_yaml::from_str(&content)
-            .with_context(|| format!("failed to parse bindings file {:?}", path))?;
+            .with_context(|| format!("failed to parse bindings file {path:?}"))?;
 
         let secrets_policy = SecretsPolicy::from_bindings(&bindings);
         let http_enabled = bindings

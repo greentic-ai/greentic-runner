@@ -351,7 +351,7 @@ fn prepare_run_dirs(root_override: Option<PathBuf>) -> Result<RunDirectories> {
             .collect::<String>();
         PathBuf::from(".greentic")
             .join("runs")
-            .join(format!("{}_{}", timestamp, short_id))
+            .join(format!("{timestamp}_{short_id}"))
     };
 
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
@@ -417,12 +417,12 @@ fn resolve_component_artifact(
         .with_context(|| format!("{} is not a valid gtpack", pack_path.display()))?;
     let mut component = archive
         .by_name(&entry)
-        .with_context(|| format!("component {} missing from pack", entry))?;
+        .with_context(|| format!("component {entry} missing from pack"))?;
     let out_path = dirs.root.join("component.wasm");
     let mut out_file = File::create(&out_path)
         .with_context(|| format!("failed to create {}", out_path.display()))?;
     std::io::copy(&mut component, &mut out_file)
-        .with_context(|| format!("failed to extract component {}", entry))?;
+        .with_context(|| format!("failed to extract component {entry}"))?;
     Ok(out_path)
 }
 
@@ -855,7 +855,7 @@ impl RunRecorder {
                 .logs
                 .join(format!("{}.stderr.log", sanitize_id(event.node_id)));
             if let Ok(mut file) = File::create(&log_path) {
-                let _ = writeln!(file, "{}", error_message);
+                let _ = writeln!(file, "{error_message}");
             }
             entry.log_paths.push(log_path);
         }
@@ -1009,7 +1009,7 @@ fn redact_recursive(value: &Value, path: &str, acc: &mut Vec<String>) -> Value {
         Value::Object(map) => {
             let mut new_map = JsonMap::new();
             for (key, val) in map {
-                let child_path = format!("{}.{}", path, key);
+                let child_path = format!("{path}.{key}");
                 if is_sensitive_key(key) {
                     acc.push(child_path);
                     new_map.insert(key.clone(), Value::String("__REDACTED__".into()));
@@ -1022,7 +1022,7 @@ fn redact_recursive(value: &Value, path: &str, acc: &mut Vec<String>) -> Value {
         Value::Array(items) => {
             let mut new_items = Vec::new();
             for (idx, item) in items.iter().enumerate() {
-                let child_path = format!("{}[{}]", path, idx);
+                let child_path = format!("{path}[{idx}]");
                 new_items.push(redact_recursive(item, &child_path, acc));
             }
             Value::Array(new_items)

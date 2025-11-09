@@ -82,12 +82,18 @@ install_pre_push_hook() {
   if [ -f "$hook" ]; then
     return
   fi
-  cat > "$hook" <<'HOOK'
+  if ! cat > "$hook" <<'HOOK'; then
 #!/usr/bin/env bash
 set -euo pipefail
 ci/local_check.sh
 HOOK
-  chmod +x "$hook"
+    echo "[warn] unable to install git pre-push hook (write failed)"
+    return
+  fi
+  if ! chmod +x "$hook"; then
+    echo "[warn] unable to mark git pre-push hook executable"
+    return
+  fi
   echo "[info] installed git pre-push hook -> ci/local_check.sh"
 }
 

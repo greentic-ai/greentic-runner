@@ -363,7 +363,7 @@ impl PackRuntime {
         let flows_raw = match exports.call_list_flows(&mut store)? {
             Ok(flows) => flows,
             Err(err) => {
-                bail!("pack list_flows failed: {:?}", err);
+                bail!("pack list_flows failed: {err:?}");
             }
         };
         let flows = flows_raw
@@ -416,7 +416,7 @@ impl PackRuntime {
         let flow_name = flow_id.to_string();
         let metadata = match exports.call_flow_metadata(&mut store, &flow_name)? {
             Ok(doc) => doc,
-            Err(err) => bail!("pack flow_metadata({flow_id}) failed: {:?}", err),
+            Err(err) => bail!("pack flow_metadata({flow_id}) failed: {err:?}"),
         };
         let flow_doc: greentic_flow::model::FlowDoc = serde_json::from_str(&metadata)
             .or_else(|_| serde_yaml::from_str(&metadata))

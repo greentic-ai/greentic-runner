@@ -22,10 +22,11 @@ pub struct Activity {
     payload: Value,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityKind {
     /// Messaging-style activity (default).
+    #[default]
     Message,
     /// Custom activity with user-specified action + optional flow type override.
     Custom {
@@ -175,11 +176,5 @@ impl ActivityKind {
             ActivityKind::Message => Some("messaging"),
             ActivityKind::Custom { action, .. } => Some(action.as_str()),
         }
-    }
-}
-
-impl Default for ActivityKind {
-    fn default() -> Self {
-        ActivityKind::Message
     }
 }
