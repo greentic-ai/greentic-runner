@@ -29,7 +29,7 @@ greentic-pack.workspace = true
 greentic-types.workspace = true
 greentic-session = "0.3"
 greentic-state = "0.3"
-greentic-secrets = { path = "../greentic-secrets" }
+greentic-secrets = { version = "0.3.3", path = "../greentic-secrets" }
 handlebars.workspace = true
 hex.workspace = true
 humantime.workspace = true
