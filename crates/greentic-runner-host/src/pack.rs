@@ -15,6 +15,7 @@ use greentic_interfaces::host_import_v0_2::greentic::host_import::imports::{
 use greentic_interfaces::host_import_v0_6::{self, iface_types, state, types};
 use greentic_interfaces::pack_export_v0_2;
 use greentic_interfaces::pack_export_v0_2::exports::greentic::pack_export::exports::FlowInfo;
+#[cfg(feature = "mcp")]
 use greentic_mcp::{ExecConfig, ExecError, ExecRequest};
 use greentic_session::SessionKey as StoreSessionKey;
 use greentic_types::{
