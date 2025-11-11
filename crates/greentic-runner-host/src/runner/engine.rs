@@ -4,9 +4,7 @@ use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "mcp")]
-use anyhow::anyhow;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use greentic_flow::ir::{FlowIR, NodeIR};
 #[cfg(feature = "mcp")]
 use greentic_mcp::{ExecConfig, ExecRequest};
@@ -14,7 +12,7 @@ use greentic_mcp::{ExecConfig, ExecRequest};
 use greentic_types::TenantCtx as TypesTenantCtx;
 use handlebars::Handlebars;
 use parking_lot::RwLock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
 use tokio::task;
 
@@ -26,8 +24,9 @@ use crate::telemetry::tenant_context;
 use crate::telemetry::{FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context};
 
 pub struct FlowEngine {
-    pack: Arc<PackRuntime>,
+    packs: Vec<Arc<PackRuntime>>,
     flows: Vec<FlowDescriptor>,
+    flow_sources: HashMap<String, usize>,
     flow_ir: RwLock<HashMap<String, FlowIR>>,
     #[cfg(feature = "mcp")]
     exec_config: ExecConfig,
@@ -35,13 +34,66 @@ pub struct FlowEngine {
     default_env: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FlowSnapshot {
+    pub flow_id: String,
+    pub next_node: String,
+    pub state: ExecutionState,
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowWait {
+    pub reason: Option<String>,
+    pub snapshot: FlowSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub enum FlowStatus {
+    Completed,
+    Waiting(FlowWait),
+}
+
+#[derive(Clone, Debug)]
+pub struct FlowExecution {
+    pub output: Value,
+    pub status: FlowStatus,
+}
+
+impl FlowExecution {
+    fn completed(output: Value) -> Self {
+        Self {
+            output,
+            status: FlowStatus::Completed,
+        }
+    }
+
+    fn waiting(output: Value, wait: FlowWait) -> Self {
+        Self {
+            output,
+            status: FlowStatus::Waiting(wait),
+        }
+    }
+}
+
 impl FlowEngine {
-    pub async fn new(pack: Arc<PackRuntime>, config: Arc<HostConfig>) -> Result<Self> {
+    pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
         #[cfg(not(feature = "mcp"))]
         let _ = &config;
-        let flows = pack.list_flows().await?;
-        for flow in &flows {
-            tracing::info!(flow_id = %flow.id, flow_type = %flow.flow_type, "registered flow");
+        let mut flow_sources = HashMap::new();
+        let mut descriptors = Vec::new();
+        for (idx, pack) in packs.iter().enumerate() {
+            let flows = pack.list_flows().await?;
+            for flow in flows {
+                tracing::info!(
+                    flow_id = %flow.id,
+                    flow_type = %flow.flow_type,
+                    pack_index = idx,
+                    "registered flow"
+                );
+                flow_sources.insert(flow.id.clone(), idx);
+                descriptors.retain(|existing: &FlowDescriptor| existing.id != flow.id);
+                descriptors.push(flow);
+            }
         }
 
         #[cfg(feature = "mcp")]
@@ -50,19 +102,21 @@ impl FlowEngine {
             .context("failed to build MCP executor config")?;
 
         let mut ir_map = HashMap::new();
-        for flow in &flows {
-            let pack_clone = Arc::clone(&pack);
-            let flow_id = flow.id.clone();
-            let task_flow_id = flow_id.clone();
-            match task::spawn_blocking(move || pack_clone.load_flow_ir(&task_flow_id)).await {
-                Ok(Ok(ir)) => {
-                    ir_map.insert(flow_id, ir);
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(flow_id = %flow.id, error = %err, "failed to load flow metadata");
-                }
-                Err(err) => {
-                    tracing::warn!(flow_id = %flow.id, error = %err, "join error loading flow metadata");
+        for flow in &descriptors {
+            if let Some(&pack_idx) = flow_sources.get(&flow.id) {
+                let pack_clone = Arc::clone(&packs[pack_idx]);
+                let flow_id = flow.id.clone();
+                let task_flow_id = flow_id.clone();
+                match task::spawn_blocking(move || pack_clone.load_flow_ir(&task_flow_id)).await {
+                    Ok(Ok(ir)) => {
+                        ir_map.insert(flow_id, ir);
+                    }
+                    Ok(Err(err)) => {
+                        tracing::warn!(flow_id = %flow.id, error = %err, "failed to load flow metadata");
+                    }
+                    Err(err) => {
+                        tracing::warn!(flow_id = %flow.id, error = %err, "join error loading flow metadata");
+                    }
                 }
             }
         }
@@ -71,8 +125,9 @@ impl FlowEngine {
         handlebars.set_strict_mode(false);
 
         Ok(Self {
-            pack,
-            flows,
+            packs,
+            flows: descriptors,
+            flow_sources,
             flow_ir: RwLock::new(ir_map),
             #[cfg(feature = "mcp")]
             exec_config,
@@ -86,7 +141,11 @@ impl FlowEngine {
             return Ok(ir);
         }
 
-        let pack = Arc::clone(&self.pack);
+        let pack_idx = *self
+            .flow_sources
+            .get(flow_id)
+            .with_context(|| format!("flow {flow_id} not registered"))?;
+        let pack = Arc::clone(&self.packs[pack_idx]);
         let flow_id_owned = flow_id.to_string();
         let task_flow_id = flow_id_owned.clone();
         let ir = task::spawn_blocking(move || pack.load_flow_ir(&task_flow_id))
@@ -98,7 +157,7 @@ impl FlowEngine {
         Ok(ir)
     }
 
-    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<Value> {
+    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let span = tracing::info_span!(
             "flow.execute",
             tenant = tracing::field::Empty,
@@ -156,15 +215,48 @@ impl FlowEngine {
         .await
     }
 
-    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<Value> {
+    pub async fn resume(
+        &self,
+        ctx: FlowContext<'_>,
+        snapshot: FlowSnapshot,
+        input: Value,
+    ) -> Result<FlowExecution> {
+        if snapshot.flow_id != ctx.flow_id {
+            bail!(
+                "snapshot flow {} does not match requested {}",
+                snapshot.flow_id,
+                ctx.flow_id
+            );
+        }
         let flow_ir = self.get_or_load_flow_ir(ctx.flow_id).await?;
+        let mut state = snapshot.state;
+        state.replace_input(input);
+        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node))
+            .await
+    }
 
-        let mut state = ExecutionState::new(input);
+    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        let flow_ir = self.get_or_load_flow_ir(ctx.flow_id).await?;
+        let state = ExecutionState::new(input);
+        self.drive_flow(ctx, flow_ir, state, None).await
+    }
+
+    async fn drive_flow(
+        &self,
+        ctx: &FlowContext<'_>,
+        flow_ir: FlowIR,
+        mut state: ExecutionState,
+        resume_from: Option<String>,
+    ) -> Result<FlowExecution> {
         let mut current = flow_ir
             .start
             .clone()
             .or_else(|| flow_ir.nodes.keys().next().cloned())
             .with_context(|| format!("flow {} has no start node", flow_ir.id))?;
+        if let Some(resume) = resume_from {
+            current = resume;
+        }
+        let mut final_payload = None;
 
         loop {
             let node = flow_ir
@@ -189,30 +281,22 @@ impl FlowEngine {
             if let Some(observer) = ctx.observer {
                 observer.on_node_start(&event);
             }
-            let dispatch = self
-                .dispatch_node(ctx, &current, node, &state, payload)
-                .await;
-            let output = match dispatch {
-                Ok(output) => {
-                    if let Some(observer) = ctx.observer {
-                        observer.on_node_end(&event, &output.payload);
-                    }
-                    output
-                }
-                Err(err) => {
-                    if let Some(observer) = ctx.observer {
-                        observer.on_node_error(&event, err.as_ref());
-                    }
-                    return Err(err);
-                }
-            };
+            let DispatchOutcome {
+                output,
+                wait_reason,
+            } = self
+                .dispatch_node(ctx, &current, node, &mut state, payload)
+                .await?;
 
             state.nodes.insert(current.clone(), output.clone());
 
             let mut next = None;
+            let mut should_exit = false;
             for route in &node.routes {
                 if route.out || matches!(route.to.as_deref(), Some("out")) {
-                    return Ok(output.payload);
+                    final_payload = Some(output.payload.clone());
+                    should_exit = true;
+                    break;
                 }
                 if let Some(to) = &route.to {
                     next = Some(to.clone());
@@ -220,11 +304,42 @@ impl FlowEngine {
                 }
             }
 
+            if let Some(wait_reason) = wait_reason {
+                let resume_target = next.clone().ok_or_else(|| {
+                    anyhow!("session.wait node {current} requires a non-empty route")
+                })?;
+                let mut snapshot_state = state.clone();
+                snapshot_state.clear_egress();
+                let snapshot = FlowSnapshot {
+                    flow_id: ctx.flow_id.to_string(),
+                    next_node: resume_target,
+                    state: snapshot_state,
+                };
+                let output_value = state.clone().finalize_with(None);
+                return Ok(FlowExecution::waiting(
+                    output_value,
+                    FlowWait {
+                        reason: Some(wait_reason),
+                        snapshot,
+                    },
+                ));
+            }
+
+            if should_exit {
+                break;
+            }
+
             match next {
                 Some(n) => current = n,
-                None => return Ok(output.payload),
+                None => {
+                    final_payload = Some(output.payload.clone());
+                    break;
+                }
             }
         }
+
+        let payload = final_payload.unwrap_or(Value::Null);
+        Ok(FlowExecution::completed(state.finalize_with(Some(payload))))
     }
 
     async fn dispatch_node(
@@ -232,15 +347,80 @@ impl FlowEngine {
         ctx: &FlowContext<'_>,
         _node_id: &str,
         node: &NodeIR,
-        state: &ExecutionState,
+        state: &mut ExecutionState,
         payload: Value,
-    ) -> Result<NodeOutput> {
+    ) -> Result<DispatchOutcome> {
         match node.component.as_str() {
-            "qa.process" => Ok(NodeOutput::new(payload)),
-            "mcp.exec" => self.execute_mcp(ctx, payload).await,
-            "templating.handlebars" => self.execute_template(state, payload),
-            component if component.starts_with("emit") => Ok(NodeOutput::new(payload)),
+            "qa.process" => Ok(DispatchOutcome::complete(NodeOutput::new(payload))),
+            "mcp.exec" => self
+                .execute_mcp(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
+            "templating.handlebars" => self
+                .execute_template(state, payload)
+                .map(DispatchOutcome::complete),
+            "flow.call" => self
+                .execute_flow_call(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
+            component if component.starts_with("emit") => {
+                state.push_egress(payload.clone());
+                Ok(DispatchOutcome::complete(NodeOutput::new(payload)))
+            }
+            "session.wait" => {
+                let reason = extract_wait_reason(&payload);
+                Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
+            }
             other => bail!("unsupported node component: {other}"),
+        }
+    }
+
+    async fn execute_flow_call(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
+        #[derive(Deserialize)]
+        struct FlowCallPayload {
+            #[serde(alias = "flow")]
+            flow_id: String,
+            #[serde(default)]
+            input: Value,
+        }
+
+        let call: FlowCallPayload =
+            serde_json::from_value(payload).context("invalid payload for flow.call node")?;
+        if call.flow_id.trim().is_empty() {
+            bail!("flow.call requires a non-empty flow_id");
+        }
+
+        let sub_input = if call.input.is_null() {
+            Value::Null
+        } else {
+            call.input
+        };
+
+        let flow_id_owned = call.flow_id;
+        let action = "flow.call";
+        let sub_ctx = FlowContext {
+            tenant: ctx.tenant,
+            flow_id: flow_id_owned.as_str(),
+            node_id: None,
+            tool: ctx.tool,
+            action: Some(action),
+            session_id: ctx.session_id,
+            provider_id: ctx.provider_id,
+            retry_config: ctx.retry_config,
+            observer: ctx.observer,
+            mocks: ctx.mocks,
+        };
+
+        let execution = Box::pin(self.execute(sub_ctx, sub_input))
+            .await
+            .with_context(|| format!("flow.call failed for {}", flow_id_owned))?;
+        match execution.status {
+            FlowStatus::Completed => Ok(NodeOutput::new(execution.output)),
+            FlowStatus::Waiting(wait) => bail!(
+                "flow.call cannot pause (flow {} waiting {:?})",
+                flow_id_owned,
+                wait.reason
+            ),
         }
     }
 
@@ -340,9 +520,11 @@ pub struct NodeEvent<'a> {
     pub payload: &'a Value,
 }
 
-struct ExecutionState {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionState {
     input: Value,
     nodes: HashMap<String, NodeOutput>,
+    egress: Vec<Value>,
 }
 
 impl ExecutionState {
@@ -350,6 +532,7 @@ impl ExecutionState {
         Self {
             input,
             nodes: HashMap::new(),
+            egress: Vec::new(),
         }
     }
 
@@ -370,9 +553,35 @@ impl ExecutionState {
             "nodes": nodes,
         })
     }
+    fn push_egress(&mut self, payload: Value) {
+        self.egress.push(payload);
+    }
+
+    fn replace_input(&mut self, input: Value) {
+        self.input = input;
+    }
+
+    fn clear_egress(&mut self) {
+        self.egress.clear();
+    }
+
+    fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
+        if self.egress.is_empty() {
+            return final_payload.unwrap_or(Value::Null);
+        }
+        let mut emitted = std::mem::take(&mut self.egress);
+        if let Some(value) = final_payload {
+            match value {
+                Value::Null => {}
+                Value::Array(items) => emitted.extend(items),
+                other => emitted.push(other),
+            }
+        }
+        Value::Array(emitted)
+    }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct NodeOutput {
     ok: bool,
     payload: Value,
@@ -385,6 +594,27 @@ impl NodeOutput {
             ok: true,
             payload,
             meta: Value::Null,
+        }
+    }
+}
+
+struct DispatchOutcome {
+    output: NodeOutput,
+    wait_reason: Option<String>,
+}
+
+impl DispatchOutcome {
+    fn complete(output: NodeOutput) -> Self {
+        Self {
+            output,
+            wait_reason: None,
+        }
+    }
+
+    fn wait(output: NodeOutput, reason: Option<String>) -> Self {
+        Self {
+            output,
+            wait_reason: reason,
         }
     }
 }
@@ -462,6 +692,17 @@ fn render_template(
         .with_context(|| "failed to render template")
 }
 
+fn extract_wait_reason(payload: &Value) -> Option<String> {
+    match payload {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(map) => map
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|value| value.to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(feature = "mcp")]
 fn types_tenant_ctx(ctx: &FlowContext<'_>, default_env: &str) -> TypesTenantCtx {
     tenant_context(
@@ -509,6 +750,40 @@ mod tests {
             render_template(&base, &payload.template, &payload.partials, &context).unwrap();
 
         assert_eq!(rendered, "Weather in London: 20C today");
+    }
+
+    #[test]
+    fn finalize_wraps_emitted_payloads() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "first" }));
+        state.push_egress(json!({ "text": "second" }));
+        let result = state.finalize_with(Some(json!({ "text": "final" })));
+        assert_eq!(
+            result,
+            json!([
+                { "text": "first" },
+                { "text": "second" },
+                { "text": "final" }
+            ])
+        );
+    }
+
+    #[test]
+    fn finalize_flattens_final_array() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "only" }));
+        let result = state.finalize_with(Some(json!([
+            { "text": "extra-1" },
+            { "text": "extra-2" }
+        ])));
+        assert_eq!(
+            result,
+            json!([
+                { "text": "only" },
+                { "text": "extra-1" },
+                { "text": "extra-2" }
+            ])
+        );
     }
 }
 

@@ -9,3 +9,10 @@ anyhow.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+greentic-runner-host = { path = "../greentic-runner-host" }
+runner-core = { path = "../runner-core" }
+serial_test = "3"
+tempfile = "3"
+async-trait.workspace = true
+parking_lot.workspace = true
+greentic-types.workspace = true

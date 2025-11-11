@@ -16,31 +16,46 @@ verify = []
 mcp = ["dep:greentic_mcp"]
 
 [dependencies]
+async-trait = "0.1"
 anyhow.workspace = true
+arc-swap.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-flow.workspace = true
 greentic-interfaces.workspace = true
 greentic-pack.workspace = true
 greentic-types.workspace = true
+greentic-session = "0.3"
+greentic-state = "0.3"
+greentic-secrets = { path = "../greentic-secrets" }
 handlebars.workspace = true
 hex.workspace = true
+humantime.workspace = true
 indexmap.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+runner-core = { path = "../runner-core" }
 serde = { workspace = true }
 serde_cbor.workspace = true
 serde_json.workspace = true
 serde_yaml_bw.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+time.workspace = true
 tracing.workspace = true
 url.workspace = true
 wasmparser.workspace = true
 zip.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hmac = "0.12"
+sha1 = "0.10"
 
 # External stack components
 greentic_mcp = { package = "mcp-exec", version = "0.3", optional = true }

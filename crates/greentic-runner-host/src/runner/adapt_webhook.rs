@@ -1,26 +1,26 @@
-use std::sync::Arc;
-
 use axum::BoxError;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::Path;
 use axum::http::{
     HeaderMap, HeaderName, HeaderValue, Method, Response as AxumResponse, StatusCode, Uri,
 };
 use axum::response::IntoResponse;
 use serde_json::{Map, Value, json};
 
-use super::{ServerState, engine::FlowContext};
+use crate::engine::runtime::IngressEnvelope;
+use crate::routing::TenantRuntimeHandle;
+use crate::runtime::TenantRuntime;
 
 pub async fn dispatch(
+    TenantRuntimeHandle { tenant, runtime }: TenantRuntimeHandle,
     Path(flow_id): Path<String>,
-    State(state): State<Arc<ServerState>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<AxumResponse<Body>, AxumResponse<Body>> {
-    let flow = state
-        .engine
+    let engine = runtime.engine();
+    let flow = engine
         .flow_by_id(&flow_id)
         .ok_or_else(|| build_error(StatusCode::NOT_FOUND, "flow not found"))?;
 
@@ -31,7 +31,7 @@ pub async fn dispatch(
         ));
     }
 
-    if !state.config.webhook_policy.is_allowed(uri.path()) {
+    if !runtime.config().webhook_policy.is_allowed(uri.path()) {
         return Err(build_error(
             StatusCode::FORBIDDEN,
             "path not permitted by policy",
@@ -44,10 +44,7 @@ pub async fn dispatch(
         .map(|value| value.to_string());
 
     if let Some(key) = idempotency_key.as_ref()
-        && let Some(cached) = {
-            let mut cache = state.webhook_cache.lock();
-            cache.get(key).cloned()
-        }
+        && let Some(cached) = lookup_cached(runtime.as_ref(), key)
     {
         tracing::debug!(flow_id = %flow.id, idempotency_key = key, "webhook cache hit");
         return build_response(cached).map_err(|_| {
@@ -56,29 +53,28 @@ pub async fn dispatch(
     }
 
     let normalized = normalize_request(&method, &uri, &headers, &body);
-    match state
-        .engine
-        .execute(
-            FlowContext {
-                tenant: &state.config.tenant,
-                flow_id: &flow.id,
-                node_id: None,
-                tool: None,
-                action: Some("webhook"),
-                session_id: None,
-                provider_id: None,
-                retry_config: state.config.mcp_retry_config().into(),
-                observer: None,
-                mocks: None,
-            },
-            normalized,
-        )
-        .await
-    {
+    let envelope = IngressEnvelope {
+        tenant: tenant.clone(),
+        env: None,
+        flow_id: flow.id.clone(),
+        flow_type: Some(flow.flow_type.clone()),
+        action: Some("webhook".into()),
+        session_hint: idempotency_key.clone(),
+        provider: Some("webhook".into()),
+        channel: Some(uri.path().to_string()),
+        conversation: Some(uri.path().to_string()),
+        user: None,
+        activity_id: idempotency_key.clone(),
+        timestamp: None,
+        payload: normalized,
+        metadata: None,
+    }
+    .canonicalize();
+
+    match runtime.state_machine().handle(envelope).await {
         Ok(value) => {
             if let Some(key) = idempotency_key {
-                let mut cache = state.webhook_cache.lock();
-                cache.put(key.clone(), value.clone());
+                insert_cache(runtime.as_ref(), key.clone(), value.clone());
             }
             Ok(build_response(value).unwrap_or_else(|err| {
                 tracing::error!(flow_id = %flow.id, error = %err, "failed to render webhook response");
@@ -98,6 +94,16 @@ pub async fn dispatch(
             ))
         }
     }
+}
+
+fn lookup_cached(runtime: &TenantRuntime, key: &str) -> Option<Value> {
+    let mut cache = runtime.webhook_cache().lock();
+    cache.get(key).cloned()
+}
+
+fn insert_cache(runtime: &TenantRuntime, key: String, value: Value) {
+    let mut cache = runtime.webhook_cache().lock();
+    cache.put(key, value);
 }
 
 fn normalize_request(method: &Method, uri: &Uri, headers: &HeaderMap, body: &[u8]) -> Value {
@@ -192,4 +198,41 @@ fn serialize_body(value: &Value) -> Body {
 fn build_error(status: StatusCode, message: &'static str) -> AxumResponse<Body> {
     let payload = json!({ "error": message });
     (status, axum::Json(payload)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{Method, Uri};
+
+    #[test]
+    fn normalize_request_serializes_headers_and_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Test", HeaderValue::from_static("value"));
+        let method = Method::POST;
+        let uri: Uri = "/hook?query=1".parse().unwrap();
+        let body = br#"{"hello":"world"}"#.to_vec();
+
+        let normalized = normalize_request(&method, &uri, &headers, &body);
+        assert_eq!(normalized["method"], json!("POST"));
+        assert_eq!(normalized["path"], json!("/hook"));
+        assert_eq!(normalized["query"], json!("query=1"));
+        assert_eq!(normalized["headers"]["x-test"], json!("value"));
+        assert_eq!(normalized["body"]["text"], json!(r#"{"hello":"world"}"#));
+    }
+
+    #[test]
+    fn build_response_accepts_string_and_object_forms() {
+        let string_response = build_response(json!("plain text")).unwrap();
+        assert_eq!(string_response.status(), StatusCode::OK);
+
+        let object_response = build_response(json!({
+            "status": 202,
+            "headers": { "X-Custom": "true" },
+            "body": { "text": "json text" }
+        }))
+        .unwrap();
+        assert_eq!(object_response.status(), StatusCode::ACCEPTED);
+        assert_eq!(object_response.headers().get("X-Custom").unwrap(), "true");
+    }
 }

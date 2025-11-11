@@ -18,6 +18,10 @@ pub struct Activity {
     provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
     #[serde(default)]
     payload: Value,
 }
@@ -47,6 +51,8 @@ impl Activity {
             session_id: None,
             provider_id: None,
             user_id: None,
+            channel_id: None,
+            conversation_id: None,
             payload: json!({ "text": text.into() }),
         }
     }
@@ -64,6 +70,8 @@ impl Activity {
             session_id: None,
             provider_id: None,
             user_id: None,
+            channel_id: None,
+            conversation_id: None,
             payload,
         }
     }
@@ -111,6 +119,18 @@ impl Activity {
         self
     }
 
+    /// Attach a channel identifier (chat, room, or queue) for canonical session keys.
+    pub fn in_channel(mut self, channel: impl Into<String>) -> Self {
+        self.channel_id = Some(channel.into());
+        self
+    }
+
+    /// Attach a conversation/thread identifier for canonical session keys.
+    pub fn in_conversation(mut self, conversation: impl Into<String>) -> Self {
+        self.conversation_id = Some(conversation.into());
+        self
+    }
+
     /// Return the resolved tenant identifier, if any.
     pub fn tenant(&self) -> Option<&str> {
         self.tenant.as_deref()
@@ -136,6 +156,21 @@ impl Activity {
     /// Return the originating provider identifier, if supplied.
     pub fn provider_id(&self) -> Option<&str> {
         self.provider_id.as_deref()
+    }
+
+    /// Return the originating user identifier, if supplied.
+    pub fn user(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    /// Return the channel identifier, if supplied.
+    pub fn channel(&self) -> Option<&str> {
+        self.channel_id.as_deref()
+    }
+
+    /// Return the conversation identifier, if supplied.
+    pub fn conversation(&self) -> Option<&str> {
+        self.conversation_id.as_deref()
     }
 
     /// Underlying payload body.

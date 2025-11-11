@@ -1,148 +1,114 @@
 # greentic-runner
 
-Greentic runner host for executing agentic flows packaged as Wasm components.  
-The workspace hosts the runner binary in `crates/host` plus integration tests in `crates/tests` and sample bindings under `examples/bindings/`.
+Monorepo for the Greentic runner host, CLI, and integration tests.  
+The workspace centres around `crates/greentic-runner-host`, which is the production runtime (pack ingestion/resolvers, canonical ingress adapters for Telegram/Teams/WebChat/Slack/Webex/WhatsApp/webhook/timer, session/state glue, admin API). The top-level crate `greentic-runner` exposes a thin binary that embeds the host.
 
-## Getting Started
-
-```bash
-cargo run -p greentic-runner -- --pack /path/to/pack.wasm --bindings examples/bindings/default.bindings.yaml --port 8080
-```
-
-On startup the host loads the supplied pack, enumerates flows, and exposes the messaging webhook for Telegram under `/messaging/telegram/webhook`.
-
-## Architecture
-
-- **Legacy host (`legacy-host` feature, default):** HTTP server that loads packs, exposes Telegram/webhook adapters, and schedules timers. Production deployments continue to use this path unchanged.
-- **New runner (`new-runner` feature):** Library + CLI built around `RunnerApi`, a policy-governed `StateMachine`, and an `AdapterRegistry`. Dependencies (sessions/state, telemetry, secrets) are injected through host traits so the legacy integrations can be bridged without duplication.
-- **Host bundle:** Secrets, telemetry, session, and state providers packaged as a `HostBundle` and shared between the server and the new runner.
-- **Adapter registry:** Connectors register under stable names (`messaging.telegram`, `email.google`, …); the state machine resolves outbound calls via the registry and enforces idempotent sends.
-
-```
-TenantCtx → RunnerApi → StateMachine → Host Bundle (session/state/secrets/telemetry)
-                                         ↘ AdapterRegistry → Connectors
-```
-
-## Quickstart (new runner)
+## Quick start
 
 ```bash
-# Build the CLI behind the new-runner feature
-cargo run -p greentic-runner --bin greentic-runner-cli --no-default-features --features new-runner -- \
-  list-flows --manifest ./manifests/sample_flows.json
+# Configure env vars (see host README for the full table)
+export PACK_INDEX_URL=./examples/index.json
+export PACK_CACHE_DIR=.packs
+export DEFAULT_TENANT=demo
 
-cargo run -p greentic-runner --bin greentic-runner-cli --no-default-features --features new-runner -- \
-  run-flow --manifest ./manifests/sample_flows.json \
-  --flow-id flow.test \
-  --tenant '{"env":"dev","tenant":"acme","attempt":0}' \
-  --input '{"value":42}'
+# Run the HTTP host on port 8080
+cargo run -p greentic-runner -- --bindings examples/bindings/demo.yaml --port 8080
+
+# Trigger a Telegram-style webhook
+curl -X POST http://localhost:8080/messaging/telegram/webhook \
+  -H "Content-Type: application/json" \
+  -d '{"update_id":1,"message":{"chat":{"id":42},"text":"hello"}}'
 ```
 
-`sample_flows.json` is a JSON array of flow definitions that the new runner ingests. Each definition declares summaries, schemas, and a linear set of steps. Adapter steps reference registry names such as `demo.adapter`.
+The host loads packs declared in `PACK_INDEX_URL`, verifies signatures/digests (via `PACK_PUBLIC_KEY` / `PACK_VERIFY_STRICT`), and exposes the built-in adapters. Every ingress payload (Telegram/WebChat/Slack/Webex/WhatsApp/webhook/timer) is normalized into the canonical schema with deterministic session keys so pause/resume + dedupe work the same way across providers.
 
-## Telemetry
+## Pack index schema
 
-Telemetry initialises automatically through the `greentic_types::telemetry::main` macro. Configure exporters and logging via environment variables:
+Pack resolution is driven by a JSON index (see `examples/index.json`). Each tenant entry supplies a `main_pack` plus optional ordered `overlays`:
 
-```
-OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-RUST_LOG=info
-OTEL_RESOURCE_ATTRIBUTES=deployment.environment=dev
-```
-
-## Runner API Usage
-
-```rust
-use greentic_runner::newrunner::builder::RunnerBuilder;
-use greentic_runner::newrunner::policy::Policy;
-use greentic_runner::newrunner::registry::AdapterRegistry;
-use greentic_runner::newrunner::shims::{InMemorySessionHost, InMemoryStateHost};
-use greentic_runner::newrunner::host::HostBundle;
-use greentic_runner::newrunner::state_machine::{FlowDefinition, FlowStep};
-use greentic_runner::newrunner::FlowSummary;
-use greentic_runner::newrunner::api::{RunFlowRequest, RunnerApi};
-use greentic_runner::glue::{FnSecretsHost, FnTelemetryHost};
-use greentic_types::{EnvId, TenantCtx, TenantId};
-use std::sync::Arc;
-
-#[greentic_types::telemetry::main(service_name = "example-runner")]
-async fn main() -> anyhow::Result<()> {
-    let secrets = Arc::new(FnSecretsHost::new(|name| std::env::var(name).map_err(|err| err.into())));
-    let telemetry = Arc::new(FnTelemetryHost::new(|span, fields| {
-        for (k, v) in fields { tracing::info!(?span, key = *k, value = *v); }
-        Ok(())
-    }));
-    let session = Arc::new(InMemorySessionHost::new());
-    let state = Arc::new(InMemoryStateHost::new());
-    let host = HostBundle::new(secrets, telemetry, session, state);
-
-    let flows = vec![FlowDefinition::new(
-        FlowSummary {
-            id: "flow.test".into(),
-            name: "Test Flow".into(),
-            version: "1.0.0".into(),
-            description: None,
-        },
-        serde_json::json!({"type": "object"}),
-        vec![FlowStep::Complete { outcome: serde_json::json!({"echo": true}) }],
-    )];
-
-    let mut builder = RunnerBuilder::new()
-        .with_host(host)
-        .with_adapters(AdapterRegistry::default())
-        .with_policy(Policy::default());
-    for flow in flows { builder = builder.with_flow(flow); }
-    let runner = builder.build()?;
-
-    let tenant = TenantCtx::new(EnvId::from("dev"), TenantId::from("acme"))
-        .with_provider("example-runner")
-        .with_flow("flow.test");
-
-    let response = runner.run_flow(RunFlowRequest {
-        tenant,
-        flow_id: "flow.test".into(),
-        input: serde_json::json!({}),
-        session_hint: None,
-    }).await?;
-
-    println!("{}", serde_json::to_string_pretty(&response.outcome)?);
-    Ok(())
+```json
+{
+  "tenants": {
+    "demo": {
+      "main_pack": {
+        "reference": { "name": "demo-pack", "version": "1.2.3" },
+        "locator": "fs:///packs/demo.gtpack",
+        "digest": "sha256:abcd...",
+        "signature": "ed25519:...",
+        "path": "./packs/demo.gtpack"
+      },
+      "overlays": [
+        {
+          "reference": { "name": "demo-overlay", "version": "1.2.3" },
+          "path": "./packs/demo-overlay.gtpack",
+          "digest": "sha256:efgh..."
+        }
+      ]
+    }
+  }
 }
 ```
 
-## Maintenance Notes
+During a reload the watcher resolves each locator (filesystem, HTTPS, OCI, S3, GCS, or Azure blob), validates the digest/signature, populates the content-addressed cache, warms Wasmtime, and swaps the `TenantRuntime` atomically. Overlays can be added/removed tenant-by-tenant without touching the base pack; `crates/tests/tests/host_integration.rs` contains a regression test for overlay reloads.
 
-- **Features:** `legacy-host` (default) keeps existing HTTP server; `new-runner` enables the new CLI, API, and state machine. `redis` is reserved for future session/state backends; `schema` will emit JSON schemas for public structs.
-- **Runtime selection:**
-  - Stable (default) enables `stable-wasmtime`, which pins Wasmtime to `<38` for compatibility with the stable toolchain.
-  - Nightly workloads can opt into `nightly-wasmtime` to compile against Wasmtime `38`. This requires building with `--no-default-features --features legacy-host,nightly-wasmtime` (or the equivalent for the CLI) and the repo-local nightly toolchain.
-  - Non-execution commands (for example, schema inspection) do not require either runtime feature.
-- **Policy & retry:** `src/newrunner/policy.rs` centralises exponential backoff with jitter. Both the new runner and the legacy server can reuse this helper to keep retry semantics aligned.
-- **Adapters:** Register legacy adapters through `glue::FnAdapterBridge` or migrate them to implement `newrunner::Adapter` directly.
-- **Testing:** `cargo test --workspace --all-features` exercises the new state machine (requires enabling `new-runner`). Redis-backed tests will attach once the external crates land.
-- **Session/state shims:** Temporary in-memory implementations live under `src/newrunner/shims/` and provide CAS semantics plus TTL. Replace them with `greentic-session` / `greentic-state` once published.
+## Sessions & pause/resume
 
-## Local Checks
+Packs can emit the `session.wait` component to pause execution (e.g., waiting for a human reply). `greentic-runner-host` automatically:
 
-Run the local CI mirror before pushing:
+1. Serializes the `FlowSnapshot` (next node + execution state) into `greentic-session`.
+2. Uses a canonical session key (`tenant:provider:channel:conversation:user`) hashed into a `UserId`, so the next inbound activity finds the correct snapshot.
+3. Resumes the snapshot on the next activity, continues execution, and clears the stored state once the flow finishes.
+
+No glue code is required inside packs; authors just emit `session.wait` and persist any additional state via `greentic-state`. The canonical session key format is `{tenant}:{provider}:{conversation-or-channel}:{user}` so every adapter participates consistently (documented in `crates/greentic-runner-host/README.md`).
+
+## Repository layout
+
+| Path | Description |
+| --- | --- |
+| `crates/greentic-runner-host/` | Production runtime crate (docs, canonical adapters, env table, admin API) |
+| `crates/greentic-runner/` | Binary that embeds the host (CLI entrypoint) |
+| `crates/tests/` | Integration test harness (demo pack execution, watcher reload/overlay regression, adapter fixtures) |
+| `examples/` | Sample bindings, reference `index.json`, example packs |
+
+## Development
 
 ```bash
-ci/local_check.sh
+cargo fmt
+cargo clippy
+cargo test
 ```
 
-Toggles:
+Integration tests under `crates/tests/tests/*.rs` exercise the demo pack, watcher reloads (including overlays), and scaffold future adapters (webhook/timer). Enable new fixtures as adapters mature.
 
-- `LOCAL_CHECK_ONLINE=1` – enable steps that need the network.
-- `LOCAL_CHECK_STRICT=1` – treat missing tools as fatal and run all optional checks.
-- `LOCAL_CHECK_VERBOSE=1` – print every command.
+## Ingress adapters at a glance
 
-The script installs a lightweight `pre-push` hook on first run so pushes stay green.
+| Provider | Route | Env/deps | Notes |
+| --- | --- | --- | --- |
+| Telegram Bot API | `POST /messaging/telegram/webhook` | `TELEGRAM_BOT_TOKEN` (used by the egress bridge) | Canonicalises update ids, dedupes via cache |
+| Microsoft Teams (Bot Framework) | `POST /teams/activities` | None (HTTPS listener; add auth proxy externally) | Uses `replyToId`/conversation/channel to derive session key |
+| Slack Events API | `POST /slack/events` | `SLACK_SIGNING_SECRET` | Handles `url_verification`, dedupes via `event_id` |
+| Slack Interactivity | `POST /slack/interactive` | `SLACK_SIGNING_SECRET` | Parses `payload=` form body; same canonical contract |
+| WebChat / Direct Line | `POST /webchat/activities` | None | Mirrors Bot Framework schema; attachments mapped 1:1 |
+| Cisco Webex | `POST /webex/webhook` | `WEBEX_WEBHOOK_SECRET` (optional signature) | File URLs surfaced in canonical attachments |
+| WhatsApp Cloud API | `GET/POST /whatsapp/webhook` | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET` | Normalizes interactive/list replies into canonical buttons |
+| Generic Webhook | `ANY /webhook/:flow_id` | Idempotency via `Idempotency-Key` header | Passes normalized HTTP request object to the target flow |
+| Timer / Cron | internal | `bindings.yaml` timer entries | Schedules flow invocations using `cron` expressions |
 
-## Releases & Publishing
+All adapters emit the canonical payload (`tenant`, `provider`, `provider_ids`, `session.key`, `text`, `attachments`, `buttons`, `entities`, `metadata`, `channel_data`, `raw`). The canonical session key `{tenant}:{provider}:{conversation-or-thread-or-channel}:{user}` drives dedupe and pause/resume semantics universally.
 
-- Crate versions come directly from each crate's `Cargo.toml`.
-- Pushing to `master` tags every crate whose version changed as `<crate-name>-v<semver>`.
-- The publish workflow runs after tagging and pushes the changed crates to crates.io.
-- Publishing is idempotent; it succeeds even when crates are already up to date.
+## Environment variables
+
+Common settings (full table lives in `crates/greentic-runner-host/README.md`):
+
+- `PACK_INDEX_URL`, `PACK_CACHE_DIR`, `PACK_SOURCE` – control pack discovery & caching.
+- `PACK_REFRESH_INTERVAL` – watcher cadence (e.g., `30s`, `5m`).
+- `TENANT_RESOLVER`, `DEFAULT_TENANT` – HTTP routing behaviour (host/header/jwt/env).
+- `SECRETS_BACKEND`, `OTEL_*` – bootstrap secrets + telemetry.
+- `ADMIN_TOKEN` – protect `/admin/*` endpoints; loopback-only access when unset.
+
+## Publishing
+
+Versions are tracked per crate. Tagging `master` with `<crate>-vX.Y.Z` triggers the publish workflow which pushes the crate to crates.io. Use `ci/local_check.sh` before tagging to mirror the CI pipeline locally.
 
 ## License
 

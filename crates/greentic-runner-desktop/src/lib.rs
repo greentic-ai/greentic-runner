@@ -9,6 +9,7 @@ pub use greentic_runner_host::runner::mocks::{
     HttpMock, HttpMockMode, KvMock, MocksConfig, SecretsMock, TelemetryMock, TimeMock, ToolsMock,
 };
 use greentic_runner_host::runner::mocks::{MockEventSink, MockLayer};
+use greentic_runner_host::storage::{new_session_store, new_state_store};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
@@ -268,12 +269,17 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         None
     };
 
+    let session_store = new_session_store();
+    let state_store = new_state_store();
     let pack = Arc::new(
         PackRuntime::load(
             &component_artifact,
             Arc::clone(&host_config),
             Some(Arc::clone(&mock_layer)),
             archive_source,
+            Some(Arc::clone(&session_store)),
+            Some(Arc::clone(&state_store)),
+            false,
         )
         .await
         .with_context(|| format!("failed to load pack {}", component_artifact.display()))?,
@@ -287,7 +293,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     let entry_flow_id = resolve_entry_flow(opts.entry_flow.clone(), pack.metadata(), &flows)?;
     recorder.set_flow_id(&entry_flow_id);
 
-    let engine = FlowEngine::new(Arc::clone(&pack), Arc::clone(&host_config))
+    let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&host_config))
         .await
         .context("failed to prime flow engine")?;
 
@@ -314,7 +320,12 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     let finished_at = OffsetDateTime::now_utc();
 
     let status = match execution {
-        Ok(_) => RunCompletion::Ok,
+        Ok(result) => match result.status {
+            greentic_runner_host::runner::engine::FlowStatus::Completed => RunCompletion::Ok,
+            greentic_runner_host::runner::engine::FlowStatus::Waiting(wait) => RunCompletion::Err(
+                anyhow::anyhow!("flow paused unexpectedly: {:?}", wait.reason),
+            ),
+        },
         Err(err) => RunCompletion::Err(err),
     };
 
