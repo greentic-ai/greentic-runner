@@ -3,6 +3,7 @@ name = "greentic-secrets"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+description = "Secrets providers for Greentic runtimes (environment backend for dev/tests)"
 
 [dependencies]
 anyhow.workspace = true

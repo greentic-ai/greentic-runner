@@ -40,7 +40,7 @@ jobs:
           dry-run: false
 
   publish-runner-host:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/runner-host-v')
     needs: build-test
     runs-on: ubuntu-latest
     permissions:
@@ -55,12 +55,10 @@ jobs:
       - name: Build greentic-runner-host (all features)
         run: cargo build -p greentic-runner-host --all-features
       - name: Dry-run publish greentic-runner-host
-        if: startsWith(github.ref, 'refs/tags/runner-host-v')
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p greentic-runner-host --dry-run
       - name: Publish greentic-runner-host
-        if: github.ref == 'refs/tags/runner-host-v0.3.0'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p greentic-runner-host
