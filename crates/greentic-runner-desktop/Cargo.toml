@@ -1,6 +1,6 @@
 [package]
 name = "greentic-runner-desktop"
-version = "0.3.0"
+version.workspace = true
 edition = "2024"
 description = "Developer desktop runner harness for Greentic packs"
 license = "MIT"

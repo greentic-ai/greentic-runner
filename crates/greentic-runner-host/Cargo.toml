@@ -1,6 +1,6 @@
 [package]
 name = "greentic-runner-host"
-version = "0.3.0"
+version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Host runtime shim for Greentic runner: config, pack loading, activity handling"
