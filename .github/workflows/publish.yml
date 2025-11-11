@@ -29,7 +29,7 @@ jobs:
           cargo test --workspace --all-features
 
   publish:
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+    if: github.event_name != 'pull_request'
     needs: build-test
     runs-on: ubuntu-latest
     permissions:
@@ -50,10 +50,11 @@ jobs:
 
   publish-runner-host:
     if: >
-      (github.event_name == 'push' &&
-        (startsWith(github.ref, 'refs/tags/greentic-runner-host-v') ||
-         startsWith(github.ref, 'refs/tags/v'))) ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+      github.event_name != 'pull_request' &&
+      (
+        startsWith(github.ref, 'refs/tags/greentic-runner-host-v') ||
+        (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+      )
     needs: build-test
     runs-on: ubuntu-latest
     steps:
