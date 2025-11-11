@@ -16,6 +16,7 @@ use crate::runner::adapt_timer;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
+use crate::wasi::RunnerWasiPolicy;
 
 pub struct PackWatcher {
     handle: tokio::task::JoinHandle<()>,
@@ -58,6 +59,7 @@ pub async fn start_pack_watcher(
     let session_store = host.session_store();
     let state_store = host.state_store();
     let state_host = host.state_host();
+    let wasi_policy = host.wasi_policy();
 
     reload_once(
         configs.as_ref(),
@@ -69,6 +71,7 @@ pub async fn start_pack_watcher(
         session_store.clone(),
         state_store.clone(),
         state_host.clone(),
+        Arc::clone(&wasi_policy),
     )
     .await?;
 
@@ -79,6 +82,7 @@ pub async fn start_pack_watcher(
     let active_clone = Arc::clone(&active);
     let configs_clone = Arc::clone(&configs);
     let state_store_clone = Arc::clone(&state_store);
+    let wasi_policy_clone = Arc::clone(&wasi_policy);
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
         loop {
@@ -100,6 +104,7 @@ pub async fn start_pack_watcher(
                 session_store.clone(),
                 state_store_clone.clone(),
                 state_host.clone(),
+                Arc::clone(&wasi_policy_clone),
             )
             .await
             {
@@ -125,6 +130,7 @@ async fn reload_once(
     session_store: DynSessionStore,
     state_store: DynStateStore,
     state_host: Arc<dyn StateHost>,
+    wasi_policy: Arc<RunnerWasiPolicy>,
 ) -> Result<()> {
     let index = Index::load(&cfg.index_location)?;
     let resolved = manager.resolve_all_for_index(&index)?;
@@ -143,6 +149,7 @@ async fn reload_once(
                 Some(&record.main.path),
                 Some(Arc::clone(&session_store)),
                 Some(Arc::clone(&state_store)),
+                Arc::clone(&wasi_policy),
                 true,
             )
             .await
@@ -159,6 +166,7 @@ async fn reload_once(
                     Some(&overlay.path),
                     Some(Arc::clone(&session_store)),
                     Some(Arc::clone(&state_store)),
+                    Arc::clone(&wasi_policy),
                     true,
                 )
                 .await

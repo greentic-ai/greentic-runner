@@ -29,7 +29,7 @@ greentic-pack.workspace = true
 greentic-types.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
-greentic-secrets = { workspace = true, path = "../greentic-secrets" }
+greentic-secrets = { version = "0.3.4", path = "../greentic-secrets" }
 handlebars.workspace = true
 hex.workspace = true
 humantime.workspace = true
@@ -60,4 +60,5 @@ sha1 = "0.10"
 # External stack components
 greentic_mcp = { package = "mcp-exec", version = "0.3", optional = true }
 wasmtime = { version = "38", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "38", default-features = false, features = ["p2"] }
 greentic-telemetry = { version = "0.3", optional = true }

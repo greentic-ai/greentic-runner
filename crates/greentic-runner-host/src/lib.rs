@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ pub mod runtime_wasmtime;
 pub mod storage;
 pub mod telemetry;
 pub mod verify;
+pub mod wasi;
 pub mod watcher;
 
 mod activity;
@@ -32,6 +33,7 @@ pub use activity::{Activity, ActivityKind};
 pub use config::HostConfig;
 pub use host::TelemetryCfg;
 pub use host::{HostBuilder, RunnerHost, TenantHandle};
+pub use wasi::{PreopenSpec, RunnerWasiPolicy};
 
 pub use greentic_types::{EnvId, FlowId, PackId, TenantCtx, TenantId};
 
@@ -51,6 +53,7 @@ pub struct RunnerConfig {
     pub admin: AdminAuth,
     pub telemetry: Option<TelemetryCfg>,
     pub secrets_backend: SecretsBackend,
+    pub wasi_policy: RunnerWasiPolicy,
 }
 
 impl RunnerConfig {
@@ -77,12 +80,18 @@ impl RunnerConfig {
             admin,
             telemetry: None,
             secrets_backend,
+            wasi_policy: RunnerWasiPolicy::default(),
         })
     }
 
     /// Override the HTTP port used by the host server.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    pub fn with_wasi_policy(mut self, policy: RunnerWasiPolicy) -> Self {
+        self.wasi_policy = policy;
         self
     }
 }
@@ -104,6 +113,7 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     if let Some(telemetry) = cfg.telemetry.clone() {
         builder = builder.with_telemetry(telemetry);
     }
+    builder = builder.with_wasi_policy(cfg.wasi_policy.clone());
 
     greentic_secrets::init(cfg.secrets_backend)?;
 

@@ -29,7 +29,9 @@ jobs:
           cargo test --workspace --all-features
 
   publish:
-    if: github.event_name != 'pull_request'
+    if: >
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
     needs: build-test
     runs-on: ubuntu-latest
     permissions:

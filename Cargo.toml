@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.3.4"
+version = "0.3.5"
 
 [workspace.dependencies]
 arc-swap = "1.7"
@@ -29,6 +29,8 @@ greentic-interfaces = "0.4"
 greentic-mcp = { package = "mcp-exec", version = "0.3" }
 greentic-types = { version = "0.3", features = ["telemetry-autoinit"] }
 greentic-pack = { version = "0.3" }
+greentic-session = "0.3.2"
+greentic-state = "0.3.0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"

@@ -19,6 +19,7 @@ use crate::storage::{
     DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
     state_host_from,
 };
+use crate::wasi::RunnerWasiPolicy;
 
 #[cfg(feature = "telemetry")]
 pub use greentic_telemetry::OtlpConfig as TelemetryCfg;
@@ -31,6 +32,7 @@ pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
     #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
+    wasi_policy: RunnerWasiPolicy,
 }
 
 impl HostBuilder {
@@ -39,6 +41,7 @@ impl HostBuilder {
             configs: HashMap::new(),
             #[cfg(feature = "telemetry")]
             telemetry: None,
+            wasi_policy: RunnerWasiPolicy::default(),
         }
     }
 
@@ -53,10 +56,16 @@ impl HostBuilder {
         self
     }
 
+    pub fn with_wasi_policy(mut self, policy: RunnerWasiPolicy) -> Self {
+        self.wasi_policy = policy;
+        self
+    }
+
     pub fn build(self) -> Result<RunnerHost> {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
         }
+        let wasi_policy = Arc::new(self.wasi_policy);
         let configs = self
             .configs
             .into_iter()
@@ -74,6 +83,7 @@ impl HostBuilder {
             state_store,
             session_host,
             state_host,
+            wasi_policy,
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry,
         })
@@ -95,6 +105,7 @@ pub struct RunnerHost {
     state_store: DynStateStore,
     session_host: Arc<dyn SessionHost>,
     state_host: Arc<dyn StateHost>,
+    wasi_policy: Arc<RunnerWasiPolicy>,
     #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
 }
@@ -199,6 +210,10 @@ impl RunnerHost {
         Arc::clone(&self.health)
     }
 
+    pub fn wasi_policy(&self) -> Arc<RunnerWasiPolicy> {
+        Arc::clone(&self.wasi_policy)
+    }
+
     pub fn session_store(&self) -> DynSessionStore {
         Arc::clone(&self.session_store)
     }
@@ -242,6 +257,7 @@ impl RunnerHost {
             None,
             archive_source,
             None,
+            self.wasi_policy(),
             self.session_host(),
             self.session_store(),
             self.state_store(),

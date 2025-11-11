@@ -21,6 +21,7 @@ use crate::runner::engine::FlowEngine;
 use crate::runner::mocks::MockLayer;
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
+use crate::wasi::RunnerWasiPolicy;
 
 const TELEGRAM_CACHE_CAPACITY: usize = 1024;
 const WEBHOOK_CACHE_CAPACITY: usize = 256;
@@ -88,6 +89,7 @@ impl TenantRuntime {
         mocks: Option<Arc<MockLayer>>,
         archive_source: Option<&Path>,
         digest: Option<String>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
         session_host: Arc<dyn SessionHost>,
         session_store: DynSessionStore,
         state_store: DynStateStore,
@@ -101,6 +103,7 @@ impl TenantRuntime {
                 archive_source,
                 Some(Arc::clone(&session_store)),
                 Some(Arc::clone(&state_store)),
+                Arc::clone(&wasi_policy),
                 true,
             )
             .await

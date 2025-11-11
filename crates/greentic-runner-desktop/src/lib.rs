@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use greentic_pack::reader::{PackLoad, open_pack};
+use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
     HostConfig, McpConfig, McpRetryConfig, RateLimits, SecretsPolicy, WebhookPolicy,
 };
@@ -279,6 +280,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             archive_source,
             Some(Arc::clone(&session_store)),
             Some(Arc::clone(&state_store)),
+            Arc::new(RunnerWasiPolicy::default()),
             false,
         )
         .await

@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::runtime_wasmtime::{Component, Engine, Linker, Store, WasmResult};
+use crate::runtime_wasmtime::{Component, Engine, Linker, ResourceTable, Store, WasmResult};
 use anyhow::{Context, Result, anyhow, bail};
 use greentic_flow::ir::{FlowIR, NodeIR, RouteIR};
+use greentic_interfaces::host_import_v0_2;
 use greentic_interfaces::host_import_v0_2::greentic::host_import::imports::{
     HttpRequest as LegacyHttpRequest, HttpResponse as LegacyHttpResponse,
     IfaceError as LegacyIfaceError, TenantCtx as LegacyTenantCtx,
@@ -39,6 +40,8 @@ use crate::config::HostConfig;
 use crate::storage::state::STATE_PREFIX;
 use crate::storage::{DynSessionStore, DynStateStore};
 use crate::verify;
+use crate::wasi::RunnerWasiPolicy;
+use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 pub struct PackRuntime {
     path: PathBuf,
@@ -50,6 +53,7 @@ pub struct PackRuntime {
     archive: Option<ArchiveFlows>,
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
+    wasi_policy: Arc<RunnerWasiPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +189,145 @@ impl HostState {
             store_cursor = store_cursor.with_outbox_marker(marker);
         }
         store_cursor
+    }
+}
+
+pub struct ComponentState {
+    host: HostState,
+    wasi_ctx: WasiCtx,
+    resource_table: ResourceTable,
+}
+
+impl ComponentState {
+    pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        let wasi_ctx = policy
+            .instantiate()
+            .context("failed to build WASI context")?;
+        Ok(Self {
+            host,
+            wasi_ctx,
+            resource_table: ResourceTable::new(),
+        })
+    }
+
+    fn host_mut(&mut self) -> &mut HostState {
+        &mut self.host
+    }
+}
+
+impl WasiView for ComponentState {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.resource_table,
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe impl Send for ComponentState {}
+#[allow(unsafe_code)]
+unsafe impl Sync for ComponentState {}
+
+impl host_import_v0_6::HostImports for ComponentState {
+    fn secrets_get(
+        &mut self,
+        key: String,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<String, types::IfaceError>> {
+        host_import_v0_6::HostImports::secrets_get(self.host_mut(), key, ctx)
+    }
+
+    fn telemetry_emit(
+        &mut self,
+        span_json: String,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<()> {
+        host_import_v0_6::HostImports::telemetry_emit(self.host_mut(), span_json, ctx)
+    }
+
+    fn http_fetch(
+        &mut self,
+        req: host_import_v0_6::http::HttpRequest,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<host_import_v0_6::http::HttpResponse, types::IfaceError>> {
+        host_import_v0_6::HostImports::http_fetch(self.host_mut(), req, ctx)
+    }
+
+    fn mcp_exec(
+        &mut self,
+        component: String,
+        action: String,
+        args_json: String,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<String, types::IfaceError>> {
+        host_import_v0_6::HostImports::mcp_exec(self.host_mut(), component, action, args_json, ctx)
+    }
+
+    fn state_get(
+        &mut self,
+        key: iface_types::StateKey,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<String, types::IfaceError>> {
+        host_import_v0_6::HostImports::state_get(self.host_mut(), key, ctx)
+    }
+
+    fn state_set(
+        &mut self,
+        key: iface_types::StateKey,
+        value_json: String,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<state::OpAck, types::IfaceError>> {
+        host_import_v0_6::HostImports::state_set(self.host_mut(), key, value_json, ctx)
+    }
+
+    fn session_update(
+        &mut self,
+        cursor: iface_types::SessionCursor,
+        ctx: Option<types::TenantCtx>,
+    ) -> WasmResult<Result<String, types::IfaceError>> {
+        host_import_v0_6::HostImports::session_update(self.host_mut(), cursor, ctx)
+    }
+}
+
+impl host_import_v0_2::HostImports for ComponentState {
+    fn secrets_get(
+        &mut self,
+        key: String,
+        ctx: Option<LegacyTenantCtx>,
+    ) -> WasmResult<Result<String, LegacyIfaceError>> {
+        host_import_v0_2::HostImports::secrets_get(self.host_mut(), key, ctx)
+    }
+
+    fn telemetry_emit(
+        &mut self,
+        span_json: String,
+        ctx: Option<LegacyTenantCtx>,
+    ) -> WasmResult<()> {
+        host_import_v0_2::HostImports::telemetry_emit(self.host_mut(), span_json, ctx)
+    }
+
+    fn tool_invoke(
+        &mut self,
+        tool: String,
+        action: String,
+        args_json: String,
+        ctx: Option<LegacyTenantCtx>,
+    ) -> WasmResult<Result<String, LegacyIfaceError>> {
+        host_import_v0_2::HostImports::tool_invoke(self.host_mut(), tool, action, args_json, ctx)
+    }
+
+    fn http_fetch(
+        &mut self,
+        req: host_import_v0_2::greentic::host_import::imports::HttpRequest,
+        ctx: Option<host_import_v0_2::greentic::host_import::imports::TenantCtx>,
+    ) -> WasmResult<
+        Result<
+            host_import_v0_2::greentic::host_import::imports::HttpResponse,
+            host_import_v0_2::greentic::host_import::imports::IfaceError,
+        >,
+    > {
+        host_import_v0_2::HostImports::http_fetch(self.host_mut(), req, ctx)
     }
 }
 
@@ -640,6 +783,7 @@ impl greentic_interfaces::host_import_v0_2::HostImports for HostState {
 }
 
 impl PackRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub async fn load(
         path: impl AsRef<Path>,
         config: Arc<HostConfig>,
@@ -647,6 +791,7 @@ impl PackRuntime {
         archive_source: Option<&Path>,
         session_store: Option<DynSessionStore>,
         state_store: Option<DynStateStore>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
         verify_archive: bool,
     ) -> Result<Self> {
         let path = path.as_ref();
@@ -700,6 +845,7 @@ impl PackRuntime {
             archive,
             session_store,
             state_store,
+            wasi_policy,
         })
     }
 
@@ -716,14 +862,15 @@ impl PackRuntime {
             .component
             .as_ref()
             .ok_or_else(|| anyhow!("pack component unavailable"))?;
+        let host_state = HostState::new(
+            Arc::clone(&self.config),
+            self.mocks.clone(),
+            self.session_store.clone(),
+            self.state_store.clone(),
+        )?;
         let mut store = Store::new(
             &self.engine,
-            HostState::new(
-                Arc::clone(&self.config),
-                self.mocks.clone(),
-                self.session_store.clone(),
-                self.state_store.clone(),
-            )?,
+            ComponentState::new(host_state, Arc::clone(&self.wasi_policy))?,
         );
         let mut linker = Linker::new(&self.engine);
         imports::register_all(&mut linker)?;
@@ -774,14 +921,15 @@ impl PackRuntime {
             .component
             .as_ref()
             .ok_or_else(|| anyhow!("pack component unavailable"))?;
+        let host_state = HostState::new(
+            Arc::clone(&self.config),
+            self.mocks.clone(),
+            self.session_store.clone(),
+            self.state_store.clone(),
+        )?;
         let mut store = Store::new(
             &self.engine,
-            HostState::new(
-                Arc::clone(&self.config),
-                self.mocks.clone(),
-                self.session_store.clone(),
-                self.state_store.clone(),
-            )?,
+            ComponentState::new(host_state, Arc::clone(&self.wasi_policy))?,
         );
         let mut linker = Linker::new(&self.engine);
         imports::register_all(&mut linker)?;
