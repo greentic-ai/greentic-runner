@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1453,7 +1453,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "greentic-pack",
@@ -1471,7 +1471,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-secrets"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "tracing",
@@ -3040,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "base64",
