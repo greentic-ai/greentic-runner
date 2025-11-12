@@ -1,0 +1,15 @@
+network:
+  allow:
+    - https://weather.example.com
+secrets:
+  required:
+    - WEATHER_API_KEY
+env:
+  passthrough:
+    - CUSTOM_FLAG
+mcp:
+  servers:
+    - name: weather_api
+      transport: websocket
+      endpoint: ws://localhost:9000
+      caps: []

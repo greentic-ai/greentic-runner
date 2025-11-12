@@ -9,3 +9,5 @@ pub use greentic_runner_host::{
 pub mod desktop {
     pub use greentic_runner_desktop::*;
 }
+
+pub mod gen_bindings;

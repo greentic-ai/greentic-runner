@@ -110,6 +110,19 @@ Common settings (full table lives in `crates/greentic-runner-host/README.md`):
 
 Versions are tracked per crate. Tagging `master` with `<crate>-vX.Y.Z` triggers the publish workflow which pushes the crate to crates.io. Use `ci/local_check.sh` before tagging to mirror the CI pipeline locally.
 
+## Bindings inference
+
+`greentic-gen-bindings` can inspect a pack directory and emit a complete `bindings.yaml` seed using the same schema the host expects:
+
+```bash
+cargo run -p greentic-runner --bin greentic-gen-bindings \
+  --pack examples/weather-demo \
+  --out generated/bindings.complete.yaml \
+  --complete
+```
+
+`--complete` fills safe defaults for env passthrough, network allowlists, secrets, and MCP server stubs; `--strict` additionally fails if HTTP/secrets/MCP requirements cannot be satisfied so pack authors can share hints via `bindings.hints.yaml` or `meta.bindings` annotations. The CLI also understands `--component` so future packs compiled to a Wasm component can be inspected for host imports before generating bindings.
+
 ## License
 
 MIT

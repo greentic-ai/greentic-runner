@@ -1,0 +1,15 @@
+tenant: weather-demo-strict
+env_passthrough:
+- CUSTOM_FLAG
+- OTEL_EXPORTER_OTLP_ENDPOINT
+- OTEL_RESOURCE_ATTRIBUTES
+- RUST_LOG
+network_allow:
+- https://weather.example.com
+secrets_required:
+- WEATHER_API_KEY
+mcp_servers:
+- name: weather_api
+  transport: websocket
+  endpoint: ws://localhost:9000
+  caps: []

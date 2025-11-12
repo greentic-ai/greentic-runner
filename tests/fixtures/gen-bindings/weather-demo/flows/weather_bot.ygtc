@@ -1,0 +1,45 @@
+id: weather_bot
+title: Weather Bot
+description: Ask for a location, call the MCP weather API, and reply with a forecast.
+type: messaging
+start: collect_location
+
+parameters:
+  days_default: 3
+
+nodes:
+  collect_location:
+    qa.process:
+      welcome: "Hi there! Let's get your weather forecast."
+      questions:
+        - id: q_location
+          prompt: "👉 Which city do you want to check?"
+          answer_type: text
+          max_words: 5
+    routing:
+      - to: forecast_weather
+
+  forecast_weather:
+    mcp.exec:
+      component: weather_api
+      action: forecast_weather
+      args:
+        q: in.q_location
+        days: parameters.days_default
+    routing:
+      - to: weather_text
+
+  weather_text:
+    templating.handlebars:
+      text: |
+        Here's the forecast for {{forecast_weather.payload.location.name}}, {{forecast_weather.payload.location.country}}:
+
+        Now: {{forecast_weather.payload.current.condition.text}}, {{forecast_weather.payload.current.temp_c}}°C
+        Wind: {{forecast_weather.payload.current.wind_kph}} kph | Humidity: {{forecast_weather.payload.current.humidity}}%
+
+        Forecast (next {{parameters.days_default}} day(s)):
+        {{#forecast_weather.payload.forecast}}
+        - {{date}}: ↑ {{day.maxtemp_c}}°C | ↓ {{day.mintemp_c}}°C — {{day.condition.text}}
+        {{/forecast_weather.payload.forecast}}
+    routing:
+      - out: true

@@ -1,0 +1,7 @@
+tenant: weather-demo
+env_passthrough:
+- OTEL_EXPORTER_OTLP_ENDPOINT
+- OTEL_RESOURCE_ATTRIBUTES
+- RUST_LOG
+network_allow:
+- https://*

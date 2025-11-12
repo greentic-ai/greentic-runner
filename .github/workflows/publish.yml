@@ -37,6 +37,24 @@ jobs:
           name: local_check.log
           path: local_check.log
 
+  generate-bindings:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Generate bindings (complete)
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          cargo run -p greentic-runner --bin greentic-gen-bindings -- --pack tests/fixtures/gen-bindings/weather-demo --out artifacts/weather-demo.complete.yaml --complete
+          cargo run -p greentic-runner --bin greentic-gen-bindings -- --pack tests/fixtures/gen-bindings/weather-demo-strict --out artifacts/weather-demo.strict.yaml --complete --strict
+      - name: Upload bindings artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-bindings
+          path: artifacts
+
   publish:
     if: >
       (github.event_name == 'push' && (
@@ -44,7 +62,7 @@ jobs:
         startsWith(github.ref, 'refs/tags/v')
       )) ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
-    needs: build-test
+    needs: [build-test, generate-bindings]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -59,5 +77,41 @@ jobs:
           path: .
           registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           ignore-unpublished-changes: true
-          check-repo: true
-          dry-run: false
+        check-repo: true
+        dry-run: false
+
+  publish-runner-host:
+    if: >
+      (github.event_name == 'push' && (
+        github.ref == 'refs/heads/master' ||
+        startsWith(github.ref, 'refs/tags/runner-host-v')
+      )) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+    needs: [build-test, generate-bindings]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build greentic-runner-host (minimal)
+        run: cargo build -p greentic-runner-host --no-default-features
+      - name: Build greentic-runner-host (all features)
+        run: cargo build -p greentic-runner-host --all-features
+      - name: Publish greentic-runner-host
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          set +e
+          output="$(cargo publish -p greentic-runner-host 2>&1)"
+          status=$?
+          set -e
+          echo "$output"
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if grep -q 'already uploaded' <<<"$output"; then
+            echo "greentic-runner-host already at this version; ignoring."
+            exit 0
+          fi
+          exit "$status"
