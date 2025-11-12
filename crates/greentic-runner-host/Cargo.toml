@@ -4,6 +4,7 @@ version.workspace = true
 edition = "2024"
 license = "MIT"
 description = "Host runtime shim for Greentic runner: config, pack loading, activity handling"
+homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"
 readme = "README.md"
 keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]

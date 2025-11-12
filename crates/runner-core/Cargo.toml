@@ -1,10 +1,11 @@
 [package]
 name = "runner-core"
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 version.workspace = true
 description = "Core helpers for Greentic runner: pack resolution, signing, session/state glue, and utilities"
 repository = "https://github.com/greentic-ai/greentic-runner"
+homepage = "https://github.com/greentic-ai/greentic-runner"
 readme = "README.md"
 
 [dependencies]

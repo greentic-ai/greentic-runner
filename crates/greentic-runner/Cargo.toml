@@ -2,7 +2,7 @@
 name = "greentic-runner"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 description = "Greentic runner binaries and re-exported host/new-runner APIs"
 homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"

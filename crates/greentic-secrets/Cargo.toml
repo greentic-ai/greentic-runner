@@ -1,9 +1,11 @@
 [package]
 name = "greentic-secrets"
 edition.workspace = true
-license.workspace = true
+license = "MIT"
 version.workspace = true
 description = "Secrets providers for Greentic runtimes (environment backend for dev/tests)"
+homepage = "https://github.com/greentic-ai/greentic-runner"
+repository = "https://github.com/greentic-ai/greentic-runner"
 
 [dependencies]
 anyhow.workspace = true

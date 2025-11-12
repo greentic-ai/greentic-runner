@@ -5,15 +5,19 @@ on:
     branches: [ master ]
     tags:
       - "v*"
-      - "*-v*"
+      - "runner-host-v*"
   workflow_dispatch:
     inputs:
       publish:
-        description: "Run publish steps as well as build/test?"
+        description: "Run publish steps in addition to build/test?"
         required: true
         default: "false"
         type: choice
         options: ["false", "true"]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-test:
@@ -22,16 +26,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - name: Lint & Test
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --all-features
+      - name: Run local_check
+        run: CI=1 bash ci/local_check.sh
 
   publish:
     if: >
-      github.event_name == 'push' ||
-      (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
     needs: build-test
     runs-on: ubuntu-latest
     permissions:
@@ -52,11 +53,8 @@ jobs:
 
   publish-runner-host:
     if: >
-      github.event_name != 'pull_request' &&
-      (
-        startsWith(github.ref, 'refs/tags/greentic-runner-host-v') ||
-        (github.event_name == 'workflow_dispatch' && inputs.publish == 'true')
-      )
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/runner-host-v')) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
     needs: build-test
     runs-on: ubuntu-latest
     steps:
