@@ -27,7 +27,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Run local_check
-        run: CI=1 bash ci/local_check.sh
+        run: |
+          set -o pipefail
+          RUN_HOST=never CI=1 bash ci/local_check.sh 2>&1 | tee local_check.log
+      - name: Upload local_check.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: local_check.log
+          path: local_check.log
 
   publish:
     if: >

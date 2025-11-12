@@ -30,7 +30,7 @@ greentic-pack.workspace = true
 greentic-types.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
-greentic-secrets = { version = "0.3.4", path = "../greentic-secrets" }
+greentic-secrets = { version = "0.3.6", path = "../greentic-secrets" }
 handlebars.workspace = true
 hex.workspace = true
 humantime.workspace = true
@@ -39,7 +39,7 @@ lru.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-runner-core = { version = "0.3.3", path = "../runner-core" }
+runner-core = { version = "0.3.6", path = "../runner-core" }
 serde = { workspace = true }
 serde_cbor.workspace = true
 serde_json.workspace = true

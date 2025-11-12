@@ -9,7 +9,7 @@ repository = "https://github.com/greentic-ai/greentic-runner"
 
 [dependencies]
 anyhow.workspace = true
-greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.0", features = ["mcp", "telemetry"] }
+greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.6", features = ["mcp", "telemetry"] }
 greentic-pack.workspace = true
 parking_lot.workspace = true
 serde.workspace = true

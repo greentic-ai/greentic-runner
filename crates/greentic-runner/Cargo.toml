@@ -20,11 +20,11 @@ schema = []
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.0", features = ["mcp"] }
-greentic-runner-desktop = { path = "../greentic-runner-desktop", version = "0.3.0" }
+greentic-runner-host = { path = "../greentic-runner-host", version = "0.3.6", features = ["mcp"] }
+greentic-runner-desktop = { path = "../greentic-runner-desktop", version = "0.3.6" }
 greentic-types.workspace = true
 humantime.workspace = true
-runner-core = { path = "../runner-core" }
+runner-core = { path = "../runner-core", version = "0.3.6" }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
