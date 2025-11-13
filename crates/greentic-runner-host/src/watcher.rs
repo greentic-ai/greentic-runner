@@ -12,7 +12,6 @@ use crate::engine::host::{SessionHost, StateHost};
 use crate::host::RunnerHost;
 use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
-use crate::runner::adapt_timer;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
@@ -190,8 +189,6 @@ async fn reload_once(
             Arc::clone(&state_host),
         )
         .await?;
-        let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
-        runtime.register_timers(timers);
 
         next.insert(tenant.clone(), runtime);
     }

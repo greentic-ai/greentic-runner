@@ -1,4 +1,9 @@
 #![deny(unsafe_code)]
+//! Official host runtime for Greentic packs and flows.
+//! `greentic-runner` embeds this crate as the one true host; the older `greentic-host`
+//! crate/docs are deprecated. Timer/cron flows are intentionally absent here and will be
+//! handled by a future `greentic-events` project so the runner can focus on sessionful
+//! messaging and webhooks.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,21 +14,49 @@ use greentic_secrets::SecretsBackend;
 use runner_core::env::PackConfig;
 use tokio::signal;
 
+#[doc(hidden)]
+/// Internal bootstrap helpers not part of the stable API.
 pub mod boot;
 pub mod config;
+#[doc(hidden)]
+/// Internal engine/runtime glue; prefer `HostBuilder`/`RunnerHost`.
 pub mod engine;
+#[doc(hidden)]
+/// HTTP helpers primarily used by the host server.
 pub mod http;
+#[doc(hidden)]
+/// Low-level import/wasi helpers maintained for runtime wiring.
 pub mod imports;
+#[doc(hidden)]
+/// Canonical ingress adapters (messaging flows, webhooks, etc.).
 pub mod ingress;
+#[doc(hidden)]
+/// Pack loading helpers and runtime embeddings.
 pub mod pack;
 pub mod routing;
+#[doc(hidden)]
+/// HTTP server wiring; use [`HostServer`] instead.
 pub mod runner;
+#[doc(hidden)]
+/// Tenant runtime internals (engine/state machine) not part of the public API.
 pub mod runtime;
+#[doc(hidden)]
+/// Wasmtime-specific bindings used internally.
 pub mod runtime_wasmtime;
+#[doc(hidden)]
+/// Storage/backing stores for secrets/state.
 pub mod storage;
+#[doc(hidden)]
+/// Telemetry helpers used by the host.
 pub mod telemetry;
+#[doc(hidden)]
+/// Verification helpers for pack/signature checks.
 pub mod verify;
+#[doc(hidden)]
+/// WASI helpers for the runner.
 pub mod wasi;
+#[doc(hidden)]
+/// Watcher helpers that drive pack reloading.
 pub mod watcher;
 
 mod activity;
@@ -42,7 +75,11 @@ pub use routing::RoutingConfig;
 use routing::TenantRouting;
 pub use runner::HostServer;
 
-/// User-facing configuration for running the unified host.
+/// Configuration for the canonical Greentic host binary (bindings + pack + routing + admin).
+///
+/// This struct exposes the official entrypoint for new integrations and enforces the
+/// canonical environment/tenant/session invariants relied upon by `HostBuilder`s and
+/// `RunnerHost`.
 #[derive(Clone)]
 pub struct RunnerConfig {
     pub bindings: Vec<PathBuf>,

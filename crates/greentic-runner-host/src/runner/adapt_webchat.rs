@@ -7,11 +7,11 @@ use serde_json::{Map, Value};
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::ingress::{
-    CanonicalAttachment, ProviderIds, build_canonical_payload, canonical_session_key,
-    default_metadata, empty_entities,
+    CanonicalAttachment, ProviderIds, build_canonical_payload, default_metadata, empty_entities,
 };
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::ingress_util::{collect_body, mark_processed};
+use greentic_types::canonical_session_key;
 
 pub async fn activities(
     TenantRuntimeHandle { tenant, runtime }: TenantRuntimeHandle,
@@ -37,7 +37,13 @@ pub async fn activities(
     }
 
     let provider_ids = build_provider_ids(&activity)?;
-    let session_key = canonical_session_key(&tenant, "webchat", &provider_ids);
+    let session_key = canonical_session_key(
+        &tenant,
+        "webchat",
+        provider_ids.anchor(),
+        provider_ids.user(),
+    );
+    let session_key_str = session_key.to_string();
     let timestamp = parse_timestamp(activity.timestamp.as_deref())?;
     let locale = activity.locale.clone();
     let text = activity.text.clone();
@@ -49,7 +55,7 @@ pub async fn activities(
         &tenant,
         "webchat",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes,
         timestamp,
         locale,
@@ -68,7 +74,7 @@ pub async fn activities(
         flow_id: flow.id.clone(),
         flow_type: Some(flow.flow_type.clone()),
         action: Some("messaging".into()),
-        session_hint: Some(session_key),
+        session_hint: Some(session_key_str.clone()),
         provider: Some("webchat".into()),
         channel: provider_ids
             .conversation_id
@@ -261,8 +267,13 @@ mod tests {
         let activity: WebChatActivity = serde_json::from_value(raw.clone()).unwrap();
         let provider_ids = build_provider_ids(&activity).unwrap();
         assert_eq!(provider_ids.conversation_id.as_deref(), Some("conv-abc"));
-        let session_key = canonical_session_key("demo", "webchat", &provider_ids);
-        assert_eq!(session_key, "demo:webchat:conv-abc:user-123");
+        let session_key = canonical_session_key(
+            "demo",
+            "webchat",
+            provider_ids.anchor(),
+            provider_ids.user(),
+        );
+        assert_eq!(session_key.as_str(), "demo:webchat:conv-abc:user-123");
         let timestamp = parse_timestamp(activity.timestamp.as_deref()).unwrap();
         let attachments = map_attachments(&activity);
         let scopes = base_scopes(!attachments.is_empty());
@@ -271,7 +282,7 @@ mod tests {
             "demo",
             "webchat",
             &provider_ids,
-            session_key,
+            session_key.to_string(),
             &scopes,
             timestamp,
             activity.locale.clone(),

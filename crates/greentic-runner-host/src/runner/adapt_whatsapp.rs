@@ -10,11 +10,12 @@ use sha2::Sha256;
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::ingress::{
-    CanonicalAttachment, CanonicalButton, ProviderIds, build_canonical_payload,
-    canonical_session_key, default_metadata, empty_entities,
+    CanonicalAttachment, CanonicalButton, ProviderIds, build_canonical_payload, default_metadata,
+    empty_entities,
 };
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::ingress_util::{collect_body, mark_processed};
+use greentic_types::canonical_session_key;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -75,7 +76,13 @@ pub async fn webhook(
         message_id: Some(message.id.clone()),
         ..ProviderIds::default()
     };
-    let session_key = canonical_session_key(&tenant, "whatsapp", &provider_ids);
+    let session_key = canonical_session_key(
+        &tenant,
+        "whatsapp",
+        provider_ids.anchor(),
+        provider_ids.user(),
+    );
+    let session_key_str = session_key.to_string();
     let timestamp = parse_timestamp(message.timestamp.as_deref())?;
 
     let (text, attachments, buttons, scopes) = map_message_content(&message);
@@ -84,7 +91,7 @@ pub async fn webhook(
         &tenant,
         "whatsapp",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes,
         timestamp,
         None,
@@ -103,7 +110,7 @@ pub async fn webhook(
         flow_id: flow.id.clone(),
         flow_type: Some(flow.flow_type.clone()),
         action: Some("messaging".into()),
-        session_hint: Some(session_key),
+        session_hint: Some(session_key_str),
         provider: Some("whatsapp".into()),
         channel: Some(message.from.clone()),
         conversation: Some(message.from.clone()),
@@ -408,9 +415,14 @@ mod tests {
             message_id: Some(message.id.clone()),
             ..ProviderIds::default()
         };
-        let session_key = canonical_session_key("zain-kuwait", "whatsapp", &provider_ids);
+        let session_key = canonical_session_key(
+            "zain-kuwait",
+            "whatsapp",
+            provider_ids.anchor(),
+            provider_ids.user(),
+        );
         assert_eq!(
-            session_key,
+            session_key.as_str(),
             "zain-kuwait:whatsapp:447700900123:447700900123"
         );
         let timestamp = parse_timestamp(message.timestamp.as_deref()).unwrap();
@@ -419,7 +431,7 @@ mod tests {
             "zain-kuwait",
             "whatsapp",
             &provider_ids,
-            session_key,
+            session_key.to_string(),
             &scopes,
             timestamp,
             None,

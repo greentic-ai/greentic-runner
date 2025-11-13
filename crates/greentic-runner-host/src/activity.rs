@@ -2,6 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// High-level activity payload exchanged with Greentic hosts.
+///
+/// Fields capture the canonical session key components (`tenant`, `provider`, `channel`,
+/// `conversation`, `user`) that every adapter must supply so the host can dedupe, pause, and
+/// resume flows consistently.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Activity {
     #[serde(default)]
@@ -26,6 +30,8 @@ pub struct Activity {
     payload: Value,
 }
 
+/// Determines how the host should interpret the activity (message vs custom) and carries optional
+/// flow/action hints for routing.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityKind {

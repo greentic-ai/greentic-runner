@@ -1,6 +1,6 @@
 # greentic-runner-host
 
-`greentic-runner-host` packages the Greentic runner as a standalone crate. It owns tenant bindings, the pack watcher, Wasmtime glue, canonical ingress adapters (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timers), the state machine (pause/resume, session/state persistence), and admin/health endpoints. Binaries such as `greentic-runner` or `greentic-demo` embed this crate instead of vendoring runtime internals.
+`greentic-runner-host` packages the **official** Greentic runner host runtime. It owns tenant bindings, the pack watcher, Wasmtime glue, canonical ingress adapters (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook), the state machine (pause/resume, session/state persistence), and admin/health endpoints. Binaries such as `greentic-runner` or `greentic-demo` embed this crate instead of vendoring runtime internals. The older `greentic-host` crate/docs are deprecated; point new integrations at this runtime. Timer/cron flows are intentionally not implemented here—those sources will surface via a future `greentic-events` project.
 
 ## Architecture highlights
 
@@ -146,9 +146,11 @@ If `ADMIN_TOKEN` is set, clients must send `Authorization: Bearer <token>`; othe
 | Cisco Webex | `POST /webex/webhook` | `parentId` → `roomId` | Optional `WEBEX_WEBHOOK_SECRET`; keeps `requires_auth` metadata for file URLs |
 | WhatsApp Cloud API | `GET/POST /whatsapp/webhook` | `messages[].from` | `WHATSAPP_VERIFY_TOKEN` (challenge) + `WHATSAPP_APP_SECRET` (signature); interactive/list replies → canonical buttons |
 | Generic Webhook | `ANY /webhook/:flow_id` | `Idempotency-Key` header (if present) | Wraps method/path/headers/body into canonical payload |
-| Timers / Cron | Defined in `bindings.yaml` | `schedule_id` | Schedules flows with normalized cron (seconds field injected) |
-
 Each adapter injects the canonical payload (`tenant`, `provider`, `provider_ids`, `session`, `timestamp`, `text`, `attachments`, `buttons`, `entities`, `metadata`, `channel_data`, `raw`) and uses the same session-key policy `{tenant}:{provider}:{conversation-or-thread-or-channel}:{user}` enforced everywhere. Custom adapters can follow the same pattern by translating incoming payloads into an `IngressEnvelope`.
+
+## Future work
+
+- Scheduled/timer-based flows will migrate to a dedicated `greentic-events` runtime. Those adapters are intentionally absent from this crate for now so the official host keeps focusing on sessionful messaging and webhooks.
 
 ## License
 

@@ -12,7 +12,6 @@ use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::IngressEnvelope;
 use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
-use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::storage::{
@@ -27,7 +26,11 @@ pub use greentic_telemetry::OtlpConfig as TelemetryCfg;
 #[derive(Clone, Debug)]
 pub struct TelemetryCfg;
 
-/// Builder for composing multi-tenant host instances.
+/// Builder for composing multi-tenant host instances backed by official bindings.
+///
+/// Each tenant configuration is treated as the canonical source of adapters, secrets, and
+/// session invariants that `RunnerHost` enforces at runtime. Timers are intentionally disabled
+/// in this host; scheduled/event sources belong in a future `greentic-events` project.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
     #[cfg(feature = "telemetry")]
@@ -97,6 +100,10 @@ impl Default for HostBuilder {
 }
 
 /// Runtime host that manages tenant-bound packs and flow execution.
+///
+/// Start/stop this host, call `load_pack`, and feed canonical `Activity` payloads through the
+/// shared session/state machine. Timers are intentionally excluded from this runtime; scheduled
+/// sources will surface in `greentic-events` later.
 pub struct RunnerHost {
     configs: HashMap<String, Arc<HostConfig>>,
     active: Arc<ActivePacks>,
@@ -111,6 +118,9 @@ pub struct RunnerHost {
 }
 
 /// Handle exposing tenant internals for embedding hosts (e.g. CLI server).
+///
+/// The handle makes the tenant-specific `TenantRuntime` available without leaking internal
+/// scheduler or watcher details.
 #[derive(Clone)]
 pub struct TenantHandle {
     runtime: Arc<TenantRuntime>,
@@ -264,8 +274,6 @@ impl RunnerHost {
             self.state_host(),
         )
         .await?;
-        let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
-        runtime.register_timers(timers);
         Ok(runtime)
     }
 }

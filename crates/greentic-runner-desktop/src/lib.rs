@@ -512,7 +512,6 @@ fn build_host_config(profile: &ResolvedProfile, dirs: &RunDirectories) -> HostCo
         http_enabled: false,
         secrets_policy: SecretsPolicy::allow_all(),
         webhook_policy: WebhookPolicy::default(),
-        timers: Vec::new(),
     }
 }
 

@@ -6,11 +6,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::engine::runtime::IngressEnvelope;
-use crate::ingress::{
-    ProviderIds, build_canonical_payload, canonical_session_key, default_metadata, empty_entities,
-};
+use crate::ingress::{ProviderIds, build_canonical_payload, default_metadata, empty_entities};
 use crate::routing::TenantRuntimeHandle;
 use crate::runtime::TenantRuntime;
+use greentic_types::canonical_session_key;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TelegramUpdate {
@@ -239,12 +238,18 @@ fn map_telegram_activity(
         ..ProviderIds::default()
     };
     let timestamp = Utc::now();
-    let session_key = canonical_session_key(tenant, "telegram", &provider_ids);
+    let session_key = canonical_session_key(
+        tenant,
+        "telegram",
+        provider_ids.anchor(),
+        provider_ids.user(),
+    );
+    let session_key_str = session_key.to_string();
     let payload = build_canonical_payload(
         tenant,
         "telegram",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &["chat".into()],
         timestamp,
         None,
@@ -259,7 +264,7 @@ fn map_telegram_activity(
 
     MappedTelegram {
         provider_ids,
-        session_key,
+        session_key: session_key_str,
         timestamp,
         payload,
         channel: Some(chat_id.clone()),

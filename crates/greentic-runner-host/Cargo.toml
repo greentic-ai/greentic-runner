@@ -23,7 +23,6 @@ arc-swap.workspace = true
 axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
-cron.workspace = true
 greentic-flow.workspace = true
 greentic-interfaces.workspace = true
 greentic-pack.workspace = true

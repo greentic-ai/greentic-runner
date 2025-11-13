@@ -1,7 +1,7 @@
 # greentic-runner
 
-Monorepo for the Greentic runner host, CLI, and integration tests.  
-The workspace centres around `crates/greentic-runner-host`, which is the production runtime (pack ingestion/resolvers, canonical ingress adapters for Telegram/Teams/WebChat/Slack/Webex/WhatsApp/webhook/timer, session/state glue, admin API). The top-level crate `greentic-runner` exposes a thin binary that embeds the host.
+Monorepo for the official Greentic runner host (binary + library) and integration tests.  
+`greentic-runner` (binary) wraps `crates/greentic-runner-host`, the production runtime for canonical adapters, session/state glue, and admin plumbing; any legacy `greentic-host` references are deprecated and should be replaced with this stack. Timer/cron flows are intentionally not supported here—the plan is to handle scheduled/event sources via a future `greentic-events` project while the runner focuses on sessionful messaging and webhooks.
 
 ## Quick start
 
@@ -20,7 +20,7 @@ curl -X POST http://localhost:8080/messaging/telegram/webhook \
   -d '{"update_id":1,"message":{"chat":{"id":42},"text":"hello"}}'
 ```
 
-The host loads packs declared in `PACK_INDEX_URL`, verifies signatures/digests (via `PACK_PUBLIC_KEY` / `PACK_VERIFY_STRICT`), and exposes the built-in adapters. Every ingress payload (Telegram/WebChat/Slack/Webex/WhatsApp/webhook/timer) is normalized into the canonical schema with deterministic session keys so pause/resume + dedupe work the same way across providers.
+The host loads packs declared in `PACK_INDEX_URL`, verifies signatures/digests (via `PACK_PUBLIC_KEY` / `PACK_VERIFY_STRICT`), and exposes the built-in adapters. Every ingress payload (Telegram/WebChat/Slack/Webex/WhatsApp/webhook) is normalized into the canonical schema with deterministic session keys so pause/resume + dedupe work the same way across providers.
 
 ## Pack index schema
 
@@ -78,7 +78,7 @@ cargo clippy
 cargo test
 ```
 
-Integration tests under `crates/tests/tests/*.rs` exercise the demo pack, watcher reloads (including overlays), and scaffold future adapters (webhook/timer). Enable new fixtures as adapters mature.
+Integration tests under `crates/tests/tests/*.rs` exercise the demo pack, watcher reloads (including overlays), and scaffold future adapters (webhook). Enable new fixtures as adapters mature.
 
 ## Ingress adapters at a glance
 
@@ -92,8 +92,6 @@ Integration tests under `crates/tests/tests/*.rs` exercise the demo pack, watche
 | Cisco Webex | `POST /webex/webhook` | `WEBEX_WEBHOOK_SECRET` (optional signature) | File URLs surfaced in canonical attachments |
 | WhatsApp Cloud API | `GET/POST /whatsapp/webhook` | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET` | Normalizes interactive/list replies into canonical buttons |
 | Generic Webhook | `ANY /webhook/:flow_id` | Idempotency via `Idempotency-Key` header | Passes normalized HTTP request object to the target flow |
-| Timer / Cron | internal | `bindings.yaml` timer entries | Schedules flow invocations using `cron` expressions |
-
 All adapters emit the canonical payload (`tenant`, `provider`, `provider_ids`, `session.key`, `text`, `attachments`, `buttons`, `entities`, `metadata`, `channel_data`, `raw`). The canonical session key `{tenant}:{provider}:{conversation-or-thread-or-channel}:{user}` drives dedupe and pause/resume semantics universally.
 
 ## Environment variables
@@ -122,6 +120,12 @@ cargo run -p greentic-runner --bin greentic-gen-bindings \
 ```
 
 `--complete` fills safe defaults for env passthrough, network allowlists, secrets, and MCP server stubs; `--strict` additionally fails if HTTP/secrets/MCP requirements cannot be satisfied so pack authors can share hints via `bindings.hints.yaml` or `meta.bindings` annotations. The CLI also understands `--component` so future packs compiled to a Wasm component can be inspected for host imports before generating bindings.
+
+These emitted hints follow the canonical [`greentic-types::bindings::hints`](https://docs.rs/greentic-types/latest/greentic_types/bindings/hints/index.html) schema (network allowlists, env passthrough, secrets.required, and MCP servers), which keeps the host and generator speaking the same language.
+
+## Future work
+
+- Scheduled/timer-based flows will move to a dedicated `greentic-events` experience (similar to `greentic-messaging` for sessionful adapters). Until that project matures, the runner intentionally keeps those adapters out of the official host surface.
 
 ## License
 

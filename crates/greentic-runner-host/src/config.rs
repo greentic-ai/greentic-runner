@@ -22,7 +22,6 @@ pub struct HostConfig {
     pub http_enabled: bool,
     pub secrets_policy: SecretsPolicy,
     pub webhook_policy: WebhookPolicy,
-    pub timers: Vec<TimerBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,8 +32,6 @@ pub struct BindingsFile {
     pub mcp: McpConfig,
     #[serde(default)]
     pub rate_limits: RateLimits,
-    #[serde(default)]
-    pub timers: Vec<TimerBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -95,14 +92,6 @@ pub struct WebhookBindingConfig {
     pub deny_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct TimerBinding {
-    pub flow_id: String,
-    pub cron: String,
-    #[serde(default)]
-    pub schedule_id: Option<String>,
-}
-
 impl HostConfig {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -139,7 +128,6 @@ impl HostConfig {
             http_enabled,
             secrets_policy,
             webhook_policy,
-            timers: bindings.timers.clone(),
         })
     }
 
@@ -238,12 +226,6 @@ impl WebhookPolicy {
         self.allow_paths
             .iter()
             .any(|prefix| path.starts_with(prefix))
-    }
-}
-
-impl TimerBinding {
-    pub fn schedule_id(&self) -> &str {
-        self.schedule_id.as_deref().unwrap_or(self.flow_id.as_str())
     }
 }
 

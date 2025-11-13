@@ -1,7 +1,6 @@
 pub mod adapt_messaging;
 pub mod adapt_slack;
 pub mod adapt_teams;
-pub mod adapt_timer;
 pub mod adapt_webchat;
 pub mod adapt_webex;
 pub mod adapt_webhook;
@@ -23,6 +22,7 @@ use crate::routing::TenantRouting;
 use crate::runtime::ActivePacks;
 use crate::watcher::PackReloadHandle;
 
+/// HTTP server publishing the canonical messaging, webhook, and admin routes.
 pub struct HostServer {
     addr: SocketAddr,
     router: Router,

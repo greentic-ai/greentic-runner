@@ -11,7 +11,6 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use reqwest::Client;
 use serde_json::Value;
-use tokio::task::JoinHandle;
 
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
@@ -78,7 +77,6 @@ pub struct TenantRuntime {
     webhook_cache: Mutex<LruCache<String, Value>>,
     messaging_rate: Mutex<RateLimiter>,
     mocks: Option<Arc<MockLayer>>,
-    timer_handles: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl TenantRuntime {
@@ -181,7 +179,6 @@ impl TenantRuntime {
                 rate_limits.messaging_burst,
             )),
             mocks,
-            timer_handles: Mutex::new(Vec::new()),
         }))
     }
 
@@ -243,10 +240,6 @@ impl TenantRuntime {
         self.mocks.as_ref()
     }
 
-    pub fn register_timers(&self, handles: Vec<JoinHandle<()>>) {
-        self.timer_handles.lock().extend(handles);
-    }
-
     pub fn get_secret(&self, key: &str) -> Result<String> {
         if !self.config.secrets_policy.is_allowed(key) {
             bail!("secret {key} is not permitted by bindings policy");
@@ -255,14 +248,6 @@ impl TenantRuntime {
             return Ok(value);
         }
         bail!("secret {key} not found in environment");
-    }
-}
-
-impl Drop for TenantRuntime {
-    fn drop(&mut self) {
-        for handle in self.timer_handles.lock().drain(..) {
-            handle.abort();
-        }
     }
 }
 

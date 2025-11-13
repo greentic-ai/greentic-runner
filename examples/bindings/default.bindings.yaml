@@ -30,6 +30,3 @@ mcp:
 rate_limits:
   messaging_send_qps: 10
   messaging_burst: 20
-timers:
-  - flow_id: nightly_weather
-    cron: "0 5 * * *"

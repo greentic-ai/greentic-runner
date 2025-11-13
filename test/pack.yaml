@@ -1,0 +1,6 @@
+id: test
+version: 0.1.0
+flow_files:
+- flows/welcome.ygtc
+template_dirs: []
+imports_required: []

@@ -8,11 +8,11 @@ use sha1::Sha1;
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::ingress::{
-    CanonicalAttachment, ProviderIds, build_canonical_payload, canonical_session_key,
-    default_metadata, empty_entities,
+    CanonicalAttachment, ProviderIds, build_canonical_payload, default_metadata, empty_entities,
 };
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::ingress_util::{collect_body, mark_processed};
+use greentic_types::canonical_session_key;
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -48,7 +48,9 @@ pub async fn webhook(
         ..ProviderIds::default()
     };
 
-    let session_key = canonical_session_key(&tenant, "webex", &provider_ids);
+    let session_key =
+        canonical_session_key(&tenant, "webex", provider_ids.anchor(), provider_ids.user());
+    let session_key_str = session_key.to_string();
     let timestamp = parse_timestamp(payload.created.as_deref())?;
     let mut attachments = map_attachments(message.files.as_ref());
     let scopes = if attachments.is_empty() {
@@ -65,7 +67,7 @@ pub async fn webhook(
         &tenant,
         "webex",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes,
         timestamp,
         None,
@@ -88,7 +90,7 @@ pub async fn webhook(
         flow_id: flow.id.clone(),
         flow_type: Some(flow.flow_type.clone()),
         action: Some("messaging".into()),
-        session_hint: Some(session_key),
+        session_hint: Some(session_key_str),
         provider: Some("webex".into()),
         channel: Some(message.room_id.clone()),
         conversation: Some(message.room_id.clone()),
@@ -234,8 +236,9 @@ mod tests {
             message_id: Some(message.id.clone()),
             ..ProviderIds::default()
         };
-        let session_key = canonical_session_key("cisco", "webex", &provider_ids);
-        assert_eq!(session_key, "cisco:webex:parent-789:person-456");
+        let session_key =
+            canonical_session_key("cisco", "webex", provider_ids.anchor(), provider_ids.user());
+        assert_eq!(session_key.as_str(), "cisco:webex:parent-789:person-456");
         let timestamp = parse_timestamp(created.as_deref()).unwrap();
         let attachments = map_attachments(message.files.as_ref());
         let scopes = vec!["chat".to_string(), "attachments".to_string()];
@@ -248,7 +251,7 @@ mod tests {
             "cisco",
             "webex",
             &provider_ids,
-            session_key,
+            session_key.to_string(),
             &scopes,
             timestamp,
             None,

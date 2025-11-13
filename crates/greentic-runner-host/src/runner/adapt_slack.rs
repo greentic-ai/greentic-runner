@@ -13,11 +13,12 @@ use sha2::Sha256;
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::ingress::{
-    CanonicalAttachment, CanonicalButton, ProviderIds, build_canonical_payload,
-    canonical_session_key, default_metadata, empty_entities,
+    CanonicalAttachment, CanonicalButton, ProviderIds, build_canonical_payload, default_metadata,
+    empty_entities,
 };
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::ingress_util::{collect_body, mark_processed};
+use greentic_types::canonical_session_key;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -183,7 +184,9 @@ fn map_slack_event(
     if provider_ids.user_id.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let session_key = canonical_session_key(tenant, "slack", &provider_ids);
+    let session_key =
+        canonical_session_key(tenant, "slack", provider_ids.anchor(), provider_ids.user());
+    let session_key_str = session_key.to_string();
     let timestamp = parse_slack_timestamp(event.ts.as_deref(), payload.event_time)?;
     let mut attachments = map_slack_files(event.files.as_deref());
     let buttons = buttons_from_event(event);
@@ -196,7 +199,7 @@ fn map_slack_event(
         tenant,
         "slack",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes_vec,
         timestamp,
         event.locale.clone(),
@@ -214,7 +217,7 @@ fn map_slack_event(
     );
     Ok(MappedCanonical {
         provider_ids,
-        session_key,
+        session_key: session_key_str,
         timestamp,
         payload: payload_value,
     })
@@ -236,7 +239,9 @@ fn map_slack_interactive(
     if provider_ids.user_id.is_none() {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let session_key = canonical_session_key(tenant, "slack", &provider_ids);
+    let session_key =
+        canonical_session_key(tenant, "slack", provider_ids.anchor(), provider_ids.user());
+    let session_key_str = session_key.to_string();
     let timestamp = parse_slack_timestamp(payload.action_ts.as_deref(), None)?;
     let buttons = payload
         .actions
@@ -269,7 +274,7 @@ fn map_slack_interactive(
         tenant,
         "slack",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes,
         timestamp,
         None,
@@ -283,7 +288,7 @@ fn map_slack_interactive(
     );
     Ok(MappedCanonical {
         provider_ids,
-        session_key,
+        session_key: session_key_str,
         timestamp,
         payload: payload_value,
     })

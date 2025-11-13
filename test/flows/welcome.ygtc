@@ -1,0 +1,15 @@
+id: welcome
+title: Welcome Flow
+description: Send a single greeting message.
+type: messaging
+start: show_welcome
+
+nodes:
+  show_welcome:
+    templating.handlebars:
+      text: |
+        👋 Welcome to your new Greentic pack!
+
+        Edit flows/welcome.ygtc to start experimenting.
+    routing:
+      - out: true

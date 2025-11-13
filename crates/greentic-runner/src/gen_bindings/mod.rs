@@ -5,66 +5,9 @@ use std::{collections::HashSet, fs, path::Path};
 use url::Url;
 
 use self::component::ComponentFeatures;
+use greentic_types::bindings::hints::{BindingsHints, McpServer};
 
 pub mod component;
-
-#[derive(Debug)]
-pub struct PackMetadata {
-    pub name: String,
-    pub flows: Vec<FlowMetadata>,
-    pub hints: BindingsHints,
-}
-
-#[derive(Debug)]
-pub struct FlowMetadata {
-    pub name: String,
-    pub document: Value,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct BindingsHints {
-    #[serde(default)]
-    pub network: NetworkHints,
-    #[serde(default)]
-    pub secrets: SecretsHints,
-    #[serde(default)]
-    pub env: EnvHints,
-    #[serde(default)]
-    pub mcp: McpHints,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct NetworkHints {
-    #[serde(default)]
-    pub allow: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct SecretsHints {
-    #[serde(default)]
-    pub required: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct EnvHints {
-    #[serde(default)]
-    pub passthrough: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct McpHints {
-    #[serde(default)]
-    pub servers: Vec<McpServer>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct McpServer {
-    pub name: String,
-    pub transport: String,
-    pub endpoint: String,
-    #[serde(default)]
-    pub caps: Vec<String>,
-}
 
 pub fn load_pack(pack_dir: &Path) -> Result<PackMetadata> {
     if !pack_dir.is_dir() {

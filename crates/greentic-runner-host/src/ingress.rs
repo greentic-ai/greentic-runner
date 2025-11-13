@@ -80,12 +80,6 @@ impl CanonicalButton {
     }
 }
 
-pub fn canonical_session_key(tenant: &str, provider: &str, ids: &ProviderIds) -> String {
-    let user = ids.user().unwrap_or("user");
-    let conversation = ids.anchor().or(ids.user()).unwrap_or("conversation");
-    format!("{tenant}:{provider}:{conversation}:{user}")
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn build_canonical_payload(
     tenant: &str,

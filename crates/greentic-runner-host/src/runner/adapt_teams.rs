@@ -7,11 +7,11 @@ use serde_json::{Map, Value};
 
 use crate::engine::runtime::IngressEnvelope;
 use crate::ingress::{
-    CanonicalAttachment, ProviderIds, build_canonical_payload, canonical_session_key,
-    default_metadata, empty_entities,
+    CanonicalAttachment, ProviderIds, build_canonical_payload, default_metadata, empty_entities,
 };
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::ingress_util::{collect_body, mark_processed};
+use greentic_types::canonical_session_key;
 
 pub async fn activities(
     TenantRuntimeHandle { tenant, runtime }: TenantRuntimeHandle,
@@ -35,7 +35,9 @@ pub async fn activities(
     }
 
     let provider_ids = build_provider_ids(&activity)?;
-    let session_key = canonical_session_key(&tenant, "teams", &provider_ids);
+    let session_key =
+        canonical_session_key(&tenant, "teams", provider_ids.anchor(), provider_ids.user());
+    let session_key_str = session_key.to_string();
     let timestamp = parse_timestamp(activity.timestamp.as_deref())?;
     let attachments = map_attachments(&activity);
     let scopes = base_scopes(!attachments.is_empty());
@@ -46,7 +48,7 @@ pub async fn activities(
         &tenant,
         "teams",
         &provider_ids,
-        session_key.clone(),
+        session_key_str.clone(),
         &scopes,
         timestamp,
         activity.locale.clone(),
@@ -65,7 +67,7 @@ pub async fn activities(
         flow_id: flow.id.clone(),
         flow_type: Some(flow.flow_type.clone()),
         action: Some("messaging".into()),
-        session_hint: Some(session_key),
+        session_hint: Some(session_key_str),
         provider: Some("teams".into()),
         channel: provider_ids
             .thread_id
@@ -297,14 +299,15 @@ mod tests {
         assert_eq!(provider_ids.conversation_id.as_deref(), Some("conv-abc"));
         assert_eq!(provider_ids.thread_id.as_deref(), Some("thread-xyz"));
         assert_eq!(provider_ids.team_id.as_deref(), Some("team-1"));
-        let session_key = canonical_session_key("acme", "teams", &provider_ids);
-        assert_eq!(session_key, "acme:teams:thread-xyz:user-123");
+        let session_key =
+            canonical_session_key("acme", "teams", provider_ids.anchor(), provider_ids.user());
+        assert_eq!(session_key.as_str(), "acme:teams:thread-xyz:user-123");
         let timestamp = parse_timestamp(activity.timestamp.as_deref()).unwrap();
         let payload = build_canonical_payload(
             "acme",
             "teams",
             &provider_ids,
-            session_key,
+            session_key.to_string(),
             &["chat".into()],
             timestamp,
             activity.locale.clone(),
