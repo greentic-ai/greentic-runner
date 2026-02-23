@@ -237,6 +237,27 @@ pub mod v0_6 {
     });
 }
 
+pub mod v0_6_runtime {
+    wasmtime::component::bindgen!({
+        inline: r#"
+        package greentic:component@0.6.0;
+
+        interface component-runtime {
+          record run-result {
+            output: list<u8>,
+            new-state: list<u8>,
+          }
+          run: func(input: list<u8>, state: list<u8>) -> run-result;
+        }
+
+        world component-v0-v6-runtime {
+          export component-runtime;
+        }
+        "#,
+        world: "component-v0-v6-runtime",
+    });
+}
+
 pub mod node {
     pub type Json = String;
 
