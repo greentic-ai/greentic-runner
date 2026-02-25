@@ -44,6 +44,7 @@ fn wait_for(next_node: &str) -> FlowWait {
         snapshot: FlowSnapshot {
             pack_id: "pack.demo".into(),
             flow_id: "flow.main".into(),
+            next_flow: None,
             next_node: next_node.into(),
             state,
         },
