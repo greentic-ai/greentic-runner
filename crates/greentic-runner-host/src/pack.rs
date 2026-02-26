@@ -2047,6 +2047,31 @@ impl PackRuntime {
         &self.metadata
     }
 
+    /// Read an asset file from the pack's assets directory.
+    ///
+    /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`
+    /// (the `assets/` prefix is stripped automatically).
+    pub fn read_asset(&self, asset_path: &str) -> Result<Vec<u8>> {
+        let normalized = asset_path
+            .trim_start_matches("assets/")
+            .trim_start_matches("/assets/");
+        // Try assets tempdir first (extracted from archive).
+        if let Some(tempdir) = &self.assets_tempdir {
+            let full = tempdir.path().join("assets").join(normalized);
+            if full.exists() {
+                return std::fs::read(&full)
+                    .with_context(|| format!("read asset {}", full.display()));
+            }
+        }
+        // Try materialized directory.
+        let full = self.path.join("assets").join(normalized);
+        if full.exists() {
+            return std::fs::read(&full)
+                .with_context(|| format!("read asset {}", full.display()));
+        }
+        bail!("asset not found: {}", asset_path)
+    }
+
     pub fn component_manifest(&self, component_ref: &str) -> Option<&ComponentManifest> {
         self.component_manifests.get(component_ref)
     }

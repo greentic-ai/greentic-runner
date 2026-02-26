@@ -485,6 +485,21 @@ fn cbor_to_json_string(bytes: &[u8]) -> String {
     }
 }
 
+/// Convert v0.6 `component-runtime::run()` output to the canonical InvokeResult.
+/// Decodes CBOR output bytes to a JSON string.
+pub fn invoke_result_from_v0_6_run(
+    result: v0_6_runtime::exports::greentic::component::component_runtime::RunResult,
+) -> node::InvokeResult {
+    let json_str = match serde_cbor::from_slice::<serde_json::Value>(&result.output) {
+        Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
+        Err(_) => {
+            // Fallback: try as UTF-8 string
+            String::from_utf8(result.output).unwrap_or_default()
+        }
+    };
+    node::InvokeResult::Ok(json_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{envelope_v0_6, node};
