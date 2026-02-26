@@ -1890,14 +1890,17 @@ impl PackRuntime {
             } else if use_schema_core_path {
                 let pre_instance = linker.instantiate_pre(component.as_ref())?;
                 let path_attempt = (|| -> Result<Vec<u8>> {
-                    let pre: PathSchemaCorePre<ComponentState> = PathSchemaCorePre::new(pre_instance)?;
+                    let pre: PathSchemaCorePre<ComponentState> =
+                        PathSchemaCorePre::new(pre_instance)?;
                     let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
                     let provider = bindings.greentic_provider_schema_core_api();
                     provider.call_invoke(&mut store, &op_owned, &input_owned)
                 })();
                 match path_attempt {
                     Ok(value) => value,
-                    Err(path_err) if path_err.to_string().contains("no exported instance named") => {
+                    Err(path_err)
+                        if path_err.to_string().contains("no exported instance named") =>
+                    {
                         let pre_instance = linker.instantiate_pre(component.as_ref())?;
                         let pre: SchemaSchemaCorePre<ComponentState> =
                             SchemaSchemaCorePre::new(pre_instance)?;
