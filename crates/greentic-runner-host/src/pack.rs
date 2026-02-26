@@ -322,7 +322,7 @@ impl HostState {
                     })?;
                     Ok(component_api::invoke_result_from_v0_4(result))
                 } else {
-                    Err(err)
+                    Err(err.into())
                 }
             }
         }
@@ -1894,7 +1894,7 @@ impl PackRuntime {
                         PathSchemaCorePre::new(pre_instance)?;
                     let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
                     let provider = bindings.greentic_provider_schema_core_api();
-                    provider.call_invoke(&mut store, &op_owned, &input_owned)
+                    Ok(provider.call_invoke(&mut store, &op_owned, &input_owned)?)
                 })();
                 match path_attempt {
                     Ok(value) => value,
@@ -2147,10 +2147,10 @@ impl PackRuntime {
                 bail!("component artifact missing: {}", path.display());
             }
             let wasm_bytes = std::fs::read(&path)?;
-            let component = Arc::new(
-                Component::from_binary(&engine, &wasm_bytes)
-                    .with_context(|| format!("failed to compile component {}", path.display()))?,
-            );
+            let component =
+                Arc::new(Component::from_binary(&engine, &wasm_bytes).map_err(|err| {
+                    anyhow!("failed to compile component {}: {err}", path.display())
+                })?);
             component_map.insert(
                 name.clone(),
                 PackComponent {

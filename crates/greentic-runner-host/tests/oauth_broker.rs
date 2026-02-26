@@ -22,7 +22,7 @@ fn oauth_world_instantiates_when_enabled() -> Result<()> {
 fn instantiate_component(wasm: &Path, config: Arc<HostConfig>) -> Result<()> {
     let engine = Engine::default();
     let component = Component::from_file(&engine, wasm)
-        .with_context(|| format!("failed to load {}", wasm.display()))?;
+        .map_err(|err| anyhow!("failed to load {}: {err}", wasm.display()))?;
     let host_state = HostState::new(
         "oauth-test".to_string(),
         Arc::clone(&config),
@@ -43,7 +43,7 @@ fn instantiate_component(wasm: &Path, config: Arc<HostConfig>) -> Result<()> {
     pack::register_all(&mut linker, false)?;
     linker
         .instantiate(&mut store, &component)
-        .context("component instantiation failed")?;
+        .map_err(|err| anyhow!("component instantiation failed: {err}"))?;
     Ok(())
 }
 

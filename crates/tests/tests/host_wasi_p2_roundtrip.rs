@@ -54,7 +54,7 @@ fn is_offline() -> bool {
 fn run_component(wasm: &Path, config: Arc<HostConfig>, policy: RunnerWasiPolicy) -> Result<()> {
     let engine = Engine::default();
     let component = Component::from_file(&engine, wasm)
-        .with_context(|| format!("failed to load {}", wasm.display()))?;
+        .map_err(|err| anyhow::anyhow!("failed to load {}: {err}", wasm.display()))?;
     let host_state = HostState::new(
         "wasi-p2-smoke".to_string(),
         Arc::clone(&config),
@@ -75,9 +75,9 @@ fn run_component(wasm: &Path, config: Arc<HostConfig>, policy: RunnerWasiPolicy)
     let instance = linker.instantiate(&mut store, &component)?;
     let run = instance
         .get_typed_func::<(), ()>(&mut store, "run")
-        .context("component missing run export")?;
+        .map_err(|err| anyhow::anyhow!("component missing run export: {err}"))?;
     run.call(&mut store, ())
-        .context("component execution failed")?;
+        .map_err(|err| anyhow::anyhow!("component execution failed: {err}"))?;
     Ok(())
 }
 
