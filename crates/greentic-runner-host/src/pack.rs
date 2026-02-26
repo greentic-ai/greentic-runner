@@ -14,6 +14,7 @@ use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
 use crate::provider::{ProviderBinding, ProviderRegistry};
 use crate::provider_core::{
     schema_core::SchemaCorePre as LegacySchemaCorePre,
+    schema_core_path::SchemaCorePre as PathSchemaCorePre,
     schema_core_schema::SchemaCorePre as SchemaSchemaCorePre,
 };
 use crate::provider_core_only;
@@ -1862,7 +1863,6 @@ impl PackRuntime {
             let mut linker = Linker::new(&engine);
             register_all(&mut linker, allow_state_store)?;
             add_component_control_to_linker(&mut linker)?;
-            let mut pre_instance = Some(linker.instantiate_pre(component.as_ref())?);
             let host_state = HostState::new(
                 pack_id.clone(),
                 config,
@@ -1878,21 +1878,37 @@ impl PackRuntime {
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
-            let use_schema_core =
-                world.contains("provider-schema-core") || world.contains("provider/schema-core");
-            let result = if use_schema_core {
-                let pre_instance = pre_instance
-                    .take()
-                    .ok_or_else(|| anyhow!("provider pre_instance already consumed"))?;
+            let use_schema_core_schema = world.contains("provider-schema-core");
+            let use_schema_core_path = world.contains("provider/schema-core");
+            let result = if use_schema_core_schema {
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
                 let pre: SchemaSchemaCorePre<ComponentState> =
                     SchemaSchemaCorePre::new(pre_instance)?;
                 let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
                 let provider = bindings.greentic_provider_schema_core_schema_core_api();
                 provider.call_invoke(&mut store, &op_owned, &input_owned)?
+            } else if use_schema_core_path {
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
+                let path_attempt = (|| -> Result<Vec<u8>> {
+                    let pre: PathSchemaCorePre<ComponentState> = PathSchemaCorePre::new(pre_instance)?;
+                    let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+                    let provider = bindings.greentic_provider_schema_core_api();
+                    provider.call_invoke(&mut store, &op_owned, &input_owned)
+                })();
+                match path_attempt {
+                    Ok(value) => value,
+                    Err(path_err) if path_err.to_string().contains("no exported instance named") => {
+                        let pre_instance = linker.instantiate_pre(component.as_ref())?;
+                        let pre: SchemaSchemaCorePre<ComponentState> =
+                            SchemaSchemaCorePre::new(pre_instance)?;
+                        let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+                        let provider = bindings.greentic_provider_schema_core_schema_core_api();
+                        provider.call_invoke(&mut store, &op_owned, &input_owned)?
+                    }
+                    Err(path_err) => return Err(path_err),
+                }
             } else {
-                let pre_instance = pre_instance
-                    .take()
-                    .ok_or_else(|| anyhow!("provider pre_instance already consumed"))?;
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
                 let pre: LegacySchemaCorePre<ComponentState> =
                     LegacySchemaCorePre::new(pre_instance)?;
                 let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
