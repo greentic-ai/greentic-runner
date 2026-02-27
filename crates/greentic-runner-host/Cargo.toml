@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 license = "MIT"
 description = "Host runtime shim for Greentic runner: config, pack loading, activity handling"
-homepage = "https://github.com/greentic-ai/greentic-runner"
-repository = "https://github.com/greentic-ai/greentic-runner"
+homepage = "https://github.com/greenticai/greentic-runner"
+repository = "https://github.com/greenticai/greentic-runner"
 readme = "README.md"
 keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
@@ -83,3 +83,4 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+

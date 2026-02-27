@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 license = "MIT"
 description = "Greentic runner binaries and re-exported host/new-runner APIs"
-homepage = "https://github.com/greentic-ai/greentic-runner"
-repository = "https://github.com/greentic-ai/greentic-runner"
+homepage = "https://github.com/greenticai/greentic-runner"
+repository = "https://github.com/greenticai/greentic-runner"
 documentation = "https://docs.rs/greentic-runner"
 readme = "../../README.md"
 keywords = ["greentic", "agent", "runner", "wasm", "mcp"]
@@ -73,3 +73,4 @@ path = "src/bin/gen_bindings.rs"
 [[bin]]
 name = "greentic-runner-cli"
 path = "src/bin/greentic-runner-cli.rs"
+

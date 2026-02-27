@@ -1,6 +1,6 @@
 PR-04 — greentic-runner: Secrets/config hardening (production-safe scoping)
 
-Repo: greentic-ai/greentic-runner
+Repo: greenticai/greentic-runner
 Goal: No cross-tenant leakage via env; always scoped lookups.
 
 Changes

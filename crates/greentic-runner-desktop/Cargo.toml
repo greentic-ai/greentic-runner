@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 description = "Developer desktop runner harness for Greentic packs"
 license = "MIT"
-homepage = "https://github.com/greentic-ai/greentic-runner"
-repository = "https://github.com/greentic-ai/greentic-runner"
+homepage = "https://github.com/greenticai/greentic-runner"
+repository = "https://github.com/greenticai/greentic-runner"
 
 [dependencies]
 anyhow.workspace = true
@@ -21,3 +21,4 @@ tracing.workspace = true
 uuid.workspace = true
 zip.workspace = true
 runner-core.workspace = true
+

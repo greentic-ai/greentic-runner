@@ -4,8 +4,8 @@ edition.workspace = true
 license = "MIT"
 version.workspace = true
 description = "Core helpers for Greentic runner: pack resolution, signing, session/state glue, and utilities"
-repository = "https://github.com/greentic-ai/greentic-runner"
-homepage = "https://github.com/greentic-ai/greentic-runner"
+repository = "https://github.com/greenticai/greentic-runner"
+homepage = "https://github.com/greenticai/greentic-runner"
 readme = "README.md"
 
 [dependencies]
@@ -25,3 +25,4 @@ greentic-config-types.workspace = true
 
 [dev-dependencies]
 tiny_http.workspace = true
+

@@ -1,6 +1,6 @@
 PR-03 — greentic-runner: Pack-aware multi-pack execution + interruptible sessions using ReplyScope
 
-Repo: greentic-ai/greentic-runner
+Repo: greenticai/greentic-runner
 Goal: True multi-tenant + multi-pack + interruptible sessions, without runner knowing channels/providers.
 
 Part 1: Make gtbind runtime-authoritative (but pack-only)
