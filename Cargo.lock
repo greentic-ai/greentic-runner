@@ -1695,7 +1695,7 @@ dependencies = [
  "greentic-types",
  "handlebars",
  "indexmap 2.13.0",
- "jsonschema",
+ "jsonschema 0.42.2",
  "lazy_static",
  "pathdiff",
  "qa-spec",
@@ -1908,7 +1908,7 @@ dependencies = [
  "hmac",
  "humantime",
  "indexmap 2.13.0",
- "jsonschema",
+ "jsonschema 0.44.0",
  "lru",
  "once_cell",
  "parking_lot",
@@ -1948,7 +1948,7 @@ dependencies = [
  "greentic-flow",
  "greentic-runner-host",
  "greentic-types",
- "jsonschema",
+ "jsonschema 0.44.0",
  "once_cell",
  "parking_lot",
  "reqwest 0.13.2",
@@ -2724,7 +2724,36 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing",
+ "referencing 0.42.2",
+ "regex",
+ "regex-syntax",
+ "reqwest 0.13.2",
+ "rustls",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "uuid-simd",
+]
+
+[[package]]
+name = "jsonschema"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "267fb27be492e66ab147d2ce0233d88ae465b93c3565016e73998729bf3fe60f"
+dependencies = [
+ "ahash",
+ "bytecount",
+ "data-encoding",
+ "email_address",
+ "fancy-regex",
+ "fraction",
+ "getrandom 0.3.4",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "num-traits",
+ "percent-encoding",
+ "referencing 0.44.0",
  "regex",
  "regex-syntax",
  "reqwest 0.13.2",
@@ -3768,6 +3797,21 @@ name = "referencing"
 version = "0.42.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97d4124f489451bb67c59d67fa16f3ae9b5690b290406a7538e38458632666df"
+dependencies = [
+ "ahash",
+ "fluent-uri",
+ "getrandom 0.3.4",
+ "hashbrown 0.16.1",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
+name = "referencing"
+version = "0.44.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12ecd0f3daefd4faff2e0821310c18e6e9d1fd00550bbd7e5a59d78184a071bc"
 dependencies = [
  "ahash",
  "fluent-uri",
