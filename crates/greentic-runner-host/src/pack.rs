@@ -439,6 +439,21 @@ impl HostState {
         }
     }
 
+    /// Build a `TenantCtx` for secrets lookups that includes the team from the
+    /// execution context. `config.tenant_ctx()` only populates env + tenant;
+    /// without this, secrets scoped to a specific team are unreachable.
+    fn secrets_tenant_ctx(&self) -> TypesTenantCtx {
+        let mut ctx = self.config.tenant_ctx();
+        if let Some(exec_ctx) = self.exec_ctx.as_ref() {
+            if let Some(team) = exec_ctx.tenant.team.as_ref() {
+                if let Ok(team_id) = TeamId::from_str(team) {
+                    ctx = ctx.with_team(Some(team_id));
+                }
+            }
+        }
+        ctx
+    }
+
     pub fn get_secret(&self, key: &str) -> Result<String> {
         if provider_core_only::is_enabled() {
             bail!(provider_core_only::blocked_message("secrets"))
@@ -451,7 +466,7 @@ impl HostState {
         {
             return Ok(value);
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, key)
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
@@ -695,7 +710,7 @@ impl SecretsStoreHost for HostState {
         {
             return Ok(Some(value.into_bytes()));
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -721,7 +736,7 @@ impl SecretsStoreHostV1_1 for HostState {
         {
             return Ok(Some(value.into_bytes()));
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -749,7 +764,7 @@ impl SecretsStoreHostV1_1 for HostState {
             warn!(secret = %key, "secret write denied by bindings policy");
             panic!("secret write denied for key {key}: policy");
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         if let Err(err) =
             write_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key, &value)
