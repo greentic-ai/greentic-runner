@@ -328,9 +328,7 @@ impl HostState {
                         }
                         Err(err_v04) => {
                             if is_missing_node_export(&err_v04, "0.4.0") {
-                                Self::try_v06_runtime(
-                                    linker, store, component, input_json,
-                                )
+                                Self::try_v06_runtime(linker, store, component, input_json)
                             } else {
                                 Err(err_v04)
                             }
@@ -360,13 +358,11 @@ impl HostState {
             let runtime = bindings.greentic_component_component_runtime();
 
             // Encode input as CBOR — the component's run() expects CBOR bytes.
-            let input_value: Value =
-                serde_json::from_str(input_json).unwrap_or(Value::Null);
+            let input_value: Value = serde_json::from_str(input_json).unwrap_or(Value::Null);
             let input_cbor =
                 serde_cbor::to_vec(&input_value).context("encode input as CBOR for v0.6")?;
-            let empty_state =
-                serde_cbor::to_vec(&Value::Object(Default::default()))
-                    .context("encode empty state")?;
+            let empty_state = serde_cbor::to_vec(&Value::Object(Default::default()))
+                .context("encode empty state")?;
 
             let run_result = runtime
                 .call_run(&mut *store, &input_cbor, &empty_state)
@@ -2043,8 +2039,7 @@ impl PackRuntime {
         // Try materialized directory.
         let full = self.path.join("assets").join(normalized);
         if full.exists() {
-            return std::fs::read(&full)
-                .with_context(|| format!("read asset {}", full.display()));
+            return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
         }
         bail!("asset not found: {}", asset_path)
     }
