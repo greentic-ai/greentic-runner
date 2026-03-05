@@ -1423,15 +1423,20 @@ impl PackRuntime {
             return false;
         }
         let Some(manifest) = self.component_manifests.get(component_ref) else {
-            return false;
+            // No manifest entry — allow state-store; Wasmtime rejects if not imported.
+            return true;
         };
+        // If manifest declares host.state capabilities, honour them.
+        // If host.state is None (not declared in manifest), default to true so
+        // components whose CBOR manifest omits the field still get state-store
+        // linked — Wasmtime will reject at instantiation if not actually imported.
         manifest
             .capabilities
             .host
             .state
             .as_ref()
             .map(|caps| caps.read || caps.write)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     pub fn contains_component(&self, component_ref: &str) -> bool {
