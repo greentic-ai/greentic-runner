@@ -170,7 +170,7 @@ pub mod v0_6_descriptor {
     });
 }
 
-// Component ABI bridge for runner-host: adds greentic:component/node@0.6 invoke envelope/result adapters and 
+// Component ABI bridge for runner-host: adds greentic:component/node@0.6 invoke envelope/result adapters and
 // keeps backward compatibility with v0.5/v0.4.
 pub mod v0_6 {
     wasmtime::component::bindgen!({
@@ -359,26 +359,28 @@ pub fn envelope_v0_6(
     };
     let payload_cbor = serde_cbor::to_vec(&payload_value)?;
 
-    Ok(v0_6::exports::greentic::component::node::InvocationEnvelope {
-        ctx: v0_6::exports::greentic::component::node::TenantCtx {
-            tenant_id: ctx.tenant.tenant.clone(),
-            team_id: ctx.tenant.team.clone(),
-            user_id: ctx.tenant.user.clone(),
-            env_id: env,
-            trace_id,
-            correlation_id,
-            deadline_ms,
+    Ok(
+        v0_6::exports::greentic::component::node::InvocationEnvelope {
+            ctx: v0_6::exports::greentic::component::node::TenantCtx {
+                tenant_id: ctx.tenant.tenant.clone(),
+                team_id: ctx.tenant.team.clone(),
+                user_id: ctx.tenant.user.clone(),
+                env_id: env,
+                trace_id,
+                correlation_id,
+                deadline_ms,
+                attempt: ctx.tenant.attempt,
+                idempotency_key: ctx.tenant.idempotency_key.clone(),
+                i18n_id,
+            },
+            flow_id: ctx.flow_id.clone(),
+            step_id,
+            component_id: component_id.to_string(),
             attempt: ctx.tenant.attempt,
-            idempotency_key: ctx.tenant.idempotency_key.clone(),
-            i18n_id,
+            payload_cbor,
+            metadata_cbor: None,
         },
-        flow_id: ctx.flow_id.clone(),
-        step_id,
-        component_id: component_id.to_string(),
-        attempt: ctx.tenant.attempt,
-        payload_cbor,
-        metadata_cbor: None,
-    })
+    )
 }
 
 pub fn invoke_result_from_v0_4(

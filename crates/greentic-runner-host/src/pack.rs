@@ -335,7 +335,12 @@ impl HostState {
                                 let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
                                 let operation_owned = operation.to_string();
                                 let input_owned = input_json.to_string();
-                                node.call_invoke(&mut *store, &ctx_v04, &operation_owned, &input_owned)
+                                node.call_invoke(
+                                    &mut *store,
+                                    &ctx_v04,
+                                    &operation_owned,
+                                    &input_owned,
+                                )
                             })?;
                             Ok(component_api::invoke_result_from_v0_4(result))
                         } else {
