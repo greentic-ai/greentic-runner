@@ -291,38 +291,62 @@ impl HostState {
         store: &mut Store<ComponentState>,
         component: &Component,
         ctx: &ComponentExecCtx,
+        component_ref: &str,
         operation: &str,
         input_json: &str,
     ) -> Result<InvokeResult> {
         let pre_instance = linker.instantiate_pre(component)?;
-        match component_api::v0_5::ComponentPre::new(pre_instance) {
+        match component_api::v0_6::ComponentPre::new(pre_instance) {
             Ok(pre) => {
+                let envelope = component_api::envelope_v0_6(ctx, component_ref, input_json)?;
+                let operation_owned = operation.to_string();
                 let result = block_on(async {
                     let bindings = pre.instantiate_async(&mut *store).await?;
                     let node = bindings.greentic_component_node();
-                    let ctx_v05 = component_api::exec_ctx_v0_5(ctx);
-                    let operation_owned = operation.to_string();
-                    let input_owned = input_json.to_string();
-                    node.call_invoke(&mut *store, &ctx_v05, &operation_owned, &input_owned)
+                    node.call_invoke(&mut *store, &operation_owned, &envelope)
                 })?;
-                Ok(component_api::invoke_result_from_v0_5(result))
+                component_api::invoke_result_from_v0_6(result)
             }
-            Err(err) => {
-                if is_missing_node_export(&err, "0.5.0") {
-                    let pre_instance = linker.instantiate_pre(component)?;
-                    let pre: component_api::v0_4::ComponentPre<ComponentState> =
-                        component_api::v0_4::ComponentPre::new(pre_instance)?;
-                    let result = block_on(async {
-                        let bindings = pre.instantiate_async(&mut *store).await?;
-                        let node = bindings.greentic_component_node();
-                        let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
-                        let operation_owned = operation.to_string();
-                        let input_owned = input_json.to_string();
-                        node.call_invoke(&mut *store, &ctx_v04, &operation_owned, &input_owned)
-                    })?;
-                    Ok(component_api::invoke_result_from_v0_4(result))
-                } else {
-                    Err(err.into())
+            Err(err_v06) => {
+                if !is_missing_node_export(&err_v06, "0.6.0") {
+                    return Err(err_v06.into());
+                }
+                let pre_instance = linker.instantiate_pre(component)?;
+                match component_api::v0_5::ComponentPre::new(pre_instance) {
+                    Ok(pre) => {
+                        let result = block_on(async {
+                            let bindings = pre.instantiate_async(&mut *store).await?;
+                            let node = bindings.greentic_component_node();
+                            let ctx_v05 = component_api::exec_ctx_v0_5(ctx);
+                            let operation_owned = operation.to_string();
+                            let input_owned = input_json.to_string();
+                            node.call_invoke(&mut *store, &ctx_v05, &operation_owned, &input_owned)
+                        })?;
+                        Ok(component_api::invoke_result_from_v0_5(result))
+                    }
+                    Err(err) => {
+                        if is_missing_node_export(&err, "0.5.0") {
+                            let pre_instance = linker.instantiate_pre(component)?;
+                            let pre: component_api::v0_4::ComponentPre<ComponentState> =
+                                component_api::v0_4::ComponentPre::new(pre_instance)?;
+                            let result = block_on(async {
+                                let bindings = pre.instantiate_async(&mut *store).await?;
+                                let node = bindings.greentic_component_node();
+                                let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
+                                let operation_owned = operation.to_string();
+                                let input_owned = input_json.to_string();
+                                node.call_invoke(
+                                    &mut *store,
+                                    &ctx_v04,
+                                    &operation_owned,
+                                    &input_owned,
+                                )
+                            })?;
+                            Ok(component_api::invoke_result_from_v0_4(result))
+                        } else {
+                            Err(err.into())
+                        }
+                    }
                 }
             }
         }
@@ -1814,6 +1838,7 @@ impl PackRuntime {
                 &mut store,
                 &component,
                 &ctx_owned,
+                &component_ref_owned,
                 &operation_owned,
                 &input_owned,
             )?;
