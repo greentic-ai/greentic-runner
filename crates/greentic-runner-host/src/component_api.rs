@@ -348,16 +348,18 @@ pub fn envelope_v0_6(
     let trace_id = ctx.tenant.trace_id.clone().unwrap_or_default();
     let correlation_id = ctx.tenant.correlation_id.clone().unwrap_or_default();
     let deadline_ms = ctx.tenant.deadline_unix_ms.unwrap_or(u64::MAX);
-    let payload_value = if let Ok(invocation) =
+    let payload_cbor = if let Ok(invocation) =
         serde_json::from_str::<greentic_types::InvocationEnvelope>(payload_json)
     {
-        serde_json::from_slice::<serde_json::Value>(&invocation.payload)
-            .unwrap_or(serde_json::Value::Null)
+        match serde_json::from_slice::<serde_json::Value>(&invocation.payload) {
+            Ok(value) => serde_cbor::to_vec(&value)?,
+            Err(_) => serde_cbor::to_vec(&serde_cbor::Value::Bytes(invocation.payload))?,
+        }
     } else {
-        serde_json::from_str::<serde_json::Value>(payload_json)
-            .unwrap_or_else(|_| serde_json::Value::String(payload_json.to_string()))
+        let payload_value = serde_json::from_str::<serde_json::Value>(payload_json)
+            .unwrap_or_else(|_| serde_json::Value::String(payload_json.to_string()));
+        serde_cbor::to_vec(&payload_value)?
     };
-    let payload_cbor = serde_cbor::to_vec(&payload_value)?;
 
     Ok(
         v0_6::exports::greentic::component::node::InvocationEnvelope {
@@ -459,5 +461,56 @@ fn cbor_to_json_string(bytes: &[u8]) -> String {
     {
         Some(json) => json,
         None => String::from_utf8_lossy(bytes).to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{envelope_v0_6, node};
+    use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
+    use std::str::FromStr;
+
+    fn sample_exec_ctx() -> node::ExecCtx {
+        node::ExecCtx {
+            tenant: node::TenantCtx {
+                tenant: "tenant.demo".to_string(),
+                team: Some("team.demo".to_string()),
+                user: Some("user.demo".to_string()),
+                trace_id: Some("trace.demo".to_string()),
+                i18n_id: Some("en-US".to_string()),
+                correlation_id: Some("corr.demo".to_string()),
+                deadline_unix_ms: Some(123),
+                attempt: 2,
+                idempotency_key: Some("idem.demo".to_string()),
+            },
+            i18n_id: Some("en-US".to_string()),
+            flow_id: "flow.demo".to_string(),
+            node_id: Some("node.demo".to_string()),
+        }
+    }
+
+    #[test]
+    fn envelope_v0_6_preserves_binary_payload_when_envelope_payload_is_not_json() {
+        let envelope = InvocationEnvelope {
+            ctx: TenantCtx::new(
+                EnvId::from_str("local").expect("valid env id"),
+                TenantId::from_str("tenant.default").expect("valid tenant id"),
+            ),
+            flow_id: "flow.demo".to_string(),
+            node_id: Some("node.demo".to_string()),
+            op: "on_message".to_string(),
+            payload: vec![255, 0, 1, 42],
+            metadata: Vec::new(),
+        };
+        let payload_json = serde_json::to_string(&envelope).expect("serialize invocation envelope");
+        let envelope = envelope_v0_6(&sample_exec_ctx(), "component.demo", &payload_json)
+            .expect("envelope conversion");
+        let decoded: serde_cbor::Value =
+            serde_cbor::from_slice(&envelope.payload_cbor).expect("decode cbor");
+        assert_eq!(
+            decoded,
+            serde_cbor::Value::Bytes(vec![255, 0, 1, 42]),
+            "binary payload must not be dropped when not valid json bytes"
+        );
     }
 }
