@@ -815,10 +815,16 @@ impl FlowEngine {
             session_id: ctx.session_id,
             attempt: ctx.attempt,
         };
-        let invocation_envelope =
-            build_invocation_envelope(meta, call.operation.as_str(), call.input)
-                .context("build invocation envelope for component call")?;
-        let input_json = serde_json::to_string(&invocation_envelope)?;
+        // Compatibility bridge: mcp.exec adapters in current packs still expect
+        // the raw payload JSON (not InvocationEnvelope).
+        let input_json = if call.component_ref == "mcp.exec" {
+            serde_json::to_string(&call.input)?
+        } else {
+            let invocation_envelope =
+                build_invocation_envelope(meta, call.operation.as_str(), call.input)
+                    .context("build invocation envelope for component call")?;
+            serde_json::to_string(&invocation_envelope)?
+        };
         let config_json = if call.config.is_null() {
             None
         } else {
