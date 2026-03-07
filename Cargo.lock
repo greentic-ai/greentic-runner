@@ -1813,9 +1813,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-pack-lib"
-version = "0.4.103"
+version = "0.4.108"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f188de688b68025d9dea7702d5936602f14b1ca10b79ac4a07ac9722cca5d9f"
+checksum = "fd1fdccb5195a30c70a07cf04060a00d49d97afa1bc6c6112d3ae689de5338d8"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1902,7 +1902,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -1921,7 +1921,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1985,7 +1985,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4039,7 +4039,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.62"
+version = "0.4.63"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4637,12 +4637,12 @@ dependencies = [
 
 [[package]]
 name = "socket2"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
+checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
