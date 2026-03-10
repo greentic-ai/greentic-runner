@@ -801,7 +801,7 @@ impl FlowEngine {
         &self,
         ctx: &FlowContext<'_>,
         node_id: &str,
-        call: ComponentCall,
+        mut call: ComponentCall,
         event: &NodeEvent<'_>,
     ) -> Result<NodeOutput> {
         self.validate_component(ctx, event, &call)?;
@@ -839,6 +839,45 @@ impl FlowEngine {
             format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
         })?;
         let pack = Arc::clone(&self.packs[pack_idx]);
+
+        // Pre-resolve card asset paths: read JSON files from the pack's assets
+        // directory and inject as inline_json so the component doesn't need
+        // WASI filesystem access.
+        resolve_card_assets(&mut call.input, &pack);
+
+        // When the input is a card-like invocation (has card_source/card_spec),
+        // pass it directly to the component instead of wrapping in an
+        // InvocationEnvelope.  The envelope serialises the payload field as a
+        // byte array which the component cannot decode back, and the
+        // InvocationPayload::parse heuristic strips domain fields when a
+        // `payload` key is present (e.g.  the card's Handlebars template
+        // context `payload: {}`).
+        let is_card = is_card_invocation(&call.input);
+
+        let input_json = if is_card {
+            serde_json::to_string(&call.input)?
+        } else {
+            // Runtime owns ctx; flows must not embed ctx, even if they provide envelopes.
+            let meta = InvocationMeta {
+                env: &self.default_env,
+                tenant: ctx.tenant,
+                flow_id: ctx.flow_id,
+                node_id: Some(node_id),
+                provider_id: ctx.provider_id,
+                session_id: ctx.session_id,
+                attempt: ctx.attempt,
+            };
+            let invocation_envelope =
+                build_invocation_envelope(meta, call.operation.as_str(), call.input)
+                    .context("build invocation envelope for component call")?;
+            serde_json::to_string(&invocation_envelope)?
+        };
+        let config_json = if call.config.is_null() {
+            None
+        } else {
+            Some(serde_json::to_string(&call.config)?)
+        };
+
         let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
@@ -1715,6 +1754,86 @@ fn emit_ref_from_kind(kind: &EmitKind) -> String {
         EmitKind::Log => "emit.log".to_string(),
         EmitKind::Response => "emit.response".to_string(),
         EmitKind::Other(other) => other.clone(),
+    }
+}
+
+/// Returns `true` when `input` looks like an Adaptive Card invocation
+/// (contains `card_source` or `card_spec` at the top level).
+fn is_card_invocation(input: &Value) -> bool {
+    if let Value::Object(map) = input {
+        return map.contains_key("card_source") || map.contains_key("card_spec");
+    }
+    false
+}
+
+/// Pre-resolve `card_source: "asset"` entries by reading the referenced JSON
+/// file from the pack's assets directory and converting to
+/// `card_source: "inline"` with `inline_json` populated.
+///
+/// This handles both top-level card fields and the nested `call.payload`
+/// structure emitted by cards2pack.
+fn resolve_card_assets(input: &mut Value, pack: &crate::pack::PackRuntime) {
+    resolve_card_spec_asset(input, pack);
+
+    // Also resolve inside `call.payload` (cards2pack duplicates the card
+    // invocation there).
+    if let Value::Object(map) = input {
+        if let Some(Value::Object(call)) = map.get_mut("call") {
+            if let Some(payload) = call.get_mut("payload") {
+                resolve_card_spec_asset(payload, pack);
+            }
+        }
+    }
+}
+
+/// Resolve a single card_spec asset_path → inline_json.
+fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
+    let Value::Object(map) = value else { return };
+
+    let is_asset = map
+        .get("card_source")
+        .and_then(Value::as_str)
+        .map(|s| s.eq_ignore_ascii_case("asset"))
+        .unwrap_or(false);
+    if !is_asset {
+        return;
+    }
+
+    let asset_path = map
+        .get("card_spec")
+        .and_then(|spec| spec.get("asset_path"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let Some(asset_path) = asset_path else { return };
+
+    match pack.read_asset(&asset_path) {
+        Ok(bytes) => {
+            let card_json: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(err) => {
+                    tracing::warn!(
+                        asset_path,
+                        %err,
+                        "failed to parse card asset as JSON; leaving as asset reference"
+                    );
+                    return;
+                }
+            };
+            tracing::debug!(asset_path, "pre-resolved card asset to inline_json");
+            map.insert("card_source".into(), Value::String("inline".into()));
+            if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
+                spec.insert("inline_json".into(), card_json);
+                spec.remove("asset_path");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                asset_path,
+                %err,
+                "card asset not found in pack; leaving as asset reference"
+            );
+        }
     }
 }
 

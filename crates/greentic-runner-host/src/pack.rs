@@ -325,31 +325,78 @@ impl HostState {
                         Ok(component_api::invoke_result_from_v0_5(result))
                     }
                     Err(err) => {
-                        if is_missing_node_export(&err, "0.5.0") {
-                            let pre_instance = linker.instantiate_pre(component)?;
-                            let pre: component_api::v0_4::ComponentPre<ComponentState> =
-                                component_api::v0_4::ComponentPre::new(pre_instance)?;
-                            let result = block_on(async {
-                                let bindings = pre.instantiate_async(&mut *store).await?;
-                                let node = bindings.greentic_component_node();
-                                let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
-                                let operation_owned = operation.to_string();
-                                let input_owned = input_json.to_string();
-                                node.call_invoke(
-                                    &mut *store,
-                                    &ctx_v04,
-                                    &operation_owned,
-                                    &input_owned,
-                                )
-                            })?;
-                            Ok(component_api::invoke_result_from_v0_4(result))
-                        } else {
-                            Err(err.into())
+                        if !is_missing_node_export(&err, "0.5.0") {
+                            return Err(err.into());
+                        }
+                        let pre_instance = linker.instantiate_pre(component)?;
+                        match component_api::v0_4::ComponentPre::new(pre_instance) {
+                            Ok(pre) => {
+                                let result = block_on(async {
+                                    let bindings = pre.instantiate_async(&mut *store).await?;
+                                    let node = bindings.greentic_component_node();
+                                    let ctx_v04 = component_api::exec_ctx_v0_4(ctx);
+                                    let operation_owned = operation.to_string();
+                                    let input_owned = input_json.to_string();
+                                    node.call_invoke(
+                                        &mut *store,
+                                        &ctx_v04,
+                                        &operation_owned,
+                                        &input_owned,
+                                    )
+                                })?;
+                                Ok(component_api::invoke_result_from_v0_4(result))
+                            }
+                            Err(err_v04) => {
+                                if is_missing_node_export(&err_v04, "0.4.0") {
+                                    Self::try_v06_runtime(linker, store, component, input_json)
+                                } else {
+                                    Err(err_v04)
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Fallback for v0.6 components that export `component-runtime::run(input, state)`
+    /// instead of the legacy `node::invoke(ctx, op, input)`.
+    fn try_v06_runtime(
+        linker: &mut Linker<ComponentState>,
+        store: &mut Store<ComponentState>,
+        component: &Component,
+        input_json: &str,
+    ) -> Result<InvokeResult> {
+        let pre_instance = linker.instantiate_pre(component)?;
+        let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance)
+            .context("component exports neither node@0.5/0.4 nor component-runtime@0.6")?;
+
+        let result = block_on(async {
+            let bindings = pre.instantiate_async(&mut *store).await?;
+            let runtime = bindings.greentic_component_component_runtime();
+
+            // Encode input as CBOR — the component's run() expects CBOR bytes.
+            let input_value: Value = serde_json::from_str(input_json).unwrap_or(Value::Null);
+            let input_cbor =
+                serde_cbor::to_vec(&input_value).context("encode input as CBOR for v0.6")?;
+            let empty_state = serde_cbor::to_vec(&Value::Object(Default::default()))
+                .context("encode empty state")?;
+
+            let run_result = runtime
+                .call_run(&mut *store, &input_cbor, &empty_state)
+                .context("v0.6 component-runtime::run call failed")?;
+
+            // Decode output CBOR to JSON.
+            let output_value: Value = serde_cbor::from_slice(&run_result.output)
+                .context("decode v0.6 run output CBOR")?;
+            let output_json = serde_json::to_string(&output_value)
+                .context("serialize v0.6 run output to JSON")?;
+
+            Ok::<_, anyhow::Error>(output_json)
+        })?;
+
+        Ok(InvokeResult::Ok(result))
     }
 
     fn convert_invoke_result(result: InvokeResult) -> Result<Value> {
@@ -388,6 +435,21 @@ impl HostState {
         }
     }
 
+    /// Build a `TenantCtx` for secrets lookups that includes the team from the
+    /// execution context. `config.tenant_ctx()` only populates env + tenant;
+    /// without this, secrets scoped to a specific team are unreachable.
+    fn secrets_tenant_ctx(&self) -> TypesTenantCtx {
+        let mut ctx = self.config.tenant_ctx();
+        if let Some(exec_ctx) = self.exec_ctx.as_ref() {
+            if let Some(team) = exec_ctx.tenant.team.as_ref() {
+                if let Ok(team_id) = TeamId::from_str(team) {
+                    ctx = ctx.with_team(Some(team_id));
+                }
+            }
+        }
+        ctx
+    }
+
     pub fn get_secret(&self, key: &str) -> Result<String> {
         if provider_core_only::is_enabled() {
             bail!(provider_core_only::blocked_message("secrets"))
@@ -400,7 +462,7 @@ impl HostState {
         {
             return Ok(value);
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, key)
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
@@ -644,7 +706,7 @@ impl SecretsStoreHost for HostState {
         {
             return Ok(Some(value.into_bytes()));
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -670,7 +732,7 @@ impl SecretsStoreHostV1_1 for HostState {
         {
             return Ok(Some(value.into_bytes()));
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
@@ -698,7 +760,7 @@ impl SecretsStoreHostV1_1 for HostState {
             warn!(secret = %key, "secret write denied by bindings policy");
             panic!("secret write denied for key {key}: policy");
         }
-        let ctx = self.config.tenant_ctx();
+        let ctx = self.secrets_tenant_ctx();
         let canonical_key = canonicalize_wasm_secret_key(&key);
         if let Err(err) =
             write_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key, &value)
@@ -1380,15 +1442,20 @@ impl PackRuntime {
             return false;
         }
         let Some(manifest) = self.component_manifests.get(component_ref) else {
-            return false;
+            // No manifest entry — allow state-store; Wasmtime rejects if not imported.
+            return true;
         };
+        // If manifest declares host.state capabilities, honour them.
+        // If host.state is None (not declared in manifest), default to true so
+        // components whose CBOR manifest omits the field still get state-store
+        // linked — Wasmtime will reject at instantiation if not actually imported.
         manifest
             .capabilities
             .host
             .state
             .as_ref()
             .map(|caps| caps.read || caps.write)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     pub fn contains_component(&self, component_ref: &str) -> bool {
@@ -1994,6 +2061,30 @@ impl PackRuntime {
 
     pub fn metadata(&self) -> &PackMetadata {
         &self.metadata
+    }
+
+    /// Read an asset file from the pack's assets directory.
+    ///
+    /// Accepts paths like `assets/cards/card-a.json` or `cards/card-a.json`
+    /// (the `assets/` prefix is stripped automatically).
+    pub fn read_asset(&self, asset_path: &str) -> Result<Vec<u8>> {
+        let normalized = asset_path
+            .trim_start_matches("assets/")
+            .trim_start_matches("/assets/");
+        // Try assets tempdir first (extracted from archive).
+        if let Some(tempdir) = &self.assets_tempdir {
+            let full = tempdir.path().join("assets").join(normalized);
+            if full.exists() {
+                return std::fs::read(&full)
+                    .with_context(|| format!("read asset {}", full.display()));
+            }
+        }
+        // Try materialized directory.
+        let full = self.path.join("assets").join(normalized);
+        if full.exists() {
+            return std::fs::read(&full).with_context(|| format!("read asset {}", full.display()));
+        }
+        bail!("asset not found: {}", asset_path)
     }
 
     pub fn component_manifest(&self, component_ref: &str) -> Option<&ComponentManifest> {

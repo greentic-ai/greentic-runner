@@ -237,6 +237,27 @@ pub mod v0_6 {
     });
 }
 
+pub mod v0_6_runtime {
+    wasmtime::component::bindgen!({
+        inline: r#"
+        package greentic:component@0.6.0;
+
+        interface component-runtime {
+          record run-result {
+            output: list<u8>,
+            new-state: list<u8>,
+          }
+          run: func(input: list<u8>, state: list<u8>) -> run-result;
+        }
+
+        world component-v0-v6-runtime {
+          export component-runtime;
+        }
+        "#,
+        world: "component-v0-v6-runtime",
+    });
+}
+
 pub mod node {
     pub type Json = String;
 
@@ -462,6 +483,21 @@ fn cbor_to_json_string(bytes: &[u8]) -> String {
         Some(json) => json,
         None => String::from_utf8_lossy(bytes).to_string(),
     }
+}
+
+/// Convert v0.6 `component-runtime::run()` output to the canonical InvokeResult.
+/// Decodes CBOR output bytes to a JSON string.
+pub fn invoke_result_from_v0_6_run(
+    result: v0_6_runtime::exports::greentic::component::component_runtime::RunResult,
+) -> node::InvokeResult {
+    let json_str = match serde_cbor::from_slice::<serde_json::Value>(&result.output) {
+        Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
+        Err(_) => {
+            // Fallback: try as UTF-8 string
+            String::from_utf8(result.output).unwrap_or_default()
+        }
+    };
+    node::InvokeResult::Ok(json_str)
 }
 
 #[cfg(test)]

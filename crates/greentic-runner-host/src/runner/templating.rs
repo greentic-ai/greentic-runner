@@ -10,7 +10,7 @@ pub struct TemplateOptions {
 
 static HANDLEBARS: Lazy<Handlebars<'static>> = Lazy::new(|| {
     let mut registry = Handlebars::new();
-    registry.set_strict_mode(true);
+    registry.set_strict_mode(false);
     registry.register_escape_fn(handlebars::no_escape);
     registry
 });
