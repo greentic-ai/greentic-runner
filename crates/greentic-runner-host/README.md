@@ -72,6 +72,37 @@ During a reload the watcher resolves each locator (filesystem, HTTPS, OCI, S3, G
 
 Runner can also execute a materialized pack directory (contains `manifest.cbor`, flows/templates, and `components/<id>.wasm`) or a `.gtpack` paired with local component files. Component resolution now prefers explicit overrides, then the materialized directory, and finally embedded archive entries; missing components raise a clear error. The desktop CLI exposes `--components-dir` / `--components-map` so distributor-produced layouts can run without the runner fetching OCI components itself.
 
+### Pack module structure
+
+The `pack` module handles pack loading, component execution, and flow management. It is organized into focused submodules:
+
+| Module | Responsibility |
+| --- | --- |
+| `runtime.rs` | `PackRuntime` - main entry point for loading and executing packs |
+| `host_state.rs` | `HostState` - host state for WASM component execution |
+| `host_traits.rs` | Trait implementations for secrets, HTTP, state store, telemetry |
+| `component_state.rs` | `ComponentState` - WASM instance state and linker registration |
+| `flows.rs` | Flow parsing, conversion, and `FlowDescriptor` handling |
+| `resolution.rs` | Component resolution, pack lock parsing, source tables |
+| `loaders.rs` | Component loading from overrides, directories, archives, remote |
+| `metadata.rs` | `PackMetadata` extraction from manifests and WASM sections |
+| `i18n.rs` | `I18nCatalog` for card translation resolution |
+| `helpers.rs` | Utilities (digest computation, path normalization, WASI threading) |
+
+Public types are re-exported from `pack/mod.rs`:
+
+```rust
+use greentic_runner_host::pack::{
+    PackRuntime,       // Main runtime for executing packs
+    PackMetadata,      // Metadata about loaded packs
+    FlowDescriptor,    // Description of flows within a pack
+    I18nCatalog,       // Internationalization catalog
+    ComponentResolution, // Configuration for component resolution
+    HostState,         // Host state for WASM execution
+    ComponentState,    // Component state for WASM instances
+};
+```
+
 ### Component cache (preview)
 
 The runner exposes a cache module for compiled component artifacts. Each cache entry is scoped by an **EngineProfile** (Wasmtime version, target triple, CPU policy, and a config fingerprint) and an **ArtifactKey** (`engine_profile_id` + `wasm_digest`). Disk entries are namespaced under `<cache_root>/v1/<engine_profile_id>/...` to prevent cross-version contamination.
