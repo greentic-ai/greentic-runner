@@ -21,7 +21,9 @@ use crate::provider_core_only;
 use crate::runtime_wasmtime::{Component, Engine, InstancePre, Linker, ResourceTable};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
-use greentic_distributor_client::dist::{DistClient, DistError, DistOptions};
+use greentic_distributor_client::dist::{
+    CachePolicy, DistClient, DistError, DistOptions, ResolvePolicy,
+};
 use greentic_interfaces_wasmtime::host_helpers::v1::{
     self as host_v1, HostFns, add_all_v1_to_linker,
     runner_host_http::RunnerHostHttp,
@@ -350,7 +352,7 @@ impl HostState {
                                 if is_missing_node_export(&err_v04, "0.4.0") {
                                     Self::try_v06_runtime(linker, store, component, input_json)
                                 } else {
-                                    Err(err_v04)
+                                    Err(err_v04.into())
                                 }
                             }
                         }
@@ -369,8 +371,9 @@ impl HostState {
         input_json: &str,
     ) -> Result<InvokeResult> {
         let pre_instance = linker.instantiate_pre(component)?;
-        let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance)
-            .context("component exports neither node@0.5/0.4 nor component-runtime@0.6")?;
+        let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance).map_err(
+            |err| err.context("component exports neither node@0.5/0.4 nor component-runtime@0.6"),
+        )?;
 
         let result = block_on(async {
             let bindings = pre.instantiate_async(&mut *store).await?;
@@ -385,7 +388,7 @@ impl HostState {
 
             let run_result = runtime
                 .call_run(&mut *store, &input_cbor, &empty_state)
-                .context("v0.6 component-runtime::run call failed")?;
+                .map_err(|err| err.context("v0.6 component-runtime::run call failed"))?;
 
             // Decode output CBOR to JSON.
             let output_value: Value = serde_cbor::from_slice(&run_result.output)
@@ -440,12 +443,11 @@ impl HostState {
     /// without this, secrets scoped to a specific team are unreachable.
     fn secrets_tenant_ctx(&self) -> TypesTenantCtx {
         let mut ctx = self.config.tenant_ctx();
-        if let Some(exec_ctx) = self.exec_ctx.as_ref() {
-            if let Some(team) = exec_ctx.tenant.team.as_ref() {
-                if let Ok(team_id) = TeamId::from_str(team) {
-                    ctx = ctx.with_team(Some(team_id));
-                }
-            }
+        if let Some(exec_ctx) = self.exec_ctx.as_ref()
+            && let Some(team) = exec_ctx.tenant.team.as_ref()
+            && let Ok(team_id) = TeamId::from_str(team)
+        {
+            ctx = ctx.with_team(Some(team_id));
         }
         ctx
     }
@@ -1455,7 +1457,7 @@ impl PackRuntime {
             .state
             .as_ref()
             .map(|caps| caps.read || caps.write)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     pub fn contains_component(&self, component_ref: &str) -> bool {
@@ -3749,14 +3751,23 @@ async fn load_components_from_sources(
                         spec.id
                     )
                 })?;
-                let cache_path = if component_resolution.dist_offline {
+                let cache_path = if let Ok(cache_path) = client.fetch_digest(digest).await {
+                    cache_path
+                } else if component_resolution.dist_offline {
                     client
                         .fetch_digest(digest)
                         .await
                         .map_err(|err| dist_error_for_component(err, &spec.id, &reference))?
                 } else {
+                    let source = client
+                        .parse_source(&reference)
+                        .map_err(|err| dist_error_for_component(err, &spec.id, &reference))?;
+                    let descriptor = client
+                        .resolve(source, ResolvePolicy)
+                        .await
+                        .map_err(|err| dist_error_for_component(err, &spec.id, &reference))?;
                     let resolved = client
-                        .resolve_ref(&reference)
+                        .fetch(&descriptor, CachePolicy)
                         .await
                         .map_err(|err| dist_error_for_component(err, &spec.id, &reference))?;
                     let expected = normalize_digest(digest);

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::fs as async_fs;
 
 use anyhow::{Context, Result, bail};
-use greentic_distributor_client::dist::{DistClient, DistOptions};
+use greentic_distributor_client::dist::{CachePolicy, DistClient, DistOptions, ResolvePolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -584,7 +584,9 @@ async fn resolve_component_bytes(
             .with_context(|| format!("failed to read {}", cache_path.display()));
     }
 
-    let resolved = dist_client.resolve_ref(source_ref).await?;
+    let source = dist_client.parse_source(source_ref)?;
+    let descriptor = dist_client.resolve(source, ResolvePolicy).await?;
+    let resolved = dist_client.fetch(&descriptor, CachePolicy).await?;
     let cache_path = resolved
         .cache_path
         .ok_or_else(|| anyhow::anyhow!("component {} missing cache path", entry.name))?;

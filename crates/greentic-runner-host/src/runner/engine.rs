@@ -805,32 +805,6 @@ impl FlowEngine {
         event: &NodeEvent<'_>,
     ) -> Result<NodeOutput> {
         self.validate_component(ctx, event, &call)?;
-        // Runtime owns ctx; flows must not embed ctx, even if they provide envelopes.
-        let meta = InvocationMeta {
-            env: &self.default_env,
-            tenant: ctx.tenant,
-            flow_id: ctx.flow_id,
-            node_id: Some(node_id),
-            provider_id: ctx.provider_id,
-            session_id: ctx.session_id,
-            attempt: ctx.attempt,
-        };
-        // Compatibility bridge: mcp.exec adapters in current packs still expect
-        // the raw payload JSON (not InvocationEnvelope).
-        let input_json = if call.component_ref == "mcp.exec" {
-            serde_json::to_string(&call.input)?
-        } else {
-            let invocation_envelope =
-                build_invocation_envelope(meta, call.operation.as_str(), call.input)
-                    .context("build invocation envelope for component call")?;
-            serde_json::to_string(&invocation_envelope)?
-        };
-        let config_json = if call.config.is_null() {
-            None
-        } else {
-            Some(serde_json::to_string(&call.config)?)
-        };
-
         let key = FlowKey {
             pack_id: ctx.pack_id.to_string(),
             flow_id: ctx.flow_id.to_string(),
@@ -1777,12 +1751,11 @@ fn resolve_card_assets(input: &mut Value, pack: &crate::pack::PackRuntime) {
 
     // Also resolve inside `call.payload` (cards2pack duplicates the card
     // invocation there).
-    if let Value::Object(map) = input {
-        if let Some(Value::Object(call)) = map.get_mut("call") {
-            if let Some(payload) = call.get_mut("payload") {
-                resolve_card_spec_asset(payload, pack);
-            }
-        }
+    if let Value::Object(map) = input
+        && let Some(Value::Object(call)) = map.get_mut("call")
+        && let Some(payload) = call.get_mut("payload")
+    {
+        resolve_card_spec_asset(payload, pack);
     }
 }
 
