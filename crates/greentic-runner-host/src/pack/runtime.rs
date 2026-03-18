@@ -29,8 +29,9 @@ use crate::provider_core::{
     schema_core::SchemaCorePre as LegacySchemaCorePre,
     schema_core_schema::SchemaCorePre as SchemaSchemaCorePre,
 };
+use crate::runner::flow_adapter::{FlowIR, flow_ir_to_flow};
 use crate::runner::mocks::MockLayer;
-use crate::runtime_wasmtime::{Engine, Linker};
+use crate::runtime_wasmtime::{Component, Engine, Linker};
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::{DynSessionStore, DynStateStore};
 use crate::verify;
@@ -812,5 +813,89 @@ impl PackRuntime {
         } else {
             Ok(None)
         }
+    }
+
+    /// Create a PackRuntime for component testing.
+    pub fn for_component_test(
+        components: Vec<(String, PathBuf)>,
+        flows: HashMap<String, FlowIR>,
+        pack_id: &str,
+        config: Arc<HostConfig>,
+    ) -> Result<Self> {
+        let engine = Engine::default();
+        let engine_profile =
+            EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        let cache = CacheManager::new(CacheConfig::default(), engine_profile);
+        let mut component_map = HashMap::new();
+        for (name, path) in components {
+            if !path.exists() {
+                bail!("component artifact missing: {}", path.display());
+            }
+            let wasm_bytes = std::fs::read(&path)?;
+            let component =
+                Arc::new(Component::from_binary(&engine, &wasm_bytes).map_err(|err| {
+                    anyhow!("failed to compile component {}: {err}", path.display())
+                })?);
+            component_map.insert(
+                name.clone(),
+                PackComponent {
+                    name,
+                    version: "0.0.0".into(),
+                    component,
+                },
+            );
+        }
+
+        let mut flow_map = HashMap::new();
+        let mut descriptors = Vec::new();
+        for (id, ir) in flows {
+            let flow_type = ir.flow_type.clone();
+            let flow = flow_ir_to_flow(ir)?;
+            flow_map.insert(id.clone(), flow);
+            descriptors.push(FlowDescriptor {
+                id: id.clone(),
+                flow_type,
+                pack_id: pack_id.to_string(),
+                profile: "test".into(),
+                version: "0.0.0".into(),
+                description: None,
+            });
+        }
+        let entry_flows = descriptors.iter().map(|flow| flow.id.clone()).collect();
+        let metadata = PackMetadata {
+            pack_id: pack_id.to_string(),
+            version: "0.0.0".into(),
+            entry_flows,
+            secret_requirements: Vec::new(),
+        };
+        let flows_cache = PackFlows {
+            descriptors: descriptors.clone(),
+            flows: flow_map,
+            metadata: metadata.clone(),
+        };
+
+        Ok(Self {
+            path: PathBuf::new(),
+            archive_path: None,
+            config,
+            engine,
+            metadata,
+            manifest: None,
+            legacy_manifest: None,
+            component_manifests: HashMap::new(),
+            mocks: None,
+            flows: Some(flows_cache),
+            components: component_map,
+            http_client: Arc::clone(&HTTP_CLIENT),
+            pre_cache: Mutex::new(HashMap::new()),
+            session_store: None,
+            state_store: None,
+            wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            assets_tempdir: None,
+            provider_registry: RwLock::new(None),
+            secrets: crate::secrets::default_manager()?,
+            oauth_config: None,
+            cache,
+        })
     }
 }
