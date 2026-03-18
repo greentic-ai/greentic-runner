@@ -71,19 +71,17 @@ impl FlowResumeStore {
                             reason: format!("failed to decode flow resume snapshot: {err}"),
                         }
                     })?;
-                if record.snapshot.flow_id == envelope.flow_id {
-                    if let Some(pack_id) = envelope.pack_id.as_deref()
-                        && record.snapshot.pack_id != pack_id
-                    {
-                        return Err(RunnerError::Session {
-                            reason: format!(
-                                "resume pack mismatch: expected {pack_id}, found {}",
-                                record.snapshot.pack_id
-                            ),
-                        });
-                    }
-                    return Ok(Some(record.snapshot));
+                if let Some(pack_id) = envelope.pack_id.as_deref()
+                    && record.snapshot.pack_id != pack_id
+                {
+                    return Err(RunnerError::Session {
+                        reason: format!(
+                            "resume pack mismatch: expected {pack_id}, found {}",
+                            record.snapshot.pack_id
+                        ),
+                    });
                 }
+                return Ok(Some(record.snapshot));
             }
         }
 
@@ -249,6 +247,7 @@ mod tests {
             snapshot: FlowSnapshot {
                 pack_id: "pack.demo".into(),
                 flow_id: "flow.main".into(),
+                next_flow: None,
                 next_node: "node-2".into(),
                 state,
             },
@@ -294,6 +293,22 @@ mod tests {
 
         let snapshot = store.fetch(&envelope)?.expect("snapshot missing");
         assert_eq!(snapshot.next_node, "node-3");
+        store.clear(&envelope)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resume_store_uses_snapshot_even_if_envelope_flow_differs() -> GResult<()> {
+        let store = FlowResumeStore::new(new_session_store());
+        let envelope = sample_envelope();
+        let wait = sample_wait();
+        let _ = store.save(&envelope, &wait)?;
+
+        let mut redirected = envelope.clone();
+        redirected.flow_id = "flow.other".into();
+        let snapshot = store.fetch(&redirected)?.expect("snapshot missing");
+        assert_eq!(snapshot.flow_id, wait.snapshot.flow_id);
+
         store.clear(&envelope)?;
         Ok(())
     }
@@ -552,41 +567,61 @@ impl Adapter for PackFlowAdapter {
         let provider_owned = envelope.provider.clone();
         let payload = envelope.payload.clone();
         let retry_config = self.config.retry_config().into();
-
-        let pack_id = if let Some(pack_id) = envelope.pack_id.as_deref() {
-            let found = self.engine.flow_by_key(pack_id, &flow_id).is_some();
+        let resume_snapshot = self.resume.fetch(&envelope)?;
+        let resume_flow_id = resume_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.next_flow.clone())
+            .or_else(|| {
+                resume_snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.flow_id.clone())
+            });
+        let effective_flow_id = resume_flow_id.clone().unwrap_or_else(|| flow_id.clone());
+        let effective_pack_id = if let Some(snapshot) = resume_snapshot.as_ref() {
+            snapshot.pack_id.clone()
+        } else if let Some(pack_id) = envelope.pack_id.as_deref() {
+            let found = self
+                .engine
+                .flow_by_key(pack_id, effective_flow_id.as_str())
+                .is_some();
             if !found {
                 return Err(RunnerError::AdapterCall {
-                    reason: format!("flow {flow_id} not registered for pack {pack_id}"),
+                    reason: format!(
+                        "flow {} not registered for pack {pack_id}",
+                        effective_flow_id
+                    ),
                 });
             }
-            pack_id
-        } else if let Some(flow) = self.engine.flow_by_id(&flow_id) {
-            flow.pack_id.as_str()
+            pack_id.to_string()
+        } else if let Some(flow) = self.engine.flow_by_id(effective_flow_id.as_str()) {
+            flow.pack_id.clone()
         } else {
             return Err(RunnerError::AdapterCall {
-                reason: format!("flow {flow_id} is ambiguous; pack_id is required"),
+                reason: format!(
+                    "flow {} is ambiguous; pack_id is required",
+                    effective_flow_id
+                ),
             });
         };
 
         let trace_config = self.config.trace.clone();
         let flow_version = self
             .engine
-            .flow_by_key(pack_id, &flow_id)
+            .flow_by_key(effective_pack_id.as_str(), effective_flow_id.as_str())
             .map(|desc| desc.version.clone())
             .unwrap_or_else(|| "unknown".to_string());
         let pack_trace = self
             .pack_trace
-            .get(pack_id)
+            .get(effective_pack_id.as_str())
             .cloned()
             .unwrap_or_else(|| PackTraceInfo {
-                pack_ref: pack_id.to_string(),
+                pack_ref: effective_pack_id.clone(),
                 resolved_digest: None,
             });
         let trace_ctx = TraceContext {
             pack_ref: pack_trace.pack_ref,
             resolved_digest: pack_trace.resolved_digest,
-            flow_id: flow_id.clone(),
+            flow_id: effective_flow_id.clone(),
             flow_version,
         };
         let trace = if trace_config.mode == TraceMode::Off {
@@ -598,8 +633,8 @@ impl Adapter for PackFlowAdapter {
         let mocks = self.mocks.as_deref();
         let ctx = FlowContext {
             tenant: &self.tenant,
-            pack_id,
-            flow_id: &flow_id,
+            pack_id: effective_pack_id.as_str(),
+            flow_id: effective_flow_id.as_str(),
             node_id: None,
             tool: None,
             action: action_owned.as_deref(),
@@ -613,10 +648,15 @@ impl Adapter for PackFlowAdapter {
             mocks,
         };
 
-        let execution = if let Some(snapshot) = self.resume.fetch(&envelope)? {
+        let execution = if let Some(snapshot) = resume_snapshot {
             let resume_pack_id = snapshot.pack_id.clone();
+            let resume_flow_id = snapshot
+                .next_flow
+                .clone()
+                .unwrap_or_else(|| snapshot.flow_id.clone());
             let resume_ctx = FlowContext {
                 pack_id: resume_pack_id.as_str(),
+                flow_id: resume_flow_id.as_str(),
                 ..ctx
             };
             self.engine.resume(resume_ctx, snapshot, payload).await

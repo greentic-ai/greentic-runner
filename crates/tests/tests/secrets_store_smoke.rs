@@ -49,8 +49,8 @@ fn invoke_component(wasm: &Path, config: Arc<HostConfig>) -> Result<String> {
         bail!(provider_core_only::blocked_message("secrets store"))
     }
     let engine = Engine::default();
-    let component =
-        Component::from_file(&engine, wasm).with_context(|| format!("failed to load {wasm:?}"))?;
+    let component = Component::from_file(&engine, wasm)
+        .map_err(|err| anyhow!("failed to load {wasm:?}: {err}"))?;
     let host_state = HostState::new(
         "secrets-store-smoke".to_string(),
         Arc::clone(&config),
@@ -70,13 +70,13 @@ fn invoke_component(wasm: &Path, config: Arc<HostConfig>) -> Result<String> {
     pack::register_all(&mut linker, false)?;
     let instance = linker
         .instantiate(&mut store, &component)
-        .context("component instantiation failed")?;
+        .map_err(|err| anyhow!("component instantiation failed: {err}"))?;
     let run = instance
         .get_typed_func::<(), (String,)>(&mut store, "run")
-        .context("missing run export")?;
+        .map_err(|err| anyhow!("missing run export: {err}"))?;
     let (result,) = run
         .call(&mut store, ())
-        .context("component execution failed")?;
+        .map_err(|err| anyhow!("component execution failed: {err}"))?;
     Ok(result)
 }
 

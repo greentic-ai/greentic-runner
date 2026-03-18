@@ -8,7 +8,7 @@ use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, Mock
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::{DynSessionStore, DynStateStore};
 use crate::runtime_wasmtime::{Component, Linker, Store};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
 use greentic_interfaces_wasmtime::host_helpers::v1::http_client::{
     HttpClientError, Request as HttpRequest, Response as HttpResponse,
@@ -344,12 +344,12 @@ impl HostState {
                             if is_missing_node_export(&err_v04, "0.4.0") {
                                 Self::try_v06_runtime(linker, store, component, input_json)
                             } else {
-                                Err(err_v04)
+                                Err(err_v04.into())
                             }
                         }
                     }
                 } else {
-                    Err(err)
+                    Err(err.into())
                 }
             }
         }
@@ -364,7 +364,7 @@ impl HostState {
     ) -> Result<InvokeResult> {
         let pre_instance = linker.instantiate_pre(component)?;
         let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance)
-            .context("component exports neither node@0.5/0.4 nor component-runtime@0.6")?;
+            .map_err(|e| anyhow!("component exports neither node@0.5/0.4 nor component-runtime@0.6: {e}"))?;
 
         let result = block_on(async {
             let bindings = pre.instantiate_async(&mut *store).await?;
@@ -378,7 +378,7 @@ impl HostState {
 
             let run_result = runtime
                 .call_run(&mut *store, &input_cbor, &empty_state)
-                .context("v0.6 component-runtime::run call failed")?;
+                .map_err(|e| anyhow!("v0.6 component-runtime::run call failed: {e}"))?;
 
             let output_value: Value = serde_cbor::from_slice(&run_result.output)
                 .context("decode v0.6 run output CBOR")?;

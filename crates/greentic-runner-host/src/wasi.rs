@@ -130,9 +130,9 @@ impl RunnerWasiPolicy {
         };
         builder
             .preopened_dir(&spec.host_path, &spec.guest_path, dir_perms, file_perms)
-            .with_context(|| {
-                format!(
-                    "failed to preopen {} as {}",
+            .map_err(|err| {
+                anyhow!(
+                    "failed to preopen {} as {}: {err}",
                     spec.host_path.display(),
                     spec.guest_path
                 )

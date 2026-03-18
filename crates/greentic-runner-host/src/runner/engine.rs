@@ -46,6 +46,8 @@ struct FlowKey {
 pub struct FlowSnapshot {
     pub pack_id: String,
     pub flow_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_flow: Option<String>,
     pub next_node: String,
     pub state: ExecutionState,
 }
@@ -360,33 +362,32 @@ impl FlowEngine {
                 ctx.pack_id
             );
         }
-        if snapshot.flow_id != ctx.flow_id {
-            bail!(
-                "snapshot flow {} does not match requested {}",
-                snapshot.flow_id,
-                ctx.flow_id
-            );
-        }
-        let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
+        let resume_flow = snapshot
+            .next_flow
+            .clone()
+            .unwrap_or_else(|| snapshot.flow_id.clone());
+        let flow_ir = self.get_or_load_flow(ctx.pack_id, &resume_flow).await?;
         let mut state = snapshot.state;
         state.replace_input(input);
         state.ensure_entry();
-        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node))
+        self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .await
     }
 
     async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let state = ExecutionState::new(input);
-        self.drive_flow(ctx, flow_ir, state, None).await
+        self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
+            .await
     }
 
     async fn drive_flow(
         &self,
         ctx: &FlowContext<'_>,
-        flow_ir: HostFlow,
+        mut flow_ir: HostFlow,
         mut state: ExecutionState,
         resume_from: Option<String>,
+        mut current_flow_id: String,
     ) -> Result<FlowExecution> {
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
@@ -399,6 +400,20 @@ impl FlowEngine {
         };
 
         loop {
+            let step_ctx = FlowContext {
+                tenant: ctx.tenant,
+                pack_id: ctx.pack_id,
+                flow_id: current_flow_id.as_str(),
+                node_id: ctx.node_id,
+                tool: ctx.tool,
+                action: ctx.action,
+                session_id: ctx.session_id,
+                provider_id: ctx.provider_id,
+                retry_config: ctx.retry_config,
+                attempt: ctx.attempt,
+                observer: ctx.observer,
+                mocks: ctx.mocks,
+            };
             let node = flow_ir
                 .nodes
                 .get(&current)
@@ -428,24 +443,28 @@ impl FlowEngine {
             let observed_payload = payload.clone();
             let node_id = current.clone();
             let event = NodeEvent {
-                context: ctx,
+                context: &step_ctx,
                 node_id: node_id.as_str(),
                 node,
                 payload: &observed_payload,
             };
-            if let Some(observer) = ctx.observer {
+            if let Some(observer) = step_ctx.observer {
                 observer.on_node_start(&event);
             }
             let dispatch = self
-                .dispatch_node(ctx, node_id.as_str(), node, &mut state, payload, &event)
+                .dispatch_node(
+                    &step_ctx,
+                    node_id.as_str(),
+                    node,
+                    &mut state,
+                    payload,
+                    &event,
+                )
                 .await;
-            let DispatchOutcome {
-                output,
-                wait_reason,
-            } = match dispatch {
+            let DispatchOutcome { output, control } = match dispatch {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    if let Some(observer) = ctx.observer {
+                    if let Some(observer) = step_ctx.observer {
                         observer.on_node_error(&event, err.as_ref());
                     }
                     return Err(err);
@@ -454,62 +473,97 @@ impl FlowEngine {
 
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
-            if let Some(observer) = ctx.observer {
+            if let Some(observer) = step_ctx.observer {
                 observer.on_node_end(&event, &output.payload);
             }
 
-            let (next, should_exit) = match &node.routing {
-                Routing::Next { node_id } => (Some(node_id.clone()), false),
-                Routing::End | Routing::Reply => (None, true),
-                Routing::Branch { default, .. } => (default.clone(), default.is_none()),
-                Routing::Custom(raw) => {
-                    tracing::warn!(
-                        flow_id = %flow_ir.id,
-                        node_id = %node_id,
-                        routing = ?raw,
-                        "unsupported routing; terminating flow"
-                    );
-                    (None, true)
+            match control {
+                NodeControl::Continue => {
+                    let (next, should_exit) = match &node.routing {
+                        Routing::Next { node_id } => (Some(node_id.clone()), false),
+                        Routing::End | Routing::Reply => (None, true),
+                        Routing::Branch { default, .. } => (default.clone(), default.is_none()),
+                        Routing::Custom(raw) => {
+                            tracing::warn!(
+                                flow_id = %flow_ir.id,
+                                node_id = %node_id,
+                                routing = ?raw,
+                                "unsupported routing; terminating flow"
+                            );
+                            (None, true)
+                        }
+                    };
+
+                    if should_exit {
+                        return Ok(FlowExecution::completed(
+                            state.finalize_with(Some(output.payload.clone())),
+                        ));
+                    }
+
+                    match next {
+                        Some(n) => current = n,
+                        None => {
+                            return Ok(FlowExecution::completed(
+                                state.finalize_with(Some(output.payload.clone())),
+                            ));
+                        }
+                    }
                 }
-            };
-
-            if let Some(wait_reason) = wait_reason {
-                let resume_target = next.clone().ok_or_else(|| {
-                    anyhow!(
-                        "session.wait node {} requires a non-empty route",
-                        current.as_str()
-                    )
-                })?;
-                let mut snapshot_state = state.clone();
-                snapshot_state.clear_egress();
-                let snapshot = FlowSnapshot {
-                    pack_id: ctx.pack_id.to_string(),
-                    flow_id: ctx.flow_id.to_string(),
-                    next_node: resume_target.as_str().to_string(),
-                    state: snapshot_state,
-                };
-                let output_value = state.clone().finalize_with(None);
-                return Ok(FlowExecution::waiting(
-                    output_value,
-                    FlowWait {
-                        reason: Some(wait_reason),
-                        snapshot,
-                    },
-                ));
-            }
-
-            if should_exit {
-                return Ok(FlowExecution::completed(
-                    state.finalize_with(Some(output.payload.clone())),
-                ));
-            }
-
-            match next {
-                Some(n) => current = n,
-                None => {
-                    return Ok(FlowExecution::completed(
-                        state.finalize_with(Some(output.payload.clone())),
+                NodeControl::Wait { reason } => {
+                    let (next, _) = match &node.routing {
+                        Routing::Next { node_id } => (Some(node_id.clone()), false),
+                        Routing::End | Routing::Reply => (None, true),
+                        Routing::Branch { default, .. } => (default.clone(), default.is_none()),
+                        Routing::Custom(raw) => {
+                            tracing::warn!(
+                                flow_id = %flow_ir.id,
+                                node_id = %node_id,
+                                routing = ?raw,
+                                "unsupported routing for wait; terminating flow"
+                            );
+                            (None, true)
+                        }
+                    };
+                    let resume_target = next.ok_or_else(|| {
+                        anyhow!(
+                            "session.wait node {} requires a non-empty route",
+                            current.as_str()
+                        )
+                    })?;
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: resume_target.as_str().to_string(),
+                        state: snapshot_state,
+                    };
+                    let output_value = state.clone().finalize_with(None);
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
                     ));
+                }
+                NodeControl::Jump(jump) => {
+                    let jump_target = self.apply_jump(&step_ctx, &mut state, jump).await?;
+                    flow_ir = jump_target.flow;
+                    current_flow_id = jump_target.flow_id;
+                    current = jump_target.node_id;
+                }
+                NodeControl::Respond {
+                    text,
+                    card_cbor,
+                    needs_user,
+                } => {
+                    let response = json!({
+                        "text": text,
+                        "card_cbor": card_cbor,
+                        "needs_user": needs_user,
+                    });
+                    state.push_egress(response);
+                    return Ok(FlowExecution::completed(state.finalize_with(None)));
                 }
             }
         }
@@ -538,11 +592,11 @@ impl FlowEngine {
                     },
                 )
                 .await
-                .map(DispatchOutcome::complete),
+                .and_then(component_dispatch_outcome),
             NodeKind::PackComponent { component_ref } => self
                 .execute_component_call(ctx, node_id, node, payload, component_ref.as_str(), event)
                 .await
-                .map(DispatchOutcome::complete),
+                .and_then(component_dispatch_outcome),
             NodeKind::FlowCall => self
                 .execute_flow_call(ctx, payload)
                 .await
@@ -566,6 +620,58 @@ impl FlowEngine {
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
         }
+    }
+
+    async fn apply_jump(
+        &self,
+        ctx: &FlowContext<'_>,
+        state: &mut ExecutionState,
+        jump: JumpControl,
+    ) -> Result<JumpTarget> {
+        let target_flow = jump.flow.trim();
+        if target_flow.is_empty() {
+            bail!("missing_flow");
+        }
+
+        let flow = self
+            .get_or_load_flow(ctx.pack_id, target_flow)
+            .await
+            .with_context(|| format!("unknown_flow:{target_flow}"))?;
+
+        let target_node = if let Some(node) = jump.node.as_deref() {
+            let parsed = NodeId::from_str(node).with_context(|| format!("unknown_node:{node}"))?;
+            if !flow.nodes.contains_key(&parsed) {
+                bail!("unknown_node:{node}");
+            }
+            parsed
+        } else {
+            flow.start
+                .clone()
+                .or_else(|| flow.nodes.keys().next().cloned())
+                .ok_or_else(|| anyhow!("jump_failed: flow {target_flow} has no start node"))?
+        };
+
+        let max_redirects = jump.max_redirects.unwrap_or(3);
+        if state.redirect_count() >= max_redirects {
+            bail!("redirect_limit");
+        }
+        state.increment_redirect_count();
+        state.replace_input(jump.payload.clone());
+        state.last_output = Some(jump.payload);
+        tracing::info!(
+            flow_id = %ctx.flow_id,
+            target_flow = %target_flow,
+            target_node = %target_node.as_str(),
+            reason = ?jump.reason,
+            redirects = state.redirect_count(),
+            "flow.jump.applied"
+        );
+
+        Ok(JumpTarget {
+            flow_id: target_flow.to_string(),
+            flow,
+            node_id: target_node,
+        })
     }
 
     async fn execute_flow_call(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
@@ -699,7 +805,6 @@ impl FlowEngine {
         event: &NodeEvent<'_>,
     ) -> Result<NodeOutput> {
         self.validate_component(ctx, event, &call)?;
-
         let key = FlowKey {
             pack_id: ctx.pack_id.to_string(),
             flow_id: ctx.flow_id.to_string(),
@@ -1077,6 +1182,8 @@ pub struct ExecutionState {
     egress: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_output: Option<Value>,
+    #[serde(default)]
+    redirect_count: u32,
 }
 
 impl ExecutionState {
@@ -1087,6 +1194,7 @@ impl ExecutionState {
             nodes: HashMap::new(),
             egress: Vec::new(),
             last_output: None,
+            redirect_count: 0,
         }
     }
 
@@ -1112,6 +1220,7 @@ impl ExecutionState {
             "entry": self.entry.clone(),
             "input": self.input.clone(),
             "nodes": nodes,
+            "redirect_count": self.redirect_count,
         })
     }
 
@@ -1132,6 +1241,14 @@ impl ExecutionState {
 
     fn clear_egress(&mut self) {
         self.egress.clear();
+    }
+
+    fn redirect_count(&self) -> u32 {
+        self.redirect_count
+    }
+
+    fn increment_redirect_count(&mut self) {
+        self.redirect_count = self.redirect_count.saturating_add(1);
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -1169,21 +1286,66 @@ impl NodeOutput {
 
 struct DispatchOutcome {
     output: NodeOutput,
-    wait_reason: Option<String>,
+    control: NodeControl,
 }
 
 impl DispatchOutcome {
     fn complete(output: NodeOutput) -> Self {
         Self {
             output,
-            wait_reason: None,
+            control: NodeControl::Continue,
         }
     }
 
     fn wait(output: NodeOutput, reason: Option<String>) -> Self {
         Self {
             output,
-            wait_reason: reason,
+            control: NodeControl::Wait { reason },
+        }
+    }
+
+    fn with_control(output: NodeOutput, control: NodeControl) -> Self {
+        Self { output, control }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum NodeControl {
+    Continue,
+    Wait {
+        reason: Option<String>,
+    },
+    Jump(JumpControl),
+    Respond {
+        text: Option<String>,
+        card_cbor: Option<Vec<u8>>,
+        needs_user: Option<bool>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct JumpControl {
+    flow: String,
+    node: Option<String>,
+    payload: Value,
+    hints: Value,
+    max_redirects: Option<u32>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct JumpTarget {
+    flow_id: String,
+    flow: HostFlow,
+    node_id: NodeId,
+}
+
+impl NodeOutput {
+    fn with_meta(payload: Value, meta: Value) -> Self {
+        Self {
+            ok: true,
+            payload,
+            meta,
         }
     }
 }
@@ -1233,6 +1395,113 @@ fn extract_wait_reason(payload: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .map(|value| value.to_string()),
         _ => None,
+    }
+}
+
+fn component_dispatch_outcome(output: NodeOutput) -> Result<DispatchOutcome> {
+    if let Some(control) = parse_component_control(&output.payload)? {
+        return Ok(match control {
+            NodeControl::Jump(jump) => {
+                let adjusted = NodeOutput::with_meta(jump.payload.clone(), jump.hints.clone());
+                DispatchOutcome::with_control(adjusted, NodeControl::Jump(jump))
+            }
+            NodeControl::Respond {
+                text,
+                card_cbor,
+                needs_user,
+            } => DispatchOutcome::with_control(
+                output,
+                NodeControl::Respond {
+                    text,
+                    card_cbor,
+                    needs_user,
+                },
+            ),
+            other => DispatchOutcome::with_control(output, other),
+        });
+    }
+    Ok(DispatchOutcome::complete(output))
+}
+
+fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
+    let Value::Object(map) = payload else {
+        return Ok(None);
+    };
+    let Some(control_value) = map.get("greentic_control") else {
+        return Ok(None);
+    };
+    let control = control_value
+        .as_object()
+        .ok_or_else(|| anyhow!("jump_failed: greentic_control must be an object"))?;
+    let action = control
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("jump_failed: greentic_control.action is required"))?;
+    let version = control
+        .get("v")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("jump_failed: greentic_control.v is required"))?;
+    if version != 1 {
+        bail!("jump_failed: unsupported greentic_control.v={version}");
+    }
+
+    match action {
+        "jump" => {
+            let flow = control
+                .get("flow")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("jump_failed: jump flow is required"))?
+                .to_string();
+            let node = control
+                .get("node")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let payload = control.get("payload").cloned().unwrap_or(Value::Null);
+            let hints = control.get("hints").cloned().unwrap_or(Value::Null);
+            let max_redirects = control
+                .get("max_redirects")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+            let reason = control
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Ok(Some(NodeControl::Jump(JumpControl {
+                flow,
+                node,
+                payload,
+                hints,
+                max_redirects,
+                reason,
+            })))
+        }
+        "respond" => {
+            let text = control
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let card_cbor = control
+                .get("card_cbor")
+                .and_then(Value::as_array)
+                .map(|bytes| {
+                    bytes
+                        .iter()
+                        .filter_map(Value::as_u64)
+                        .filter_map(|value| u8::try_from(value).ok())
+                        .collect::<Vec<_>>()
+                });
+            let needs_user = control.get("needs_user").and_then(Value::as_bool);
+            Ok(Some(NodeControl::Respond {
+                text,
+                card_cbor,
+                needs_user,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1482,12 +1751,11 @@ fn resolve_card_assets(input: &mut Value, pack: &crate::pack::PackRuntime) {
 
     // Also resolve inside `call.payload` (cards2pack duplicates the card
     // invocation there).
-    if let Value::Object(map) = input {
-        if let Some(Value::Object(call)) = map.get_mut("call") {
-            if let Some(payload) = call.get_mut("payload") {
-                resolve_card_spec_asset(payload, pack);
-            }
-        }
+    if let Value::Object(map) = input
+        && let Some(Value::Object(call)) = map.get_mut("call")
+        && let Some(payload) = call.get_mut("payload")
+    {
+        resolve_card_spec_asset(payload, pack);
     }
 }
 
@@ -1614,6 +1882,55 @@ mod tests {
                 { "text": "extra-2" }
             ])
         );
+    }
+
+    #[test]
+    fn parse_component_control_ignores_plain_payload() {
+        let payload = json!({
+            "flow": "not-a-control-field",
+            "node": "n1"
+        });
+        let control = parse_component_control(&payload).expect("parse control");
+        assert!(control.is_none());
+    }
+
+    #[test]
+    fn parse_component_control_parses_jump_marker() {
+        let payload = json!({
+            "greentic_control": {
+                "action": "jump",
+                "v": 1,
+                "flow": "flow.b",
+                "node": "node-2",
+                "payload": { "message": "hi" },
+                "hints": { "k": "v" },
+                "max_redirects": 2,
+                "reason": "handoff"
+            }
+        });
+        let control = parse_component_control(&payload)
+            .expect("parse control")
+            .expect("missing control");
+        match control {
+            NodeControl::Jump(jump) => {
+                assert_eq!(jump.flow, "flow.b");
+                assert_eq!(jump.node.as_deref(), Some("node-2"));
+                assert_eq!(jump.payload, json!({ "message": "hi" }));
+                assert_eq!(jump.hints, json!({ "k": "v" }));
+                assert_eq!(jump.max_redirects, Some(2));
+                assert_eq!(jump.reason.as_deref(), Some("handoff"));
+            }
+            other => panic!("expected jump control, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_component_control_rejects_invalid_marker() {
+        let payload = json!({
+            "greentic_control": "bad-shape"
+        });
+        let err = parse_component_control(&payload).expect_err("expected invalid marker error");
+        assert!(err.to_string().contains("greentic_control"));
     }
 
     #[test]
@@ -1850,6 +2167,182 @@ mod tests {
         assert_eq!(starts.len(), 1);
         assert_eq!(ends.len(), 1);
         assert_eq!(ends[0], json!({ "message": "logged" }));
+    }
+
+    fn host_flow_for_test(
+        flow_id: &str,
+        node_ids: &[&str],
+        default_start: Option<&str>,
+    ) -> HostFlow {
+        let mut nodes = indexmap::IndexMap::default();
+        for node_id in node_ids {
+            let id = NodeId::from_str(node_id).unwrap();
+            let node = Node {
+                id: id.clone(),
+                component: FlowComponentRef {
+                    id: "emit.log".parse().unwrap(),
+                    pack_alias: None,
+                    operation: None,
+                },
+                input: InputMapping {
+                    mapping: json!({ "message": node_id }),
+                },
+                output: OutputMapping {
+                    mapping: Value::Null,
+                },
+                routing: Routing::End,
+                telemetry: TelemetryHints::default(),
+            };
+            nodes.insert(id, node);
+        }
+        let mut entrypoints = BTreeMap::new();
+        if let Some(start) = default_start {
+            entrypoints.insert("default".to_string(), Value::String(start.to_string()));
+        }
+        HostFlow::from(Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str(flow_id).unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints,
+            nodes,
+            metadata: Default::default(),
+        })
+    }
+
+    fn jump_test_engine() -> FlowEngine {
+        let target_flow = host_flow_for_test("flow.target", &["node-a", "node-b"], None);
+        FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "flow.target".to_string(),
+                },
+                target_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+        }
+    }
+
+    fn jump_ctx<'a>(flow_id: &'a str) -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[test]
+    fn apply_jump_unknown_flow_errors() {
+        let engine = minimal_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                JumpControl {
+                    flow: "flow.missing".into(),
+                    node: None,
+                    payload: json!({ "ok": true }),
+                    hints: Value::Null,
+                    max_redirects: None,
+                    reason: None,
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown_flow"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_jump_unknown_node_errors() {
+        let engine = jump_test_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                JumpControl {
+                    flow: "flow.target".into(),
+                    node: Some("node-missing".into()),
+                    payload: json!({ "ok": true }),
+                    hints: Value::Null,
+                    max_redirects: None,
+                    reason: None,
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown_node"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_jump_uses_default_start_fallback() {
+        let engine = jump_test_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let rt = Runtime::new().unwrap();
+        let target = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                JumpControl {
+                    flow: "flow.target".into(),
+                    node: None,
+                    payload: json!({ "k": "v" }),
+                    hints: Value::Null,
+                    max_redirects: None,
+                    reason: None,
+                },
+            ))
+            .expect("jump target");
+        assert_eq!(target.flow_id, "flow.target");
+        assert_eq!(target.node_id.as_str(), "node-a");
+    }
+
+    #[test]
+    fn apply_jump_redirect_limit_enforced() {
+        let engine = jump_test_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        state.redirect_count = 3;
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(engine.apply_jump(
+                &jump_ctx("flow.source"),
+                &mut state,
+                JumpControl {
+                    flow: "flow.target".into(),
+                    node: None,
+                    payload: json!({ "k": "v" }),
+                    hints: Value::Null,
+                    max_redirects: Some(3),
+                    reason: None,
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(err.to_string(), "redirect_limit");
     }
 }
 

@@ -52,6 +52,7 @@ mod redis_lb {
             snapshot: FlowSnapshot {
                 pack_id: "pack.redis".into(),
                 flow_id: "flow.main".into(),
+                next_flow: None,
                 next_node: next_node.into(),
                 state,
             },

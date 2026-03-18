@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 pub mod v0_4 {
     wasmtime::component::bindgen!({
         inline: r#"
@@ -168,6 +170,74 @@ pub mod v0_6_descriptor {
     });
 }
 
+// Component ABI bridge for runner-host: adds greentic:component/node@0.6 invoke envelope/result adapters and
+// keeps backward compatibility with v0.5/v0.4.
+pub mod v0_6 {
+    wasmtime::component::bindgen!({
+        inline: r#"
+        package greentic:component@0.6.0;
+
+        interface node {
+          type capability-id = string;
+          type component-id = string;
+          type flow-id = string;
+          type step-id = string;
+          type tenant-id = string;
+          type team-id = string;
+          type user-id = string;
+          type env-id = string;
+          type trace-id = string;
+          type correlation-id = string;
+
+          record node-error {
+            code: string,
+            message: string,
+            retryable: bool,
+            backoff-ms: option<u64>,
+            details: option<list<u8>>,
+          }
+
+          record tenant-ctx {
+            tenant-id: tenant-id,
+            team-id: option<team-id>,
+            user-id: option<user-id>,
+            env-id: env-id,
+            trace-id: trace-id,
+            correlation-id: correlation-id,
+            deadline-ms: u64,
+            attempt: u32,
+            idempotency-key: option<string>,
+            i18n-id: string,
+          }
+
+          record invocation-envelope {
+            ctx: tenant-ctx,
+            flow-id: flow-id,
+            step-id: step-id,
+            component-id: component-id,
+            attempt: u32,
+            payload-cbor: list<u8>,
+            metadata-cbor: option<list<u8>>,
+          }
+
+          record invocation-result {
+            ok: bool,
+            output-cbor: list<u8>,
+            output-metadata-cbor: option<list<u8>>,
+          }
+
+          invoke: func(op: string, envelope: invocation-envelope) -> result<invocation-result, node-error>;
+        }
+
+        world component {
+          export node;
+        }
+        "#,
+        world: "component",
+    });
+}
+
+
 pub mod v0_6_runtime {
     wasmtime::component::bindgen!({
         inline: r#"
@@ -282,6 +352,61 @@ pub fn exec_ctx_v0_5(ctx: &node::ExecCtx) -> v0_5::exports::greentic::component:
     }
 }
 
+pub fn envelope_v0_6(
+    ctx: &node::ExecCtx,
+    component_id: &str,
+    payload_json: &str,
+) -> Result<v0_6::exports::greentic::component::node::InvocationEnvelope> {
+    let env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
+    let step_id = ctx
+        .node_id
+        .clone()
+        .unwrap_or_else(|| "component.exec".to_string());
+    let i18n_id = ctx
+        .i18n_id
+        .clone()
+        .or_else(|| ctx.tenant.i18n_id.clone())
+        .unwrap_or_default();
+    let trace_id = ctx.tenant.trace_id.clone().unwrap_or_default();
+    let correlation_id = ctx.tenant.correlation_id.clone().unwrap_or_default();
+    let deadline_ms = ctx.tenant.deadline_unix_ms.unwrap_or(u64::MAX);
+    let payload_cbor = if let Ok(invocation) =
+        serde_json::from_str::<greentic_types::InvocationEnvelope>(payload_json)
+    {
+        match serde_json::from_slice::<serde_json::Value>(&invocation.payload) {
+            Ok(value) => serde_cbor::to_vec(&value)?,
+            Err(_) => serde_cbor::to_vec(&serde_cbor::Value::Bytes(invocation.payload))?,
+        }
+    } else {
+        let payload_value = serde_json::from_str::<serde_json::Value>(payload_json)
+            .unwrap_or_else(|_| serde_json::Value::String(payload_json.to_string()));
+        serde_cbor::to_vec(&payload_value)?
+    };
+
+    Ok(
+        v0_6::exports::greentic::component::node::InvocationEnvelope {
+            ctx: v0_6::exports::greentic::component::node::TenantCtx {
+                tenant_id: ctx.tenant.tenant.clone(),
+                team_id: ctx.tenant.team.clone(),
+                user_id: ctx.tenant.user.clone(),
+                env_id: env,
+                trace_id,
+                correlation_id,
+                deadline_ms,
+                attempt: ctx.tenant.attempt,
+                idempotency_key: ctx.tenant.idempotency_key.clone(),
+                i18n_id,
+            },
+            flow_id: ctx.flow_id.clone(),
+            step_id,
+            component_id: component_id.to_string(),
+            attempt: ctx.tenant.attempt,
+            payload_cbor,
+            metadata_cbor: None,
+        },
+    )
+}
+
 pub fn invoke_result_from_v0_4(
     result: v0_4::exports::greentic::component::node::InvokeResult,
 ) -> node::InvokeResult {
@@ -298,6 +423,37 @@ pub fn invoke_result_from_v0_4(
                 details: err.details,
             })
         }
+    }
+}
+
+pub fn invoke_result_from_v0_6(
+    result: std::result::Result<
+        v0_6::exports::greentic::component::node::InvocationResult,
+        v0_6::exports::greentic::component::node::NodeError,
+    >,
+) -> Result<node::InvokeResult> {
+    match result {
+        Ok(ok) => {
+            let body = cbor_to_json_string(&ok.output_cbor);
+            if ok.ok {
+                Ok(node::InvokeResult::Ok(body))
+            } else {
+                Ok(node::InvokeResult::Err(node::NodeError {
+                    code: "COMPONENT_INVOCATION_FAILED".to_string(),
+                    message: body,
+                    retryable: false,
+                    backoff_ms: None,
+                    details: None,
+                }))
+            }
+        }
+        Err(err) => Ok(node::InvokeResult::Err(node::NodeError {
+            code: err.code,
+            message: err.message,
+            retryable: err.retryable,
+            backoff_ms: err.backoff_ms,
+            details: err.details.map(|bytes| cbor_to_json_string(bytes.as_ref())),
+        })),
     }
 }
 
@@ -320,6 +476,17 @@ pub fn invoke_result_from_v0_5(
     }
 }
 
+fn cbor_to_json_string(bytes: &[u8]) -> String {
+    match serde_cbor::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| serde_json::to_string(&value).ok())
+    {
+        Some(json) => json,
+        None => String::from_utf8_lossy(bytes).to_string(),
+    }
+}
+
+
 /// Convert v0.6 `component-runtime::run()` output to the canonical InvokeResult.
 /// Decodes CBOR output bytes to a JSON string.
 pub fn invoke_result_from_v0_6_run(
@@ -333,4 +500,55 @@ pub fn invoke_result_from_v0_6_run(
         }
     };
     node::InvokeResult::Ok(json_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{envelope_v0_6, node};
+    use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
+    use std::str::FromStr;
+
+    fn sample_exec_ctx() -> node::ExecCtx {
+        node::ExecCtx {
+            tenant: node::TenantCtx {
+                tenant: "tenant.demo".to_string(),
+                team: Some("team.demo".to_string()),
+                user: Some("user.demo".to_string()),
+                trace_id: Some("trace.demo".to_string()),
+                i18n_id: Some("en-US".to_string()),
+                correlation_id: Some("corr.demo".to_string()),
+                deadline_unix_ms: Some(123),
+                attempt: 2,
+                idempotency_key: Some("idem.demo".to_string()),
+            },
+            i18n_id: Some("en-US".to_string()),
+            flow_id: "flow.demo".to_string(),
+            node_id: Some("node.demo".to_string()),
+        }
+    }
+
+    #[test]
+    fn envelope_v0_6_preserves_binary_payload_when_envelope_payload_is_not_json() {
+        let envelope = InvocationEnvelope {
+            ctx: TenantCtx::new(
+                EnvId::from_str("local").expect("valid env id"),
+                TenantId::from_str("tenant.default").expect("valid tenant id"),
+            ),
+            flow_id: "flow.demo".to_string(),
+            node_id: Some("node.demo".to_string()),
+            op: "on_message".to_string(),
+            payload: vec![255, 0, 1, 42],
+            metadata: Vec::new(),
+        };
+        let payload_json = serde_json::to_string(&envelope).expect("serialize invocation envelope");
+        let envelope = envelope_v0_6(&sample_exec_ctx(), "component.demo", &payload_json)
+            .expect("envelope conversion");
+        let decoded: serde_cbor::Value =
+            serde_cbor::from_slice(&envelope.payload_cbor).expect("decode cbor");
+        assert_eq!(
+            decoded,
+            serde_cbor::Value::Bytes(vec![255, 0, 1, 42]),
+            "binary payload must not be dropped when not valid json bytes"
+        );
+    }
 }
