@@ -1,0 +1,1 @@
+/Users/maarten/Documents/GitHub/agentic/greentic-runner/tests/assets/component-v0-6-dummy/target/wasm32-wasip2/release/component_v0_6_dummy.wasm: /Users/maarten/Documents/GitHub/agentic/greentic-runner/tests/assets/component-v0-6-dummy/src/lib.rs /Users/maarten/Documents/GitHub/agentic/greentic-runner/tests/assets/component-v0-6-dummy/wit/component-v0-6.wit
