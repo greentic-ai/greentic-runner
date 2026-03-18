@@ -6,8 +6,10 @@ use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
 use crate::runtime_wasmtime::{Linker, ResourceTable};
 use crate::wasi::RunnerWasiPolicy;
 use anyhow::{Context, Result};
-use greentic_interfaces_wasmtime::host_helpers::v1::{self as host_v1, HostFns, add_all_v1_to_linker};
 use greentic_interfaces_wasmtime::host_helpers::v1::http_client as host_http_client;
+use greentic_interfaces_wasmtime::host_helpers::v1::{
+    self as host_v1, HostFns, add_all_v1_to_linker,
+};
 use greentic_interfaces_wasmtime::http_client_client_v1_1::greentic::http::http_client as http_client_client_alias;
 use greentic_interfaces_wasmtime::http_client_client_v1_1::greentic::interfaces_types::types as http_types_v1_1;
 use std::sync::Arc;
@@ -122,7 +124,9 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
 }
 
 /// Add component control functions to linker.
-pub fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmtime::Result<()> {
+pub fn add_component_control_to_linker(
+    linker: &mut Linker<ComponentState>,
+) -> wasmtime::Result<()> {
     add_component_control_instance(linker, "greentic:component/control@0.5.0")?;
     add_component_control_instance(linker, "greentic:component/control@0.4.0")?;
     Ok(())

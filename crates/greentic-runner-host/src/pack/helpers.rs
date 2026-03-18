@@ -14,8 +14,7 @@ use tempfile::TempDir;
 use zip::ZipArchive;
 
 /// Global HTTP client shared across pack operations.
-pub static HTTP_CLIENT: Lazy<Arc<BlockingClient>> =
-    Lazy::new(|| Arc::new(build_blocking_client()));
+pub static HTTP_CLIENT: Lazy<Arc<BlockingClient>> = Lazy::new(|| Arc::new(build_blocking_client()));
 
 fn build_blocking_client() -> BlockingClient {
     std::thread::spawn(|| {

@@ -21,7 +21,7 @@ mod resolution;
 mod runtime;
 
 // Re-export public types
-pub use component_state::{ComponentState, register_all, add_component_control_to_linker};
+pub use component_state::{ComponentState, add_component_control_to_linker, register_all};
 pub use flows::FlowDescriptor;
 pub use host_state::HostState;
 pub use i18n::I18nCatalog;

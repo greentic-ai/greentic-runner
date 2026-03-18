@@ -227,21 +227,11 @@ pub(crate) async fn load_components_from_sources(
 
         let bytes = match &source.artifact {
             ComponentArtifactLocation::Inline { wasm_path } => {
-                load_inline_artifact(
-                    &spec.id,
-                    wasm_path,
-                    materialized_root,
-                    archive.as_mut(),
-                )?
+                load_inline_artifact(&spec.id, wasm_path, materialized_root, archive.as_mut())?
             }
             ComponentArtifactLocation::Remote => {
-                load_remote_artifact(
-                    &spec.id,
-                    source,
-                    component_resolution,
-                    &mut dist_client,
-                )
-                .await?
+                load_remote_artifact(&spec.id, source, component_resolution, &mut dist_client)
+                    .await?
             }
         };
 
@@ -333,8 +323,8 @@ async fn load_remote_artifact(
         );
     }
 
-    let client = dist_client
-        .get_or_insert_with(|| DistClient::new(dist_options_from(component_resolution)));
+    let client =
+        dist_client.get_or_insert_with(|| DistClient::new(dist_options_from(component_resolution)));
     let reference = source.source.to_string();
 
     fault::maybe_fail_asset(&reference)

@@ -237,7 +237,6 @@ pub mod v0_6 {
     });
 }
 
-
 pub mod v0_6_runtime {
     wasmtime::component::bindgen!({
         inline: r#"
@@ -485,7 +484,6 @@ fn cbor_to_json_string(bytes: &[u8]) -> String {
         None => String::from_utf8_lossy(bytes).to_string(),
     }
 }
-
 
 /// Convert v0.6 `component-runtime::run()` output to the canonical InvokeResult.
 /// Decodes CBOR output bytes to a JSON string.

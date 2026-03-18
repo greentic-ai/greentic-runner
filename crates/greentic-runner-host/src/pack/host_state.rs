@@ -1,21 +1,23 @@
 //! Host state for WASM component execution.
 
-use crate::component_api::{self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError};
+use crate::component_api::{
+    self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError,
+};
 use crate::config::HostConfig;
 use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost};
 use crate::provider_core_only;
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
+use crate::runtime_wasmtime::{Component, Linker, Store};
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::{DynSessionStore, DynStateStore};
-use crate::runtime_wasmtime::{Component, Linker, Store};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
 use greentic_interfaces_wasmtime::host_helpers::v1::http_client::{
-    HttpClientError, Request as HttpRequest, Response as HttpResponse,
-    RequestOptionsV1_1 as HttpRequestOptionsV1_1, TenantCtx as HttpTenantCtx,
+    HttpClientError, Request as HttpRequest, RequestOptionsV1_1 as HttpRequestOptionsV1_1,
+    Response as HttpResponse, TenantCtx as HttpTenantCtx,
 };
-use greentic_types::{EnvId, TeamId, TenantCtx as TypesTenantCtx, TenantId, UserId};
 use greentic_interfaces_wasmtime::host_helpers::v1::state_store::TenantCtx as StateTenantCtx;
+use greentic_types::{EnvId, TeamId, TenantCtx as TypesTenantCtx, TenantId, UserId};
 use reqwest::blocking::Client as BlockingClient;
 use serde_json::Value;
 use std::str::FromStr;
@@ -363,8 +365,9 @@ impl HostState {
         input_json: &str,
     ) -> Result<InvokeResult> {
         let pre_instance = linker.instantiate_pre(component)?;
-        let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance)
-            .map_err(|e| anyhow!("component exports neither node@0.5/0.4 nor component-runtime@0.6: {e}"))?;
+        let pre = component_api::v0_6_runtime::ComponentV0V6RuntimePre::new(pre_instance).map_err(
+            |e| anyhow!("component exports neither node@0.5/0.4 nor component-runtime@0.6: {e}"),
+        )?;
 
         let result = block_on(async {
             let bindings = pre.instantiate_async(&mut *store).await?;
