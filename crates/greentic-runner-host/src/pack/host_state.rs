@@ -73,7 +73,7 @@ impl HostState {
             mocks,
             secrets,
             oauth_config,
-            oauth_host: OAuthBrokerHost::default(),
+            oauth_host: OAuthBrokerHost,
             exec_ctx,
             component_ref,
             provider_core_component,
@@ -83,12 +83,11 @@ impl HostState {
     /// Build a TenantCtx for secrets lookups including team from exec context.
     pub(crate) fn secrets_tenant_ctx(&self) -> TypesTenantCtx {
         let mut ctx = self.config.tenant_ctx();
-        if let Some(exec_ctx) = self.exec_ctx.as_ref() {
-            if let Some(team) = exec_ctx.tenant.team.as_ref() {
-                if let Ok(team_id) = TeamId::from_str(team) {
-                    ctx = ctx.with_team(Some(team_id));
-                }
-            }
+        if let Some(exec_ctx) = self.exec_ctx.as_ref()
+            && let Some(team) = exec_ctx.tenant.team.as_ref()
+            && let Ok(team_id) = TeamId::from_str(team)
+        {
+            ctx = ctx.with_team(Some(team_id));
         }
         ctx
     }

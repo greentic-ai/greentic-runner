@@ -338,6 +338,7 @@ async fn load_remote_artifact(
         )
     })?;
 
+    #[allow(deprecated)] // TODO: migrate to parse_source + resolve + fetch
     let cache_path = if component_resolution.dist_offline {
         client
             .fetch_digest(digest)

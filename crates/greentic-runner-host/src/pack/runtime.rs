@@ -143,13 +143,12 @@ impl PackRuntime {
         };
         let archive_hint = archive_hint_path.as_deref();
 
-        if verify_archive {
-            if let Some(verify_target) = archive_hint
+        if verify_archive
+            && let Some(verify_target) = archive_hint
                 .and_then(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|_| p))
-            {
-                verify::verify_pack(verify_target).await?;
-                tracing::info!(pack_path = %verify_target.display(), "pack verification complete");
-            }
+        {
+            verify::verify_pack(verify_target).await?;
+            tracing::info!(pack_path = %verify_target.display(), "pack verification complete");
         }
 
         let engine = Engine::default();
@@ -195,33 +194,34 @@ impl PackRuntime {
             }
         }
 
-        if manifest.is_none() && legacy_manifest.is_none() {
-            if let Some(archive_path) = archive_hint {
-                match load_manifest_and_flows(archive_path) {
-                    Ok(ManifestLoad::New {
-                        manifest: m,
-                        flows: cache,
-                    }) => {
-                        metadata = cache.metadata.clone();
-                        manifest = Some(*m);
-                        flows = Some(cache);
-                    }
-                    Ok(ManifestLoad::Legacy {
-                        manifest: m,
-                        flows: cache,
-                    }) => {
-                        metadata = cache.metadata.clone();
-                        legacy_manifest = Some(m);
-                        flows = Some(cache);
-                    }
-                    Err(err) => {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "failed to load manifest.cbor from {}",
-                                archive_path.display()
-                            )
-                        });
-                    }
+        if manifest.is_none()
+            && legacy_manifest.is_none()
+            && let Some(archive_path) = archive_hint
+        {
+            match load_manifest_and_flows(archive_path) {
+                Ok(ManifestLoad::New {
+                    manifest: m,
+                    flows: cache,
+                }) => {
+                    metadata = cache.metadata.clone();
+                    manifest = Some(*m);
+                    flows = Some(cache);
+                }
+                Ok(ManifestLoad::Legacy {
+                    manifest: m,
+                    flows: cache,
+                }) => {
+                    metadata = cache.metadata.clone();
+                    legacy_manifest = Some(m);
+                    flows = Some(cache);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "failed to load manifest.cbor from {}",
+                            archive_path.display()
+                        )
+                    });
                 }
             }
         }
@@ -564,10 +564,10 @@ impl PackRuntime {
                     if scope.env != env || scope.tenant != tenant {
                         return false;
                     }
-                    if let Some(ref team_req) = scope.team {
-                        if team.as_ref() != Some(team_req) {
-                            return false;
-                        }
+                    if let Some(ref team_req) = scope.team
+                        && team.as_ref() != Some(team_req)
+                    {
+                        return false;
                     }
                 }
                 let ctx = self.config.tenant_ctx();
