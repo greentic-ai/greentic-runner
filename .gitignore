@@ -5,6 +5,7 @@
 tests/fixtures/**/target/
 tests/fixtures/**/target-test/
 tests/fixtures/packs/runner-components/components/
+temp_auto_push.bat
 tests/fixtures/packs/runner-components/manifest.cbor
 .greentic
 examples/packs/*.gtpack
@@ -12,3 +13,5 @@ examples/packs/*.gtpack
 .packs/
 tests/assets/provider-core-dummy/target/
 crates/tests/trace.json
+.gitignore
+branch_structure.json
