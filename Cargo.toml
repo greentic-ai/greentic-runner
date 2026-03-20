@@ -20,7 +20,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.4.65"
+version = "0.4.66"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -86,9 +86,9 @@ serial_test = "3"
 toml = "0.9"
 greentic-telemetry = "0.4"
 walkdir = "2"
-wasmtime = { version = "42", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-wasmtime-wasi = { version = "42", default-features = false, features = ["p2"] }
-wasmtime-environ = { version = "42" }
+wasmtime = { version = "43", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime-wasi = { version = "43", default-features = false, features = ["p2"] }
+wasmtime-environ = { version = "43" }
 jsonschema = "0.45"
 handlebars = "6"
 dashmap = "6"
