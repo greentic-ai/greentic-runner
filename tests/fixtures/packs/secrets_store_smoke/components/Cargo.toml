@@ -11,5 +11,6 @@ crate-type = ["cdylib"]
 path = "echo_secret.rs"
 
 [dependencies]
-anyhow = "1"
-wit-bindgen = { version = "0.50", default-features = false, features = ["macros", "realloc"] }
+anyhow =  { workspace = true }
+
+wit-bindgen = { workspace = true, default-features = false, features = ["macros", "realloc"] }
