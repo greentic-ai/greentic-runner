@@ -100,7 +100,7 @@ impl PackRuntime {
             .state
             .as_ref()
             .map(|caps| caps.read || caps.write)
-            .unwrap_or(true)
+            .unwrap_or(false)
     }
 
     /// Check if pack contains a component.

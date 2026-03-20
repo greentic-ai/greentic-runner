@@ -622,6 +622,7 @@ fn gtpack_manifest_loads_remote_components_from_cache() -> Result<()> {
         false,
         ComponentResolution {
             dist_cache_dir: Some(cache_root),
+            dist_offline: true,
             ..ComponentResolution::default()
         },
     ))?);
