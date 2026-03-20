@@ -120,6 +120,13 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
+
+    // Register type-only interfaces that components may import directly
+    let _ = linker.instance("greentic:interfaces-types/types@0.1.0");
+    let _ = linker.instance("greentic:interfaces-types/types@0.2.0");
+    let _ = linker.instance("greentic:interfaces-types/types@0.3.0");
+    let _ = linker.instance("greentic:interfaces-types/types@0.4.0");
+
     Ok(())
 }
 
