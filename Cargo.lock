@@ -1698,14 +1698,16 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.4.56"
+version = "0.4.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b34a2b1f808f3ab6fcf732ac705db5283ed813705ae49de375d30c4d0f37140"
+checksum = "17723c7a4cff94e5983315bd8c738ba99f08e1b9c4641deb0e0481bcf4a27268"
 dependencies = [
  "anyhow",
  "blake3",
+ "chrono",
  "ciborium",
  "clap",
+ "dashmap",
  "greentic-distributor-client",
  "greentic-i18n-translator",
  "greentic-interfaces-host",
@@ -1733,6 +1735,7 @@ dependencies = [
  "unic-langid",
  "url",
  "wasmtime",
+ "wasmtime-environ",
  "wasmtime-wasi",
 ]
 
