@@ -1512,7 +1512,8 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
         state.entry.clone()
     };
     let mut ctx = JsonMap::new();
-    ctx.insert("entry".into(), entry);
+    ctx.insert("entry".into(), entry.clone());
+    ctx.insert("in".into(), entry); // alias for entry - used in flow templates
     ctx.insert("prev".into(), prev);
     ctx.insert("node".into(), Value::Object(state.outputs_map()));
     ctx.insert("state".into(), state.context());
