@@ -102,6 +102,26 @@ consent URLs, exchange codes for tokens, or fetch stored tokens, while
 environments without the block behave exactly as before (no broker world is
 wired).
 
+For OAuth-backed `events-email` execution, the host now has the first explicit
+execution helpers in:
+
+- [adapt_events_email.rs](/home/vgrishkyan/greentic/greentic-runner/crates/greentic-runner-host/src/runner/adapt_events_email.rs)
+- [oauth.rs](/home/vgrishkyan/greentic/greentic-runner/crates/greentic-runner-host/src/oauth.rs)
+
+The intended host-side flow is:
+
+1. parse `EmailSendRequest`
+2. validate the embedded OAuth hint
+3. build the resource-token request
+4. build the provider HTTP execution target
+5. perform the live HTTP call with the resolved access token
+
+`TenantRuntime` now exposes the first host-side primitives for this path:
+
+- `build_events_email_execution_plan(...)`
+- `execute_events_email_request(...)`
+- `execute_events_email_with_oauth(...)`
+
 ## Quick start
 
 ```rust

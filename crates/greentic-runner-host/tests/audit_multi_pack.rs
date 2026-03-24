@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
     WebhookPolicy,
@@ -41,9 +42,66 @@ fn host_config(tenant: &str) -> HostConfig {
 }
 
 fn fixture_component() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../tests/fixtures/runner-components/target-test/wasm32-wasip2/release/qa_process.wasm",
-    )
+    let workspace = workspace_root().join("tests/fixtures/runner-components");
+    let target_root = workspace.join("target-test");
+    target_root.join("wasm32-wasip2/release/qa_process.wasm")
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .expect("workspace root")
+}
+
+fn ensure_fixture_component() -> Result<PathBuf> {
+    let artifact = fixture_component();
+    if artifact.exists() {
+        return Ok(artifact);
+    }
+
+    let workspace = workspace_root().join("tests/fixtures/runner-components");
+    let target_root = workspace.join("target-test");
+    let manifest = workspace.join("qa_process/Cargo.toml");
+    let offline = std::env::var("CARGO_NET_OFFLINE").ok();
+    let mut cmd = Command::new("cargo");
+    if let Some(val) = &offline {
+        cmd.env("CARGO_NET_OFFLINE", val);
+    }
+    let mut args: Vec<String> = vec![
+        "build".into(),
+        "--manifest-path".into(),
+        manifest
+            .to_str()
+            .ok_or_else(|| anyhow!("fixture manifest path not valid utf-8"))?
+            .into(),
+        "--target".into(),
+        "wasm32-wasip2".into(),
+        "--release".into(),
+    ];
+    if matches!(offline.as_deref(), Some("true")) {
+        args.insert(1, "--offline".into());
+    }
+
+    let status = cmd
+        .env("CARGO_TARGET_DIR", &target_root)
+        .current_dir(&workspace)
+        .args(args)
+        .status()
+        .context("failed to build qa_process fixture component")?;
+    if !status.success() {
+        anyhow::bail!("qa_process fixture component build failed");
+    }
+
+    if artifact.exists() {
+        Ok(artifact)
+    } else {
+        Err(anyhow!(
+            "component artifact missing: {}",
+            artifact.display()
+        ))
+    }
 }
 
 fn flow_ir(flow_id: &str) -> FlowIR {
@@ -107,7 +165,7 @@ async fn state_store_key_includes_pack_id() -> Result<()> {
 #[tokio::test]
 async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
     let config = Arc::new(host_config("tenant-a"));
-    let component = fixture_component();
+    let component = ensure_fixture_component()?;
     let pack_a = PackRuntime::for_component_test(
         vec![("qa.process".to_string(), component.clone())],
         HashMap::from([("main".to_string(), flow_ir("main"))]),
