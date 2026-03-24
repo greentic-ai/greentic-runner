@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use axum::http::StatusCode;
 use lru::LruCache;
@@ -18,9 +18,13 @@ use tokio::task::JoinHandle;
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::StateMachineRuntime;
+use crate::oauth::{OAuthBrokerConfig, request_resource_token};
 use crate::operator_metrics::OperatorMetrics;
 use crate::operator_registry::OperatorRegistry;
 use crate::pack::{ComponentResolution, PackRuntime};
+use crate::runner::adapt_events_email::{
+    EmailExecutionPlan, EmailSendRequest, build_email_execution_plan, execute_email_request,
+};
 use crate::runner::contract_cache::{ContractCache, ContractCacheStats};
 use crate::runner::engine::FlowEngine;
 use crate::runner::mocks::MockLayer;
@@ -299,6 +303,10 @@ impl TenantRuntime {
         &self.http_client
     }
 
+    pub fn oauth_config(&self) -> Option<OAuthBrokerConfig> {
+        self.config.oauth_broker_config()
+    }
+
     pub fn digest(&self) -> Option<&str> {
         self.digests.first().and_then(|d| d.as_deref())
     }
@@ -353,6 +361,36 @@ impl TenantRuntime {
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
         Ok(value)
+    }
+
+    pub fn build_events_email_execution_plan(
+        &self,
+        tenant: &greentic_types::TenantCtx,
+        request: &EmailSendRequest,
+    ) -> Result<EmailExecutionPlan> {
+        let oauth = self
+            .oauth_config()
+            .ok_or_else(|| anyhow!("oauth broker config is not configured for tenant runtime"))?;
+        build_email_execution_plan(&oauth, tenant, request)
+    }
+
+    pub async fn execute_events_email_request(
+        &self,
+        access_token: &str,
+        request: &EmailSendRequest,
+    ) -> Result<()> {
+        execute_email_request(self.http_client(), access_token, request).await
+    }
+
+    pub async fn execute_events_email_with_oauth(
+        &self,
+        tenant: &greentic_types::TenantCtx,
+        request: &EmailSendRequest,
+    ) -> Result<()> {
+        let plan = self.build_events_email_execution_plan(tenant, request)?;
+        let token = request_resource_token(self.http_client(), &plan.token_request).await?;
+        self.execute_events_email_request(&token.access_token, request)
+            .await
     }
 
     pub fn pack_for_component(&self, component_ref: &str) -> Option<Arc<PackRuntime>> {

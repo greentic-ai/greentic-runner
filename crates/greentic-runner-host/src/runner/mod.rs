@@ -1,3 +1,4 @@
+pub mod adapt_events_email;
 pub mod adapt_messaging;
 pub mod adapt_slack;
 pub mod adapt_teams;
