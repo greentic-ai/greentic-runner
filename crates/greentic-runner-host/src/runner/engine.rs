@@ -1542,8 +1542,23 @@ impl From<Flow> for HostFlow {
 
 impl From<Node> for HostNode {
     fn from(node: Node) -> Self {
-        let component_ref = node.component.id.as_str().to_string();
-        let raw_operation = node.component.operation.clone();
+        let full_ref = node.component.id.as_str().to_string();
+        // When the pack compiler stores "component.operation" as a single ID
+        // without a separate operation field, split on the last dot.
+        let is_builtin = full_ref.starts_with("component.exec")
+            || full_ref.starts_with("flow.")
+            || full_ref.starts_with("emit.")
+            || full_ref.starts_with("session.")
+            || full_ref.starts_with("provider.");
+        let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
+            (full_ref, node.component.operation.clone())
+        } else if let Some(dot) = full_ref.rfind('.') {
+            let comp = full_ref[..dot].to_string();
+            let op = full_ref[dot + 1..].to_string();
+            (comp, Some(op))
+        } else {
+            (full_ref, None)
+        };
         let operation_in_mapping = extract_operation_from_mapping(&node.input.mapping);
         let operation_is_component_exec = raw_operation.as_deref() == Some("component.exec");
         let operation_is_emit = raw_operation
