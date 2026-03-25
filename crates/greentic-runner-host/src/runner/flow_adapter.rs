@@ -123,17 +123,64 @@ fn map_nodes(nodes: IndexMap<String, NodeIR>) -> Result<IndexMap<NodeId, Node, F
 }
 
 fn map_node(node_id: NodeId, node_ir: NodeIR) -> Result<Node> {
-    let component_id = ComponentId::from_str(&node_ir.component).with_context(|| {
-        format!(
-            "invalid component ref `{}` for node {}",
-            node_ir.component,
-            node_id.as_str()
-        )
-    })?;
+    // Split "component-id.operation" from the YGTC node key.
+    // When the component string contains a '.', try splitting on the last '.'
+    // to separate component ID from operation (e.g. "redbutton-handler.render"
+    // → component="redbutton-handler", operation="render").
+    // Built-in refs like "component.exec", "flow.call", "emit.*" are left as-is.
+    let (component_id, operation) = {
+        let is_builtin = node_ir.component.starts_with("component.exec")
+            || node_ir.component.starts_with("flow.")
+            || node_ir.component.starts_with("emit.")
+            || node_ir.component.starts_with("session.")
+            || node_ir.component.starts_with("provider.");
+        if !is_builtin {
+            if let Some(dot) = node_ir.component.rfind('.') {
+                let (comp_part, op_part) = node_ir.component.split_at(dot);
+                let op_part = &op_part[1..];
+                if let Ok(cid) = ComponentId::from_str(comp_part) {
+                    (cid, Some(op_part.to_string()))
+                } else {
+                    (
+                        ComponentId::from_str(&node_ir.component).with_context(|| {
+                            format!(
+                                "invalid component ref `{}` for node {}",
+                                node_ir.component,
+                                node_id.as_str()
+                            )
+                        })?,
+                        None,
+                    )
+                }
+            } else {
+                (
+                    ComponentId::from_str(&node_ir.component).with_context(|| {
+                        format!(
+                            "invalid component ref `{}` for node {}",
+                            node_ir.component,
+                            node_id.as_str()
+                        )
+                    })?,
+                    None,
+                )
+            }
+        } else {
+            (
+                ComponentId::from_str(&node_ir.component).with_context(|| {
+                    format!(
+                        "invalid component ref `{}` for node {}",
+                        node_ir.component,
+                        node_id.as_str()
+                    )
+                })?,
+                None,
+            )
+        }
+    };
     let component = FlowComponentRef {
         id: component_id,
         pack_alias: None,
-        operation: None,
+        operation,
     };
     let routing = map_routing(&node_ir.routes)?;
     Ok(Node {

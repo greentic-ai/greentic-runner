@@ -1861,9 +1861,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-pack-lib"
-version = "0.4.114"
+version = "0.4.115"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c51959951e5d843b63f593f014506ec3b0e2aaa8916644c2facc84374b4732bb"
+checksum = "d793a04b347e424005239ae8d44c68e56c10e5649617999fbf0c1d99ab9930d0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "0.4.69"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.4.69"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "greentic-pack-lib",
@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.4.69"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2033,7 +2033,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "0.4.69"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2916,9 +2916,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libredox"
-version = "0.1.14"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
+checksum = "7ddbf48fd451246b1f8c2610bd3b4ac0cc6e149d89832867093ab69a17194f08"
 dependencies = [
  "libc",
 ]
@@ -3109,9 +3109,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
+checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
 
 [[package]]
 name = "num-integer"
@@ -4093,7 +4093,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.4.69"
+version = "0.4.70"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
