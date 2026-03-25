@@ -75,6 +75,8 @@ jsonschema.workspace = true
 # External stack components
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
+wasmtime-wasi-http = { workspace = true }
+wasmtime-wasi-tls = { workspace = true }
 greentic-telemetry = { workspace = true, optional = true }
 
 [dev-dependencies]

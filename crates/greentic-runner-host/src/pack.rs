@@ -73,6 +73,11 @@ use tempfile::TempDir;
 use tokio::fs;
 use wasmparser::{Parser, Payload};
 use wasmtime::{Store, StoreContextMut};
+use wasmtime_wasi_http::WasiHttpCtx;
+use wasmtime_wasi_http::p2::{
+    WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
+};
+use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -1200,6 +1205,8 @@ fn parse_flow_doc_with_legacy_aliases(bytes: &[u8], path: &str) -> Result<FlowDo
 pub struct ComponentState {
     pub host: HostState,
     wasi_ctx: WasiCtx,
+    wasi_tls_ctx: WasiTlsCtx,
+    wasi_http_ctx: WasiHttpCtx,
     resource_table: ResourceTable,
 }
 
@@ -1211,6 +1218,8 @@ impl ComponentState {
         Ok(Self {
             host,
             wasi_ctx,
+            wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
+            wasi_http_ctx: WasiHttpCtx::new(),
             resource_table: ResourceTable::new(),
         })
     }
@@ -1279,6 +1288,17 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
 
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
     add_wasi_to_linker(linker)?;
+
+    // Add wasi-tls types and turn on the feature in linker
+    let mut opts = LinkOptions::default();
+    opts.tls(true);
+    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
+        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
+    })?;
+
+    // Add wasi-http types and turn on the feature in linker
+    add_wasi_http_to_linker(linker)?;
+
     add_all_v1_to_linker(
         linker,
         HostFns {
@@ -1426,6 +1446,16 @@ impl WasiView for ComponentState {
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
             table: &mut self.resource_table,
+        }
+    }
+}
+
+impl WasiHttpView for ComponentState {
+    fn http(&mut self) -> WasiHttpCtxView<'_> {
+        WasiHttpCtxView {
+            ctx: &mut self.wasi_http_ctx,
+            table: &mut self.resource_table,
+            hooks: Default::default(),
         }
     }
 }
