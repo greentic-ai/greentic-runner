@@ -167,13 +167,13 @@ async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
     let config = Arc::new(host_config("tenant-a"));
     let component = ensure_fixture_component()?;
     let pack_a = PackRuntime::for_component_test(
-        vec![("qa.process".to_string(), component.clone())],
+        vec![("qa".to_string(), component.clone())],
         HashMap::from([("main".to_string(), flow_ir("main"))]),
         "pack-a",
         Arc::clone(&config),
     )?;
     let pack_b = PackRuntime::for_component_test(
-        vec![("qa.process".to_string(), component)],
+        vec![("qa".to_string(), component)],
         HashMap::from([("main".to_string(), flow_ir("main"))]),
         "pack-b",
         Arc::clone(&config),
