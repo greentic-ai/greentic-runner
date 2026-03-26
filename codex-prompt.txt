@@ -11,4 +11,4 @@ Security alerts JSON:
 
 
 New PR Dependency Vulnerabilities:
-[{"change_type":"added","manifest":"Cargo.lock","ecosystem":"cargo","name":"rustls-webpki","version":"0.102.8","package_url":"pkg:cargo/rustls-webpki@0.102.8","license":"ISC","source_repository_url":"https://github.com/rustls/webpki","scope":"runtime","vulnerabilities":[{"severity":"moderate","advisory_ghsa_id":"GHSA-pwjx-qhcg-rvj4","advisory_summary":"webpki: CRLs not considered authoritative by Distribution Point due to faulty matching logic","advisory_url":"https://github.com/advisories/GHSA-pwjx-qhcg-rvj4"}]}]
+[]
