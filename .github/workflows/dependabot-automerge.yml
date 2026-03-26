@@ -1,44 +1,11 @@
 name: Dependabot auto-merge
-
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-
 permissions:
-  contents: write
   pull-requests: write
-
+  contents: write
 jobs:
   automerge:
-    if: >
-      github.actor == 'dependabot[bot]' &&
-      github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
-    steps:
-      - name: Enable auto-merge for Dependabot PRs
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const pr = context.payload.pull_request;
-
-            // Approve the PR (required in many repos with branch protections)
-            await github.rest.pulls.createReview({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: pr.number,
-              event: "APPROVE",
-              body: "Auto-approving Dependabot PR."
-            });
-
-            // Enable auto-merge (merge occurs once required checks are green)
-            await github.graphql(`
-              mutation EnableAutoMerge($pullRequestId: ID!) {
-                enablePullRequestAutoMerge(input: {
-                  pullRequestId: $pullRequestId,
-                  mergeMethod: SQUASH
-                }) {
-                  pullRequest { number autoMergeRequest { enabledAt } }
-                }
-              }
-            `, { pullRequestId: pr.node_id });
+    uses: greenticai/.github/.github/workflows/dependabot-automerge.yml@main
+    secrets: inherit
