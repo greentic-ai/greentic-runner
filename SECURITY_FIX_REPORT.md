@@ -1,26 +1,34 @@
 # Security Fix Report
 
 Date (UTC): 2026-03-27
-Environment: CI (`pull_request`), base branch `main`
+Environment: CI pull request (`refs/pull/203/merge`), base branch `main`
 
 ## Inputs Reviewed
-- Dependabot alerts: `0`
-- Code scanning alerts: `0`
-- New PR dependency vulnerabilities: `0`
+- Dependabot alerts JSON: `0` findings
+- Code scanning alerts JSON: `0` findings
+- New PR dependency vulnerabilities JSON: `0` findings
 
-## PR Diff Review
-Compared PR HEAD to `origin/main` merge-base.
+## PR Dependency Review
+Compared PR diff against `origin/main`.
 
-Changed files:
-- `.github/workflows/codex-security-fix.yml`
+Changed files in PR:
+- `.github/workflows/auto-tag.yml`
 
-Dependency/security-sensitive manifest changes detected in PR:
-- None (`Cargo.toml`, `Cargo.lock`, and other dependency files were not modified in the PR diff)
+Dependency manifests/lockfiles changed in PR:
+- None
+
+Checked patterns:
+- `Cargo.toml`, `Cargo.lock`
+- `package.json`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`
+- `pyproject.toml`, `poetry.lock`, `requirements*.txt`
+- `Gemfile`, `Gemfile.lock`
+- `go.mod`, `go.sum`
 
 ## Remediation Actions
-- No code or dependency fixes were required.
-- No vulnerabilities were identified from provided alerts or introduced via PR dependency changes.
+- No vulnerabilities were present in provided alerts.
+- No new dependency vulnerabilities were introduced by PR dependency changes.
+- No code or dependency modifications were required for remediation.
 
 ## Result
-- Repository state is unchanged from a vulnerability-remediation perspective.
-- This report file was added to document the security review outcome.
+- Security posture unchanged.
+- No actionable vulnerabilities identified in this run.
