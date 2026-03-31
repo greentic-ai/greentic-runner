@@ -7,7 +7,10 @@ Task:
 4) Write SECURITY_FIX_REPORT.md summarizing your actions.
 
 Security alerts JSON:
-{"dependabot": [], "code_scanning": []}
+{
+  "dependabot": [],
+  "code_scanning": []
+}
 
 
 New PR Dependency Vulnerabilities:
