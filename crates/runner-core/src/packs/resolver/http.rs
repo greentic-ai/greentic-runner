@@ -59,3 +59,45 @@ impl PackResolver for HttpResolver {
         Ok(FetchResponse::from_temp(temp.into_temp_path()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_rejects_disabled_tls_validation() {
+        let cfg = NetworkConfig {
+            proxy_url: None,
+            connect_timeout_ms: Some(100),
+            read_timeout_ms: Some(100),
+            tls_mode: TlsMode::Disabled,
+        };
+        let err = match HttpResolver::new("http", Some(&cfg)) {
+            Ok(_) => panic!("tls disabled must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("cannot be disabled"));
+    }
+
+    #[test]
+    fn new_accepts_proxy_and_preserves_scheme() {
+        let cfg = NetworkConfig {
+            proxy_url: Some("http://proxy.example.com:8080".into()),
+            connect_timeout_ms: Some(250),
+            read_timeout_ms: Some(500),
+            tls_mode: TlsMode::Strict,
+        };
+        let resolver = HttpResolver::new("https", Some(&cfg)).expect("resolver");
+        assert_eq!(resolver.scheme(), "https");
+    }
+
+    #[test]
+    fn fetch_rejects_malformed_locator() {
+        let resolver = HttpResolver::new("http", None).expect("resolver");
+        let err = match resolver.fetch("http://[::1") {
+            Ok(_) => panic!("malformed url must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("failed to download"));
+    }
+}

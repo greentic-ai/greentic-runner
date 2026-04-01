@@ -54,3 +54,58 @@ impl StateHost for InMemoryStateHost {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::host::SessionKey;
+    use greentic_types::{EnvId, TenantCtx, TenantId};
+    use serde_json::json;
+
+    fn key(flow_id: &str) -> SessionKey {
+        let tenant = TenantCtx::new(
+            EnvId::new("local").expect("env"),
+            TenantId::new("tenant-a").expect("tenant"),
+        );
+        SessionKey::new(&tenant, "pack-a", flow_id, None)
+    }
+
+    #[tokio::test]
+    async fn state_host_round_trips_and_deletes_by_prefix() {
+        let host = InMemoryStateHost::new();
+        let first = key("flow-1");
+        let second = key("flow-2");
+
+        host.set_json(&first, json!({"count": 1}))
+            .await
+            .expect("set first");
+        host.set_json(&second, json!({"count": 2}))
+            .await
+            .expect("set second");
+
+        assert_eq!(
+            host.get_json(&first).await.expect("get first"),
+            Some(json!({"count": 1}))
+        );
+
+        host.del_prefix("local::tenant-a:pack-a:flow-")
+            .await
+            .expect("delete prefix");
+
+        assert_eq!(host.get_json(&first).await.expect("get first"), None);
+        assert_eq!(host.get_json(&second).await.expect("get second"), None);
+    }
+
+    #[tokio::test]
+    async fn state_host_delete_removes_single_key() {
+        let host = InMemoryStateHost::new();
+        let key = key("flow-1");
+        host.set_json(&key, json!({"ready": true}))
+            .await
+            .expect("set");
+
+        host.del(&key).await.expect("delete");
+
+        assert_eq!(host.get_json(&key).await.expect("get"), None);
+    }
+}

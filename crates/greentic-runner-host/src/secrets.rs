@@ -127,3 +127,66 @@ fn ensure_env_secrets_allowed() -> Result<()> {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greentic_config_types::SecretsBackendRefConfig;
+    use greentic_types::{EnvId, TeamId, TenantId, UserId};
+
+    fn tenant_ctx() -> greentic_types::TenantCtx {
+        greentic_types::TenantCtx::new(
+            EnvId::new("local").expect("env"),
+            TenantId::new("tenant-a").expect("tenant"),
+        )
+        .with_team(Some(TeamId::new("team-a").expect("team")))
+        .with_user(Some(UserId::new("user-a").expect("user")))
+    }
+
+    #[test]
+    fn scoped_secret_path_normalizes_pack_and_key_segments() {
+        let path =
+            scoped_secret_path_for_pack(&tenant_ctx(), "My Pack/Prod", " API/KEY value ").unwrap();
+        assert_eq!(
+            path,
+            "secrets://local/tenant-a/team-a/my_pack_prod/user.user-a.API.KEY_value"
+        );
+    }
+
+    #[test]
+    fn scoped_secret_path_rejects_empty_inputs() {
+        let ctx = tenant_ctx();
+        assert!(scoped_secret_path_for_pack(&ctx, "demo", "   ").is_err());
+        assert!(scoped_secret_path_for_pack(&ctx, "   ", "key").is_err());
+    }
+
+    #[test]
+    fn backend_parsers_reject_unknown_kinds() {
+        let err =
+            SecretsBackend::from_env(Some("vault".into())).expect_err("backend should be rejected");
+        assert!(err.to_string().contains("unsupported SECRETS_BACKEND"));
+
+        let err = SecretsBackend::from_config(&SecretsBackendRefConfig {
+            kind: "vault".into(),
+            reference: None,
+        })
+        .expect_err("backend config should be rejected");
+        assert!(err.to_string().contains("unsupported secrets backend"));
+    }
+
+    #[test]
+    fn backend_parsers_accept_default_aliases() {
+        assert!(matches!(
+            SecretsBackend::from_env(Some("".into())).unwrap(),
+            SecretsBackend::Env
+        ));
+        assert!(matches!(
+            SecretsBackend::from_config(&SecretsBackendRefConfig {
+                kind: "none".into(),
+                reference: None,
+            })
+            .unwrap(),
+            SecretsBackend::Env
+        ));
+    }
+}

@@ -183,3 +183,41 @@ async fn warmup_persists_and_hits_disk() {
     assert!(after.disk_hits > before.disk_hits);
     assert_eq!(after.compiles, before.compiles);
 }
+
+#[tokio::test]
+async fn doctor_warmup_and_prune_report_expected_defaults() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let config = CacheConfig {
+        root: temp.path().to_path_buf(),
+        disk_enabled: false,
+        memory_enabled: true,
+        memory_max_bytes: 1024,
+        ..CacheConfig::default()
+    };
+    let cache = CacheManager::new(config, profile.clone());
+    let key = ArtifactKey::new(profile.id().to_string(), "sha256:doctor".to_string());
+
+    assert_eq!(cache.engine_profile_id(), profile.id());
+    assert_eq!(cache.disk_stats().expect("disk stats").artifact_count, 0);
+
+    let warmup = cache
+        .warmup(
+            &engine,
+            &[crate::cache::WarmupItem { key }],
+            crate::cache::WarmupMode::BestEffort,
+        )
+        .await
+        .expect("warmup");
+    assert_eq!(warmup.warmed, 1);
+    assert_eq!(warmup.skipped, 0);
+
+    let doctor = cache.doctor();
+    assert!(!doctor.disk_enabled);
+    assert!(doctor.memory_enabled);
+    assert_eq!(doctor.entries_checked, 0);
+
+    let prune = cache.prune_disk(true).await.expect("prune");
+    assert_eq!(prune.removed_entries, 0);
+}

@@ -212,6 +212,9 @@ struct WebexMessageData {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::TenantRuntimeHandle;
+    use axum::body::Body;
+    use axum::http::Request;
     use serde_json::json;
 
     #[test]
@@ -279,5 +282,60 @@ mod tests {
             canonical["attachments"][0]["url"],
             json!("https://files.example.com/doc.pdf")
         );
+    }
+
+    #[test]
+    fn webex_helpers_cover_signature_timestamp_and_empty_attachments() {
+        assert_eq!(map_attachments(None), Vec::<Value>::new());
+        assert!(parse_timestamp(Some("bad-timestamp")).is_err());
+        assert!(!subtle_equals("abc", "abd"));
+    }
+
+    #[test]
+    fn webex_helpers_cover_valid_timestamp_and_file_mapping() {
+        let ts = parse_timestamp(Some("2025-11-11T09:00:00Z")).unwrap();
+        assert_eq!(ts.timestamp(), 1_762_851_600);
+
+        let attachments = map_attachments(Some(&vec!["https://files.example.com/doc.pdf".into()]));
+        assert_eq!(attachments[0]["type"], json!("file"));
+        assert_eq!(
+            attachments[0]["url"],
+            json!("https://files.example.com/doc.pdf")
+        );
+        assert!(subtle_equals("same", "same"));
+    }
+
+    #[test]
+    fn webex_signature_without_configured_secret_is_allowed() {
+        let headers = HeaderMap::new();
+        assert!(verify_signature(&headers, br#"{"ok":true}"#).is_ok());
+    }
+
+    #[test]
+    fn webex_parse_timestamp_defaults_when_missing() {
+        let before = Utc::now().timestamp();
+        let ts = parse_timestamp(None).unwrap();
+        let after = Utc::now().timestamp();
+        assert!(ts.timestamp() >= before);
+        assert!(ts.timestamp() <= after);
+        assert!(map_attachments(Some(&Vec::new())).is_empty());
+    }
+
+    #[tokio::test]
+    async fn webex_webhook_returns_not_implemented_in_provider_core_only_mode() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime()
+            .await
+            .expect("runtime");
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let status = webhook(
+            TenantRuntimeHandle {
+                tenant: "demo".into(),
+                runtime,
+            },
+            request,
+        )
+        .await
+        .expect_err("provider-core only should block legacy webhook");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 }

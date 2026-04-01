@@ -6,7 +6,7 @@ use axum::http::header::{AUTHORIZATION, HOST};
 use axum::http::request::Parts;
 use axum::http::{HeaderName, StatusCode};
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
 use serde_json::Value;
 use serde_json::json;
 
@@ -144,7 +144,10 @@ fn decode_jwt_claim(token: &str, claim: &str) -> Result<Option<String>> {
         3 => format!("{payload}="),
         _ => payload.to_string(),
     };
-    let bytes = STANDARD.decode(padded.as_bytes())?;
+    let bytes = URL_SAFE_NO_PAD
+        .decode(payload.as_bytes())
+        .or_else(|_| URL_SAFE.decode(padded.as_bytes()))
+        .or_else(|_| STANDARD.decode(padded.as_bytes()))?;
     let value: Value = serde_json::from_slice(&bytes)?;
     Ok(value
         .get(claim)
@@ -228,5 +231,57 @@ mod tests {
         let expected = std::env::var("DEFAULT_TENANT").unwrap_or_else(|_| "custom".into());
         let cfg = RoutingConfig::from_env_with_default("custom".into());
         assert_eq!(cfg.default_tenant, expected);
+    }
+
+    #[test]
+    fn jwt_resolver_reads_tenant_claim() {
+        let routing = TenantRouting::new(RoutingConfig {
+            resolver: TenantResolver::Jwt {
+                header: AUTHORIZATION,
+                claim: "tenant".into(),
+            },
+            default_tenant: "demo".into(),
+        });
+        let payload = STANDARD.encode(br#"{"tenant":"jwt-tenant"}"#);
+        let token = format!("ignored.{payload}.ignored");
+        let (parts, _) = Request::builder()
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(routing.resolve(&parts).unwrap(), "jwt-tenant");
+    }
+
+    #[test]
+    fn jwt_resolver_falls_back_on_invalid_payload() {
+        let routing = TenantRouting::new(RoutingConfig {
+            resolver: TenantResolver::Jwt {
+                header: AUTHORIZATION,
+                claim: "tenant".into(),
+            },
+            default_tenant: "demo".into(),
+        });
+        let (parts, _) = Request::builder()
+            .header(AUTHORIZATION, "Bearer invalid.token.payload")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        assert_eq!(routing.resolve(&parts).unwrap(), "demo");
+    }
+
+    #[test]
+    fn jwt_resolver_requires_bearer_prefix() {
+        let routing = TenantRouting::new(RoutingConfig {
+            resolver: TenantResolver::Jwt {
+                header: AUTHORIZATION,
+                claim: "tenant".into(),
+            },
+            default_tenant: "demo".into(),
+        });
+        let (parts, _) = Request::builder().body(()).unwrap().into_parts();
+
+        assert!(routing.resolve(&parts).is_err());
     }
 }

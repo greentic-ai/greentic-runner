@@ -41,3 +41,25 @@ impl OperatorMetrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_reflects_counters() {
+        let metrics = OperatorMetrics::default();
+        metrics.resolve_attempts.fetch_add(2, Ordering::Relaxed);
+        metrics.resolve_errors.fetch_add(1, Ordering::Relaxed);
+        metrics.invoke_attempts.fetch_add(4, Ordering::Relaxed);
+        metrics.invoke_errors.fetch_add(3, Ordering::Relaxed);
+        metrics.cbor_decode_errors.fetch_add(5, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.resolve_attempts, 2);
+        assert_eq!(snapshot.resolve_errors, 1);
+        assert_eq!(snapshot.invoke_attempts, 4);
+        assert_eq!(snapshot.invoke_errors, 3);
+        assert_eq!(snapshot.cbor_decode_errors, 5);
+    }
+}

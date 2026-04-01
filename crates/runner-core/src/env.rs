@@ -133,3 +133,91 @@ impl FromStr for PackSource {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greentic_config_types::{PackSourceConfig, PackTrustConfig, PacksConfig, PathsConfig};
+
+    fn paths(root: &std::path::Path) -> PathsConfig {
+        PathsConfig {
+            greentic_root: root.join("greentic"),
+            state_dir: root.join("state"),
+            cache_dir: root.join("cache"),
+            logs_dir: root.join("logs"),
+        }
+    }
+
+    #[test]
+    fn index_location_parses_remote_and_file_values() {
+        match IndexLocation::from_value("https://example.com/index.json").unwrap() {
+            IndexLocation::Remote(url) => {
+                assert_eq!(url.as_str(), "https://example.com/index.json")
+            }
+            IndexLocation::File(_) => panic!("expected remote index"),
+        }
+
+        match IndexLocation::from_value("file:///tmp/index.json").unwrap() {
+            IndexLocation::File(path) => assert_eq!(path, PathBuf::from("/tmp/index.json")),
+            IndexLocation::Remote(_) => panic!("expected file index"),
+        }
+
+        match IndexLocation::from_value("relative/index.json").unwrap() {
+            IndexLocation::File(path) => assert_eq!(path, PathBuf::from("relative/index.json")),
+            IndexLocation::Remote(_) => panic!("expected local file"),
+        }
+    }
+
+    #[test]
+    fn default_for_paths_prefers_greentic_root_index_when_present() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let path_cfg = paths(temp.path());
+        std::fs::create_dir_all(&path_cfg.cache_dir).expect("cache dir");
+        std::fs::create_dir_all(&path_cfg.greentic_root).expect("greentic root");
+        let expected_index = path_cfg.greentic_root.join("index.json");
+        std::fs::write(&expected_index, "{}").expect("index file");
+
+        let config = PackConfig::default_for_paths(&path_cfg).expect("default config");
+        match config.index_location {
+            IndexLocation::File(path) => assert_eq!(path, expected_index),
+            IndexLocation::Remote(_) => panic!("expected local example index"),
+        }
+        assert_eq!(config.cache_dir, path_cfg.cache_dir.join("packs"));
+    }
+
+    #[test]
+    fn from_packs_uses_cache_and_public_key() {
+        let cfg = PacksConfig {
+            source: PackSourceConfig::HttpIndex {
+                url: "https://example.com/index.json".into(),
+            },
+            cache_dir: PathBuf::from("/tmp/packs-cache"),
+            index_cache_ttl_secs: None,
+            trust: Some(PackTrustConfig {
+                public_keys: vec!["ed25519:abc".into()],
+                require_signatures: true,
+            }),
+        };
+
+        let pack = PackConfig::from_packs(&cfg).expect("pack config");
+        assert_eq!(pack.cache_dir, PathBuf::from("/tmp/packs-cache"));
+        assert_eq!(pack.public_key.as_deref(), Some("ed25519:abc"));
+        match pack.index_location {
+            IndexLocation::Remote(url) => {
+                assert_eq!(url.as_str(), "https://example.com/index.json")
+            }
+            IndexLocation::File(_) => panic!("expected remote index"),
+        }
+    }
+
+    #[test]
+    fn pack_source_accepts_aliases() {
+        assert_eq!(PackSource::from_str("https").unwrap(), PackSource::Http);
+        assert_eq!(
+            PackSource::from_str("azureblob").unwrap(),
+            PackSource::AzBlob
+        );
+        assert_eq!(PackSource::AzBlob.scheme(), "azblob");
+        assert!(PackSource::from_str("ftp").is_err());
+    }
+}

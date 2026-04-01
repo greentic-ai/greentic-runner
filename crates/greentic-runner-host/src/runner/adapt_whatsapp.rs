@@ -388,6 +388,11 @@ struct WhatsappListReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::TenantRuntimeHandle;
+    use axum::body::Body;
+    use axum::extract::Query;
+    use axum::http::Request;
+    use axum::response::IntoResponse;
     use serde_json::json;
 
     #[test]
@@ -448,5 +453,118 @@ mod tests {
         assert_eq!(canonical["text"], json!("Hi"));
         assert_eq!(canonical["attachments"], json!([]));
         assert_eq!(canonical["buttons"], json!([]));
+    }
+
+    #[test]
+    fn whatsapp_maps_media_location_and_interactive_content() {
+        let image: WhatsappMessage = serde_json::from_value(json!({
+            "id": "1",
+            "from": "447700900123",
+            "type": "image",
+            "image": { "link": "https://example.com/image.png", "caption": "photo" }
+        }))
+        .unwrap();
+        let (text, attachments, buttons, scopes) = map_message_content(&image);
+        assert_eq!(text, None);
+        assert_eq!(attachments[0]["type"], json!("image"));
+        assert!(buttons.is_empty());
+        assert!(scopes.contains(&"attachments".to_string()));
+
+        let list_reply: WhatsappMessage = serde_json::from_value(json!({
+            "id": "2",
+            "from": "447700900123",
+            "type": "interactive",
+            "interactive": {
+                "list_reply": { "id": "choice-1", "title": "Choice" }
+            }
+        }))
+        .unwrap();
+        let (text, _attachments, buttons, scopes) = map_message_content(&list_reply);
+        assert_eq!(text.as_deref(), Some("Choice"));
+        assert_eq!(buttons[0]["payload"], json!("choice-1"));
+        assert!(scopes.contains(&"buttons".to_string()));
+
+        let location: WhatsappMessage = serde_json::from_value(json!({
+            "id": "3",
+            "from": "447700900123",
+            "type": "location",
+            "location": { "name": "HQ" }
+        }))
+        .unwrap();
+        let (text, _, _, _) = map_message_content(&location);
+        assert_eq!(text.as_deref(), Some("HQ"));
+    }
+
+    #[test]
+    fn whatsapp_timestamp_and_compare_helpers_are_stable() {
+        assert!(parse_timestamp(Some("not-epoch")).is_ok());
+        assert!(!subtle_equals("abc", "abd"));
+    }
+
+    #[tokio::test]
+    async fn whatsapp_verify_accepts_and_rejects_tokens() {
+        let ok = verify(Query(VerifyQuery {
+            mode: Some("subscribe".into()),
+            challenge: Some("12345".into()),
+            verify_token: Some("token".into()),
+        }))
+        .await
+        .into_response();
+        assert_eq!(ok.status(), StatusCode::FORBIDDEN);
+
+        let bad = verify(Query(VerifyQuery {
+            mode: Some("other".into()),
+            challenge: Some("12345".into()),
+            verify_token: Some("token".into()),
+        }))
+        .await
+        .into_response();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn whatsapp_maps_document_audio_and_button_reply() {
+        let document: WhatsappMessage = serde_json::from_value(json!({
+            "id": "4",
+            "from": "447700900123",
+            "type": "document",
+            "document": { "link": "https://example.com/file.pdf", "filename": "file.pdf" }
+        }))
+        .unwrap();
+        let (_text, attachments, _buttons, scopes) = map_message_content(&document);
+        assert_eq!(attachments[0]["type"], json!("file"));
+        assert!(scopes.contains(&"attachments".to_string()));
+
+        let button: WhatsappMessage = serde_json::from_value(json!({
+            "id": "5",
+            "from": "447700900123",
+            "type": "interactive",
+            "interactive": {
+                "button_reply": { "id": "yes", "title": "Yes" }
+            }
+        }))
+        .unwrap();
+        let (text, _attachments, buttons, scopes) = map_message_content(&button);
+        assert_eq!(text.as_deref(), Some("Yes"));
+        assert_eq!(buttons[0]["id"], json!("yes"));
+        assert!(scopes.contains(&"buttons".to_string()));
+    }
+
+    #[tokio::test]
+    async fn whatsapp_webhook_returns_not_implemented_in_provider_core_only_mode() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime()
+            .await
+            .expect("runtime");
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let status = webhook(
+            TenantRuntimeHandle {
+                tenant: "demo".into(),
+                runtime,
+            },
+            request,
+        )
+        .await
+        .expect_err("provider-core only should block legacy webhook");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 }

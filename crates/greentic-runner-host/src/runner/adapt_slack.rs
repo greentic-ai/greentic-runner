@@ -465,6 +465,81 @@ mod tests {
         assert_eq!(canonical["attachments"], json!([]));
         assert_eq!(canonical["buttons"], json!([]));
     }
+
+    #[test]
+    fn slack_interactive_maps_buttons_and_selected_values() {
+        let raw = json!({
+            "type": "block_actions",
+            "trigger_id": "trigger-123",
+            "action_ts": "1731315601.000200",
+            "team": { "id": "T123" },
+            "channel": { "id": "C123" },
+            "user": { "id": "U123" },
+            "message": { "text": "Choose one" },
+            "actions": [{
+                "action_id": "pick",
+                "text": { "text": "Pick" },
+                "selected_option": { "value": "alpha" }
+            }]
+        });
+        let payload: SlackInteractivePayload = serde_json::from_value(raw.clone()).unwrap();
+        let mapped = map_slack_interactive("demo", &payload, &raw).unwrap();
+        assert_eq!(mapped.provider_ids.workspace_id.as_deref(), Some("T123"));
+        assert_eq!(mapped.provider_ids.channel_id.as_deref(), Some("C123"));
+        assert_eq!(mapped.provider_ids.user_id.as_deref(), Some("U123"));
+        assert_eq!(mapped.payload["buttons"][0]["id"], json!("pick"));
+        assert_eq!(mapped.payload["buttons"][0]["payload"], json!("alpha"));
+        assert_eq!(mapped.payload["text"], json!("Choose one"));
+    }
+
+    #[test]
+    fn buttons_from_event_extracts_button_elements() {
+        let raw = json!({
+            "type": "message",
+            "user": "U1",
+            "blocks": [{
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "btn-1",
+                        "text": { "text": "Confirm" },
+                        "value": "yes"
+                    },
+                    { "type": "plain_text" }
+                ]
+            }]
+        });
+        let event: SlackEvent = serde_json::from_value(raw).unwrap();
+        let buttons = buttons_from_event(&event);
+        assert_eq!(buttons.len(), 1);
+        assert_eq!(buttons[0]["id"], json!("btn-1"));
+        assert_eq!(buttons[0]["title"], json!("Confirm"));
+        assert_eq!(buttons[0]["payload"], json!("yes"));
+    }
+
+    #[test]
+    fn slack_helpers_cover_files_timestamp_and_hmac() {
+        let files: Vec<SlackFile> = serde_json::from_value(json!([
+            { "name": "image.png", "mimetype": "image/png", "size": 12, "url_private": "https://files/image.png" },
+            { "name": "note.txt", "mimetype": "text/plain", "size": 4, "url_private": "https://files/note.txt" }
+        ]))
+        .unwrap();
+        let attachments = map_slack_files(Some(&files));
+        assert_eq!(attachments[0]["type"], json!("image"));
+        assert_eq!(attachments[1]["type"], json!("file"));
+
+        let ts = parse_slack_timestamp(None, Some(1_731_315_600)).unwrap();
+        assert_eq!(ts.timestamp(), 1_731_315_600);
+        assert!(parse_slack_timestamp(None, Some(i64::MAX)).is_err());
+
+        let base = "v0:1731315600:{\"type\":\"event_callback\"}";
+        let mut mac = HmacSha256::new_from_slice(b"secret").unwrap();
+        mac.update(base.as_bytes());
+        let signature = format!("v0={}", hex::encode(mac.finalize().into_bytes()));
+        assert!(verify_hmac("secret", base, &signature));
+        assert!(!verify_hmac("secret", base, "v0=deadbeef"));
+        assert!(!subtle_equals("abc", "abd"));
+    }
 }
 
 fn subtle_equals(a: &str, b: &str) -> bool {

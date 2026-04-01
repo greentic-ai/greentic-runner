@@ -74,6 +74,72 @@ pub use routing::RoutingConfig;
 use routing::TenantRouting;
 pub use runner::HostServer;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use crate::config::{OperatorPolicy, SecretsPolicy};
+    use crate::runtime::TenantRuntime;
+    use crate::secrets::default_manager;
+    use crate::storage::{new_session_store, new_state_store, session_host_from, state_host_from};
+    use crate::trace::TraceConfig;
+    use crate::validate::ValidationConfig;
+    use tempfile::TempDir;
+
+    pub(crate) fn fixture_pack_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/packs/demo.gtpack")
+            .canonicalize()
+            .expect("fixture pack path")
+    }
+
+    fn minimal_config(workspace: &std::path::Path) -> Result<Arc<HostConfig>> {
+        let bindings_path = workspace.join("bindings.yaml");
+        std::fs::write(
+            &bindings_path,
+            r#"
+tenant: demo
+flow_type_bindings: {}
+rate_limits: {}
+retry: {}
+timers: []
+"#,
+        )?;
+        let mut config =
+            HostConfig::load_from_path(&bindings_path).context("load minimal host bindings")?;
+        config.secrets_policy = SecretsPolicy::allow_all();
+        config.operator_policy = OperatorPolicy::allow_all();
+        config.trace = TraceConfig::from_env();
+        config.validation = ValidationConfig::from_env();
+        Ok(Arc::new(config))
+    }
+
+    pub(crate) async fn build_test_runtime() -> Result<(TempDir, Arc<TenantRuntime>)> {
+        let workspace = TempDir::new().context("temp workspace")?;
+        let config = minimal_config(workspace.path())?;
+        let session_store = new_session_store();
+        let session_host = session_host_from(Arc::clone(&session_store));
+        let state_store = new_state_store();
+        let state_host = state_host_from(Arc::clone(&state_store));
+        let secrets = default_manager()?;
+        let pack_path = fixture_pack_path();
+        let runtime = TenantRuntime::load(
+            &pack_path,
+            config,
+            None,
+            Some(&pack_path),
+            None,
+            Arc::new(RunnerWasiPolicy::new()),
+            session_host,
+            Arc::clone(&session_store),
+            Arc::clone(&state_store),
+            state_host,
+            secrets,
+        )
+        .await?;
+        Ok((workspace, runtime))
+    }
+}
+
 /// User-facing configuration for running the unified host.
 #[derive(Clone)]
 pub struct RunnerConfig {
@@ -403,4 +469,135 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     drop(watcher);
     host.stop().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gtbind::{PackBinding, TenantBindings};
+    use greentic_config_types::PackTrustConfig;
+    use tempfile::TempDir;
+
+    fn paths(temp: &TempDir) -> PathsConfig {
+        PathsConfig {
+            greentic_root: temp.path().join("greentic"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+            logs_dir: temp.path().join("logs"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_interval_uses_default_and_rejects_invalid_values() {
+        assert_eq!(
+            parse_refresh_interval(None).expect("default interval"),
+            Duration::from_secs(30)
+        );
+        assert!(parse_refresh_interval(Some("not-a-duration".into())).is_err());
+    }
+
+    #[test]
+    fn ensure_paths_exist_creates_expected_directories() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        ensure_paths_exist(&paths).expect("create directories");
+
+        assert!(paths.greentic_root.is_dir());
+        assert!(paths.state_dir.is_dir());
+        assert!(paths.cache_dir.is_dir());
+        assert!(paths.logs_dir.is_dir());
+    }
+
+    #[test]
+    fn maybe_write_gtbind_index_writes_locator_index() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        fs::create_dir_all(&paths.greentic_root).expect("greentic root");
+        let mut pack = PackConfig::default_for_paths(&paths).expect("pack config");
+        let tenant_bindings = HashMap::from([(
+            "demo".to_string(),
+            TenantBindings {
+                tenant: "demo".into(),
+                packs: vec![
+                    PackBinding {
+                        pack_id: "pack.main".into(),
+                        pack_ref: "pack.main@1.0.0".into(),
+                        pack_locator: Some("fs:///packs/main.gtpack".into()),
+                        flows: vec!["main".into()],
+                    },
+                    PackBinding {
+                        pack_id: "pack.overlay".into(),
+                        pack_ref: "pack.overlay@sha256:abcd".into(),
+                        pack_locator: Some("fs:///packs/overlay.gtpack".into()),
+                        flows: vec![],
+                    },
+                ],
+                env_passthrough: vec![],
+            },
+        )]);
+
+        maybe_write_gtbind_index(&tenant_bindings, &paths, &mut pack).expect("write gtbind index");
+
+        let index_path = paths.greentic_root.join("packs").join("gtbind.index.json");
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&index_path).expect("read index")).expect("json");
+        assert_eq!(
+            json["demo"]["main_pack"]["locator"],
+            "fs:///packs/main.gtpack"
+        );
+        assert_eq!(json["demo"]["overlays"][0]["digest"], "sha256:abcd");
+        match pack.index_location {
+            runner_core::env::IndexLocation::File(path) => assert_eq!(path, index_path),
+            runner_core::env::IndexLocation::Remote(_) => panic!("expected generated file index"),
+        }
+    }
+
+    #[test]
+    fn pack_config_from_prefers_configured_pack_source() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let packs = Some(PacksConfig {
+            source: PackSourceConfig::HttpIndex {
+                url: "https://example.com/index.json".into(),
+            },
+            cache_dir: temp.path().join("packs-cache"),
+            index_cache_ttl_secs: None,
+            trust: Some(PackTrustConfig {
+                public_keys: vec!["ed25519:test".into()],
+                require_signatures: true,
+            }),
+        });
+        let config = pack_config_from(&packs, &paths, &NetworkConfig::default())
+            .expect("pack config from packs");
+
+        match config.index_location {
+            runner_core::env::IndexLocation::Remote(url) => {
+                assert_eq!(url.as_str(), "https://example.com/index.json");
+            }
+            runner_core::env::IndexLocation::File(_) => panic!("expected remote index"),
+        }
+        assert_eq!(config.public_key.as_deref(), Some("ed25519:test"));
+        assert!(config.network.is_some());
+    }
+
+    #[test]
+    fn default_wasi_policy_sets_expected_env_and_preopens() {
+        let temp = TempDir::new().expect("tempdir");
+        let paths = paths(&temp);
+        let policy = default_wasi_policy(&paths);
+
+        assert_eq!(
+            policy.env_set.get("GREENTIC_ROOT"),
+            Some(&paths.greentic_root.display().to_string())
+        );
+        assert_eq!(policy.preopens.len(), 3);
+        assert_eq!(policy.preopens[0].guest_path, "/state");
+        assert_eq!(policy.preopens[1].guest_path, "/cache");
+        assert_eq!(policy.preopens[2].guest_path, "/logs");
+    }
+
+    #[test]
+    fn telemetry_from_is_disabled_without_exporter() {
+        assert!(telemetry_from(&TelemetryConfig::default()).is_none());
+    }
 }

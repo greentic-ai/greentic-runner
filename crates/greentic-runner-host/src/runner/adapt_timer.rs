@@ -133,6 +133,7 @@ fn normalize_cron(expr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn normalize_cron_adds_seconds_for_five_fields() {
@@ -144,5 +145,28 @@ mod tests {
     fn duration_until_returns_zero_for_past_times() {
         let past = Utc::now() - chrono::Duration::seconds(10);
         assert_eq!(duration_until(past).unwrap(), Duration::from_secs(0));
+    }
+
+    #[test]
+    fn duration_until_returns_positive_duration_for_future_times() {
+        let future = Utc::now() + chrono::Duration::milliseconds(150);
+        let wait = duration_until(future).unwrap();
+        assert!(wait > Duration::from_secs(0));
+        assert!(wait <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn normalize_cron_preserves_non_five_field_expressions() {
+        assert_eq!(normalize_cron("@daily"), "@daily");
+        assert_eq!(normalize_cron("0 0 */2 * * *"), "0 0 */2 * * *");
+    }
+
+    #[tokio::test]
+    async fn spawn_timers_is_empty_when_config_has_no_timers() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime()
+            .await
+            .expect("runtime");
+        let timers = spawn_timers(Arc::clone(&runtime)).expect("spawn timers");
+        assert!(timers.is_empty());
     }
 }

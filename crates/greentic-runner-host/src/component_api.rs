@@ -502,7 +502,10 @@ pub fn invoke_result_from_v0_6_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{envelope_v0_6, node};
+    use super::{
+        cbor_to_json_string, envelope_v0_6, exec_ctx_v0_4, exec_ctx_v0_5, invoke_result_from_v0_4,
+        invoke_result_from_v0_5, invoke_result_from_v0_6, invoke_result_from_v0_6_run, node,
+    };
     use greentic_types::{EnvId, InvocationEnvelope, TenantCtx, TenantId};
     use std::str::FromStr;
 
@@ -548,5 +551,117 @@ mod tests {
             serde_cbor::Value::Bytes(vec![255, 0, 1, 42]),
             "binary payload must not be dropped when not valid json bytes"
         );
+    }
+
+    #[test]
+    fn exec_ctx_conversions_preserve_identity_fields() {
+        let ctx = sample_exec_ctx();
+
+        let v04 = exec_ctx_v0_4(&ctx);
+        assert_eq!(v04.tenant.tenant, "tenant.demo");
+        assert_eq!(v04.flow_id, "flow.demo");
+
+        let v05 = exec_ctx_v0_5(&ctx);
+        assert_eq!(v05.tenant.tenant_id, "tenant.demo");
+        assert_eq!(v05.tenant.team_id.as_deref(), Some("team.demo"));
+        assert_eq!(v05.tenant.user_id.as_deref(), Some("user.demo"));
+        assert_eq!(v05.tenant.deadline_ms, Some(123));
+        assert_eq!(v05.tenant.flow_id.as_deref(), Some("flow.demo"));
+    }
+
+    #[test]
+    fn invoke_result_adapters_preserve_error_details() {
+        let v04 = invoke_result_from_v0_4(
+            super::v0_4::exports::greentic::component::node::InvokeResult::Err(
+                super::v0_4::exports::greentic::component::node::NodeError {
+                    code: "E04".into(),
+                    message: "bad request".into(),
+                    retryable: true,
+                    backoff_ms: Some(10),
+                    details: Some("{\"detail\":true}".into()),
+                },
+            ),
+        );
+        match v04 {
+            node::InvokeResult::Err(err) => {
+                assert_eq!(err.code, "E04");
+                assert!(err.retryable);
+            }
+            node::InvokeResult::Ok(_) => panic!("expected error"),
+        }
+
+        let v05 = invoke_result_from_v0_5(
+            super::v0_5::exports::greentic::component::node::InvokeResult::Err(
+                super::v0_5::exports::greentic::component::node::NodeError {
+                    code: "E05".into(),
+                    message: "still bad".into(),
+                    retryable: false,
+                    backoff_ms: None,
+                    details: Some("{\"reason\":\"x\"}".into()),
+                },
+            ),
+        );
+        match v05 {
+            node::InvokeResult::Err(err) => {
+                assert_eq!(err.code, "E05");
+                assert_eq!(err.details.as_deref(), Some("{\"reason\":\"x\"}"));
+            }
+            node::InvokeResult::Ok(_) => panic!("expected error"),
+        }
+    }
+
+    #[test]
+    fn invoke_result_v0_6_handles_component_failures_and_run_output() {
+        let ok = invoke_result_from_v0_6(Ok(
+            super::v0_6::exports::greentic::component::node::InvocationResult {
+                ok: false,
+                output_cbor: serde_cbor::to_vec(&serde_json::json!({"error":"boom"}))
+                    .expect("cbor"),
+                output_metadata_cbor: None,
+            },
+        ))
+        .expect("adapt result");
+        match ok {
+            node::InvokeResult::Err(err) => {
+                assert_eq!(err.code, "COMPONENT_INVOCATION_FAILED");
+                assert!(err.message.contains("boom"));
+            }
+            node::InvokeResult::Ok(_) => panic!("expected component failure"),
+        }
+
+        let err = invoke_result_from_v0_6(Err(
+            super::v0_6::exports::greentic::component::node::NodeError {
+                code: "E06".into(),
+                message: "bad".into(),
+                retryable: true,
+                backoff_ms: Some(25),
+                details: Some(serde_cbor::to_vec(&serde_json::json!({"kind":"timeout"})).unwrap()),
+            },
+        ))
+        .expect("adapt error");
+        match err {
+            node::InvokeResult::Err(err) => {
+                assert_eq!(err.code, "E06");
+                assert_eq!(err.backoff_ms, Some(25));
+                assert!(err.details.expect("details").contains("timeout"));
+            }
+            node::InvokeResult::Ok(_) => panic!("expected node error"),
+        }
+
+        let run = invoke_result_from_v0_6_run(
+            super::v0_6_runtime::exports::greentic::component::component_runtime::RunResult {
+                output: serde_cbor::to_vec(&serde_json::json!({"ok":true})).expect("cbor"),
+                new_state: Vec::new(),
+            },
+        );
+        match run {
+            node::InvokeResult::Ok(body) => assert!(body.contains("\"ok\":true")),
+            node::InvokeResult::Err(_) => panic!("expected ok"),
+        }
+    }
+
+    #[test]
+    fn cbor_to_json_string_falls_back_to_utf8() {
+        assert_eq!(cbor_to_json_string(b"plain-text"), "plain-text");
     }
 }

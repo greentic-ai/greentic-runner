@@ -48,3 +48,46 @@ impl AdapterBridge for FnAdapterBridge {
         (self.inner)(call).await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fn_adapter_bridge_invokes_closure() {
+        let bridge = FnAdapterBridge::new(|call: AdapterCall| async move {
+            Ok(json!({
+                "adapter": call.adapter,
+                "operation": call.operation,
+                "payload": call.payload,
+            }))
+        });
+        let call = AdapterCall {
+            adapter: "legacy".into(),
+            operation: "run".into(),
+            payload: json!({"ok": true}),
+        };
+
+        let result = bridge.invoke(call).await.expect("invoke");
+        assert_eq!(result["adapter"], "legacy");
+        assert_eq!(result["operation"], "run");
+        assert_eq!(result["payload"]["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn adapter_trait_forwards_to_bridge() {
+        let bridge =
+            FnAdapterBridge::new(
+                |call: AdapterCall| async move { Ok(json!({ "echo": call.payload })) },
+            );
+        let call = AdapterCall {
+            adapter: "legacy".into(),
+            operation: "echo".into(),
+            payload: json!({"value": 7}),
+        };
+
+        let result = Adapter::call(&bridge, &call).await.expect("adapter call");
+        assert_eq!(result["echo"]["value"], 7);
+    }
+}
