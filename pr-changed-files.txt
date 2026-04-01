@@ -1,1 +1,1 @@
-.github/workflows/codex-semver-fix.yml
+.github/workflows/dependency-review.yml
