@@ -139,15 +139,22 @@ fn decode_jwt_claim(token: &str, claim: &str) -> Result<Option<String>> {
         .split('.')
         .nth(1)
         .ok_or_else(|| anyhow!("invalid jwt structure"))?;
-    let padded = match payload.len() % 4 {
-        2 => format!("{payload}=="),
-        3 => format!("{payload}="),
-        _ => payload.to_string(),
-    };
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload.as_bytes())
-        .or_else(|_| URL_SAFE.decode(padded.as_bytes()))
-        .or_else(|_| STANDARD.decode(padded.as_bytes()))?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload.as_bytes()).or_else(|_| {
+        let padded = match payload.len() % 4 {
+            2 => Some(format!("{payload}==")),
+            3 => Some(format!("{payload}=")),
+            _ => None,
+        };
+        if let Some(padded) = padded.as_deref() {
+            URL_SAFE
+                .decode(padded.as_bytes())
+                .or_else(|_| STANDARD.decode(padded.as_bytes()))
+        } else {
+            URL_SAFE
+                .decode(payload.as_bytes())
+                .or_else(|_| STANDARD.decode(payload.as_bytes()))
+        }
+    })?;
     let value: Value = serde_json::from_slice(&bytes)?;
     Ok(value
         .get(claim)

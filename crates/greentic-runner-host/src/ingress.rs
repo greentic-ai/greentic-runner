@@ -103,7 +103,7 @@ pub fn build_canonical_payload(
     mut channel_data: Value,
     raw: Value,
 ) -> Value {
-    let mut payload = Map::new();
+    let mut payload = Map::with_capacity(13);
     payload.insert("tenant".into(), Value::String(tenant.to_string()));
     payload.insert("provider".into(), Value::String(provider.to_string()));
     payload.insert("provider_ids".into(), provider_ids.to_value());

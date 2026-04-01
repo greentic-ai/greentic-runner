@@ -80,8 +80,13 @@ wasmtime-wasi-tls = { workspace = true }
 greentic-telemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "perf"
+harness = false
