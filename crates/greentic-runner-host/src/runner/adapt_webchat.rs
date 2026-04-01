@@ -303,4 +303,36 @@ mod tests {
             json!("demo:webchat:conv-abc:user-123")
         );
     }
+
+    #[test]
+    fn webchat_helpers_cover_card_attachments_and_defaults() {
+        let activity: WebChatActivity = serde_json::from_value(json!({
+            "from": { "id": "user-123" },
+            "attachments": [{
+                "contentType": "application/json",
+                "content": "{\"card\":true}"
+            }]
+        }))
+        .unwrap();
+        let attachments = map_attachments(&activity);
+        assert_eq!(attachments[0]["type"], json!("card"));
+
+        let data = build_channel_data(&activity);
+        assert_eq!(data["type"], json!("message"));
+        assert_eq!(data["channel_data"], json!({}));
+
+        assert!(parse_timestamp(Some("bad-timestamp")).is_err());
+    }
+
+    #[test]
+    fn webchat_build_provider_ids_requires_sender() {
+        let activity: WebChatActivity = serde_json::from_value(json!({
+            "conversation": { "id": "conv-abc" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            build_provider_ids(&activity),
+            Err(StatusCode::BAD_REQUEST)
+        ));
+    }
 }

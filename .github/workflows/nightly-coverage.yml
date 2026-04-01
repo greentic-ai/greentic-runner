@@ -1,0 +1,63 @@
+name: Nightly Coverage
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 4 * * *"
+
+concurrency:
+  group: nightly-coverage-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  coverage-policy:
+    name: Coverage Policy
+    runs-on: ubuntu-latest
+    env:
+      CI: "1"
+      CARGO_NET_OFFLINE: "false"
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-wasip2
+
+      - name: Install wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2 --toolchain 1.94.0
+
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview --toolchain 1.94.0
+
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Install coverage tools
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo binstall --no-confirm greentic-dev cargo-nextest cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Validate coverage policy
+        run: greentic-dev coverage
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-coverage-artifacts
+          path: |
+            target/coverage
+            coverage-policy.json
+          if-no-files-found: ignore

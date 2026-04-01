@@ -205,6 +205,7 @@ fn build_error(status: StatusCode, message: &'static str) -> AxumResponse<Body> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::TenantRuntimeHandle;
     use axum::http::{Method, Uri};
 
     #[test]
@@ -236,5 +237,67 @@ mod tests {
         .unwrap();
         assert_eq!(object_response.status(), StatusCode::ACCEPTED);
         assert_eq!(object_response.headers().get("X-Custom").unwrap(), "true");
+    }
+
+    #[test]
+    fn normalize_request_encodes_binary_body_as_hex() {
+        let headers = HeaderMap::new();
+        let method = Method::PUT;
+        let uri: Uri = "/hook".parse().unwrap();
+        let body = [0_u8, 255_u8];
+
+        let normalized = normalize_request(&method, &uri, &headers, &body);
+        assert_eq!(normalized["body"]["base16"], json!("00ff"));
+    }
+
+    #[tokio::test]
+    async fn build_response_decodes_binary_and_rejects_invalid_status() {
+        let response = build_response(json!({
+            "body": { "base16": "6869" }
+        }))
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"hi");
+
+        assert!(build_response(json!({ "status": 42 })).is_err());
+    }
+
+    #[tokio::test]
+    async fn serialize_body_and_errors_cover_text_and_json_fallbacks() {
+        let text_body = serialize_body(&json!({"text": "hello"}));
+        let text = axum::body::to_bytes(text_body, usize::MAX).await.unwrap();
+        assert_eq!(&text[..], b"hello");
+
+        let fallback_body = serialize_body(&json!({"unexpected": true}));
+        let fallback = axum::body::to_bytes(fallback_body, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&fallback[..], br#"{"unexpected":true}"#);
+
+        let error = build_error(StatusCode::FORBIDDEN, "nope");
+        assert_eq!(error.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_not_found_for_unknown_flow() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime()
+            .await
+            .expect("runtime");
+        let response = dispatch(
+            TenantRuntimeHandle {
+                tenant: "demo".into(),
+                runtime,
+            },
+            axum::extract::Path("missing.flow".to_string()),
+            Method::POST,
+            "/hook".parse().unwrap(),
+            HeaderMap::new(),
+            axum::body::Bytes::new(),
+        )
+        .await
+        .expect_err("missing flow should reject");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

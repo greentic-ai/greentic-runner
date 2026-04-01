@@ -158,3 +158,119 @@ fn merge_env(tenant: &mut TenantBindings, envs: Vec<String>) {
     tenant.env_passthrough = merged.into_iter().collect();
     tenant.env_passthrough.sort();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_file(path: &Path, body: &str) {
+        fs::write(path, body).expect("write file");
+    }
+
+    #[test]
+    fn collect_gtbind_paths_scans_dirs_and_dedups() {
+        let temp = TempDir::new().expect("tempdir");
+        let a = temp.path().join("a.gtbind");
+        let b = temp.path().join("b.gtbind");
+        let ignored = temp.path().join("ignored.txt");
+        write_file(&a, "tenant: demo\npack_id: pack\npack_ref: pack@1\n");
+        write_file(&b, "tenant: demo\npack_id: pack2\npack_ref: pack2@1\n");
+        write_file(&ignored, "ignore");
+
+        let paths = collect_gtbind_paths(std::slice::from_ref(&a), &[temp.path().to_path_buf()])
+            .expect("collect paths");
+
+        assert_eq!(paths, vec![a, b]);
+    }
+
+    #[test]
+    fn load_gtbinds_merges_flows_locators_and_env() {
+        let temp = TempDir::new().expect("tempdir");
+        let one = temp.path().join("one.gtbind");
+        let two = temp.path().join("two.gtbind");
+        write_file(
+            &one,
+            r#"
+tenant: demo
+pack_id: pack.main
+pack_ref: pack.main@1.0.0
+pack_locator: fs:///packs/main.gtpack
+flows:
+  - id: flow-a
+  - id: ""
+env_passthrough: [TOKEN, API_KEY]
+"#,
+        );
+        write_file(
+            &two,
+            r#"
+tenant: demo
+pack_id: pack.main
+pack_ref: pack.main@1.0.0
+flows:
+  - id: flow-b
+env_passthrough: [API_KEY, SECRET]
+"#,
+        );
+
+        let tenants = load_gtbinds(&[one, two]).expect("load gtbinds");
+        let tenant = tenants.get("demo").expect("tenant");
+        assert_eq!(tenant.packs.len(), 1);
+        assert_eq!(tenant.packs[0].flows, vec!["flow-a", "flow-b"]);
+        assert_eq!(
+            tenant.packs[0].pack_locator.as_deref(),
+            Some("fs:///packs/main.gtpack")
+        );
+        assert_eq!(tenant.env_passthrough, vec!["API_KEY", "SECRET", "TOKEN"]);
+    }
+
+    #[test]
+    fn load_gtbinds_rejects_missing_required_fields() {
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("broken.gtbind");
+        write_file(&file, "tenant: demo\npack_id: ''\npack_ref: pack@1\n");
+
+        assert!(load_gtbinds(&[file]).is_err());
+    }
+
+    #[test]
+    fn merge_pack_rejects_conflicting_refs_and_locators() {
+        let mut tenant = TenantBindings {
+            tenant: "demo".into(),
+            packs: vec![PackBinding {
+                pack_id: "pack.main".into(),
+                pack_ref: "pack.main@1.0.0".into(),
+                pack_locator: Some("fs:///packs/a.gtpack".into()),
+                flows: vec!["flow-a".into()],
+            }],
+            env_passthrough: Vec::new(),
+        };
+
+        assert!(
+            merge_pack(
+                &mut tenant,
+                PackBinding {
+                    pack_id: "pack.main".into(),
+                    pack_ref: "pack.main@2.0.0".into(),
+                    pack_locator: Some("fs:///packs/a.gtpack".into()),
+                    flows: vec![],
+                }
+            )
+            .is_err()
+        );
+
+        assert!(
+            merge_pack(
+                &mut tenant,
+                PackBinding {
+                    pack_id: "pack.main".into(),
+                    pack_ref: "pack.main@1.0.0".into(),
+                    pack_locator: Some("fs:///packs/b.gtpack".into()),
+                    flows: vec![],
+                }
+            )
+            .is_err()
+        );
+    }
+}

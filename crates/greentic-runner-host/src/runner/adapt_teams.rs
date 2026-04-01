@@ -327,4 +327,38 @@ mod tests {
         assert_eq!(payload["provider"], json!("teams"));
         assert_eq!(payload["text"], json!("Hello"));
     }
+
+    #[test]
+    fn build_provider_ids_requires_sender_id() {
+        let activity: TeamsActivity = serde_json::from_value(json!({
+            "conversation": { "id": "conv-abc" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            build_provider_ids(&activity),
+            Err(StatusCode::BAD_REQUEST)
+        ));
+    }
+
+    #[test]
+    fn teams_helpers_map_attachments_and_channel_data() {
+        let activity: TeamsActivity = serde_json::from_value(json!({
+            "from": { "id": "user-123" },
+            "attachments": [{
+                "contentType": "image/png",
+                "contentUrl": "https://example.com/image.png",
+                "content": "inline-data",
+                "name": "image.png",
+                "size": 42
+            }]
+        }))
+        .unwrap();
+        let attachments = map_attachments(&activity);
+        assert_eq!(attachments[0]["type"], json!("image"));
+        assert_eq!(attachments[0]["data_inline_b64"], json!("inline-data"));
+
+        let empty_data = build_channel_data(&activity);
+        assert_eq!(empty_data["channel_data"], Value::Null);
+        assert!(parse_timestamp(Some("not-a-timestamp")).is_err());
+    }
 }

@@ -354,3 +354,134 @@ fn sanitize(value: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl MockEventSink for RecordingSink {
+        fn on_mock_event(&self, capability: &str, provider: &str, payload: &Value) {
+            self.events.lock().push((
+                capability.to_string(),
+                provider.to_string(),
+                payload.clone(),
+            ));
+        }
+    }
+
+    #[test]
+    fn mock_layer_emits_secret_and_telemetry_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = MockLayer::new(
+            MocksConfig {
+                secrets: Some(SecretsMock {
+                    map: [("API_KEY".to_string(), "secret".to_string())]
+                        .into_iter()
+                        .collect(),
+                }),
+                telemetry: Some(TelemetryMock),
+                ..MocksConfig::default()
+            },
+            temp.path(),
+        )
+        .unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        layer.register_sink(sink.clone());
+
+        assert_eq!(layer.secrets_lookup("API_KEY").as_deref(), Some("secret"));
+        assert!(layer.telemetry_drain(&[("tenant", "demo")]));
+
+        let events = sink.events.lock();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "secrets");
+        assert_eq!(events[1].0, "telemetry");
+    }
+
+    #[test]
+    fn tool_short_circuit_reads_json_script() {
+        let temp = tempfile::tempdir().unwrap();
+        let scripts = temp.path().join("scripts");
+        fs::create_dir_all(&scripts).unwrap();
+        fs::write(
+            scripts.join("tool_name__do_it.json"),
+            br#"{ "ok": true, "answer": 7 }"#,
+        )
+        .unwrap();
+        let layer = MockLayer::new(
+            MocksConfig {
+                mcp_tools: Some(ToolsMock {
+                    directory: None,
+                    script_dir: Some(scripts),
+                    short_circuit: true,
+                }),
+                ..MocksConfig::default()
+            },
+            temp.path(),
+        )
+        .unwrap();
+
+        let value = layer
+            .tool_short_circuit("tool-name", "do it")
+            .expect("short circuit")
+            .expect("script value");
+        assert_eq!(value["ok"], json!(true));
+        assert_eq!(value["answer"], json!(7));
+    }
+
+    #[test]
+    fn http_mock_request_and_runtime_record_replay_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let request =
+            HttpMockRequest::new("GET", "https://api.example.com/v1/items", None).unwrap();
+        assert_eq!(request.host, "api.example.com");
+
+        let runtime = HttpMockRuntime::new(
+            &HttpMock {
+                record_replay_dir: Some(temp.path().join("cassettes")),
+                mode: HttpMockMode::RecordReplay,
+                rewrites: Vec::new(),
+            },
+            temp.path(),
+        )
+        .unwrap();
+        let response = HttpMockResponse::new(200, BTreeMap::new(), Some("body".into()));
+        runtime.record(&request, &response).unwrap();
+        let replayed = runtime.replay(&request).expect("replayed response");
+        assert_eq!(replayed.status, 200);
+        assert_eq!(replayed.body.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn mock_layer_http_begin_enforces_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = MockLayer::new(
+            MocksConfig {
+                http: Some(HttpMock {
+                    record_replay_dir: None,
+                    mode: HttpMockMode::FailOnMiss,
+                    rewrites: Vec::new(),
+                }),
+                net_allowlist: vec!["allowed.example.com".into()],
+                ..MocksConfig::default()
+            },
+            temp.path(),
+        )
+        .unwrap();
+
+        let denied = layer
+            .http_begin(&HttpMockRequest::new("GET", "https://blocked.example.com", None).unwrap());
+        assert!(matches!(denied, HttpDecision::Deny(message) if message.contains("allowlist")));
+
+        let miss = layer
+            .http_begin(&HttpMockRequest::new("GET", "https://allowed.example.com", None).unwrap());
+        assert!(
+            matches!(miss, HttpDecision::Deny(message) if message.contains("no recorded response"))
+        );
+        assert_eq!(sanitize("tool-name/do it"), "tool_name_do_it");
+    }
+}

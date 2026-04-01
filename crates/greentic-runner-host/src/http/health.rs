@@ -92,3 +92,61 @@ pub async fn handler(State(state): State<ServerState>) -> impl IntoResponse {
         "last_error": snapshot.last_error,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::auth::AdminAuth;
+    use crate::routing::{RoutingConfig, TenantRouting};
+    use crate::runner::ServerState;
+    use crate::runtime::ActivePacks;
+    use axum::body::to_bytes;
+    use axum::response::IntoResponse;
+    use std::sync::Arc;
+
+    fn state() -> ServerState {
+        ServerState {
+            active: Arc::new(ActivePacks::new()),
+            routing: TenantRouting::new(RoutingConfig::default()),
+            health: Arc::new(HealthState::new()),
+            reload: None,
+            admin: AdminAuth::default(),
+        }
+    }
+
+    #[test]
+    fn snapshot_tracks_readiness_and_errors() {
+        let health = HealthState::new();
+        health.mark_telemetry_ready();
+        health.record_reload_error(&anyhow::anyhow!("reload failed"));
+        let before = health.snapshot();
+        assert!(before.telemetry_ready);
+        assert!(!before.secrets_ready);
+        assert_eq!(before.last_error.as_deref(), Some("reload failed"));
+
+        health.mark_secrets_ready();
+        health.record_reload_success();
+        let after = health.snapshot();
+        assert!(after.telemetry_ready);
+        assert!(after.secrets_ready);
+        assert!(after.last_reload.is_some());
+        assert!(after.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn handler_reports_degraded_without_active_packs() {
+        let state = state();
+        state.health.set_ready();
+
+        let response = handler(State(state)).await.into_response();
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["telemetry_ready"], true);
+        assert_eq!(json["secrets_ready"], true);
+        assert_eq!(json["active_packs"], 0);
+    }
+}

@@ -1107,3 +1107,210 @@ fn sanitize_id(value: &str) -> String {
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    fn sample_metadata() -> PackMetadata {
+        PackMetadata {
+            pack_id: "pack.demo".into(),
+            version: "1.0.0".into(),
+            entry_flows: vec!["entry.flow".into()],
+            secret_requirements: Vec::new(),
+        }
+    }
+
+    fn sample_profile() -> ResolvedProfile {
+        ResolvedProfile {
+            tenant_id: "tenant".into(),
+            team_id: "team".into(),
+            user_id: "user".into(),
+            session_id: "session-1".into(),
+            provider_id: PROVIDER_ID_DEV.into(),
+            max_node_wall_time_ms: 1000,
+            max_run_wall_time_ms: 2000,
+        }
+    }
+
+    #[test]
+    fn resolve_entry_flow_prefers_override_then_metadata_then_flows() {
+        let metadata = sample_metadata();
+        let flows = vec![FlowDescriptor {
+            id: "fallback.flow".into(),
+            flow_type: "message".into(),
+            pack_id: "pack.demo".into(),
+            profile: "default".into(),
+            version: "1.0.0".into(),
+            description: None,
+        }];
+
+        assert_eq!(
+            resolve_entry_flow(Some("manual.flow".into()), &metadata, &flows).unwrap(),
+            "manual.flow"
+        );
+        assert_eq!(
+            resolve_entry_flow(None, &metadata, &flows).unwrap(),
+            "entry.flow"
+        );
+        assert!(
+            resolve_entry_flow(
+                None,
+                &PackMetadata {
+                    entry_flows: Vec::new(),
+                    ..metadata
+                },
+                &flows
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn normalize_pack_path_accepts_relative_files_inside_cwd() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().expect("cwd")).expect("tempdir");
+        let pack = temp.path().join("demo.gtpack");
+        fs::write(&pack, b"pack").expect("pack file");
+        let relative = pack
+            .strip_prefix(std::env::current_dir().expect("cwd"))
+            .expect("relative")
+            .to_path_buf();
+
+        let normalized = normalize_pack_path(&relative).expect("normalized path");
+
+        assert_eq!(normalized, pack.canonicalize().expect("canonical"));
+    }
+
+    #[test]
+    fn prepare_run_dirs_creates_logs_and_resolved_subdirs() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("artifacts");
+        let dirs = prepare_run_dirs(Some(root.clone())).expect("run dirs");
+
+        assert_eq!(dirs.root, root);
+        assert!(dirs.logs.is_dir());
+        assert!(dirs.resolved.is_dir());
+    }
+
+    #[test]
+    fn redact_value_masks_nested_sensitive_fields() {
+        let (redacted, paths) = redact_value(
+            &json!({
+                "token": "abc",
+                "nested": { "authorization_header": "secret" },
+                "items": [{ "password_hint": "nope" }]
+            }),
+            "$",
+        );
+
+        assert_eq!(redacted["token"], "__REDACTED__");
+        assert_eq!(redacted["nested"]["authorization_header"], "__REDACTED__");
+        assert_eq!(redacted["items"][0]["password_hint"], "__REDACTED__");
+        assert!(paths.contains(&"$.token".to_string()));
+        assert!(paths.contains(&"$.nested.authorization_header".to_string()));
+    }
+
+    #[test]
+    fn helper_functions_preserve_ids_and_transcript_shape() {
+        assert_eq!(sanitize_id("flow demo/1"), "flow-demo-1");
+        assert!(is_signature_error("Signature verification failed"));
+        assert_eq!(
+            to_reader_policy(SigningPolicy::DevOk),
+            greentic_pack::reader::SigningPolicy::DevOk
+        );
+
+        let profile = sample_profile();
+        let event = build_transcript_event(TranscriptEventArgs {
+            profile: &profile,
+            flow_id: "flow.demo",
+            node_id: "node.demo",
+            component: "component.demo",
+            phase: "invoke",
+            status: "ok",
+            timestamp: OffsetDateTime::now_utc(),
+            inputs: json!({"input": true}),
+            outputs: json!({"output": true}),
+            error: Value::Null,
+            redactions: vec!["$.token".into()],
+        });
+        assert_eq!(event["session_id"], "session-1");
+        assert_eq!(event["flow_id"], "flow.demo");
+        assert_eq!(event["redactions"][0], "$.token");
+    }
+
+    #[test]
+    fn resolve_profile_uses_context_overrides() {
+        let profile = resolve_profile(
+            &Profile::Dev(DevProfile::default()),
+            &TenantContext {
+                tenant_id: Some("tenant-x".into()),
+                team_id: Some("team-x".into()),
+                user_id: Some("user-x".into()),
+                session_id: Some("session-x".into()),
+            },
+        );
+
+        assert_eq!(profile.tenant_id, "tenant-x");
+        assert_eq!(profile.team_id, "team-x");
+        assert_eq!(profile.user_id, "user-x");
+        assert_eq!(profile.session_id, "session-x");
+        assert_eq!(profile.provider_id, PROVIDER_ID_DEV);
+    }
+
+    #[test]
+    fn desktop_defaults_and_runner_builder_preserve_overrides() {
+        let defaults = desktop_defaults();
+        assert_eq!(defaults.signing, SigningPolicy::DevOk);
+        assert_eq!(defaults.ctx.tenant_id.as_deref(), Some("local-dev"));
+
+        let runner = Runner::new()
+            .with_mocks(MocksConfig {
+                telemetry: Some(TelemetryMock),
+                ..MocksConfig::default()
+            })
+            .configure(|opts| {
+                opts.entry_flow = Some("entry.flow".into());
+                opts.input = json!({"demo": true});
+            });
+
+        let rendered = format!("{:?}", runner.base);
+        assert!(rendered.contains("entry.flow"));
+        assert!(runner.base.mocks.telemetry.is_some());
+        assert_eq!(runner.base.input, json!({"demo": true}));
+    }
+
+    #[test]
+    fn resolve_entry_flow_errors_when_pack_has_no_flows() {
+        let metadata = PackMetadata {
+            entry_flows: Vec::new(),
+            ..sample_metadata()
+        };
+        assert!(resolve_entry_flow(None, &metadata, &[]).is_err());
+    }
+
+    #[test]
+    fn build_host_config_enables_local_dev_defaults() {
+        let temp = TempDir::new().expect("tempdir");
+        let dirs = prepare_run_dirs(Some(temp.path().join("run"))).expect("dirs");
+        let config = build_host_config(&sample_profile(), &dirs);
+
+        assert_eq!(config.tenant, "tenant");
+        assert!(!config.http_enabled);
+        assert!(config.secrets_policy.is_allowed("any.secret"));
+        assert!(
+            config
+                .operator_policy
+                .allows_provider(Some("provider"), "provider")
+        );
+    }
+
+    #[test]
+    fn redact_value_leaves_non_sensitive_payloads_unchanged() {
+        let original = json!({"public": {"value": 1}});
+        let (redacted, paths) = redact_value(&original, "$");
+        assert_eq!(redacted, original);
+        assert!(paths.is_empty());
+    }
+}

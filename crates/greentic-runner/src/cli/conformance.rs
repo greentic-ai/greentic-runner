@@ -884,3 +884,69 @@ fn build_host(enable_trace: bool) -> Result<RunnerHost> {
         .build()?;
     Ok(host)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn sample_report(status: &str) -> PackReport {
+        PackReport {
+            pack: "pack.demo".into(),
+            version: "1.0.0".into(),
+            level: "L1".into(),
+            status: status.into(),
+            stage: "run".into(),
+            case: None,
+            diagnostics: Vec::new(),
+            timing_ms: TimingReport::default(),
+        }
+    }
+
+    #[test]
+    fn summarize_counts_pass_and_fail() {
+        let summary = summarize(
+            &[sample_report("pass"), sample_report("fail")],
+            ConformanceLevel::L1,
+        );
+        assert_eq!(summary.level, "L1");
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn discover_packs_finds_only_gtpack_files() {
+        let temp = TempDir::new().expect("tempdir");
+        let nested = temp.path().join("nested");
+        fs::create_dir_all(&nested).expect("nested");
+        fs::write(temp.path().join("a.gtpack"), b"a").expect("a");
+        fs::write(nested.join("b.GTPACK"), b"b").expect("b");
+        fs::write(temp.path().join("ignore.txt"), b"x").expect("x");
+
+        let packs = discover_packs(temp.path()).expect("discover packs");
+        assert_eq!(packs.len(), 2);
+    }
+
+    #[test]
+    fn helper_filters_and_activity_builder_behave() {
+        assert!(matches_prefix("messaging-demo"));
+        assert!(!matches_prefix("other-demo"));
+        assert!(matches_provider("provider-slack", Some("slack")));
+        assert!(!matches_provider("provider-webex", Some("slack")));
+        assert_eq!(level_label(ConformanceLevel::L2), "L2");
+
+        let activity = build_activity("pack.demo", "flow.demo", "message", Some("session-1"));
+        assert_eq!(activity.pack_id(), Some("pack.demo"));
+        assert_eq!(activity.flow_id(), Some("flow.demo"));
+        assert_eq!(activity.flow_type(), Some("message"));
+        assert_eq!(activity.session_id(), Some("session-1"));
+    }
+
+    #[test]
+    fn structured_check_and_build_host_work() {
+        let replies = vec![Activity::custom("one", serde_json::json!({"ok": true}))];
+        assert!(is_structured(&replies));
+        assert!(build_host(false).is_ok());
+    }
+}

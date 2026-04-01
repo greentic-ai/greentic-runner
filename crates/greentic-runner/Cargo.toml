@@ -53,6 +53,7 @@ fault-injection = ["greentic-runner-host/fault-injection"]
 
 [dev-dependencies]
 greentic-flow.workspace = true
+greentic-config-types.workspace = true
 serial_test.workspace = true
 semver.workspace = true
 insta.workspace = true

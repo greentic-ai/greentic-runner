@@ -105,3 +105,21 @@ pub use schema_core_path::SchemaCore as PathSchemaCore;
 pub use schema_core_path::SchemaCorePre as PathSchemaCorePre;
 pub use schema_core_schema::SchemaCore as SchemaSchemaCore;
 pub use schema_core_schema::SchemaCorePre as SchemaSchemaCorePre;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_provider_core_exports_are_distinct_types() {
+        let legacy = std::any::type_name::<LegacySchemaCorePre<()>>();
+        let path = std::any::type_name::<PathSchemaCorePre<()>>();
+        let schema = std::any::type_name::<SchemaSchemaCorePre<()>>();
+
+        assert!(legacy.contains("SchemaCorePre"));
+        assert!(path.contains("SchemaCorePre"));
+        assert!(schema.contains("SchemaCorePre"));
+        assert_ne!(legacy, path);
+        assert_ne!(legacy, schema);
+    }
+}

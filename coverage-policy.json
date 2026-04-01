@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "global": {
+    "line_coverage_min": 60.0
+  },
+  "defaults": {
+    "per_file_line_coverage_min": 60.0
+  },
+  "exclusions": {
+    "files": [
+      "crates/greentic-runner/src/main.rs",
+      "crates/greentic-runner/src/bin/gen_bindings.rs",
+      "crates/greentic-runner/src/bin/greentic-runner-cli.rs",
+      "crates/greentic-runner/src/gen_bindings/component.rs",
+      "crates/greentic-runner/examples/run_demo.rs",
+      "crates/greentic-runner-host/src/runner/mod.rs",
+      "crates/runner-core/examples/resolve_fs.rs"
+    ]
+  },
+  "per_file": {
+    "crates/runner-core/src/path_safety.rs": {
+      "line_coverage_min": 90.0
+    },
+    "crates/runner-core/src/packs/verify.rs": {
+      "line_coverage_min": 85.0
+    },
+    "crates/greentic-runner-host/src/http/auth.rs": {
+      "line_coverage_min": 85.0
+    },
+    "crates/greentic-runner-host/src/secrets.rs": {
+      "line_coverage_min": 85.0
+    },
+    "crates/greentic-runner-host/src/engine/policy.rs": {
+      "line_coverage_min": 80.0
+    }
+  }
+}

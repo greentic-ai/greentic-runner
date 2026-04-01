@@ -25,3 +25,24 @@ pub async fn collect_body(body: Body) -> Result<Bytes, StatusCode> {
     }
     Ok(data.freeze())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroUsize;
+
+    #[test]
+    fn mark_processed_dedupes_keys() {
+        let cache = Mutex::new(LruCache::new(NonZeroUsize::new(4).unwrap()));
+        assert!(!mark_processed(&cache, "evt-1"));
+        assert!(mark_processed(&cache, "evt-1"));
+        assert!(!mark_processed(&cache, "evt-2"));
+    }
+
+    #[tokio::test]
+    async fn collect_body_returns_request_bytes() {
+        let body = Body::from(r#"{"hello":"world"}"#);
+        let bytes = collect_body(body).await.expect("collect body");
+        assert_eq!(bytes, Bytes::from_static(br#"{"hello":"world"}"#));
+    }
+}

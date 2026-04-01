@@ -68,4 +68,32 @@ mod tests {
         let bad_sig = STANDARD.encode([0xAAu8; 64]);
         assert!(verifier.verify(b"msg", &bad_sig).is_err());
     }
+
+    #[test]
+    fn rejects_unsupported_public_key_algorithms() {
+        let err = PackVerifier::from_env_value("rsa:Zm9v")
+            .err()
+            .expect("algorithm should be rejected");
+        assert!(err.to_string().contains("unsupported public key algorithm"));
+    }
+
+    #[test]
+    fn rejects_public_keys_with_wrong_length() {
+        let err = PackVerifier::from_env_value("ed25519:Zm9v")
+            .err()
+            .expect("short public key should be rejected");
+        assert!(err.to_string().contains("must be 32 bytes"));
+    }
+
+    #[test]
+    fn rejects_malformed_signature_encoding() {
+        let secret = SigningKey::from_bytes(&[9u8; 32]);
+        let public_b64 = STANDARD.encode(secret.verifying_key().as_bytes());
+        let verifier = PackVerifier::from_env_value(&format!("ed25519:{public_b64}")).unwrap();
+
+        let err = verifier
+            .verify(b"msg", "!not-base64!")
+            .expect_err("malformed signature should be rejected");
+        assert!(err.to_string().contains("not valid base64"));
+    }
 }

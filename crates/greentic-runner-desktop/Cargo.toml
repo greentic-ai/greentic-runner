@@ -21,3 +21,6 @@ tracing.workspace = true
 uuid.workspace = true
 zip.workspace = true
 runner-core.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

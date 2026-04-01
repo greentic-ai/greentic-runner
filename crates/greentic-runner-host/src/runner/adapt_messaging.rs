@@ -282,6 +282,7 @@ fn map_telegram_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::TenantRuntimeHandle;
     use serde_json::json;
 
     #[test]
@@ -304,6 +305,21 @@ mod tests {
     }
 
     #[test]
+    fn collect_text_ignores_non_text_scalars_and_prefers_messages_array() {
+        let payload = json!({
+            "text": "ignored",
+            "messages": [
+                { "text": "nested" },
+                1,
+                false,
+                { "other": "field" }
+            ]
+        });
+        let replies = collect_text_responses(&payload);
+        assert_eq!(replies, vec!["nested"]);
+    }
+
+    #[test]
     fn telegram_activity_maps_to_canonical_payload() {
         let update = TelegramUpdate {
             update_id: 42,
@@ -321,5 +337,55 @@ mod tests {
         assert_eq!(mapped.provider_ids.user_id.as_deref(), Some("777"));
         assert_eq!(mapped.payload["provider"], json!("telegram"));
         assert_eq!(mapped.payload["text"], json!("Hello"));
+    }
+
+    #[test]
+    fn telegram_activity_without_sender_uses_chat_scoped_session() {
+        let message = TelegramMessage {
+            text: Some("Ping".into()),
+            chat: TelegramChat { id: 321 },
+            from: None,
+        };
+        let mapped = map_telegram_activity("demo", &message, "Ping", 99, json!({}));
+        assert_eq!(mapped.session_key, "demo:telegram:321:user");
+        assert_eq!(mapped.channel.as_deref(), Some("321"));
+        assert_eq!(mapped.conversation.as_deref(), Some("321"));
+        assert_eq!(mapped.user, None);
+        assert_eq!(mapped.provider_ids.message_id.as_deref(), Some("99"));
+    }
+
+    #[test]
+    fn telegram_activity_payload_keeps_chat_id_in_channel_data() {
+        let message = TelegramMessage {
+            text: Some("Ping".into()),
+            chat: TelegramChat { id: 555 },
+            from: Some(TelegramUser { id: 888 }),
+        };
+        let mapped = map_telegram_activity("demo", &message, "Ping", 7, json!({"raw": true}));
+        assert_eq!(mapped.payload["channel_data"]["chat_id"], json!(555));
+        assert_eq!(mapped.payload["raw"]["raw"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn telegram_webhook_returns_not_implemented_in_provider_core_only_mode() {
+        let (_workspace, runtime) = crate::test_support::build_test_runtime()
+            .await
+            .expect("runtime");
+        let status = telegram_webhook(
+            TenantRuntimeHandle {
+                tenant: "demo".into(),
+                runtime,
+            },
+            axum::Json(TelegramUpdate {
+                update_id: 1,
+                message: Some(TelegramMessage {
+                    text: Some("hello".into()),
+                    chat: TelegramChat { id: 7 },
+                    from: Some(TelegramUser { id: 8 }),
+                }),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     }
 }

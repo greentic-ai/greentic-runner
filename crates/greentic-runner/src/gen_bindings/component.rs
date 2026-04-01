@@ -34,3 +34,15 @@ pub fn analyze_component(path: &std::path::Path) -> Result<ComponentFeatures> {
     }
     Ok(features)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_component_reports_read_errors() {
+        let err = analyze_component(std::path::Path::new("does-not-exist.wasm"))
+            .expect_err("missing component should error");
+        assert!(err.to_string().contains("failed to read component"));
+    }
+}

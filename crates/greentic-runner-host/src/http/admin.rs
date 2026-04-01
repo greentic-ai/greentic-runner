@@ -78,3 +78,55 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::auth::AdminAuth;
+    use crate::http::health::HealthState;
+    use crate::routing::{RoutingConfig, TenantRouting};
+    use crate::runtime::ActivePacks;
+    use axum::body::to_bytes;
+    use axum::response::Response;
+    use std::sync::Arc;
+
+    fn state() -> ServerState {
+        ServerState {
+            active: Arc::new(ActivePacks::new()),
+            routing: TenantRouting::new(RoutingConfig::default()),
+            health: Arc::new(HealthState::new()),
+            reload: None,
+            admin: AdminAuth::default(),
+        }
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        serde_json::from_slice(&body).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn status_reports_empty_runtime_snapshot() {
+        let state = state();
+        state.health.record_reload_success();
+
+        let response = status(AdminGuard, State(state)).await.into_response();
+        let body = json_body(response).await;
+
+        assert_eq!(body["active"], 0);
+        assert_eq!(body["tenants"], serde_json::Value::Array(Vec::new()));
+        assert!(body["last_reload"].is_string());
+        assert!(body["last_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn reload_without_handle_reports_not_implemented() {
+        let response = reload(AdminGuard, State(state())).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = json_body(response).await;
+        assert_eq!(body["error"], "reload handle unavailable");
+    }
+}
