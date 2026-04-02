@@ -85,7 +85,7 @@ semver = "1"
 tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
-toml = "0.9"
+toml = "1.1"
 greentic-telemetry = "0.4"
 walkdir = "2"
 wasmtime = { version = "43", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
