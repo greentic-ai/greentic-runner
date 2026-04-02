@@ -484,13 +484,7 @@ impl FlowEngine {
                         Routing::End | Routing::Reply => (None, true),
                         Routing::Branch { default, .. } => (default.clone(), default.is_none()),
                         Routing::Custom(raw) => {
-                            tracing::warn!(
-                                flow_id = %flow_ir.id,
-                                node_id = %node_id,
-                                routing = ?raw,
-                                "unsupported routing; terminating flow"
-                            );
-                            (None, true)
+                            evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                         }
                     };
 
@@ -515,13 +509,7 @@ impl FlowEngine {
                         Routing::End | Routing::Reply => (None, true),
                         Routing::Branch { default, .. } => (default.clone(), default.is_none()),
                         Routing::Custom(raw) => {
-                            tracing::warn!(
-                                flow_id = %flow_ir.id,
-                                node_id = %node_id,
-                                routing = ?raw,
-                                "unsupported routing for wait; terminating flow"
-                            );
-                            (None, true)
+                            evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
                         }
                     };
                     let resume_target = next.ok_or_else(|| {
@@ -1824,6 +1812,181 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
             );
         }
     }
+}
+
+/// Evaluate custom routing (conditional routes) against node output and input.
+///
+/// Parses `Routing::Custom(Value)` as an array of `{condition, to}` objects.
+/// Conditions are simple equality expressions like `response.action == "about"`.
+/// Falls back to the first route without a condition (default route).
+///
+/// The evaluation context includes:
+/// - All fields from the node output payload (top-level)
+/// - `entry` / `in` — the original flow entry (incoming message)
+/// - `response` — synthesized from entry metadata for convenient condition checks
+///   (e.g. `response.action` maps to `metadata.action` from the incoming envelope)
+fn evaluate_custom_routing(
+    raw: &Value,
+    output: &NodeOutput,
+    state: &ExecutionState,
+    flow_ir: &HostFlow,
+    node_id: &NodeId,
+) -> (Option<NodeId>, bool) {
+    let routes = match raw.as_array() {
+        Some(arr) => arr,
+        None => {
+            tracing::warn!(
+                flow_id = %flow_ir.id,
+                node_id = %node_id,
+                "custom routing is not an array; terminating"
+            );
+            return (None, true);
+        }
+    };
+
+    // Build a rich context for condition evaluation:
+    // Start with output payload, then overlay entry and synthesised "response".
+    let ctx = build_routing_context(output, state);
+
+    for route in routes {
+        let condition = route.get("condition").and_then(|v| v.as_str());
+        let to = route.get("to").and_then(|v| v.as_str());
+
+        if let Some(cond) = condition {
+            if evaluate_simple_condition(cond, &ctx)
+                && let Some(target) = to
+                && let Ok(nid) = NodeId::new(target)
+            {
+                tracing::debug!(
+                    flow_id = %flow_ir.id,
+                    node_id = %node_id,
+                    condition = cond,
+                    target = target,
+                    "conditional route matched"
+                );
+                return (Some(nid), false);
+            }
+        } else if let Some(target) = to
+            && let Ok(nid) = NodeId::new(target)
+        {
+            tracing::debug!(
+                flow_id = %flow_ir.id,
+                node_id = %node_id,
+                target = target,
+                "default route taken"
+            );
+            return (Some(nid), false);
+        }
+    }
+
+    tracing::warn!(
+        flow_id = %flow_ir.id,
+        node_id = %node_id,
+        "no conditional route matched; terminating"
+    );
+    (None, true)
+}
+
+/// Evaluate a simple condition expression like `response.action == "about"`.
+///
+/// Supports dotted path lookups against a JSON value context.
+/// Format: `<path> == "<value>"` or `<path> != "<value>"`
+fn evaluate_simple_condition(condition: &str, ctx: &Value) -> bool {
+    // Parse: `path == "value"` or `path != "value"`
+    let (path, expected, negate) = if let Some(idx) = condition.find("==") {
+        let path = condition[..idx].trim();
+        let val = condition[idx + 2..].trim().trim_matches('"');
+        (path, val, false)
+    } else if let Some(idx) = condition.find("!=") {
+        let path = condition[..idx].trim();
+        let val = condition[idx + 2..].trim().trim_matches('"');
+        (path, val, true)
+    } else {
+        return false;
+    };
+
+    // Resolve dotted path against context (case-insensitive comparison)
+    let actual = resolve_dotted_path(ctx, path);
+    let matches = actual
+        .as_deref()
+        .is_some_and(|a| a.eq_ignore_ascii_case(expected));
+    if negate { !matches } else { matches }
+}
+
+/// Resolve a dotted path like `response.action` against a JSON value.
+fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut current = value;
+    for part in &parts {
+        current = current.get(part)?;
+    }
+    match current {
+        Value::String(s) => Some(s.clone()),
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => Some(current.to_string()),
+    }
+}
+
+/// Build a context object for routing condition evaluation.
+///
+/// The context merges the node output with the flow entry so that conditions
+/// can reference both component results and incoming message data.
+///
+/// Layout:
+/// ```text
+/// {
+///   ...output.payload...,     // top-level fields from component output
+///   "entry": <flow entry>,
+///   "in":    <flow entry>,    // alias
+///   "response": {             // synthesised from envelope metadata
+///     <key>: <value>,         // e.g. "action": "about"
+///     ...
+///   }
+/// }
+/// ```
+fn build_routing_context(output: &NodeOutput, state: &ExecutionState) -> Value {
+    let mut ctx = match &output.payload {
+        Value::Object(map) => map.clone(),
+        _ => JsonMap::new(),
+    };
+
+    let entry = &state.entry;
+    ctx.insert("entry".into(), entry.clone());
+    ctx.insert("in".into(), entry.clone());
+
+    // Synthesise "response" from the envelope metadata.
+    // greentic-start demo path: entry.input.metadata.*
+    // greentic-runner direct path: entry.metadata.*
+    let metadata = entry
+        .pointer("/input/metadata")
+        .or_else(|| entry.pointer("/metadata"));
+
+    let mut response = JsonMap::new();
+    if let Some(Value::Object(meta)) = metadata {
+        for (k, v) in meta {
+            // Flatten string values; stringify others
+            match v {
+                Value::String(s) => {
+                    response.insert(k.clone(), Value::String(s.clone()));
+                }
+                other => {
+                    response.insert(k.clone(), other.clone());
+                }
+            }
+        }
+    }
+    // Also pull text from the envelope for convenience
+    if let Some(text) = entry
+        .pointer("/input/text")
+        .or_else(|| entry.pointer("/text"))
+        .filter(|t| !t.is_null())
+    {
+        response.insert("text".into(), text.clone());
+    }
+    ctx.insert("response".into(), Value::Object(response));
+
+    Value::Object(ctx)
 }
 
 #[cfg(test)]
