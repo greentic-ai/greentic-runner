@@ -1,11 +1,2 @@
-.github/workflows/auto-tag.yml
 .github/workflows/ci.yml
-.github/workflows/codeql.yml
-.github/workflows/codex-security-fix.yml
-.github/workflows/codex-semver-fix.yml
-.github/workflows/dependabot-automerge.yml
-.github/workflows/dependency-review.yml
-.github/workflows/gen-bindings.yml
-.github/workflows/nightly-coverage.yml
-.github/workflows/perf.yml
 .github/workflows/publish.yml
