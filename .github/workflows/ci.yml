@@ -17,6 +17,10 @@ on:
   schedule:
     - cron: "0 3 * * *"
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   semver-checks:
     runs-on: ubuntu-latest
