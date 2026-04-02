@@ -70,7 +70,7 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 wit-bindgen = { version = "0.54", default-features = false }
-wasmparser = "0.245"
+wasmparser = "0.246"
 cron = "0.15"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
