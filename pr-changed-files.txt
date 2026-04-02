@@ -1,2 +1,6 @@
-.github/workflows/ci.yml
-.github/workflows/publish.yml
+Cargo.lock
+Cargo.toml
+SECURITY_FIX_REPORT.md
+all-code-scanning-alerts.json
+crates/greentic-runner-host/src/runner/engine.rs
+pr-changed-files.txt
