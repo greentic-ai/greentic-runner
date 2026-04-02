@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: autotag-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write

@@ -5,6 +5,11 @@ on:
 permissions:
   pull-requests: write
   contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   automerge:
     uses: greenticai/.github/.github/workflows/dependabot-automerge.yml@main
