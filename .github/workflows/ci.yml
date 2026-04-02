@@ -3,6 +3,7 @@ permissions:
   contents: read
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -18,7 +19,7 @@ on:
     - cron: "0 3 * * *"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
