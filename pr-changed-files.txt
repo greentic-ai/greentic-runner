@@ -1,3 +1,4 @@
+Cargo.lock
 Cargo.toml
 SECURITY_FIX_REPORT.md
 all-code-scanning-alerts.json
