@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use greentic_types::TenantCtx;
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -62,6 +63,12 @@ pub fn build_email_http_execution(request: &EmailSendRequest) -> Result<EmailHtt
                         "msgraph email host execution requires message.from.emailAddress.address"
                     )
                 })?;
+            if sender.contains(['/', '?', '#']) {
+                bail!(
+                    "msgraph sender address must not contain '/', '?' or '#': {}",
+                    sender
+                );
+            }
             Ok(EmailHttpExecution {
                 method: "POST",
                 url: format!("https://graph.microsoft.com/v1.0/users/{sender}/sendMail"),
@@ -144,9 +151,22 @@ pub async fn execute_email_request(
     request: &EmailSendRequest,
 ) -> Result<()> {
     let plan = build_email_http_execution(request)?;
+    let url = Url::parse(&plan.url).context("invalid email provider URL")?;
+    if url.scheme() != "https" {
+        bail!(
+            "email provider URL must use https, got scheme `{}`",
+            url.scheme()
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("email provider URL must not include URL credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("email provider URL must not include query or fragment components");
+    }
     let payload = build_email_http_payload(request)?;
     client
-        .post(&plan.url)
+        .post(url)
         .bearer_auth(access_token)
         .json(&payload)
         .send()
@@ -411,5 +431,27 @@ mod tests {
             err.to_string()
                 .contains("message.from.emailAddress.address")
         );
+    }
+
+    #[test]
+    fn msgraph_rejects_sender_with_url_delimiters() {
+        let value = json!({
+            "provider": "msgraph",
+            "payload": {
+                "message": {
+                    "subject": "Hello",
+                    "from": { "emailAddress": { "address": "sender@example.com?debug=1" } }
+                }
+            },
+            "oauth": {
+                "provider_id": "msgraph-email",
+                "flow": "client_credentials",
+                "scopes": ["https://graph.microsoft.com/.default"]
+            }
+        });
+
+        let request = parse_email_send_request(&value).expect("parse request");
+        let err = build_email_http_execution(&request).expect_err("invalid sender should fail");
+        assert!(err.to_string().contains("must not contain '/', '?' or '#'"));
     }
 }

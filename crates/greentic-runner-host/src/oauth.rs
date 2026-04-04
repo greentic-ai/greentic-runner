@@ -61,6 +61,7 @@ pub fn build_resource_token_request(
     if scopes.is_empty() {
         bail!("resource token request requires at least one scope");
     }
+    validate_https_base_url(&config.http_base_url)?;
     Ok(ResourceTokenRequest {
         http_base_url: config.http_base_url.clone(),
         env: tenant.env.to_string(),
@@ -80,6 +81,7 @@ pub async fn request_resource_token(
     request: &ResourceTokenRequest,
 ) -> Result<ResourceTokenResponse> {
     let base = Url::parse(&request.http_base_url)?;
+    validate_https_url_no_credentials_and_no_query(&base, "oauth broker http_base_url")?;
     let url = base.join("resource-token")?;
     let response = client
         .post(url)
@@ -88,6 +90,25 @@ pub async fn request_resource_token(
         .await?
         .error_for_status()?;
     Ok(response.json().await?)
+}
+
+fn validate_https_base_url(url: &str) -> Result<()> {
+    let parsed = Url::parse(url)?;
+    validate_https_url_no_credentials_and_no_query(&parsed, "oauth broker http_base_url")?;
+    Ok(())
+}
+
+fn validate_https_url_no_credentials_and_no_query(url: &Url, label: &str) -> Result<()> {
+    if url.scheme() != "https" {
+        bail!("{label} must use https, got scheme `{}`", url.scheme());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("{label} must not include URL credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("{label} must not include query or fragment components");
+    }
+    Ok(())
 }
 
 pub fn add_oauth_broker_to_linker<T>(_linker: &mut Linker<T>) -> Result<()> {
@@ -164,5 +185,39 @@ mod tests {
         let base = Url::parse(&request.http_base_url).expect("base url");
         let url = base.join("resource-token").expect("joined url");
         assert_eq!(url.as_str(), "https://oauth.example/api/resource-token");
+    }
+
+    #[test]
+    fn rejects_non_https_oauth_broker_base_url() {
+        let cfg = OAuthBrokerConfig::new("http://oauth.example", "nats://localhost:4222");
+        let tenant = sample_tenant();
+        let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
+            .expect_err("http oauth broker url should fail");
+        assert!(err.to_string().contains("must use https"));
+    }
+
+    #[test]
+    fn rejects_oauth_broker_base_url_with_userinfo() {
+        let cfg =
+            OAuthBrokerConfig::new("https://user:pass@oauth.example", "nats://localhost:4222");
+        let tenant = sample_tenant();
+        let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
+            .expect_err("userinfo in oauth broker url should fail");
+        assert!(err.to_string().contains("must not include URL credentials"));
+    }
+
+    #[test]
+    fn rejects_oauth_broker_base_url_with_query_or_fragment() {
+        let cfg = OAuthBrokerConfig::new(
+            "https://oauth.example/base?token=secret#frag",
+            "nats://localhost:4222",
+        );
+        let tenant = sample_tenant();
+        let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
+            .expect_err("query or fragment in oauth broker url should fail");
+        assert!(
+            err.to_string()
+                .contains("must not include query or fragment components")
+        );
     }
 }
