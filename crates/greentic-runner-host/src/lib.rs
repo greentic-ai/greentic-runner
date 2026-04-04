@@ -34,7 +34,6 @@ pub mod engine;
 pub mod fault;
 pub mod gtbind;
 pub mod http;
-pub mod ingress;
 pub mod operator_metrics;
 pub mod operator_registry;
 pub mod pack;
