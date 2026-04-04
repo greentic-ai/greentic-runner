@@ -1,12 +1,17 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
+use axum::http::StatusCode;
+use lru::LruCache;
 use parking_lot::Mutex;
 use reqwest::Client;
+use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 
@@ -30,6 +35,8 @@ use crate::trace::PackTraceInfo;
 use crate::wasi::RunnerWasiPolicy;
 use greentic_types::SecretRequirement;
 
+const TELEGRAM_CACHE_CAPACITY: usize = 1024;
+const WEBHOOK_CACHE_CAPACITY: usize = 256;
 const RUNTIME_SECRETS_PACK_ID: &str = "_runner";
 
 /// Atomically swapped view of live tenant runtimes.
@@ -80,6 +87,9 @@ pub struct TenantRuntime {
     engine: Arc<FlowEngine>,
     state_machine: Arc<StateMachineRuntime>,
     http_client: Client,
+    telegram_cache: Mutex<LruCache<i64, StatusCode>>,
+    webhook_cache: Mutex<LruCache<String, Value>>,
+    messaging_rate: Mutex<RateLimiter>,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
     secrets: DynSecretsManager,
@@ -169,6 +179,10 @@ impl TenantRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
     ) -> Result<Arc<Self>> {
+        let telegram_capacity = NonZeroUsize::new(TELEGRAM_CACHE_CAPACITY)
+            .expect("telegram cache capacity must be > 0");
+        let webhook_capacity =
+            NonZeroUsize::new(WEBHOOK_CACHE_CAPACITY).expect("webhook cache capacity must be > 0");
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
         let pack_runtimes = packs
@@ -215,6 +229,8 @@ impl TenantRuntime {
             .context("failed to initialise state machine runtime")?,
         );
         let http_client = Client::builder().build()?;
+        let messaging_send_qps = config.rate_limits.messaging_send_qps;
+        let messaging_burst = config.rate_limits.messaging_burst;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
             config,
@@ -223,6 +239,9 @@ impl TenantRuntime {
             engine,
             state_machine,
             http_client,
+            telegram_cache: Mutex::new(LruCache::new(telegram_capacity)),
+            webhook_cache: Mutex::new(LruCache::new(webhook_capacity)),
+            messaging_rate: Mutex::new(RateLimiter::new(messaging_send_qps, messaging_burst)),
             mocks,
             timer_handles: Mutex::new(Vec::new()),
             secrets: secrets_manager,
@@ -306,6 +325,21 @@ impl TenantRuntime {
             .iter()
             .flat_map(|pack| pack.missing_secrets(&self.config.tenant_ctx()))
             .collect()
+    }
+
+    #[deprecated(note = "legacy ingress compatibility API")]
+    pub fn telegram_cache(&self) -> &Mutex<LruCache<i64, StatusCode>> {
+        &self.telegram_cache
+    }
+
+    #[deprecated(note = "legacy ingress compatibility API")]
+    pub fn webhook_cache(&self) -> &Mutex<LruCache<String, Value>> {
+        &self.webhook_cache
+    }
+
+    #[deprecated(note = "legacy ingress compatibility API")]
+    pub fn messaging_rate(&self) -> &Mutex<RateLimiter> {
+        &self.messaging_rate
     }
 
     pub fn mocks(&self) -> Option<&Arc<MockLayer>> {
@@ -394,6 +428,42 @@ impl Drop for TenantRuntime {
     fn drop(&mut self) {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
+        }
+    }
+}
+
+pub struct RateLimiter {
+    allowance: f64,
+    rate: f64,
+    burst: f64,
+    last_check: Instant,
+}
+
+impl RateLimiter {
+    pub fn new(qps: u32, burst: u32) -> Self {
+        let rate = qps.max(1) as f64;
+        let burst = burst.max(1) as f64;
+        Self {
+            allowance: burst,
+            rate,
+            burst,
+            last_check: Instant::now(),
+        }
+    }
+
+    pub fn try_acquire(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_check).as_secs_f64();
+        self.last_check = now;
+        self.allowance += elapsed * self.rate;
+        if self.allowance > self.burst {
+            self.allowance = self.burst;
+        }
+        if self.allowance < 1.0 {
+            false
+        } else {
+            self.allowance -= 1.0;
+            true
         }
     }
 }
