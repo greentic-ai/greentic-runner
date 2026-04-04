@@ -1,7 +1,6 @@
 name: Codex Semver Fix
+# Disabled temporarily — intentional breaking API removal (legacy adapters)
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       branch:
