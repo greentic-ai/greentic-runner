@@ -1487,7 +1487,7 @@ impl PackRuntime {
             .state
             .as_ref()
             .map(|caps| caps.read || caps.write)
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     pub fn contains_component(&self, component_ref: &str) -> bool {
