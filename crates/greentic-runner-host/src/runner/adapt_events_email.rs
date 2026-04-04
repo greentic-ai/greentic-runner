@@ -152,6 +152,9 @@ pub async fn execute_email_request(
             url.scheme()
         );
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("email provider URL must not include URL credentials");
+    }
     let payload = build_email_http_payload(request)?;
     client
         .post(url)

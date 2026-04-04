@@ -87,6 +87,9 @@ pub async fn request_resource_token(
             base.scheme()
         );
     }
+    if !base.username().is_empty() || base.password().is_some() {
+        bail!("oauth broker http_base_url must not include URL credentials");
+    }
     let url = base.join("resource-token")?;
     let response = client
         .post(url)
@@ -104,6 +107,9 @@ fn validate_https_base_url(url: &str) -> Result<()> {
             "oauth broker http_base_url must use https, got scheme `{}`",
             parsed.scheme()
         );
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("oauth broker http_base_url must not include URL credentials");
     }
     Ok(())
 }
@@ -191,5 +197,14 @@ mod tests {
         let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
             .expect_err("http oauth broker url should fail");
         assert!(err.to_string().contains("must use https"));
+    }
+
+    #[test]
+    fn rejects_oauth_broker_base_url_with_userinfo() {
+        let cfg = OAuthBrokerConfig::new("https://user:pass@oauth.example", "nats://localhost:4222");
+        let tenant = sample_tenant();
+        let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
+            .expect_err("userinfo in oauth broker url should fail");
+        assert!(err.to_string().contains("must not include URL credentials"));
     }
 }
