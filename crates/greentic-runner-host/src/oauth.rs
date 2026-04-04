@@ -201,7 +201,8 @@ mod tests {
 
     #[test]
     fn rejects_oauth_broker_base_url_with_userinfo() {
-        let cfg = OAuthBrokerConfig::new("https://user:pass@oauth.example", "nats://localhost:4222");
+        let cfg =
+            OAuthBrokerConfig::new("https://user:pass@oauth.example", "nats://localhost:4222");
         let tenant = sample_tenant();
         let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
             .expect_err("userinfo in oauth broker url should fail");
