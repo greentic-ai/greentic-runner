@@ -407,15 +407,20 @@ fn state_store_component_artifact() -> Result<PathBuf> {
 fn build_state_store_pack(pack_path: &Path, include_state_capability: bool) -> Result<()> {
     let component_path = state_store_component_artifact()?;
     let mut capabilities = ComponentCapabilities::default();
-    if include_state_capability {
-        capabilities.host = HostCapabilities {
-            state: Some(StateCapabilities {
+    capabilities.host = HostCapabilities {
+        state: Some(if include_state_capability {
+            StateCapabilities {
                 read: true,
                 write: true,
-            }),
-            ..HostCapabilities::default()
-        };
-    }
+            }
+        } else {
+            StateCapabilities {
+                read: false,
+                write: false,
+            }
+        }),
+        ..HostCapabilities::default()
+    };
 
     let manifest = PackManifest {
         schema_version: "1.0".into(),
