@@ -1,7 +1,7 @@
 name: Codex Semver Fix
+# Disabled temporarily — codex auto-remediation re-adds intentionally deleted code.
+# Re-enable after PR #235 is merged.
 on:
-  pull_request:
-    branches: [main]
   workflow_dispatch:
     inputs:
       branch:
