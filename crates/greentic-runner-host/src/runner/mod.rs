@@ -1,18 +1,10 @@
 pub mod adapt_events_email;
-pub mod adapt_messaging;
-pub mod adapt_slack;
-pub mod adapt_teams;
 pub mod adapt_timer;
-pub mod adapt_webchat;
-pub mod adapt_webex;
-pub mod adapt_webhook;
-pub mod adapt_whatsapp;
 pub mod contract_cache;
 pub mod contract_introspection;
 pub mod engine;
 pub mod flow_adapter;
 pub mod i18n;
-pub mod ingress_util;
 pub mod invocation;
 pub mod mocks;
 pub mod operator;
@@ -23,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::routing::{any, get, post};
+use axum::routing::{get, post};
 use axum::{Router, serve};
 use tokio::net::TcpListener;
 
@@ -56,20 +48,6 @@ impl HostServer {
             admin,
         };
         let router = Router::new()
-            .route(
-                "/messaging/telegram/webhook",
-                post(adapt_messaging::telegram_webhook),
-            )
-            .route("/webchat/activities", post(adapt_webchat::activities))
-            .route("/teams/activities", post(adapt_teams::activities))
-            .route("/slack/events", post(adapt_slack::events))
-            .route("/slack/interactive", post(adapt_slack::interactive))
-            .route("/webex/webhook", post(adapt_webex::webhook))
-            .route(
-                "/whatsapp/webhook",
-                get(adapt_whatsapp::verify).post(adapt_whatsapp::webhook),
-            )
-            .route("/webhook/{flow_id}", any(adapt_webhook::dispatch))
             .route("/operator/op/invoke", post(operator::invoke))
             .route("/healthz", get(http::health::handler))
             .route("/admin/packs/status", get(admin::status))
