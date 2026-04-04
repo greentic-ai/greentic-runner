@@ -61,6 +61,7 @@ pub fn build_resource_token_request(
     if scopes.is_empty() {
         bail!("resource token request requires at least one scope");
     }
+    validate_https_base_url(&config.http_base_url)?;
     Ok(ResourceTokenRequest {
         http_base_url: config.http_base_url.clone(),
         env: tenant.env.to_string(),
@@ -80,6 +81,12 @@ pub async fn request_resource_token(
     request: &ResourceTokenRequest,
 ) -> Result<ResourceTokenResponse> {
     let base = Url::parse(&request.http_base_url)?;
+    if base.scheme() != "https" {
+        bail!(
+            "oauth broker http_base_url must use https, got scheme `{}`",
+            base.scheme()
+        );
+    }
     let url = base.join("resource-token")?;
     let response = client
         .post(url)
@@ -88,6 +95,17 @@ pub async fn request_resource_token(
         .await?
         .error_for_status()?;
     Ok(response.json().await?)
+}
+
+fn validate_https_base_url(url: &str) -> Result<()> {
+    let parsed = Url::parse(url)?;
+    if parsed.scheme() != "https" {
+        bail!(
+            "oauth broker http_base_url must use https, got scheme `{}`",
+            parsed.scheme()
+        );
+    }
+    Ok(())
 }
 
 pub fn add_oauth_broker_to_linker<T>(_linker: &mut Linker<T>) -> Result<()> {
@@ -164,5 +182,14 @@ mod tests {
         let base = Url::parse(&request.http_base_url).expect("base url");
         let url = base.join("resource-token").expect("joined url");
         assert_eq!(url.as_str(), "https://oauth.example/api/resource-token");
+    }
+
+    #[test]
+    fn rejects_non_https_oauth_broker_base_url() {
+        let cfg = OAuthBrokerConfig::new("http://oauth.example", "nats://localhost:4222");
+        let tenant = sample_tenant();
+        let err = build_resource_token_request(&cfg, &tenant, "msgraph-email", &["scope".into()])
+            .expect_err("http oauth broker url should fail");
+        assert!(err.to_string().contains("must use https"));
     }
 }

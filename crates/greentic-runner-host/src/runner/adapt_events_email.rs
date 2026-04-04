@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use greentic_types::TenantCtx;
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -144,9 +145,16 @@ pub async fn execute_email_request(
     request: &EmailSendRequest,
 ) -> Result<()> {
     let plan = build_email_http_execution(request)?;
+    let url = Url::parse(&plan.url).context("invalid email provider URL")?;
+    if url.scheme() != "https" {
+        bail!(
+            "email provider URL must use https, got scheme `{}`",
+            url.scheme()
+        );
+    }
     let payload = build_email_http_payload(request)?;
     client
-        .post(&plan.url)
+        .post(url)
         .bearer_auth(access_token)
         .json(&payload)
         .send()
