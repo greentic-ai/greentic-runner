@@ -452,9 +452,6 @@ mod tests {
 
         let request = parse_email_send_request(&value).expect("parse request");
         let err = build_email_http_execution(&request).expect_err("invalid sender should fail");
-        assert!(
-            err.to_string()
-                .contains("must not contain '/', '?' or '#'")
-        );
+        assert!(err.to_string().contains("must not contain '/', '?' or '#'"));
     }
 }
