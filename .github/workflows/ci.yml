@@ -4,9 +4,6 @@ permissions:
 
 on:
   workflow_call:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
     inputs:
