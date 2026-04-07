@@ -26,7 +26,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Parser)]
-#[command(name = "greentic-runner")]
+#[command(name = "greentic-runner", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
