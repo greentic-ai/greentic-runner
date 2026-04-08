@@ -121,7 +121,8 @@ pub struct RunOptions {
     pub allow_missing_hash: bool,
     /// Optional cross-pack resolver for `provider.invoke` nodes that reference
     /// providers in other packs (e.g., OAuth broker from a capability pack).
-    pub cross_pack_resolver: Option<Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
+    pub cross_pack_resolver:
+        Option<Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
 }
 
 impl Default for RunOptions {

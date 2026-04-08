@@ -594,18 +594,17 @@ impl FlowEngine {
     ) -> Result<DispatchOutcome> {
         // For card invocations, inject the user's locale from the ingress
         // event metadata so the component can resolve i18n translations.
-        if is_card_invocation(&payload) {
-            if let Value::Object(ref mut map) = payload {
-                if !map.contains_key("locale") {
-                    let locale = state
-                        .entry
-                        .pointer("/input/metadata/locale")
-                        .or_else(|| state.entry.pointer("/metadata/locale"))
-                        .and_then(Value::as_str);
-                    if let Some(loc) = locale {
-                        map.insert("locale".into(), Value::String(loc.to_string()));
-                    }
-                }
+        if is_card_invocation(&payload)
+            && let Value::Object(ref mut map) = payload
+            && !map.contains_key("locale")
+        {
+            let locale = state
+                .entry
+                .pointer("/input/metadata/locale")
+                .or_else(|| state.entry.pointer("/metadata/locale"))
+                .and_then(Value::as_str);
+            if let Some(loc) = locale {
+                map.insert("locale".into(), Value::String(loc.to_string()));
             }
         }
         match &node.kind {
@@ -1018,10 +1017,7 @@ impl FlowEngine {
                 self.cross_pack_resolver.is_some()
             );
             if let Some(ref resolver) = self.cross_pack_resolver {
-                let provider_id = payload
-                    .provider_id
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let provider_id = payload.provider_id.as_deref().unwrap_or("unknown");
                 tracing::info!(
                     provider_id,
                     op = %op,
@@ -1900,10 +1896,10 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
 
         if bundle_path.ends_with(".json") {
             // Single-file mode: load the file under "en" locale.
-            if let Ok(bytes) = pack.read_asset(&bundle_path) {
-                if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
-                    i18n_entries.insert("en".to_string(), Value::Object(entries));
-                }
+            if let Ok(bytes) = pack.read_asset(&bundle_path)
+                && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+            {
+                i18n_entries.insert("en".to_string(), Value::Object(entries));
             }
         } else {
             // Directory mode: discover available locales from _manifest.json
@@ -1915,10 +1911,16 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
                 .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
                 .and_then(|v| {
                     // _manifest.json may be {"locales":["en","de",...]} or ["en","de",...]
-                    let arr = v.get("locales").and_then(Value::as_array).cloned()
+                    let arr = v
+                        .get("locales")
+                        .and_then(Value::as_array)
+                        .cloned()
                         .or_else(|| v.as_array().cloned());
                     arr.map(|a| {
-                        a.iter().filter_map(Value::as_str).map(String::from).collect()
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(String::from)
+                            .collect()
                     })
                 })
                 .unwrap_or_default();
@@ -1927,19 +1929,19 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
 
             for locale in &locale_codes {
                 let candidate = format!("{bundle_path}/{locale}.json");
-                if let Ok(bytes) = pack.read_asset(&candidate) {
-                    if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
-                        i18n_entries.insert(locale.clone(), Value::Object(entries));
-                    }
+                if let Ok(bytes) = pack.read_asset(&candidate)
+                    && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    i18n_entries.insert(locale.clone(), Value::Object(entries));
                 }
             }
             // Always try en.json even if not in manifest
             if !i18n_entries.contains_key("en") {
                 let en_path = format!("{bundle_path}/en.json");
-                if let Ok(bytes) = pack.read_asset(&en_path) {
-                    if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
-                        i18n_entries.insert("en".to_string(), Value::Object(entries));
-                    }
+                if let Ok(bytes) = pack.read_asset(&en_path)
+                    && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+                {
+                    i18n_entries.insert("en".to_string(), Value::Object(entries));
                 }
             }
         }
@@ -2153,6 +2155,7 @@ mod tests {
             validation: ValidationConfig {
                 mode: ValidationMode::Off,
             },
+            cross_pack_resolver: None,
         }
     }
 
@@ -2457,6 +2460,7 @@ mod tests {
             validation: ValidationConfig {
                 mode: ValidationMode::Off,
             },
+            cross_pack_resolver: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -2545,6 +2549,7 @@ mod tests {
             validation: ValidationConfig {
                 mode: ValidationMode::Off,
             },
+            cross_pack_resolver: None,
         }
     }
 
