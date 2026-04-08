@@ -20,7 +20,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.4.75"
+version = "0.4.76"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -61,7 +61,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 serde_yaml_bw= {package="serde_yaml_gtc", version="2.5.2"}
 serde_cbor = "0.11"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2.0"
 time = { version = "0.3", features = ["macros", "serde-well-known"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "rt", "signal", "time", "net", "sync", "fs"] }
@@ -69,23 +69,23 @@ tokio-util = "0.7"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-wit-bindgen = { version = "0.54", default-features = false }
-wasmparser = "0.245"
+wit-bindgen = { version = "0.55", default-features = false }
+wasmparser = "0.246"
 cron = "0.15"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 indexmap = "2"
 bytes = "1"
-criterion = "0.5"
-hmac = "0.12"
-sha1 = "0.10"
+criterion = "0.8"
+hmac = "0.13"
+sha1 = "0.11"
 blake3 = "1"
 semver = "1"
 tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
-toml = "0.9"
+toml = "1"
 greentic-telemetry = "0.4"
 walkdir = "2"
 wasmtime = { version = "43", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
