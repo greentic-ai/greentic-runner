@@ -1,0 +1,233 @@
+{
+  "$schema": "https://greenticai.github.io/greentic-component/schemas/v1/component.manifest.schema.json",
+  "artifacts": {
+    "component_wasm": "target/wasm32-wasip2/release/component_v0_6_dummy.wasm"
+  },
+  "capabilities": {
+    "host": {
+      "secrets": {
+        "required": []
+      },
+      "telemetry": {
+        "scope": "node"
+      }
+    },
+    "wasi": {
+      "clocks": true,
+      "filesystem": {
+        "mode": "none",
+        "mounts": []
+      },
+      "random": true
+    }
+  },
+  "config_schema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+  },
+  "default_operation": "run",
+  "describe_export": "describe",
+  "dev_flows": {
+    "default": {
+      "format": "flow-ir-json",
+      "graph": {
+        "edges": [
+          {
+            "from": "start",
+            "to": "end"
+          }
+        ],
+        "nodes": [
+          {
+            "id": "start",
+            "type": "start"
+          },
+          {
+            "id": "end",
+            "type": "end"
+          }
+        ]
+      }
+    }
+  },
+  "hashes": {
+    "component_wasm": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "id": "com.example.component-v0-6-dummy",
+  "limits": {
+    "memory_mb": 128,
+    "wall_time_ms": 1000
+  },
+  "name": "component-v0-6-dummy",
+  "operations": [
+    {
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "default": "Hello from component-v0-6-dummy!",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input"
+        ],
+        "title": "component-v0-6-dummy run input",
+        "type": "object"
+      },
+      "name": "run",
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "component-v0-6-dummy run output",
+        "type": "object"
+      }
+    },
+    {
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "enum": [
+              "default",
+              "setup",
+              "install",
+              "update",
+              "upgrade",
+              "remove"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "title": "component-v0-6-dummy qa-spec input",
+        "type": "object"
+      },
+      "name": "qa-spec",
+      "output_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "description_i18n_key": {
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "enum": [
+              "setup",
+              "update",
+              "remove"
+            ],
+            "type": "string"
+          },
+          "title_i18n_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "fields"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": true,
+        "properties": {
+          "answers": {
+            "type": "object"
+          },
+          "current_config": {
+            "type": "object"
+          },
+          "mode": {
+            "type": "string"
+          }
+        },
+        "title": "component-v0-6-dummy apply-answers input",
+        "type": "object"
+      },
+      "name": "apply-answers",
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": true,
+        "properties": {
+          "config": {
+            "type": "object"
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "warnings",
+          "errors"
+        ],
+        "title": "component-v0-6-dummy apply-answers output",
+        "type": "object"
+      }
+    },
+    {
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "title": "component-v0-6-dummy i18n-keys input",
+        "type": "object"
+      },
+      "name": "i18n-keys",
+      "output_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "items": {
+          "type": "string"
+        },
+        "title": "component-v0-6-dummy i18n-keys output",
+        "type": "array"
+      }
+    }
+  ],
+  "profiles": {
+    "default": "stateless",
+    "supported": [
+      "stateless"
+    ]
+  },
+  "secret_requirements": [],
+  "supports": [
+    "messaging"
+  ],
+  "version": "0.1.0",
+  "world": "greentic:component/component@0.6.0"
+}
