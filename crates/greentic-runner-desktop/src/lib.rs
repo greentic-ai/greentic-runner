@@ -119,6 +119,9 @@ pub struct RunOptions {
     pub dist_offline: bool,
     pub dist_cache_dir: Option<PathBuf>,
     pub allow_missing_hash: bool,
+    /// Optional cross-pack resolver for `provider.invoke` nodes that reference
+    /// providers in other packs (e.g., OAuth broker from a capability pack).
+    pub cross_pack_resolver: Option<Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
 }
 
 impl Default for RunOptions {
@@ -255,6 +258,7 @@ pub fn desktop_defaults() -> RunOptions {
         dist_offline: false,
         dist_cache_dir: None,
         allow_missing_hash: false,
+        cross_pack_resolver: None,
     }
 }
 
@@ -359,9 +363,12 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     let entry_flow_id = resolve_entry_flow(opts.entry_flow.clone(), pack.metadata(), &flows)?;
     recorder.set_flow_id(&entry_flow_id);
 
-    let engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&host_config))
+    let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&host_config))
         .await
         .context("failed to prime flow engine")?;
+    if let Some(resolver) = opts.cross_pack_resolver.clone() {
+        engine.set_cross_pack_resolver(resolver);
+    }
 
     let started_at = OffsetDateTime::now_utc();
     let tenant_str = host_config.tenant.clone();

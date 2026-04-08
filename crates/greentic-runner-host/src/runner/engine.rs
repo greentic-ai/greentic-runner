@@ -27,6 +27,24 @@ use crate::validate::{
 };
 use greentic_types::{Flow, Node, NodeId, Routing};
 
+/// Callback trait for resolving cross-pack provider invocations.
+///
+/// When a `provider.invoke` node references a provider that is not in the
+/// current pack, the flow engine calls this resolver as a fallback.
+/// Implementations typically delegate to a capability registry that knows
+/// about all packs in the bundle.
+pub trait CrossPackResolver: Send + Sync {
+    fn invoke(
+        &self,
+        provider_id: &str,
+        provider_type: Option<&str>,
+        op: &str,
+        input: &[u8],
+        tenant: &str,
+        team: Option<&str>,
+    ) -> Result<Value>;
+}
+
 pub struct FlowEngine {
     packs: Vec<Arc<PackRuntime>>,
     flows: Vec<FlowDescriptor>,
@@ -34,6 +52,7 @@ pub struct FlowEngine {
     flow_cache: RwLock<HashMap<FlowKey, HostFlow>>,
     default_env: String,
     validation: ValidationConfig,
+    cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -245,7 +264,14 @@ impl FlowEngine {
             flow_cache: RwLock::new(flow_map),
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
+            cross_pack_resolver: None,
         })
+    }
+
+    /// Set an optional cross-pack resolver for `provider.invoke` nodes that
+    /// reference providers in other packs (resolved via capability registry).
+    pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
+        self.cross_pack_resolver = Some(resolver);
     }
 
     async fn get_or_load_flow(&self, pack_id: &str, flow_id: &str) -> Result<HostFlow> {
@@ -563,9 +589,25 @@ impl FlowEngine {
         node_id: &str,
         node: &HostNode,
         state: &mut ExecutionState,
-        payload: Value,
+        mut payload: Value,
         event: &NodeEvent<'_>,
     ) -> Result<DispatchOutcome> {
+        // For card invocations, inject the user's locale from the ingress
+        // event metadata so the component can resolve i18n translations.
+        if is_card_invocation(&payload) {
+            if let Value::Object(ref mut map) = payload {
+                if !map.contains_key("locale") {
+                    let locale = state
+                        .entry
+                        .pointer("/input/metadata/locale")
+                        .or_else(|| state.entry.pointer("/metadata/locale"))
+                        .and_then(Value::as_str);
+                    if let Some(loc) = locale {
+                        map.insert("locale".into(), Value::String(loc.to_string()));
+                    }
+                }
+            }
+        }
         match &node.kind {
             NodeKind::Exec { target_component } => self
                 .execute_component_exec(
@@ -967,7 +1009,37 @@ impl FlowEngine {
         let binding = pack.resolve_provider(
             payload.provider_id.as_deref(),
             payload.provider_type.as_deref(),
-        )?;
+        );
+
+        // If pack-local resolution fails, try the cross-pack resolver (capability registry).
+        if binding.is_err() {
+            eprintln!(
+                "[DEBUG] provider.invoke: pack-local failed, has_resolver={}",
+                self.cross_pack_resolver.is_some()
+            );
+            if let Some(ref resolver) = self.cross_pack_resolver {
+                let provider_id = payload
+                    .provider_id
+                    .as_deref()
+                    .unwrap_or("unknown");
+                tracing::info!(
+                    provider_id,
+                    op = %op,
+                    "provider.invoke: pack-local resolution failed, trying cross-pack resolver"
+                );
+                let result_value = resolver.invoke(
+                    provider_id,
+                    payload.provider_type.as_deref(),
+                    &op,
+                    &input_json,
+                    ctx.tenant,
+                    None,
+                )?;
+                return Ok(NodeOutput::new(result_value));
+            }
+        }
+
+        let binding = binding?;
         let exec_ctx = component_exec_ctx(ctx, node_id);
         #[cfg(feature = "fault-injection")]
         {
@@ -1810,6 +1882,74 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
                 %err,
                 "card asset not found in pack; leaving as asset reference"
             );
+        }
+    }
+
+    // Pre-resolve i18n bundle: the WASM component cannot read pack assets
+    // directly (no host resolver registered), so inline the i18n JSON into
+    // the invocation under `card_spec.i18n_inline`.
+    let bundle_path_owned = map
+        .get("card_spec")
+        .and_then(|spec| spec.get("i18n_bundle_path"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty());
+
+    if let Some(bundle_path) = bundle_path_owned {
+        let mut i18n_entries: serde_json::Map<String, Value> = serde_json::Map::new();
+
+        if bundle_path.ends_with(".json") {
+            // Single-file mode: load the file under "en" locale.
+            if let Ok(bytes) = pack.read_asset(&bundle_path) {
+                if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
+                    i18n_entries.insert("en".to_string(), Value::Object(entries));
+                }
+            }
+        } else {
+            // Directory mode: discover available locales from _manifest.json
+            // or try well-known locale codes.
+            let manifest_path = format!("{bundle_path}/_manifest.json");
+            let locale_codes: Vec<String> = pack
+                .read_asset(&manifest_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|v| {
+                    // _manifest.json may be {"locales":["en","de",...]} or ["en","de",...]
+                    let arr = v.get("locales").and_then(Value::as_array).cloned()
+                        .or_else(|| v.as_array().cloned());
+                    arr.map(|a| {
+                        a.iter().filter_map(Value::as_str).map(String::from).collect()
+                    })
+                })
+                .unwrap_or_default();
+
+            tracing::info!(%bundle_path, ?locale_codes, "i18n manifest discovered locales");
+
+            for locale in &locale_codes {
+                let candidate = format!("{bundle_path}/{locale}.json");
+                if let Ok(bytes) = pack.read_asset(&candidate) {
+                    if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
+                        i18n_entries.insert(locale.clone(), Value::Object(entries));
+                    }
+                }
+            }
+            // Always try en.json even if not in manifest
+            if !i18n_entries.contains_key("en") {
+                let en_path = format!("{bundle_path}/en.json");
+                if let Ok(bytes) = pack.read_asset(&en_path) {
+                    if let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes) {
+                        i18n_entries.insert("en".to_string(), Value::Object(entries));
+                    }
+                }
+            }
+        }
+
+        if !i18n_entries.is_empty() {
+            let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
+            if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
+                spec.insert("i18n_inline".into(), Value::Object(i18n_entries));
+                tracing::info!(%bundle_path, ?locale_keys, "pre-resolved i18n bundle into card_spec.i18n_inline");
+            }
         }
     }
 }
