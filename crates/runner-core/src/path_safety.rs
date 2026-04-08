@@ -97,19 +97,17 @@ mod tests {
     #[test]
     fn caches_root_canonicalization_per_thread() -> Result<()> {
         let temp = TempDir::new()?;
-        // Use the canonical path as root so that `canonical == root` holds on
-        // platforms where the temp directory contains symlinks (e.g. macOS
-        // `/var` -> `/private/var`).
-        let canonical_root = temp.path().canonicalize()?;
-        let file_path = canonical_root.join("pack.gtpack");
+        // Use the canonical path so the cache key matches (on macOS
+        // /var/folders/... canonicalizes to /private/var/folders/...).
+        let root = temp.path().canonicalize()?;
+        let file_path = root.join("pack.gtpack");
         fs::write(&file_path, b"pack")?;
 
         CANONICAL_ROOT_CACHE.with(|cache| cache.borrow_mut().clear());
-        normalize_under_root(&canonical_root, std::path::Path::new("pack.gtpack"))?;
+        normalize_under_root(&root, std::path::Path::new("pack.gtpack"))?;
 
-        let cached =
-            CANONICAL_ROOT_CACHE.with(|cache| cache.borrow().get(&canonical_root).cloned());
-        assert_eq!(cached, Some(canonical_root));
+        let cached = CANONICAL_ROOT_CACHE.with(|cache| cache.borrow().get(&root).cloned());
+        assert_eq!(cached, Some(root));
         Ok(())
     }
 
