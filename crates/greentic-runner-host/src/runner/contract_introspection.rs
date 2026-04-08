@@ -148,7 +148,11 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     let digest = hasher.finalize();
-    format!("sha256:{:x}", digest)
+    format!("sha256:{}", to_hex(&digest))
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn canonicalize_json(value: Value) -> Value {

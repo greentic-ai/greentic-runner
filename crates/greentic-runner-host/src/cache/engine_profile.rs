@@ -64,7 +64,11 @@ fn compute_engine_profile_id(
     hasher.update(target_triple.as_bytes());
     hasher.update(cpu_policy.as_str().as_bytes());
     hasher.update(config_fingerprint.as_bytes());
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", to_hex(&hasher.finalize()))
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]

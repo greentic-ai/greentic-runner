@@ -471,7 +471,11 @@ fn build_state_store_pack(pack_path: &Path, include_state_capability: bool) -> R
 fn digest_for_bytes(bytes: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", to_hex(&hasher.finalize()))
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn write_component_cache(cache_root: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
