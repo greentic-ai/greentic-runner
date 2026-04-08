@@ -11,6 +11,7 @@ examples/packs/*.gtpack
 !examples/packs/demo.gtpack
 .packs/
 tests/assets/provider-core-dummy/target/
+tests/assets/component-v0-6-dummy/target/
 crates/tests/trace.json
 
 # CI workflow artifacts (codex-security-fix, dependency-review, codex-semver-fix)

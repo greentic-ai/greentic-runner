@@ -6,6 +6,7 @@ members = [
     "crates/greentic-runner-desktop",
     "crates/tests",
     "crates/runner-core", "tests/fixtures/packs/secrets_store_smoke/components",
+    "tests/assets/component-v0-6-dummy",
 ]
 resolver = "2"
 exclude = [
@@ -14,7 +15,6 @@ exclude = [
     "tests/fixtures/runner-components",
     "tests/fixtures/wasi-p2-smoke",
     "tests/assets/provider-core-dummy",
-    "tests/assets/component-v0-6-dummy",
 ]
 
 [workspace.package]
@@ -39,6 +39,7 @@ greentic-distributor-client = { version = "0.4", features = ["dist-client"] }
 greentic-session = "0.4"
 greentic-state = "0.4"
 greentic-interfaces = { version = "0.4", default-features = false, features = ["bindings-rust"] }
+greentic-interfaces-guest = { version = "0.4", default-features = false }
 greentic-interfaces-host = { version = "0.4" }
 greentic-interfaces-wasmtime = { version = "0.4" }
 greentic-config = "0.4"
@@ -71,7 +72,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 wit-bindgen = { version = "0.55", default-features = false }
 wasmparser = "0.246"
-cron = "0.15"
+cron = "0.16"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
