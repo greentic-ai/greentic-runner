@@ -3093,13 +3093,13 @@ fn compute_digest_for(bytes: &[u8], digest: &str) -> Result<String> {
     }
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", to_hex(&hasher.finalize())))
 }
 
 fn compute_sha256_digest_for(bytes: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
+    format!("sha256:{}", to_hex(&hasher.finalize()))
 }
 
 fn build_artifact_key(cache: &CacheManager, digest: Option<&str>, bytes: &[u8]) -> ArtifactKey {
@@ -3139,6 +3139,10 @@ fn verify_wasm_sha256(component_id: &str, expected: &str, bytes: &[u8]) -> Resul
         );
     }
     Ok(())
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
