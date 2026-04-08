@@ -1,10 +1,15 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::runtime::block_on;
 use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use greentic_secrets_lib::env::EnvSecretsManager;
 use greentic_secrets_lib::{SecretScope, SecretsManager};
 use greentic_types::TenantCtx;
+use lru::LruCache;
+use parking_lot::Mutex;
 
 /// Shared secrets manager handle used by the host.
 pub type DynSecretsManager = Arc<dyn SecretsManager>;
@@ -36,17 +41,121 @@ impl SecretsBackend {
     }
 
     pub fn build_manager(&self) -> Result<DynSecretsManager> {
-        match self {
+        let inner: DynSecretsManager = match self {
             SecretsBackend::Env => {
                 ensure_env_secrets_allowed()?;
-                Ok(Arc::new(EnvSecretsManager) as DynSecretsManager)
+                Arc::new(EnvSecretsManager)
             }
-        }
+        };
+        Ok(CachingSecretsManager::wrap(inner))
     }
 }
 
 pub fn default_manager() -> Result<DynSecretsManager> {
     SecretsBackend::Env.build_manager()
+}
+
+// ---------------------------------------------------------------------------
+// Caching wrapper
+// ---------------------------------------------------------------------------
+
+const DEFAULT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 512;
+
+fn cache_ttl() -> Duration {
+    let secs = std::env::var("SECRETS_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CACHE_TTL_SECS);
+    Duration::from_secs(secs)
+}
+
+fn cache_max_entries() -> NonZeroUsize {
+    let n = std::env::var("SECRETS_CACHE_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_CACHE_MAX_ENTRIES);
+    NonZeroUsize::new(n).expect("cache max entries must be > 0")
+}
+
+struct CacheEntry {
+    data: Vec<u8>,
+    inserted_at: Instant,
+}
+
+/// A [`SecretsManager`] wrapper that caches read results in an LRU cache with
+/// a time-to-live. Writes and deletes invalidate the corresponding entry so
+/// subsequent reads always see the latest value.
+pub struct CachingSecretsManager {
+    inner: DynSecretsManager,
+    cache: Mutex<LruCache<String, CacheEntry>>,
+    ttl: Duration,
+}
+
+impl CachingSecretsManager {
+    pub fn wrap(inner: DynSecretsManager) -> DynSecretsManager {
+        let ttl = cache_ttl();
+        if ttl.is_zero() {
+            tracing::info!("secrets cache disabled (TTL=0)");
+            return inner;
+        }
+        let max = cache_max_entries();
+        tracing::info!(
+            ttl_secs = ttl.as_secs(),
+            max_entries = max.get(),
+            "secrets value cache enabled"
+        );
+        Arc::new(Self {
+            inner,
+            cache: Mutex::new(LruCache::new(max)),
+            ttl,
+        })
+    }
+}
+
+#[async_trait]
+impl SecretsManager for CachingSecretsManager {
+    async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        // Check cache first.
+        {
+            let mut cache = self.cache.lock();
+            if let Some(entry) = cache.get(path) {
+                if entry.inserted_at.elapsed() < self.ttl {
+                    return Ok(entry.data.clone());
+                }
+                // Expired — remove and fall through.
+                cache.pop(path);
+            }
+        }
+
+        let data = self.inner.read(path).await?;
+
+        {
+            let mut cache = self.cache.lock();
+            cache.put(
+                path.to_owned(),
+                CacheEntry {
+                    data: data.clone(),
+                    inserted_at: Instant::now(),
+                },
+            );
+        }
+        Ok(data)
+    }
+
+    async fn write(&self, path: &str, bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+        self.inner.write(path, bytes).await?;
+        // Invalidate so the next read sees the fresh value.
+        self.cache.lock().pop(path);
+        Ok(())
+    }
+
+    async fn delete(&self, path: &str) -> greentic_secrets_lib::Result<()> {
+        self.inner.delete(path).await?;
+        self.cache.lock().pop(path);
+        Ok(())
+    }
 }
 
 fn normalize_pack_segment(pack_id: &str) -> String {
@@ -133,6 +242,7 @@ mod tests {
     use super::*;
     use greentic_config_types::SecretsBackendRefConfig;
     use greentic_types::{EnvId, TeamId, TenantId, UserId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn tenant_ctx() -> greentic_types::TenantCtx {
         greentic_types::TenantCtx::new(
@@ -188,5 +298,118 @@ mod tests {
             .unwrap(),
             SecretsBackend::Env
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // CachingSecretsManager tests
+    // -----------------------------------------------------------------------
+
+    /// In-memory mock that counts how many times `read` is called.
+    struct CountingManager {
+        read_count: AtomicUsize,
+    }
+
+    impl CountingManager {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                read_count: AtomicUsize::new(0),
+            })
+        }
+
+        fn reads(&self) -> usize {
+            self.read_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl SecretsManager for CountingManager {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            self.read_count.fetch_add(1, Ordering::SeqCst);
+            Ok(b"secret-value".to_vec())
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_cached(inner: Arc<CountingManager>) -> CachingSecretsManager {
+        CachingSecretsManager {
+            inner: inner as DynSecretsManager,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            ttl: Duration::from_secs(300),
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_read_avoids_backend_on_second_call() {
+        let inner = CountingManager::new();
+        let cached = make_cached(Arc::clone(&inner));
+
+        let v1 = cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        let v2 = cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        assert_eq!(v1, v2);
+        assert_eq!(inner.reads(), 1, "second read should hit cache");
+    }
+
+    #[tokio::test]
+    async fn write_invalidates_cache() {
+        let inner = CountingManager::new();
+        let cached = make_cached(Arc::clone(&inner));
+
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        assert_eq!(inner.reads(), 1);
+
+        cached
+            .write("secrets://dev/t/team/pack/key", b"new")
+            .await
+            .unwrap();
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        assert_eq!(inner.reads(), 2, "read after write should bypass cache");
+    }
+
+    #[tokio::test]
+    async fn delete_invalidates_cache() {
+        let inner = CountingManager::new();
+        let cached = make_cached(Arc::clone(&inner));
+
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        cached
+            .delete("secrets://dev/t/team/pack/key")
+            .await
+            .unwrap();
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        assert_eq!(inner.reads(), 2, "read after delete should bypass cache");
+    }
+
+    #[tokio::test]
+    async fn expired_entry_triggers_backend_read() {
+        let inner = CountingManager::new();
+        let cached = CachingSecretsManager {
+            inner: Arc::clone(&inner) as DynSecretsManager,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(64).unwrap())),
+            ttl: Duration::from_millis(1), // expires almost immediately
+        };
+
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        cached.read("secrets://dev/t/team/pack/key").await.unwrap();
+        assert_eq!(inner.reads(), 2, "expired entry should re-fetch");
+    }
+
+    #[test]
+    fn wrap_with_zero_ttl_returns_inner_directly() {
+        std::env::set_var("SECRETS_CACHE_TTL_SECS", "0");
+        let inner: DynSecretsManager = CountingManager::new();
+        let ptr_before = Arc::as_ptr(&inner);
+        let wrapped = CachingSecretsManager::wrap(Arc::clone(&inner));
+        let ptr_after = Arc::as_ptr(&wrapped);
+        // When TTL is 0, wrap should return the same Arc (no caching layer).
+        assert_eq!(ptr_before, ptr_after);
+        std::env::remove_var("SECRETS_CACHE_TTL_SECS");
     }
 }
