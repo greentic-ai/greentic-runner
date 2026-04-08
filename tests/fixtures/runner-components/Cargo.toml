@@ -11,6 +11,16 @@ resolver = "2"
 edition = "2021"
 
 [workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+greentic-pack = "0.4"
+greentic-flow = "0.4"
+indexmap = "2"
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_bw = "2.5.2"
+time = { version = "0.3", features = ["formatting"] }
+zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 wit-bindgen = "0.50"

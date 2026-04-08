@@ -93,10 +93,11 @@ impl PackDigest {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let digest = hasher.finalize();
+        let digest_hex = to_hex(&digest);
         Self {
-            raw: format!("sha256:{digest:0x}"),
+            raw: format!("sha256:{digest_hex}"),
             algorithm: "sha256".into(),
-            value: format!("{digest:0x}"),
+            value: digest_hex,
         }
     }
 
@@ -282,7 +283,8 @@ fn compute_digest(path: &Path) -> Result<PackDigest> {
         hasher.update(&buf[..read]);
     }
     let digest = hasher.finalize();
-    PackDigest::parse(format!("sha256:{digest:0x}"))
+    let digest_hex = to_hex(&digest);
+    PackDigest::parse(format!("sha256:{digest_hex}"))
 }
 
 fn sanitize_segment(value: &str) -> String {
@@ -293,4 +295,8 @@ fn sanitize_segment(value: &str) -> String {
             other => other,
         })
         .collect()
+}
+
+fn to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }

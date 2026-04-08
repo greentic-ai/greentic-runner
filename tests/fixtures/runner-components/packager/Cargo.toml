@@ -4,15 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-greentic-pack = "0.4"
-greentic-flow = "0.4"
-indexmap = "2"
-semver = "1"
-serde = { version = "1", features = ["derive"] }
-serde_yaml_bw = "2.5"
-serde_json = "1"
-time = { version = "0.3", features = ["formatting"] }
-zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+flate2 = { workspace = true }
+greentic-pack = { workspace = true }
+greentic-flow = { workspace = true }
+indexmap = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml_bw = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true, features = ["formatting"] }
+zip = { workspace = true }

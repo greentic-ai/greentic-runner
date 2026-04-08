@@ -21,7 +21,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   crate-publish:
-    needs: ci
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,7 +44,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    needs: crate-publish
+    needs: ci
     strategy:
       matrix:
         include:
@@ -120,8 +120,7 @@ jobs:
 
   release:
     name: GitHub Release
-    needs: [crate-publish, dist]
-    if: needs.crate-publish.result == 'success' && needs.dist.result == 'success'
+    needs: [dist]
     runs-on: ubuntu-latest
     permissions:
       contents: write
