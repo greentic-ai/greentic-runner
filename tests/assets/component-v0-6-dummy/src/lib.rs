@@ -10,6 +10,13 @@ use greentic_types::schemas::common::schema_ir::{AdditionalProperties, SchemaIr}
 #[cfg(target_arch = "wasm32")]
 use greentic_types::schemas::component::v0_6_0::{ComponentInfo, I18nText};
 
+#[cfg(target_arch = "wasm32")]
+wit_bindgen::generate!({
+    path: "wit",
+    world: "component-v0-v6-v0",
+    generate_all,
+});
+
 // i18n: runtime lookup + embedded CBOR bundle helpers.
 pub mod i18n;
 pub mod i18n_bundle;
@@ -292,6 +299,39 @@ unsafe extern "C" fn export_component_i18n_keys() -> *mut u8 {
 unsafe extern "C" fn post_return_component_i18n_keys(arg0: *mut u8) {
     unsafe { post_return_i18n_keys(arg0) }
 }
+
+#[cfg(target_arch = "wasm32")]
+fn component_descriptor_payload_json() -> serde_json::Value {
+    // The runner-host introspection logic expects CBOR-encoded JSON with:
+    // - `operations`: list of objects with `name`/`id` and `input_schema`/`output_schema`
+    // - `config_schema`: an object
+    serde_json::json!({
+        "operations": [
+            {
+                "name": "run",
+                "input": { "schema": { "type": "object" } },
+                "output": { "schema": { "type": "object" } },
+                // Keep the legacy/alternate keys too.
+                "input_schema": { "type": "object" },
+                "output_schema": { "type": "object" }
+            }
+        ],
+        "config_schema": { "type": "object" }
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+struct ComponentDescriptorExports;
+
+#[cfg(target_arch = "wasm32")]
+impl exports::greentic::component::component_descriptor::Guest for ComponentDescriptorExports {
+    fn describe() -> Vec<u8> {
+        encode_cbor(&component_descriptor_payload_json())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+export!(ComponentDescriptorExports);
 
 #[cfg(target_arch = "wasm32")]
 greentic_interfaces_guest::export_component_v060!(Component);
