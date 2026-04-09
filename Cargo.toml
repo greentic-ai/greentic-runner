@@ -33,7 +33,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 futures = "0.3"
 greentic-flow = "0.4"
-greentic-types = { version = "0.4", features = ["telemetry-autoinit"] }
+greentic-types = { version = "0.4", default-features = false, features = ["std", "serde", "time", "otel-keys"] }
 greentic_pack = { package = "greentic-pack-lib", version = "0.4" }
 greentic-distributor-client = { version = "0.4", features = ["dist-client"] }
 greentic-session = "0.4"
