@@ -129,8 +129,7 @@ fn build_component_pack_v06(component_path: &Path, pack_path: &Path) -> Result<(
 
 fn build_component_v06_fixture() -> Result<PathBuf> {
     let root = fixture_path("tests/assets/component-v0-6-dummy");
-    let workspace_wasm =
-        fixture_path("target/wasm32-wasip2/release/component_v0_6_dummy.wasm");
+    let workspace_wasm = fixture_path("target/wasm32-wasip2/release/component_v0_6_dummy.wasm");
     let fixture_wasm = root.join("target/wasm32-wasip2/release/component_v0_6_dummy.wasm");
     let wasm = if workspace_wasm.exists() {
         workspace_wasm
