@@ -12,7 +12,18 @@ use greentic_types::schemas::component::v0_6_0::{ComponentInfo, I18nText};
 
 #[cfg(target_arch = "wasm32")]
 wit_bindgen::generate!({
-    path: "wit",
+    inline: r#"
+        package greentic:component@0.6.0;
+
+        interface component-descriptor {
+          // CBOR-encoded JSON used by runner-host for contract introspection.
+          describe: func() -> list<u8>;
+        }
+
+        world component-v0-v6-v0 {
+          export component-descriptor;
+        }
+    "#,
     world: "component-v0-v6-v0",
     generate_all,
 });
