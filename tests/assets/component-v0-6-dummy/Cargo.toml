@@ -21,10 +21,10 @@ world = "greentic:component/component@0.6.0"
 
 [dependencies]
 greentic-interfaces-guest = { workspace = true, features = ["component-v0-6"] }
-greentic-types = { workspace = true }
+greentic-types = { workspace = true, default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [build-dependencies]
-greentic-types = { workspace = true }
+greentic-types = { workspace = true, default-features = false }
 serde_json = { workspace = true }

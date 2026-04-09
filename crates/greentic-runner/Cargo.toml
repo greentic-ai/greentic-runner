@@ -24,7 +24,7 @@ greentic-runner-desktop = { workspace = true }
 greentic-interfaces.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
-greentic-types.workspace = true
+greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic-config.workspace = true
 greentic-distributor-client.workspace = true
 humantime.workspace = true
