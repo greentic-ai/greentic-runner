@@ -95,12 +95,14 @@ pub struct CachingSecretsManager {
 
 impl CachingSecretsManager {
     pub fn wrap(inner: DynSecretsManager) -> DynSecretsManager {
-        let ttl = cache_ttl();
+        Self::wrap_with(inner, cache_ttl(), cache_max_entries())
+    }
+
+    fn wrap_with(inner: DynSecretsManager, ttl: Duration, max: NonZeroUsize) -> DynSecretsManager {
         if ttl.is_zero() {
             tracing::info!("secrets cache disabled (TTL=0)");
             return inner;
         }
-        let max = cache_max_entries();
         tracing::info!(
             ttl_secs = ttl.as_secs(),
             max_entries = max.get(),
@@ -403,13 +405,15 @@ mod tests {
 
     #[test]
     fn wrap_with_zero_ttl_returns_inner_directly() {
-        std::env::set_var("SECRETS_CACHE_TTL_SECS", "0");
         let inner: DynSecretsManager = CountingManager::new();
         let ptr_before = Arc::as_ptr(&inner);
-        let wrapped = CachingSecretsManager::wrap(Arc::clone(&inner));
+        let wrapped = CachingSecretsManager::wrap_with(
+            Arc::clone(&inner),
+            Duration::ZERO,
+            NonZeroUsize::new(64).unwrap(),
+        );
         let ptr_after = Arc::as_ptr(&wrapped);
         // When TTL is 0, wrap should return the same Arc (no caching layer).
         assert_eq!(ptr_before, ptr_after);
-        std::env::remove_var("SECRETS_CACHE_TTL_SECS");
     }
 }
