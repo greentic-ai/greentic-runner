@@ -171,6 +171,215 @@ where
         .and_then(|res| res)
 }
 
+fn secret_key_env_var(key: &str) -> String {
+    let mut env = String::from("MCP_SECRET_");
+    for ch in key.trim().chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => env.push(ch.to_ascii_uppercase()),
+            _ => env.push('_'),
+        }
+    }
+    env
+}
+
+fn build_component_secret_tenant_ctx(
+    config: &HostConfig,
+    ctx: &ComponentExecCtx,
+) -> Result<TypesTenantCtx> {
+    let mut tenant_ctx = config.tenant_ctx();
+
+    if let Some(team) = ctx.tenant.team.as_ref() {
+        let team_id =
+            TeamId::from_str(team).with_context(|| format!("invalid team id `{team}`"))?;
+        tenant_ctx = tenant_ctx.with_team(Some(team_id));
+    }
+
+    if let Some(user) = ctx.tenant.user.as_ref() {
+        let user_id =
+            UserId::from_str(user).with_context(|| format!("invalid user id `{user}`"))?;
+        tenant_ctx = tenant_ctx.with_user(Some(user_id));
+    }
+
+    tenant_ctx = tenant_ctx.with_flow(ctx.flow_id.clone());
+    if let Some(node_id) = ctx.node_id.as_ref() {
+        tenant_ctx = tenant_ctx.with_node(node_id.clone());
+    }
+    if let Some(session_id) = ctx.tenant.correlation_id.as_ref() {
+        tenant_ctx = tenant_ctx.with_session(session_id.clone());
+    }
+    tenant_ctx.trace_id = ctx.tenant.trace_id.clone();
+
+    Ok(tenant_ctx)
+}
+
+fn secret_requirement_matches_scope(
+    requirement: &greentic_types::SecretRequirement,
+    tenant_ctx: &TypesTenantCtx,
+) -> bool {
+    let Some(scope) = requirement.scope.as_ref() else {
+        return true;
+    };
+
+    if scope.env != tenant_ctx.env.as_str() {
+        return false;
+    }
+    if scope.tenant != tenant_ctx.tenant.as_str() {
+        return false;
+    }
+    if let Some(team) = scope.team.as_ref() {
+        let current_team = tenant_ctx.team_id.as_ref().or(tenant_ctx.team.as_ref());
+        if current_team.map(|value| value.as_str()) != Some(team.as_str()) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn component_secret_requirements(
+    component_manifest: Option<&ComponentManifest>,
+    pack_requirements: &[greentic_types::SecretRequirement],
+) -> Vec<greentic_types::SecretRequirement> {
+    let mut requirements = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(manifest) = component_manifest
+        && let Some(secret_caps) = manifest.capabilities.host.secrets.as_ref()
+    {
+        for requirement in &secret_caps.required {
+            let key = requirement.key.as_str().to_string();
+            if seen.insert(key) {
+                requirements.push(requirement.clone());
+            }
+        }
+    }
+
+    let allowed_envs = component_manifest
+        .and_then(|manifest| manifest.capabilities.wasi.env.as_ref())
+        .map(|env| env.allow.iter().cloned().collect::<HashSet<_>>())
+        .unwrap_or_default();
+
+    for requirement in pack_requirements {
+        let env_name = secret_key_env_var(requirement.key.as_str());
+        let legacy_api = env_name
+            .ends_with("_API_KEY")
+            .then_some("MCP_API_KEY".to_string());
+        let legacy_bearer = env_name
+            .ends_with("_BEARER_TOKEN")
+            .then_some("MCP_BEARER_TOKEN".to_string());
+        let relevant = component_manifest.is_none()
+            || allowed_envs.contains(&env_name)
+            || legacy_api
+                .as_ref()
+                .is_some_and(|legacy| allowed_envs.contains(legacy))
+            || legacy_bearer
+                .as_ref()
+                .is_some_and(|legacy| allowed_envs.contains(legacy));
+        if !relevant {
+            continue;
+        }
+        let key = requirement.key.as_str().to_string();
+        if seen.insert(key) {
+            requirements.push(requirement.clone());
+        }
+    }
+
+    requirements
+}
+
+fn with_legacy_secret_env_aliases(envs: &mut BTreeMap<String, String>) {
+    let api_key_matches = envs
+        .iter()
+        .filter(|(key, _)| key.ends_with("_API_KEY"))
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    if api_key_matches.len() == 1 {
+        envs.insert("MCP_API_KEY".to_string(), api_key_matches[0].clone());
+    }
+
+    let bearer_matches = envs
+        .iter()
+        .filter(|(key, _)| key.ends_with("_BEARER_TOKEN"))
+        .map(|(_, value)| value.clone())
+        .collect::<Vec<_>>();
+    if bearer_matches.len() == 1 {
+        envs.insert("MCP_BEARER_TOKEN".to_string(), bearer_matches[0].clone());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_component_invocation_wasi_policy(
+    base_policy: &RunnerWasiPolicy,
+    config: &HostConfig,
+    pack_id: &str,
+    component_manifest: Option<&ComponentManifest>,
+    pack_requirements: &[greentic_types::SecretRequirement],
+    secrets: &DynSecretsManager,
+    component_ref: &str,
+    operation: &str,
+    ctx: &ComponentExecCtx,
+) -> Result<RunnerWasiPolicy> {
+    let mut policy = base_policy.clone();
+    let tenant_ctx = build_component_secret_tenant_ctx(config, ctx)?;
+    let requirements = component_secret_requirements(component_manifest, pack_requirements);
+    if requirements.is_empty() {
+        return Ok(policy);
+    }
+
+    let mut envs = BTreeMap::new();
+    for requirement in requirements {
+        if !secret_requirement_matches_scope(&requirement, &tenant_ctx) {
+            continue;
+        }
+
+        let key = requirement.key.as_str();
+        if !config.secrets_policy.is_allowed(key) {
+            if requirement.required {
+                bail!("secret {key} is not permitted by bindings policy");
+            }
+            continue;
+        }
+
+        let bytes = match read_secret_blocking(secrets, &tenant_ctx, pack_id, key) {
+            Ok(bytes) => bytes,
+            Err(_err) if !requirement.required => continue,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to resolve secret `{key}` for component `{component_ref}` operation `{operation}`"
+                    )
+                });
+            }
+        };
+
+        let value = String::from_utf8(bytes).with_context(|| {
+            format!(
+                "secret `{key}` for component `{component_ref}` operation `{operation}` is not valid UTF-8"
+            )
+        })?;
+        let env_name = secret_key_env_var(key);
+        match envs.entry(env_name.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &value {
+                    bail!(
+                        "secret env collision for component `{component_ref}` operation `{operation}`: `{env_name}`"
+                    );
+                }
+            }
+        }
+    }
+
+    with_legacy_secret_env_aliases(&mut envs);
+    for (key, value) in envs {
+        policy = policy.with_env(key, value);
+    }
+
+    Ok(policy)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ComponentResolution {
     /// Root of a materialized pack directory containing `manifest.cbor` and `components/`.
@@ -1902,7 +2111,17 @@ impl PackRuntime {
         let state_store = self.state_store.clone();
         let secrets = Arc::clone(&self.secrets);
         let oauth_config = self.oauth_config.clone();
-        let wasi_policy = Arc::clone(&self.wasi_policy);
+        let wasi_policy = Arc::new(build_component_invocation_wasi_policy(
+            self.wasi_policy.as_ref(),
+            self.config.as_ref(),
+            self.metadata().pack_id.as_str(),
+            self.component_manifests.get(component_ref),
+            &self.metadata.secret_requirements,
+            &self.secrets,
+            component_ref,
+            operation,
+            &ctx,
+        )?);
         let pack_id = self.metadata().pack_id.clone();
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
@@ -4021,9 +4240,21 @@ async fn load_components_from_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{HostConfig, SecretsPolicy};
+    use crate::secrets::scoped_secret_path_for_pack;
+    use async_trait::async_trait;
     use greentic_flow::model::{FlowDoc, NodeDoc};
+    use greentic_secrets_lib::{SecretError, SecretsManager};
+    use greentic_types::component::{
+        ComponentCapabilities, ComponentProfiles, EnvCapabilities, WasiCapabilities,
+    };
+    use greentic_types::{SecretRequirement, SecretScope};
     use indexmap::IndexMap;
+    use semver::Version;
     use serde_json::json;
+    use serial_test::serial;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn normalizes_raw_component_to_component_exec() {
@@ -4070,6 +4301,238 @@ mod tests {
         );
         let input = payload.get("input").unwrap();
         assert_eq!(input, &json!({ "template": "Hi {{name}}" }));
+    }
+
+    #[test]
+    #[serial]
+    fn injects_query_param_secret_env_and_api_fallback() -> Result<()> {
+        let config = write_minimal_config()?;
+        let ctx = test_exec_ctx(Some("weather-team"));
+        let tenant_ctx = build_component_secret_tenant_ctx(config.as_ref(), &ctx)?;
+        let secret_path =
+            scoped_secret_path_for_pack(&tenant_ctx, "demo.pack", "weatherapi/api-key")?;
+        let secrets = seeded_secrets([(secret_path, "wx-secret")]);
+
+        let mut requirement = SecretRequirement::default();
+        requirement.key = "weatherapi/api-key".into();
+        requirement.scope = Some(SecretScope {
+            env: tenant_ctx.env.as_str().to_string(),
+            tenant: tenant_ctx.tenant.as_str().to_string(),
+            team: Some("weather-team".to_string()),
+        });
+
+        let policy = build_component_invocation_wasi_policy(
+            &RunnerWasiPolicy::new(),
+            config.as_ref(),
+            "demo.pack",
+            Some(&test_component_manifest(&[
+                "MCP_SECRET_WEATHERAPI_API_KEY",
+            ])?),
+            &[requirement],
+            &secrets,
+            "weather.component",
+            "query",
+            &ctx,
+        )?;
+
+        assert_eq!(
+            policy.env_set.get("MCP_SECRET_WEATHERAPI_API_KEY"),
+            Some(&"wx-secret".to_string())
+        );
+        assert_eq!(
+            policy.env_set.get("MCP_API_KEY"),
+            Some(&"wx-secret".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn injects_bearer_token_env_and_legacy_alias() -> Result<()> {
+        let config = write_minimal_config()?;
+        let ctx = test_exec_ctx(None);
+        let tenant_ctx = build_component_secret_tenant_ctx(config.as_ref(), &ctx)?;
+        let secret_path =
+            scoped_secret_path_for_pack(&tenant_ctx, "demo.pack", "auth/bearer-token")?;
+        let secrets = seeded_secrets([(secret_path, "bearer-secret")]);
+
+        let mut requirement = SecretRequirement::default();
+        requirement.key = "auth/bearer-token".into();
+
+        let policy = build_component_invocation_wasi_policy(
+            &RunnerWasiPolicy::new(),
+            config.as_ref(),
+            "demo.pack",
+            Some(&test_component_manifest(&["MCP_SECRET_AUTH_BEARER_TOKEN"])?),
+            &[requirement],
+            &secrets,
+            "auth.component",
+            "bearer",
+            &ctx,
+        )?;
+
+        assert_eq!(
+            policy.env_set.get("MCP_SECRET_AUTH_BEARER_TOKEN"),
+            Some(&"bearer-secret".to_string())
+        );
+        assert_eq!(
+            policy.env_set.get("MCP_BEARER_TOKEN"),
+            Some(&"bearer-secret".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn keeps_operation_scoped_secret_envs_without_ambiguous_api_fallback() -> Result<()> {
+        let config = write_minimal_config()?;
+        let ctx = test_exec_ctx(None);
+        let tenant_ctx = build_component_secret_tenant_ctx(config.as_ref(), &ctx)?;
+        let forecast_path =
+            scoped_secret_path_for_pack(&tenant_ctx, "demo.pack", "forecast/weatherapi/api-key")?;
+        let alerts_path =
+            scoped_secret_path_for_pack(&tenant_ctx, "demo.pack", "alerts/weatherapi/api-key")?;
+        let secrets = seeded_secrets([
+            (forecast_path, "forecast-secret"),
+            (alerts_path, "alerts-secret"),
+        ]);
+
+        let mut forecast_requirement = SecretRequirement::default();
+        forecast_requirement.key = "forecast/weatherapi/api-key".into();
+        let mut alerts_requirement = SecretRequirement::default();
+        alerts_requirement.key = "alerts/weatherapi/api-key".into();
+        let requirements = vec![forecast_requirement, alerts_requirement];
+
+        let policy = build_component_invocation_wasi_policy(
+            &RunnerWasiPolicy::new(),
+            config.as_ref(),
+            "demo.pack",
+            Some(&test_component_manifest(&[
+                "MCP_SECRET_FORECAST_WEATHERAPI_API_KEY",
+                "MCP_SECRET_ALERTS_WEATHERAPI_API_KEY",
+            ])?),
+            &requirements,
+            &secrets,
+            "weather.component",
+            "setup",
+            &ctx,
+        )?;
+
+        assert_eq!(
+            policy.env_set.get("MCP_SECRET_FORECAST_WEATHERAPI_API_KEY"),
+            Some(&"forecast-secret".to_string())
+        );
+        assert_eq!(
+            policy.env_set.get("MCP_SECRET_ALERTS_WEATHERAPI_API_KEY"),
+            Some(&"alerts-secret".to_string())
+        );
+        assert!(
+            !policy.env_set.contains_key("MCP_API_KEY"),
+            "legacy API alias should stay unset when multiple api keys are present"
+        );
+        Ok(())
+    }
+
+    fn write_minimal_config() -> Result<Arc<HostConfig>> {
+        let temp = tempfile::TempDir::new()?;
+        let path = temp.path().join("bindings.yaml");
+        std::fs::write(
+            &path,
+            r#"
+tenant: demo
+flow_type_bindings: {}
+rate_limits: {}
+retry: {}
+timers: []
+"#,
+        )?;
+        let mut cfg = HostConfig::load_from_path(&path)?;
+        cfg.secrets_policy = SecretsPolicy::allow_all();
+        Ok(Arc::new(cfg))
+    }
+
+    fn test_exec_ctx(team: Option<&str>) -> ComponentExecCtx {
+        ComponentExecCtx {
+            tenant: component_api::node::TenantCtx {
+                tenant: "demo".to_string(),
+                team: team.map(str::to_string),
+                user: None,
+                trace_id: None,
+                i18n_id: None,
+                correlation_id: Some("corr-123".to_string()),
+                deadline_unix_ms: None,
+                attempt: 1,
+                idempotency_key: Some("idem-123".to_string()),
+            },
+            i18n_id: None,
+            flow_id: "flow.weather".to_string(),
+            node_id: Some("node.weather".to_string()),
+        }
+    }
+
+    fn test_component_manifest(allowed_envs: &[&str]) -> Result<ComponentManifest> {
+        Ok(ComponentManifest {
+            id: "weather.component".parse()?,
+            version: Version::parse("0.1.0")?,
+            supports: vec![FlowKind::Messaging],
+            world: "greentic:component@0.6.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities {
+                wasi: WasiCapabilities {
+                    env: Some(EnvCapabilities {
+                        allow: allowed_envs
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect(),
+                    }),
+                    ..Default::default()
+                },
+                host: Default::default(),
+            },
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: greentic_types::ResourceHints::default(),
+            dev_flows: BTreeMap::new(),
+        })
+    }
+
+    fn seeded_secrets<const N: usize>(entries: [(String, &str); N]) -> DynSecretsManager {
+        let store = entries
+            .into_iter()
+            .map(|(key, value)| (key, value.as_bytes().to_vec()))
+            .collect();
+        Arc::new(RecordingSecretsManager {
+            store,
+            reads: StdMutex::new(Vec::new()),
+        }) as DynSecretsManager
+    }
+
+    struct RecordingSecretsManager {
+        store: HashMap<String, Vec<u8>>,
+        reads: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SecretsManager for RecordingSecretsManager {
+        async fn read(&self, path: &str) -> std::result::Result<Vec<u8>, SecretError> {
+            self.reads
+                .lock()
+                .expect("reads lock")
+                .push(path.to_string());
+            self.store
+                .get(path)
+                .cloned()
+                .ok_or_else(|| SecretError::NotFound(path.to_string()))
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> std::result::Result<(), SecretError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> std::result::Result<(), SecretError> {
+            Ok(())
+        }
     }
 }
 
