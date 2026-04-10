@@ -100,7 +100,7 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 
 ## Conventions
 
-- **Rust 1.91**, edition 2024, pinned via `rust-toolchain.toml`
+- **Rust 1.94.0**, edition 2024, pinned via `rust-toolchain.toml`
 - **YAML**: Uses `serde_yaml_gtc` (imported as `serde_yaml_bw`), not `serde_yaml`
 - **Error handling**: `anyhow::Result<T>` with `.context()`; `thiserror` for domain errors
 - **Serialization**: JSON for messages, CBOR for components/caching, YAML for config
