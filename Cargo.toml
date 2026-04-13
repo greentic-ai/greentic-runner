@@ -94,7 +94,7 @@ wasmtime-wasi = { version = "43", default-features = false, features = ["p2"] }
 wasmtime-environ = { version = "43" }
 wasmtime-wasi-http = "43"
 wasmtime-wasi-tls = "43"
-jsonschema = "0.45"
+jsonschema = "0.46"
 handlebars = "6"
 dashmap = "6"
 proptest = "1"
