@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/greentic-i18n",
     "crates/greentic-runner",
     "crates/greentic-runner-host",
     "crates/greentic-runner-desktop",
@@ -20,7 +19,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.4.76"
+version = "0.5.0"
 
 [workspace.dependencies]
 arc-swap = "1"
