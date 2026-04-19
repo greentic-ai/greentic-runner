@@ -592,21 +592,7 @@ impl FlowEngine {
         mut payload: Value,
         event: &NodeEvent<'_>,
     ) -> Result<DispatchOutcome> {
-        // For card invocations, inject the user's locale from the ingress
-        // event metadata so the component can resolve i18n translations.
-        if is_card_invocation(&payload)
-            && let Value::Object(ref mut map) = payload
-            && !map.contains_key("locale")
-        {
-            let locale = state
-                .entry
-                .pointer("/input/metadata/locale")
-                .or_else(|| state.entry.pointer("/metadata/locale"))
-                .and_then(Value::as_str);
-            if let Some(loc) = locale {
-                map.insert("locale".into(), Value::String(loc.to_string()));
-            }
-        }
+        inject_card_locale(&mut payload, &state.entry);
         match &node.kind {
             NodeKind::Exec { target_component } => self
                 .execute_component_exec(
@@ -1011,28 +997,16 @@ impl FlowEngine {
         );
 
         // If pack-local resolution fails, try the cross-pack resolver (capability registry).
-        if binding.is_err() {
-            eprintln!(
-                "[DEBUG] provider.invoke: pack-local failed, has_resolver={}",
-                self.cross_pack_resolver.is_some()
-            );
-            if let Some(ref resolver) = self.cross_pack_resolver {
-                let provider_id = payload.provider_id.as_deref().unwrap_or("unknown");
-                tracing::info!(
-                    provider_id,
-                    op = %op,
-                    "provider.invoke: pack-local resolution failed, trying cross-pack resolver"
-                );
-                let result_value = resolver.invoke(
-                    provider_id,
-                    payload.provider_type.as_deref(),
-                    &op,
-                    &input_json,
-                    ctx.tenant,
-                    None,
-                )?;
-                return Ok(NodeOutput::new(result_value));
-            }
+        if binding.is_err()
+            && let Some(output) = self.try_invoke_cross_pack_resolver(
+                payload.provider_id.as_deref(),
+                payload.provider_type.as_deref(),
+                &op,
+                &input_json,
+                ctx.tenant,
+            )?
+        {
+            return Ok(output);
         }
 
         let binding = binding?;
@@ -1082,6 +1056,32 @@ impl FlowEngine {
         };
         let _ = payload.err_map;
         Ok(NodeOutput::new(output))
+    }
+
+    fn try_invoke_cross_pack_resolver(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+        op: &str,
+        input_json: &[u8],
+        tenant: &str,
+    ) -> Result<Option<NodeOutput>> {
+        eprintln!(
+            "[DEBUG] provider.invoke: pack-local failed, has_resolver={}",
+            self.cross_pack_resolver.is_some()
+        );
+        let Some(resolver) = self.cross_pack_resolver.as_ref() else {
+            return Ok(None);
+        };
+        let provider_id = provider_id.unwrap_or("unknown");
+        tracing::info!(
+            provider_id,
+            op = %op,
+            "provider.invoke: pack-local resolution failed, trying cross-pack resolver"
+        );
+        let result_value =
+            resolver.invoke(provider_id, provider_type, op, input_json, tenant, None)?;
+        Ok(Some(NodeOutput::new(result_value)))
     }
 
     fn validate_component(
@@ -1812,6 +1812,23 @@ fn is_card_invocation(input: &Value) -> bool {
     false
 }
 
+fn inject_card_locale(payload: &mut Value, entry: &Value) {
+    if !is_card_invocation(payload) {
+        return;
+    }
+    let Value::Object(map) = payload else { return };
+    if map.contains_key("locale") {
+        return;
+    }
+    let locale = entry
+        .pointer("/input/metadata/locale")
+        .or_else(|| entry.pointer("/metadata/locale"))
+        .and_then(Value::as_str);
+    if let Some(locale) = locale {
+        map.insert("locale".into(), Value::String(locale.to_string()));
+    }
+}
+
 /// Pre-resolve `card_source: "asset"` entries by reading the referenced JSON
 /// file from the pack's assets directory and converting to
 /// `card_source: "inline"` with `inline_json` populated.
@@ -1892,59 +1909,7 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
         .filter(|s| !s.is_empty());
 
     if let Some(bundle_path) = bundle_path_owned {
-        let mut i18n_entries: serde_json::Map<String, Value> = serde_json::Map::new();
-
-        if bundle_path.ends_with(".json") {
-            // Single-file mode: load the file under "en" locale.
-            if let Ok(bytes) = pack.read_asset(&bundle_path)
-                && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
-            {
-                i18n_entries.insert("en".to_string(), Value::Object(entries));
-            }
-        } else {
-            // Directory mode: discover available locales from _manifest.json
-            // or try well-known locale codes.
-            let manifest_path = format!("{bundle_path}/_manifest.json");
-            let locale_codes: Vec<String> = pack
-                .read_asset(&manifest_path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|v| {
-                    // _manifest.json may be {"locales":["en","de",...]} or ["en","de",...]
-                    let arr = v
-                        .get("locales")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .or_else(|| v.as_array().cloned());
-                    arr.map(|a| {
-                        a.iter()
-                            .filter_map(Value::as_str)
-                            .map(String::from)
-                            .collect()
-                    })
-                })
-                .unwrap_or_default();
-
-            tracing::info!(%bundle_path, ?locale_codes, "i18n manifest discovered locales");
-
-            for locale in &locale_codes {
-                let candidate = format!("{bundle_path}/{locale}.json");
-                if let Ok(bytes) = pack.read_asset(&candidate)
-                    && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
-                {
-                    i18n_entries.insert(locale.clone(), Value::Object(entries));
-                }
-            }
-            // Always try en.json even if not in manifest
-            if !i18n_entries.contains_key("en") {
-                let en_path = format!("{bundle_path}/en.json");
-                if let Ok(bytes) = pack.read_asset(&en_path)
-                    && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
-                {
-                    i18n_entries.insert("en".to_string(), Value::Object(entries));
-                }
-            }
-        }
+        let i18n_entries = load_i18n_bundle_entries(&bundle_path, |path| pack.read_asset(path));
 
         if !i18n_entries.is_empty() {
             let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
@@ -1954,6 +1919,63 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
             }
         }
     }
+}
+
+fn load_i18n_bundle_entries<F>(bundle_path: &str, mut read_asset: F) -> JsonMap<String, Value>
+where
+    F: FnMut(&str) -> Result<Vec<u8>>,
+{
+    let mut i18n_entries = JsonMap::new();
+
+    if bundle_path.ends_with(".json") {
+        if let Ok(bytes) = read_asset(bundle_path)
+            && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+        {
+            i18n_entries.insert("en".to_string(), Value::Object(entries));
+        }
+        return i18n_entries;
+    }
+
+    let manifest_path = format!("{bundle_path}/_manifest.json");
+    let locale_codes: Vec<String> = read_asset(&manifest_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            let locales = value
+                .get("locales")
+                .and_then(Value::as_array)
+                .cloned()
+                .or_else(|| value.as_array().cloned());
+            locales.map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
+    tracing::info!(%bundle_path, ?locale_codes, "i18n manifest discovered locales");
+
+    for locale in &locale_codes {
+        let candidate = format!("{bundle_path}/{locale}.json");
+        if let Ok(bytes) = read_asset(&candidate)
+            && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+        {
+            i18n_entries.insert(locale.clone(), Value::Object(entries));
+        }
+    }
+    if !i18n_entries.contains_key("en") {
+        let en_path = format!("{bundle_path}/en.json");
+        if let Ok(bytes) = read_asset(&en_path)
+            && let Ok(Value::Object(entries)) = serde_json::from_slice::<Value>(&bytes)
+        {
+            i18n_entries.insert("en".to_string(), Value::Object(entries));
+        }
+    }
+
+    i18n_entries
 }
 
 /// Evaluate custom routing (conditional routes) against node output and input.
@@ -2140,7 +2162,7 @@ mod tests {
         Routing, TelemetryHints,
     };
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap as StdHashMap};
     use std::str::FromStr;
     use std::sync::Mutex;
     use tokio::runtime::Runtime;
@@ -2203,6 +2225,120 @@ mod tests {
                 { "text": "extra-1" },
                 { "text": "extra-2" }
             ])
+        );
+    }
+
+    #[test]
+    fn inject_card_locale_uses_entry_metadata_without_overwriting_payload() {
+        let mut payload = json!({
+            "card_source": "inline",
+            "card_spec": { "title": "Hello" }
+        });
+        inject_card_locale(
+            &mut payload,
+            &json!({"input": {"metadata": {"locale": "nl-NL"}}}),
+        );
+        assert_eq!(payload["locale"], json!("nl-NL"));
+
+        let mut existing = json!({
+            "card_source": "inline",
+            "card_spec": { "title": "Hello" },
+            "locale": "en-GB"
+        });
+        inject_card_locale(&mut existing, &json!({"metadata": {"locale": "nl-NL"}}));
+        assert_eq!(existing["locale"], json!("en-GB"));
+    }
+
+    #[test]
+    fn load_i18n_bundle_entries_reads_manifest_and_falls_back_to_en() {
+        let assets = StdHashMap::from([
+            (
+                "cards/i18n/_manifest.json".to_string(),
+                br#"{"locales":["de"]}"#.to_vec(),
+            ),
+            (
+                "cards/i18n/de.json".to_string(),
+                br#"{"title":"Hallo"}"#.to_vec(),
+            ),
+            (
+                "cards/i18n/en.json".to_string(),
+                br#"{"title":"Hello"}"#.to_vec(),
+            ),
+        ]);
+
+        let entries = load_i18n_bundle_entries("cards/i18n", |path| {
+            assets
+                .get(path)
+                .cloned()
+                .with_context(|| format!("missing asset {path}"))
+        });
+
+        assert_eq!(entries["de"]["title"], json!("Hallo"));
+        assert_eq!(entries["en"]["title"], json!("Hello"));
+    }
+
+    #[test]
+    fn load_i18n_bundle_entries_reads_single_file_bundle() {
+        let entries = load_i18n_bundle_entries("cards/i18n.json", |path| {
+            if path == "cards/i18n.json" {
+                Ok(br#"{"title":"Hello"}"#.to_vec())
+            } else {
+                bail!("unexpected asset {path}");
+            }
+        });
+
+        assert_eq!(entries["en"]["title"], json!("Hello"));
+    }
+
+    struct TestCrossPackResolver;
+
+    impl CrossPackResolver for TestCrossPackResolver {
+        fn invoke(
+            &self,
+            provider_id: &str,
+            provider_type: Option<&str>,
+            op: &str,
+            input: &[u8],
+            tenant: &str,
+            team: Option<&str>,
+        ) -> Result<Value> {
+            Ok(json!({
+                "provider_id": provider_id,
+                "provider_type": provider_type,
+                "op": op,
+                "tenant": tenant,
+                "team": team,
+                "input": serde_json::from_slice::<Value>(input)?,
+            }))
+        }
+    }
+
+    #[test]
+    fn cross_pack_resolver_returns_node_output_when_present() {
+        let mut engine = minimal_engine();
+        engine.set_cross_pack_resolver(Arc::new(TestCrossPackResolver));
+
+        let output = engine
+            .try_invoke_cross_pack_resolver(
+                Some("mail"),
+                Some("messaging"),
+                "send",
+                br#"{"subject":"hello"}"#,
+                "demo",
+            )
+            .expect("resolver invocation")
+            .expect("resolver output");
+
+        assert_eq!(
+            output.payload,
+            json!({
+                "provider_id": "mail",
+                "provider_type": "messaging",
+                "op": "send",
+                "tenant": "demo",
+                "team": null,
+                "input": { "subject": "hello" },
+            })
         );
     }
 

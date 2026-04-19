@@ -1,0 +1,20 @@
+{
+  "qa.install.title": "Install configuration",
+  "qa.install.description": "Provide values for initial provider setup.",
+  "qa.update.title": "Update configuration",
+  "qa.update.description": "Adjust existing provider settings.",
+  "qa.remove.title": "Remove configuration",
+  "qa.remove.description": "Confirm provider removal settings.",
+  "qa.field.api_key.label": "API key",
+  "qa.field.api_key.help": "Secret key used to authenticate provider requests.",
+  "qa.field.region.label": "Region",
+  "qa.field.region.help": "Region identifier for the provider account.",
+  "qa.field.webhook_base_url.label": "Webhook base URL",
+  "qa.field.webhook_base_url.help": "Public base URL used for webhook callbacks.",
+  "qa.field.enabled.label": "Enable provider",
+  "qa.field.enabled.help": "Enable this provider after setup completes.",
+  "qa.field.confirm_remove.label": "Confirm removal",
+  "qa.field.confirm_remove.help": "Set to true to allow provider removal.",
+  "qa.error.required": "One or more required fields are missing.",
+  "qa.error.remove_confirmation": "Removal requires explicit confirmation."
+}

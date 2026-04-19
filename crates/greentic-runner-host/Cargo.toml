@@ -30,7 +30,7 @@ greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
 greentic-interfaces.workspace = true
-greentic-types.workspace = true
+greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
 greentic-distributor-client.workspace = true
 greentic-session.workspace = true
