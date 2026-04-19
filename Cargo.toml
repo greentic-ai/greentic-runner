@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/greentic-i18n",
     "crates/greentic-runner",
     "crates/greentic-runner-host",
     "crates/greentic-runner-desktop",
@@ -20,7 +19,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.4.76"
+version = "0.5.0"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -32,24 +31,24 @@ clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["pkcs8"] }
 futures = "0.3"
-greentic-flow = "0.4"
-greentic-types = { version = "0.4", features = ["telemetry-autoinit"] }
-greentic_pack = { package = "greentic-pack-lib", version = "0.4" }
-greentic-distributor-client = { version = "0.4", features = ["dist-client"] }
-greentic-session = "0.4"
-greentic-state = "0.4"
-greentic-interfaces = { version = "0.4", default-features = false, features = ["bindings-rust"] }
-greentic-interfaces-host = { version = "0.4" }
-greentic-interfaces-wasmtime = { version = "0.4" }
-greentic-config = "0.4"
-greentic-config-types = "0.4"
-greentic-i18n = { path = "crates/greentic-i18n", version = "0.4" }
-greentic-oauth-sdk = { version = "0.4"  }
-greentic-oauth-host = { version = "0.4" }
-greentic-runner-host = { path = "crates/greentic-runner-host", version = "0.4" }
-greentic-runner-desktop = { path = "crates/greentic-runner-desktop", version = "0.4" }
-runner-core = { path = "crates/runner-core", version = "0.4" }
-greentic-secrets-lib = "0.4"
+greentic-flow = "0.5"
+greentic-types = { version = "0.5", features = ["telemetry-autoinit"] }
+greentic_pack = { package = "greentic-pack-lib", version = "0.5" }
+greentic-distributor-client = { version = "0.5", features = ["dist-client"] }
+greentic-session = "0.5"
+greentic-state = "0.5"
+greentic-interfaces = { version = "0.5", default-features = false, features = ["bindings-rust"] }
+greentic-interfaces-host = { version = "0.5" }
+greentic-interfaces-wasmtime = { version = "0.5" }
+greentic-config = "0.5"
+greentic-config-types = "0.5"
+greentic-i18n = { version = "0.5" }
+greentic-oauth-sdk = { version = "0.5"  }
+greentic-oauth-host = { version = "0.5" }
+greentic-runner-host = { path = "crates/greentic-runner-host", version = "0.5" }
+greentic-runner-desktop = { path = "crates/greentic-runner-desktop", version = "0.5" }
+runner-core = { path = "crates/runner-core", version = "0.5" }
+greentic-secrets-lib = "0.5"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
