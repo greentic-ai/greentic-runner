@@ -163,6 +163,7 @@ fn legacy_component_exec_flow(flow_id: &str, message: &str) -> Result<Flow> {
             output: OutputMapping {
                 mapping: Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
         },
@@ -268,6 +269,7 @@ fn build_component_exec_flow_with_input(flow_id: &str, input: Value) -> Result<F
             output: OutputMapping {
                 mapping: Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
         },

@@ -1087,7 +1087,7 @@ fn load_manifest_and_flows(path: &Path) -> Result<ManifestLoad> {
             );
             let legacy: legacy_pack::PackManifest = serde_cbor::from_slice(&bytes)
                 .context("failed to decode legacy pack manifest from manifest.cbor")?;
-            let flows = load_legacy_flows_from_archive(&mut archive, path, &legacy)?;
+            let flows = load_legacy_flows_from_archive(&mut archive, &legacy)?;
             Ok(ManifestLoad::Legacy {
                 manifest: Box::new(legacy),
                 flows,
@@ -1137,12 +1137,10 @@ fn load_legacy_flows_from_dir(
 
 fn load_legacy_flows_from_archive(
     archive: &mut ZipArchive<File>,
-    pack_path: &Path,
     manifest: &legacy_pack::PackManifest,
 ) -> Result<PackFlows> {
     build_legacy_flows(manifest, |rel_path| {
-        read_entry(archive, rel_path)
-            .with_context(|| format!("missing flow json {} in {}", rel_path, pack_path.display()))
+        read_entry(archive, rel_path).with_context(|| format!("missing flow json {}", rel_path))
     })
 }
 
@@ -1156,7 +1154,7 @@ fn build_legacy_flows(
     for entry in &manifest.flows {
         let bytes = read_json(&entry.file_json)
             .with_context(|| format!("missing flow json {}", entry.file_json))?;
-        let doc = parse_flow_doc_with_legacy_aliases(&bytes, &entry.file_json)?;
+        let doc = parse_flow_doc_with_legacy_aliases(&bytes)?;
         let normalized = normalize_flow_doc(doc);
         let flow_ir = flow_doc_to_ir(normalized)?;
         let flow = flow_ir_to_flow(flow_ir)?;
@@ -1190,16 +1188,16 @@ fn build_legacy_flows(
     })
 }
 
-fn parse_flow_doc_with_legacy_aliases(bytes: &[u8], path: &str) -> Result<FlowDoc> {
-    let mut value: Value = serde_json::from_slice(bytes)
-        .with_context(|| format!("failed to decode flow doc {}", path))?;
+fn parse_flow_doc_with_legacy_aliases(bytes: &[u8]) -> Result<FlowDoc> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).context("failed to decode flow doc JSON")?;
     if let Some(map) = value.as_object_mut()
         && !map.contains_key("type")
         && let Some(flow_type) = map.remove("flow_type")
     {
         map.insert("type".to_string(), flow_type);
     }
-    serde_json::from_value(value).with_context(|| format!("failed to decode flow doc {}", path))
+    serde_json::from_value(value).context("failed to decode flow doc structure")
 }
 
 pub struct ComponentState {
@@ -2602,6 +2600,7 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 output: OutputMapping {
                     mapping: Value::Null,
                 },
+                err_map: None,
                 routing,
                 telemetry,
             },
