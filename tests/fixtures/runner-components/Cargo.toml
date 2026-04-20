@@ -12,15 +12,43 @@ edition = "2021"
 
 [workspace.dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+# Stays on 0.4 until greentic-pack ships 0.5.x (Phase 3 of the 0.4→0.5 plan).
 greentic-pack = "0.4"
-greentic-flow = "0.4"
+greentic-flow = ">=0.5.0-0, <0.6.0-0"
 indexmap = "2"
 semver = "1"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_bw = "2.5.2"
-time = { version = "0.3", features = ["formatting"] }
-zip = { version = "6", default-features = false, features = ["deflate-flate2"] }
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 wit-bindgen = "0.50"
+
+[workspace.dependencies.clap]
+version = "4"
+features = [
+    "derive",
+]
+
+[workspace.dependencies.serde]
+version = "1"
+features = [
+    "derive",
+]
+
+[workspace.dependencies.time]
+version = "0.3"
+features = [
+    "formatting",
+]
+
+[workspace.dependencies.zip]
+version = "6"
+default-features = false
+features = [
+    "deflate-flate2",
+]
+
+[workspace.dependencies.flate2]
+version = "1.1"
+default-features = false
+features = [
+    "rust_backend",
+]
