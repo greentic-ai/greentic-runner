@@ -286,6 +286,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     let mock_sink: Arc<dyn MockEventSink> = recorder.clone();
     mock_layer.register_sink(mock_sink);
 
+    let mut pack_components: Vec<greentic_types::ComponentManifest> = Vec::new();
     if pack_path.is_file() {
         match open_pack(&pack_path, to_reader_policy(opts.signing)) {
             Ok(load) => {
@@ -296,6 +297,9 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     entry_flows: meta.entry_flows.clone(),
                     secret_requirements: Vec::new(),
                 });
+                if let Some(manifest) = load.gpack_manifest.as_ref() {
+                    pack_components = manifest.components.clone();
+                }
             }
             Err(err) => {
                 recorder.record_verify_event("error", &err.message)?;
@@ -313,7 +317,24 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         );
     }
 
-    let host_config = Arc::new(build_host_config(&resolved_profile, &directories));
+    let kill_switch = desktop_http_kill_switch_active();
+    let http_enabled = derive_http_enabled(&pack_components, kill_switch);
+    if http_enabled {
+        info!(
+            component_count = pack_components.len(),
+            "enabling HTTP client gate based on component manifest capabilities"
+        );
+    } else if kill_switch {
+        info!(
+            env_var = DESKTOP_HTTP_DISABLE_ENV,
+            "HTTP client gate forced off by desktop kill-switch"
+        );
+    }
+    let host_config = Arc::new(build_host_config(
+        &resolved_profile,
+        &directories,
+        http_enabled,
+    ));
     let mut component_resolution = ComponentResolution::default();
     if let Some(dir) = opts.components_dir.clone() {
         component_resolution.materialized_root = Some(dir);
@@ -535,14 +556,66 @@ fn resolve_profile(profile: &Profile, ctx: &TenantContext) -> ResolvedProfile {
     }
 }
 
-fn build_host_config(profile: &ResolvedProfile, dirs: &RunDirectories) -> HostConfig {
+/// Environment variable that forces the HTTP client gate off regardless of
+/// what component manifests declare. Operators set this to `1` / `true` to
+/// disable outbound HTTP as a kill-switch when running the desktop profile.
+const DESKTOP_HTTP_DISABLE_ENV: &str = "GREENTIC_DESKTOP_HTTP_DISABLE";
+
+/// Derive whether the desktop profile must enable the HTTP client gate.
+///
+/// Returns `true` when any of the supplied component manifests declares
+/// `capabilities.host.http.client: true` AND the kill-switch is not active.
+///
+/// Packs opt in to HTTP by declaring the capability in their component
+/// manifest. Operators retain a kill-switch by setting
+/// `GREENTIC_DESKTOP_HTTP_DISABLE=1`, which forces the return value to
+/// `false` even when the manifest requests HTTP.
+///
+/// @param components - Component manifests loaded from the active pack.
+/// @param kill_switch - When true, forces the gate to remain disabled.
+/// @returns Whether the desktop runner should enable outbound HTTP.
+fn derive_http_enabled(
+    components: &[greentic_types::ComponentManifest],
+    kill_switch: bool,
+) -> bool {
+    if kill_switch {
+        return false;
+    }
+    components.iter().any(|component| {
+        component
+            .capabilities
+            .host
+            .http
+            .as_ref()
+            .map(|http| http.client)
+            .unwrap_or(false)
+    })
+}
+
+/// Read the kill-switch env var. Non-truthy / unset values leave the gate
+/// controlled purely by the manifest.
+fn desktop_http_kill_switch_active() -> bool {
+    match std::env::var(DESKTOP_HTTP_DISABLE_ENV) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
+}
+
+fn build_host_config(
+    profile: &ResolvedProfile,
+    dirs: &RunDirectories,
+    http_enabled: bool,
+) -> HostConfig {
     HostConfig {
         tenant: profile.tenant_id.clone(),
         bindings_path: dirs.resolved.join("dev.bindings.yaml"),
         flow_type_bindings: HashMap::new(),
         rate_limits: RateLimits::default(),
         retry: FlowRetryConfig::default(),
-        http_enabled: false,
+        http_enabled,
         secrets_policy: SecretsPolicy::allow_all(),
         state_store_policy: StateStorePolicy::default(),
         webhook_policy: WebhookPolicy::default(),
