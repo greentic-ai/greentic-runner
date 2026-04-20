@@ -286,7 +286,10 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     let mock_sink: Arc<dyn MockEventSink> = recorder.clone();
     mock_layer.register_sink(mock_sink);
 
-    let mut pack_components: Vec<greentic_types::ComponentManifest> = Vec::new();
+    // Collect only the `host.http.client` booleans from the component manifest
+    // rather than cloning full `ComponentManifest` values — we just need to know
+    // whether any component opted in.
+    let mut pack_http_flags: Vec<bool> = Vec::new();
     if pack_path.is_file() {
         match open_pack(&pack_path, to_reader_policy(opts.signing)) {
             Ok(load) => {
@@ -298,7 +301,18 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     secret_requirements: Vec::new(),
                 });
                 if let Some(manifest) = load.gpack_manifest.as_ref() {
-                    pack_components = manifest.components.clone();
+                    pack_http_flags = manifest
+                        .components
+                        .iter()
+                        .map(|component| {
+                            component
+                                .capabilities
+                                .host
+                                .http
+                                .as_ref()
+                                .is_some_and(|http| http.client)
+                        })
+                        .collect();
                 }
             }
             Err(err) => {
@@ -318,16 +332,23 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     }
 
     let kill_switch = desktop_http_kill_switch_active();
-    let http_enabled = derive_http_enabled(&pack_components, kill_switch);
+    let http_enabled = derive_http_enabled(&pack_http_flags, kill_switch);
+    let http_component_count = pack_http_flags.iter().filter(|flag| **flag).count();
     if http_enabled {
         info!(
-            component_count = pack_components.len(),
+            total_component_count = pack_http_flags.len(),
+            http_component_count,
             "enabling HTTP client gate based on component manifest capabilities"
         );
     } else if kill_switch {
         info!(
             env_var = DESKTOP_HTTP_DISABLE_ENV,
             "HTTP client gate forced off by desktop kill-switch"
+        );
+    } else {
+        tracing::debug!(
+            total_component_count = pack_http_flags.len(),
+            "HTTP client gate disabled: no component manifest declares host.http.client"
         );
     }
     let host_config = Arc::new(build_host_config(
@@ -563,45 +584,31 @@ const DESKTOP_HTTP_DISABLE_ENV: &str = "GREENTIC_DESKTOP_HTTP_DISABLE";
 
 /// Derive whether the desktop profile must enable the HTTP client gate.
 ///
-/// Returns `true` when any of the supplied component manifests declares
-/// `capabilities.host.http.client: true` AND the kill-switch is not active.
-///
-/// Packs opt in to HTTP by declaring the capability in their component
-/// manifest. Operators retain a kill-switch by setting
-/// `GREENTIC_DESKTOP_HTTP_DISABLE=1`, which forces the return value to
-/// `false` even when the manifest requests HTTP.
-///
-/// @param components - Component manifests loaded from the active pack.
-/// @param kill_switch - When true, forces the gate to remain disabled.
-/// @returns Whether the desktop runner should enable outbound HTTP.
-fn derive_http_enabled(
-    components: &[greentic_types::ComponentManifest],
-    kill_switch: bool,
-) -> bool {
-    if kill_switch {
-        return false;
-    }
-    components.iter().any(|component| {
-        component
-            .capabilities
-            .host
-            .http
-            .as_ref()
-            .map(|http| http.client)
-            .unwrap_or(false)
-    })
+/// Returns `true` when at least one component flag is `true` and the
+/// kill-switch is not active. Packs opt in to HTTP by declaring
+/// `capabilities.host.http.client: true`; operators can force the gate off
+/// via [`DESKTOP_HTTP_DISABLE_ENV`] regardless of what the manifest says.
+fn derive_http_enabled(component_http_flags: &[bool], kill_switch: bool) -> bool {
+    !kill_switch && component_http_flags.iter().any(|flag| *flag)
 }
 
-/// Read the kill-switch env var. Non-truthy / unset values leave the gate
-/// controlled purely by the manifest.
+/// Parse the raw value of [`DESKTOP_HTTP_DISABLE_ENV`] into a kill-switch bool.
+///
+/// Truthy values (`1`, `true`, `yes`, `on`, case- and whitespace-insensitive)
+/// activate the kill-switch. `None` or any other value leaves it inactive so
+/// the gate remains controlled by the component manifest.
+fn parse_kill_switch(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Read [`DESKTOP_HTTP_DISABLE_ENV`] from the process environment and
+/// interpret it via [`parse_kill_switch`].
 fn desktop_http_kill_switch_active() -> bool {
-    match std::env::var(DESKTOP_HTTP_DISABLE_ENV) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        Err(_) => false,
-    }
+    parse_kill_switch(std::env::var(DESKTOP_HTTP_DISABLE_ENV).ok().as_deref())
 }
 
 fn build_host_config(
@@ -1401,66 +1408,52 @@ mod tests {
         assert!(!disabled.http_enabled);
     }
 
-    fn component_manifest_with_http_client(client: bool) -> greentic_types::ComponentManifest {
-        use greentic_types::{
-            ComponentCapabilities, ComponentManifest, ComponentProfiles, HostCapabilities,
-            HttpCapabilities, ResourceHints,
-        };
-        ComponentManifest {
-            id: "component.test".parse().expect("component id"),
-            version: semver::Version::parse("0.1.0").expect("version"),
-            supports: Vec::new(),
-            world: "greentic:component@0.6.0".into(),
-            profiles: ComponentProfiles::default(),
-            capabilities: ComponentCapabilities {
-                wasi: Default::default(),
-                host: HostCapabilities {
-                    http: Some(HttpCapabilities {
-                        client,
-                        server: false,
-                    }),
-                    ..Default::default()
-                },
-            },
-            configurators: None,
-            operations: Vec::new(),
-            config_schema: None,
-            resources: ResourceHints::default(),
-            dev_flows: std::collections::BTreeMap::new(),
-        }
-    }
-
     #[test]
     fn derive_http_enabled_true_when_any_component_declares_http_client() {
-        let components = vec![
-            component_manifest_with_http_client(false),
-            component_manifest_with_http_client(true),
-        ];
-        assert!(derive_http_enabled(&components, false));
+        assert!(derive_http_enabled(&[false, true], false));
     }
 
     #[test]
     fn derive_http_enabled_false_when_no_component_declares_http_client() {
-        let components = vec![
-            component_manifest_with_http_client(false),
-            component_manifest_with_http_client(false),
-        ];
-        assert!(!derive_http_enabled(&components, false));
+        assert!(!derive_http_enabled(&[false, false], false));
     }
 
     #[test]
     fn derive_http_enabled_false_for_empty_components() {
-        let components: Vec<greentic_types::ComponentManifest> = Vec::new();
-        assert!(!derive_http_enabled(&components, false));
+        assert!(!derive_http_enabled(&[], false));
     }
 
     #[test]
     fn derive_http_enabled_kill_switch_forces_disable() {
-        let components = vec![component_manifest_with_http_client(true)];
         assert!(
-            !derive_http_enabled(&components, true),
+            !derive_http_enabled(&[true], true),
             "kill-switch must override positive manifest declaration"
         );
+    }
+
+    #[test]
+    fn parse_kill_switch_matches_truthy_and_falsy_inputs() {
+        // (raw input, expected kill-switch active)
+        let cases: &[(Option<&str>, bool)] = &[
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("YES"), true),
+            (Some("  on  "), true),
+            (Some("On"), true),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("bogus"), false),
+            (Some(""), false),
+            (None, false),
+        ];
+
+        for (raw, expected) in cases {
+            assert_eq!(
+                parse_kill_switch(*raw),
+                *expected,
+                "parse_kill_switch({raw:?}) should be {expected}"
+            );
+        }
     }
 
     #[test]
