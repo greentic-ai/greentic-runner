@@ -25,6 +25,9 @@ jobs:
   security-fix:
     # Do not run on fork PRs to avoid passing untrusted refs into privileged remediation workflows.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Don't block PRs on external Codex API failures (quota, rate limits, outages).
+    # Security alerts are still surfaced via Dependabot / CodeQL directly.
+    continue-on-error: true
     uses: greenticai/.github/.github/workflows/codex-security-fix.yml@main
     with:
       branch: ${{ github.event.inputs.branch || '' }}
