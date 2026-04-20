@@ -1302,7 +1302,7 @@ mod tests {
     fn build_host_config_enables_local_dev_defaults() {
         let temp = TempDir::new().expect("tempdir");
         let dirs = prepare_run_dirs(Some(temp.path().join("run"))).expect("dirs");
-        let config = build_host_config(&sample_profile(), &dirs);
+        let config = build_host_config(&sample_profile(), &dirs, false);
 
         assert_eq!(config.tenant, "tenant");
         assert!(!config.http_enabled);
@@ -1311,6 +1311,82 @@ mod tests {
             config
                 .operator_policy
                 .allows_provider(Some("provider"), "provider")
+        );
+    }
+
+    #[test]
+    fn build_host_config_honours_http_enabled_flag() {
+        let temp = TempDir::new().expect("tempdir");
+        let dirs = prepare_run_dirs(Some(temp.path().join("run"))).expect("dirs");
+        let enabled = build_host_config(&sample_profile(), &dirs, true);
+        assert!(
+            enabled.http_enabled,
+            "http_enabled should propagate when derived from manifest"
+        );
+
+        let disabled = build_host_config(&sample_profile(), &dirs, false);
+        assert!(!disabled.http_enabled);
+    }
+
+    fn component_manifest_with_http_client(client: bool) -> greentic_types::ComponentManifest {
+        use greentic_types::{
+            ComponentCapabilities, ComponentManifest, ComponentProfiles, HostCapabilities,
+            HttpCapabilities, ResourceHints,
+        };
+        ComponentManifest {
+            id: "component.test".parse().expect("component id"),
+            version: semver::Version::parse("0.1.0").expect("version"),
+            supports: Vec::new(),
+            world: "greentic:component@0.6.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities {
+                wasi: Default::default(),
+                host: HostCapabilities {
+                    http: Some(HttpCapabilities {
+                        client,
+                        server: false,
+                    }),
+                    ..Default::default()
+                },
+            },
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: ResourceHints::default(),
+            dev_flows: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn derive_http_enabled_true_when_any_component_declares_http_client() {
+        let components = vec![
+            component_manifest_with_http_client(false),
+            component_manifest_with_http_client(true),
+        ];
+        assert!(derive_http_enabled(&components, false));
+    }
+
+    #[test]
+    fn derive_http_enabled_false_when_no_component_declares_http_client() {
+        let components = vec![
+            component_manifest_with_http_client(false),
+            component_manifest_with_http_client(false),
+        ];
+        assert!(!derive_http_enabled(&components, false));
+    }
+
+    #[test]
+    fn derive_http_enabled_false_for_empty_components() {
+        let components: Vec<greentic_types::ComponentManifest> = Vec::new();
+        assert!(!derive_http_enabled(&components, false));
+    }
+
+    #[test]
+    fn derive_http_enabled_kill_switch_forces_disable() {
+        let components = vec![component_manifest_with_http_client(true)];
+        assert!(
+            !derive_http_enabled(&components, true),
+            "kill-switch must override positive manifest declaration"
         );
     }
 
