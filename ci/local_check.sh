@@ -4,7 +4,7 @@ set -euo pipefail
 : "${CI:=0}"
 : "${RUN_HOST:=never}"
 
-RUST_TOOLCHAIN_VERSION="1.91.0"
+RUST_TOOLCHAIN_VERSION="1.95.0"
 echo "==> Local CI mirror (greentic-runner, rustc ${RUST_TOOLCHAIN_VERSION})"
 export CARGO_TERM_COLOR=always
 export RUSTFLAGS="-Dwarnings"

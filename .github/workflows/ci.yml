@@ -47,18 +47,23 @@ jobs:
           - clippy
           - crate_tests
           - workspace_tests
-          - package
+          # `package` step intentionally absent during the 0.4 → 0.5 cascade:
+          # workspace members (greentic-runner-host, greentic-runner-desktop,
+          # runner-core) aren't on crates.io at 0.5.x yet, so
+          # `cargo package --no-verify` against this workspace fails to resolve
+          # them. The real publish path (crates-publish.yml) handles this by
+          # uploading in topological order. Re-add once everything is at 0.5.x.
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: 1.95.0
           components: clippy, rustfmt
           targets: wasm32-wasip2
 
       - name: Install wasm32-wasip2 target
-        run: rustup target add wasm32-wasip2 --toolchain 1.91.0
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -101,13 +106,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: 1.95.0
           targets: wasm32-wasip2
 
       - name: Install wasm32-wasip2 target
-        run: rustup target add wasm32-wasip2 --toolchain 1.91.0
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         with:

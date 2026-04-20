@@ -2602,6 +2602,7 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 output: OutputMapping {
                     mapping: Value::Null,
                 },
+                err_map: None,
                 routing,
                 telemetry,
             },

@@ -385,6 +385,9 @@ fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     export.mode = match cfg.exporter {
         TelemetryExporterKind::Otlp => ExportMode::OtlpGrpc,
         TelemetryExporterKind::Stdout => ExportMode::JsonStdout,
+        TelemetryExporterKind::Gcp => ExportMode::GcpCloudTrace,
+        TelemetryExporterKind::Azure => ExportMode::AzureAppInsights,
+        TelemetryExporterKind::Aws => ExportMode::AwsXRay,
         TelemetryExporterKind::None => return None,
     };
     export.endpoint = cfg.endpoint.clone();
