@@ -1140,8 +1140,7 @@ fn load_legacy_flows_from_archive(
     manifest: &legacy_pack::PackManifest,
 ) -> Result<PackFlows> {
     build_legacy_flows(manifest, |rel_path| {
-        read_entry(archive, rel_path)
-            .with_context(|| format!("missing flow json {}", rel_path))
+        read_entry(archive, rel_path).with_context(|| format!("missing flow json {}", rel_path))
     })
 }
 
