@@ -1,198 +1,190 @@
 # greentic-runner
 
-Monorepo for the Greentic runner host, CLI, and integration tests.  
-The workspace centres around `crates/greentic-runner-host`, which is the production runtime (pack ingestion/resolvers, canonical ingress adapters for Telegram/Teams/WebChat/Slack/Webex/WhatsApp/webhook/timer, session/state glue, admin API). The top-level crate `greentic-runner` exposes a thin binary that embeds the host.
+`greentic-runner` is the runtime that executes Greentic packs.
 
-## Quick start
+If you are new to Greentic, the shortest useful description is:
+
+- `greentic-pack` builds a pack
+- `gtc` creates, sets up, and starts an app or bundle
+- `greentic-runner` is the engine that actually runs the flows and components inside that app
+
+This repository is mainly for people who:
+
+- want to understand how Greentic runtime execution works
+- need to debug flow execution, component calls, secrets, state, or messaging ingress
+- are working on the runner itself
+
+It is not usually the first tool end users should start with.
+
+## Who This README Is For
+
+This README is written for humans first, especially:
+
+- product-minded builders
+- technical writers
+- non-specialist programmers
+- people who need to understand what this repo does before changing code
+
+If you are a coding agent or someone automating development tasks, skip to:
+
+- [docs/coding-agents.md](docs/coding-agents.md)
+
+That document explains how this repo should be used together with `gtc`, `greentic-dev`, `greentic-pack`, and related tools.
+
+## What This Repository Does
+
+This repository contains the runtime that:
+
+- loads `.gtpack` files and materialized pack directories
+- runs flow graphs
+- invokes WebAssembly components
+- handles `component.exec`, `provider.invoke`, `flow.call`, and built-in control nodes
+- exposes HTTP ingress for channels such as webchat, Slack, Teams, Telegram, Webex, WhatsApp, generic webhooks, and timers
+- manages pause/resume state for multi-step or waiting flows
+
+In plainer language:
+
+- your pack defines what should happen
+- this runner is the thing that makes it happen at runtime
+
+## How It Fits With Other Greentic Tools
+
+People often expect this repo to do more than it actually does, so it helps to be explicit.
+
+### `greentic-pack`
+
+Use `greentic-pack` when you want to:
+
+- create a pack
+- resolve component references
+- build a `.gtpack`
+
+### `gtc`
+
+Use `gtc` when you want to:
+
+- create a runnable bundle
+- apply setup answers
+- start an app locally
+- work with a complete app experience instead of a raw runtime
+
+### `greentic-dev`
+
+Use `greentic-dev` for developer tooling, diagnostics, and helper workflows around the broader Greentic ecosystem.
+
+### `greentic-runner`
+
+Use this repo when you need to:
+
+- debug why a flow behaves a certain way at runtime
+- inspect how `component.exec` or `provider.invoke` is executed
+- investigate secrets, state, templating, pause/resume, or ingress normalization
+- run a pack directly with the runner CLI for low-level troubleshooting
+
+## The Main Things Built Here
+
+This workspace produces a few important binaries and crates:
+
+- `greentic-runner`
+  The main HTTP runtime host.
+
+- `greentic-runner-cli`
+  A local execution tool for running a pack directly without a full bundle.
+
+- `greentic-gen-bindings`
+  A helper that inspects a pack and emits a bindings seed.
+
+- `greentic-runner-host`
+  The core runtime crate where most of the real execution logic lives.
+
+- `greentic-runner-desktop`
+  A local desktop-style harness used by runner-side tools and tests.
+
+## The Simplest Mental Model
+
+If you are not deep in the codebase yet, this model is usually enough:
+
+1. A pack contains flows and components.
+2. A flow reaches a node.
+3. The runner renders any templates in that node.
+4. The runner decides what action to take.
+5. If the node is a component call, the runner invokes the component.
+6. If the flow pauses, the runner stores the state and waits for the next event.
+
+That is the heart of this repository.
+
+## When You Should Use This Repo Directly
+
+You should probably work in this repo directly if:
+
+- a pack works in theory but fails only at runtime
+- a component receives the wrong payload
+- setup, secrets, state, or context seem to disappear before invocation
+- a messaging adapter normalizes input incorrectly
+- a flow pauses or resumes in the wrong place
+
+You probably should not start here if your task is mainly:
+
+- authoring a new pack
+- packaging or publishing a pack
+- creating a bundle
+- answering setup questions
+- starting an app in the usual product workflow
+
+Those tasks usually belong to `greentic-pack`, `gtc`, or another repo.
+
+## Quick Local Commands
+
+For people working on the runner itself, the most common commands are:
 
 ```bash
-# Run the HTTP host on port 8080
+cargo build
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+To run the HTTP runtime directly:
+
+```bash
 cargo run -p greentic-runner -- \
   --bindings examples/bindings/demo.yaml \
   --port 8080
-
-# Optional: point at an explicit config file and print the resolved config
-cargo run -p greentic-runner -- \
-  --config examples/greentic.toml \
-  --config-explain
-
-# Trigger a Telegram-style webhook
-curl -X POST http://localhost:8080/messaging/telegram/webhook \
-  -H "Content-Type: application/json" \
-  -d '{"update_id":1,"message":{"chat":{"id":42},"text":"hello"}}'
 ```
 
-By default the host resolves `greentic.toml`/`greentic.json` (or the workspace
-defaults) and uses the `packs`/`paths` settings to locate the pack index
-(`.greentic/index.json` by default, falling back to `examples/index.json` for
-local runs). Network, telemetry, and secrets wiring are also taken from
-greentic-config. Every ingress payload (Telegram/WebChat/Slack/Webex/WhatsApp/
-webhook/timer) is normalized into the canonical schema with deterministic
-session keys so pause/resume + dedupe work the same way across providers.
-
-## Documentation
-
-- Docs index: `docs/README.md`
-- Canonical v0.6 guide: `docs/vision/canonical-v0.6.md`
-- Legacy guidance and replacements: `docs/vision/legacy.md`
-
-## Public API
-
-The `greentic_runner` crate is the supported embedding surface:
-
-```rust
-use greentic_runner::{run_http_host, start_embedded_host, RunnerConfig, HostBuilder};
-use greentic_runner::config::HostConfig;
-use greentic_config::ConfigResolver;
-
-// Mirror the CLI
-let resolved = ConfigResolver::new().load()?;
-run_http_host(RunnerConfig::from_config(resolved, vec![bindings_path])?).await?;
-
-// Or build an API-only host (no HTTP server) and drive it manually
-let host = start_embedded_host(
-    HostBuilder::new().with_config(HostConfig::load_from_path("tenant.yaml")?),
-)
-.await?;
-host.load_pack("tenant", "./packs/demo.gtpack".as_ref()).await?;
-```
-
-`run_http_host` matches the behaviour of the `greentic-runner` binary (pack
-watcher + HTTP ingress). `start_embedded_host` is designed for developer tools
-and tests that want to load packs/bindings and call `handle_activity` directly
-without starting axum or the watcher.
-
-## Pack index schema
-
-Pack resolution is driven by a JSON index (see `examples/index.json`). Each tenant entry supplies a `main_pack` plus optional ordered `overlays`:
-
-```json
-{
-  "tenants": {
-    "demo": {
-      "main_pack": {
-        "reference": { "name": "demo-pack", "version": "1.2.3" },
-        "locator": "fs:///packs/demo.gtpack",
-        "digest": "sha256:abcd...",
-        "signature": "ed25519:...",
-        "path": "./packs/demo.gtpack"
-      },
-      "overlays": [
-        {
-          "reference": { "name": "demo-overlay", "version": "1.2.3" },
-          "path": "./packs/demo-overlay.gtpack",
-          "digest": "sha256:efgh..."
-        }
-      ]
-    }
-  }
-}
-```
-
-During a reload the watcher resolves each locator (filesystem, HTTPS, OCI, S3, GCS, or Azure blob), validates the digest/signature, populates the content-addressed cache, warms Wasmtime, and swaps the `TenantRuntime` atomically. Overlays can be added/removed tenant-by-tenant without touching the base pack; `crates/tests/tests/host_integration.rs` contains a regression test for overlay reloads.
-
-## Sessions & pause/resume
-
-Packs can emit the `session.wait` component to pause execution (e.g., waiting for a human reply). `greentic-runner-host` automatically:
-
-1. Serializes the `FlowSnapshot` (next node + execution state) into `greentic-session`.
-2. Uses a canonical session key (`tenant:provider:channel:conversation:user`) hashed into a `UserId`, so the next inbound activity finds the correct snapshot.
-3. Resumes the snapshot on the next activity, continues execution, and clears the stored state once the flow finishes.
-
-No glue code is required inside packs; authors just emit `session.wait` and persist any additional state via `greentic-state`. The canonical session key format is `{tenant}:{provider}:{conversation-or-channel}:{user}` so every adapter participates consistently (documented in `crates/greentic-runner-host/README.md`).
-
-## OAuth broker world
-
-Tenants can opt into the OAuth broker world by adding an `oauth` block to their
-bindings file. The host wires `greentic-oauth-host`, connects to the broker
-(HTTP + NATS), and exposes the WIT world
-`greentic:oauth-broker@1.0.0/world broker` to components that import it. Each
-flow execution receives the tenant’s `TenantCtx`, so deployment packs or
-channels can call `get-consent-url`, `exchange-code`, and `get-token` without
-embedding provider-specific logic.
-
-```yaml
-tenant: acme
-flow_type_bindings: { ... }
-oauth:
-  http_base_url: https://oauth.api.greentic.net/
-  nats_url: nats://oauth-broker:4222
-  provider: greentic.oauth.default
-  env: prod        # optional, defaults to GREENTIC_ENV/local
-  team: ops        # optional logical scoping hint
-```
-
-When `oauth` is omitted nothing changes—the linker simply skips the OAuth world
-and packs behave exactly as they did before. This keeps environments that do not
-run the broker lightweight while enabling deployment packs and channels to
-request consent URLs or tokens wherever the broker is configured.
-
-## Repository layout
-
-| Path | Description |
-| --- | --- |
-| `crates/greentic-runner-host/` | Production runtime crate (docs, canonical adapters, env table, admin API) |
-| `crates/greentic-runner/` | Binary that embeds the host (CLI entrypoint) |
-| `crates/tests/` | Integration test harness (demo pack execution, watcher reload/overlay regression, adapter fixtures) |
-| `examples/` | Sample bindings, reference `index.json`, example packs |
-
-## Development
+To run a pack directly with the local runner harness:
 
 ```bash
-cargo fmt
-cargo clippy
-cargo test
+cargo run -p greentic-runner --bin greentic-runner-cli -- \
+  --pack ./path/to/pack.gtpack \
+  --input '{}'
 ```
 
-Integration tests under `crates/tests/tests/*.rs` exercise the demo pack, watcher reloads (including overlays), and scaffold future adapters (webhook/timer). Enable new fixtures as adapters mature.
+These are runtime/debugging commands. They are not the normal end-user way to run a Greentic app.
 
-## Ingress adapters at a glance
+## Where To Read Next
 
-| Provider | Route | Env/deps | Notes |
-| --- | --- | --- | --- |
-| Telegram Bot API | `POST /messaging/telegram/webhook` | `TELEGRAM_BOT_TOKEN` (used by the egress bridge) | Canonicalises update ids, dedupes via cache |
-| Microsoft Teams (Bot Framework) | `POST /teams/activities` | None (HTTPS listener; add auth proxy externally) | Uses `replyToId`/conversation/channel to derive session key |
-| Slack Events API | `POST /slack/events` | `SLACK_SIGNING_SECRET` | Handles `url_verification`, dedupes via `event_id` |
-| Slack Interactivity | `POST /slack/interactive` | `SLACK_SIGNING_SECRET` | Parses `payload=` form body; same canonical contract |
-| WebChat / Direct Line | `POST /webchat/activities` | None | Mirrors Bot Framework schema; attachments mapped 1:1 |
-| Cisco Webex | `POST /webex/webhook` | `WEBEX_WEBHOOK_SECRET` (optional signature) | File URLs surfaced in canonical attachments |
-| WhatsApp Cloud API | `GET/POST /whatsapp/webhook` | `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET` | Normalizes interactive/list replies into canonical buttons |
-| Generic Webhook | `ANY /webhook/:flow_id` | Idempotency via `Idempotency-Key` header | Passes normalized HTTP request object to the target flow |
-| Timer / Cron | internal | `bindings.yaml` timer entries | Schedules flow invocations using `cron` expressions |
+Start with the document that matches your goal:
 
-All adapters emit the canonical payload (`tenant`, `provider`, `provider_ids`, `session.key`, `text`, `attachments`, `buttons`, `entities`, `metadata`, `channel_data`, `raw`). The canonical session key `{tenant}:{provider}:{conversation-or-thread-or-channel}:{user}` drives dedupe and pause/resume semantics universally.
+- [docs/coding-agents.md](docs/coding-agents.md)
+  For coding agents and contributors who need tool-by-tool workflow guidance.
 
-## Environment variables
+- [docs/README.md](docs/README.md)
+  For the wider documentation map.
 
-Common settings (full table lives in `crates/greentic-runner-host/README.md`):
+- [crates/greentic-runner-host/README.md](crates/greentic-runner-host/README.md)
+  For low-level runtime details, host behavior, and crate-specific reference material.
 
-- `PACK_REFRESH_INTERVAL` – watcher cadence (e.g., `30s`, `5m`).
-- `PORT` – overrides the HTTP server port (also settable via CLI).
-- `TENANT_RESOLVER`, `DEFAULT_TENANT` – HTTP routing behaviour (host/header/jwt/env).
-- `OTEL_*` – OTLP exporter overrides; otherwise telemetry follows greentic-config.
-- Provider secrets such as `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`,
-  `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
+## Notes About Older Documentation
 
-## Publishing
+This repository still contains older deep-dive documents and historical notes.
 
-Versions are tracked per crate. Tagging `master` with `<crate>-vX.Y.Z` triggers the publish workflow which pushes the crate to crates.io. Use `ci/local_check.sh` before tagging to mirror the CI pipeline locally.
+They may still be useful for archaeology, but they are not the best starting point for most readers.
 
-## Bindings inference
+If two documents seem to disagree:
 
-`greentic-gen-bindings` can inspect a `.gtpack` and emit a complete `bindings.yaml` seed using the same schema the host expects:
-
-```bash
-cargo run -p greentic-runner --bin greentic-gen-bindings \
-  examples/packs/demo.gtpack \
-  --out generated/demo.gtbind \
-  --complete
-```
-
-`--complete` fills safe defaults for env passthrough, network allowlists, and secrets; `--strict` additionally fails if HTTP/secrets requirements cannot be satisfied so pack authors can share hints via `bindings.hints.yaml` or `meta.bindings` annotations. Use `--pack-dir` for unpacked pack directories; `--component` inspects a compiled component.
-
-## Repo settings
-
-Enable GitHub’s “Allow auto-merge” in repo settings and configure required branch checks; the Dependabot auto-merge workflow only acts on `dependabot[bot]` PRs once required checks pass.
+- trust the current code first
+- trust focused crate-level docs next
+- treat historical or “current behaviour” snapshots as reference material, not product guidance
 
 ## License
 

@@ -70,7 +70,7 @@ fn tenant_scoped_secret_reads_do_not_cross() -> Result<()> {
 }
 
 #[test]
-fn user_scoped_secret_reads_include_user_prefix() -> Result<()> {
+fn user_context_does_not_change_provider_secret_scope() -> Result<()> {
     let manager_impl: Arc<MemorySecretsManager> = Arc::new(MemorySecretsManager::default());
     let manager: DynSecretsManager = manager_impl.clone();
     let key = "SESSION_TOKEN";
