@@ -24,9 +24,6 @@ jobs:
     uses: greenticai/.github/.github/workflows/pr-ci.yml@main
     with:
       variant: host
-      # dependency-review already runs via dependency-review.yml (which also
-      # wires the Codex remediation path); avoid duplicate runs.
-      run-dependency-review: false
 
   heavy_wasm:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_heavy_wasm == true)
