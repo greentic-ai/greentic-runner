@@ -533,6 +533,101 @@ nodes:
 }
 
 #[test]
+fn component_exec_preserves_flow_node_config_for_wasm_components() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("component-exec-config.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let flow_yaml = r#"
+id: exec.config.flow
+type: messaging
+start: exec
+nodes:
+  exec:
+    component.exec:
+      component: qa.process
+      operation: process
+      config:
+        provider: ollama
+        default_model: llama3.2
+        base_url: http://127.0.0.1:11434/v1
+      input:
+        messages:
+          - role: user
+            content: hello
+    routing:
+      - out: true
+"#;
+    build_pack(flow_yaml, &pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &pack_path,
+        Arc::clone(&config),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+    let engine = rt.block_on(FlowEngine::new(
+        vec![Arc::clone(&pack)],
+        Arc::clone(&config),
+    ))?;
+
+    let retry_config = config.retry.clone().into();
+    let ctx = FlowContext {
+        tenant: config.tenant.as_str(),
+        pack_id: pack.metadata().pack_id.as_str(),
+        flow_id: "exec.config.flow",
+        node_id: None,
+        tool: None,
+        action: None,
+        session_id: None,
+        provider_id: None,
+        retry_config,
+        attempt: 1,
+        observer: None,
+        mocks: None,
+    };
+
+    let execution = rt
+        .block_on(engine.execute(ctx, Value::Null))
+        .context("component.exec flow with config run")?;
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => {
+            anyhow::bail!("flow paused unexpectedly: {:?}", wait.reason);
+        }
+    }
+
+    let payload = envelope_payload(&execution.output)?;
+    assert_eq!(
+        payload,
+        json!({
+            "config": {
+                "provider": "ollama",
+                "default_model": "llama3.2",
+                "base_url": "http://127.0.0.1:11434/v1"
+            },
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": "hello"
+                }]
+            }
+        })
+    );
+    Ok(())
+}
+
+#[test]
 fn component_exec_always_serializes_invocation_envelope() -> Result<()> {
     let rt = *RUNTIME;
     let config_temp = TempDir::new()?;

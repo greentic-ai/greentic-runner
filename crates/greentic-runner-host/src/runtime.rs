@@ -23,7 +23,7 @@ use crate::runner::adapt_events_email::{
 use crate::runner::contract_cache::{ContractCache, ContractCacheStats};
 use crate::runner::engine::FlowEngine;
 use crate::runner::mocks::MockLayer;
-use crate::secrets::{DynSecretsManager, read_secret_blocking};
+use crate::secrets::{DynSecretsManager, canonicalize_secret_key, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
 use crate::trace::PackTraceInfo;
@@ -324,8 +324,10 @@ impl TenantRuntime {
             bail!("secret {key} is not permitted by bindings policy");
         }
         let ctx = self.config.tenant_ctx();
-        let bytes = read_secret_blocking(&self.secrets, &ctx, RUNTIME_SECRETS_PACK_ID, key)
-            .context("failed to read secret from manager")?;
+        let canonical_key = canonicalize_secret_key(key);
+        let bytes =
+            read_secret_blocking(&self.secrets, &ctx, RUNTIME_SECRETS_PACK_ID, &canonical_key)
+                .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
         Ok(value)
     }

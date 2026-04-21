@@ -11,7 +11,7 @@ pub use greentic_runner_host::runner::mocks::{
     HttpMock, HttpMockMode, KvMock, MocksConfig, SecretsMock, TelemetryMock, TimeMock, ToolsMock,
 };
 use greentic_runner_host::runner::mocks::{MockEventSink, MockLayer};
-use greentic_runner_host::secrets::default_manager;
+use greentic_runner_host::secrets::{DynSecretsManager, default_manager};
 use greentic_runner_host::storage::{new_session_store, new_state_store};
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
@@ -119,6 +119,9 @@ pub struct RunOptions {
     pub dist_offline: bool,
     pub dist_cache_dir: Option<PathBuf>,
     pub allow_missing_hash: bool,
+    /// Optional secrets manager override used by embedded runtimes that need
+    /// to share a caller-owned secrets backend with the runner.
+    pub secrets_manager: Option<DynSecretsManager>,
     /// Optional cross-pack resolver for `provider.invoke` nodes that reference
     /// providers in other packs (e.g., OAuth broker from a capability pack).
     pub cross_pack_resolver:
@@ -148,6 +151,7 @@ impl fmt::Debug for RunOptions {
             .field("dist_offline", &self.dist_offline)
             .field("dist_cache_dir", &self.dist_cache_dir)
             .field("allow_missing_hash", &self.allow_missing_hash)
+            .field("secrets_manager", &self.secrets_manager.is_some())
             .finish()
     }
 }
@@ -259,7 +263,16 @@ pub fn desktop_defaults() -> RunOptions {
         dist_offline: false,
         dist_cache_dir: None,
         allow_missing_hash: false,
+        secrets_manager: None,
         cross_pack_resolver: None,
+    }
+}
+
+fn resolve_secrets_manager(opts: &RunOptions) -> Result<DynSecretsManager> {
+    if let Some(manager) = opts.secrets_manager.clone() {
+        Ok(manager)
+    } else {
+        default_manager().context("failed to initialise secrets backend")
     }
 }
 
@@ -379,7 +392,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
 
     let session_store = new_session_store();
     let state_store = new_state_store();
-    let secrets_manager = default_manager().context("failed to initialise secrets backend")?;
+    let secrets_manager = resolve_secrets_manager(&opts)?;
     let pack = Arc::new(
         PackRuntime::load(
             &pack_path,
@@ -1199,6 +1212,11 @@ fn sanitize_id(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use greentic_runner_host::secrets::DynSecretsManager;
+    use greentic_secrets_lib::{SecretError, SecretsManager};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1220,6 +1238,23 @@ mod tests {
             provider_id: PROVIDER_ID_DEV.into(),
             max_node_wall_time_ms: 1000,
             max_run_wall_time_ms: 2000,
+        }
+    }
+
+    struct NoopSecretsManager;
+
+    #[async_trait]
+    impl SecretsManager for NoopSecretsManager {
+        async fn read(&self, path: &str) -> Result<Vec<u8>, SecretError> {
+            Err(SecretError::NotFound(path.to_string()))
+        }
+
+        async fn write(&self, _path: &str, _bytes: &[u8]) -> Result<(), SecretError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _path: &str) -> Result<(), SecretError> {
+            Ok(())
         }
     }
 
@@ -1462,5 +1497,38 @@ mod tests {
         let (redacted, paths) = redact_value(&original, "$");
         assert_eq!(redacted, original);
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn resolve_secrets_manager_prefers_injected_override_even_in_prod() {
+        let previous_env = std::env::var("GREENTIC_ENV").ok();
+        unsafe {
+            std::env::set_var("GREENTIC_ENV", "prod");
+        }
+
+        let without_override = resolve_secrets_manager(&RunOptions::default());
+        assert!(
+            without_override.is_err(),
+            "expected prod desktop default backend to be rejected"
+        );
+
+        let injected: DynSecretsManager = Arc::new(NoopSecretsManager);
+        let with_override = resolve_secrets_manager(&RunOptions {
+            secrets_manager: Some(Arc::clone(&injected)),
+            ..RunOptions::default()
+        });
+        assert!(
+            with_override.is_ok(),
+            "expected injected secrets manager to bypass desktop default backend"
+        );
+
+        match previous_env {
+            Some(value) => unsafe {
+                std::env::set_var("GREENTIC_ENV", value);
+            },
+            None => unsafe {
+                std::env::remove_var("GREENTIC_ENV");
+            },
+        }
     }
 }

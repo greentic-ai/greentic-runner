@@ -19,9 +19,10 @@ use greentic_runner_host::{
     validate::ValidationConfig,
 };
 use greentic_types::{
-    ComponentCapabilities, ComponentManifest, ComponentProfiles, ExtensionInline, ExtensionRef,
-    PROVIDER_EXTENSION_ID, PackKind, PackManifest, ProviderDecl, ProviderExtensionInline,
-    ProviderRuntimeRef, ResourceHints, encode_pack_manifest,
+    ComponentCapabilities, ComponentManifest, ComponentProfiles, EnvId, ExtensionInline,
+    ExtensionRef, PROVIDER_EXTENSION_ID, PackKind, PackManifest, ProviderDecl,
+    ProviderExtensionInline, ProviderRuntimeRef, ResourceHints, StateKey, TenantCtx, TenantId,
+    encode_pack_manifest,
 };
 use semver::Version;
 use serde_json::{Value, json};
@@ -450,6 +451,85 @@ async fn invoke_operator_api_skip_output_validate_bypasses_output_schema_errors(
     Ok(())
 }
 
+#[tokio::test]
+async fn invoke_operator_api_preserves_provider_instance_config_for_component_runtime() -> Result<()>
+{
+    let workspace = TempDir::new()?;
+    let config = minimal_config(workspace.path())?;
+    let pack_path = workspace.path().join("operator-component-config.gtpack");
+    let component_path = build_qa_component()?;
+    build_component_provider_pack(&component_path, &pack_path)?;
+    let (runtime, state_store) = setup_runtime_with_state(&pack_path, Arc::clone(&config)).await?;
+
+    let tenant = TenantCtx::new(EnvId::new("local")?, TenantId::new("demo")?);
+    let key = StateKey::from(format!("providers/instances/{PROVIDER_TYPE}.json"));
+    state_store.set_json(
+        &tenant,
+        "runner",
+        &key,
+        None,
+        &json!({
+            "provider_id": PROVIDER_TYPE,
+            "provider_type": PROVIDER_TYPE,
+            "enabled": true,
+            "component_ref": "qa.process",
+            "export": "node",
+            "world": "greentic:component@0.4.0",
+            "config": {
+                "provider": "ollama",
+                "default_model": "llama3.2",
+                "base_url": "http://127.0.0.1:11434/v1"
+            }
+        }),
+        None,
+    )?;
+
+    let payload = serde_cbor::to_vec(&json!({"message": "ping"}))?;
+    let request = OperatorRequest {
+        tenant_id: Some("demo".into()),
+        provider_id: Some(PROVIDER_TYPE.to_string()),
+        provider_type: None,
+        pack_id: None,
+        op_id: "process".to_string(),
+        trace_id: None,
+        correlation_id: None,
+        timeout: None,
+        flags: Vec::new(),
+        op_version: None,
+        schema_hash: None,
+        locale: None,
+        payload: OperatorPayload {
+            cbor_input: payload,
+            attachments: Vec::new(),
+        },
+    };
+
+    let response = invoke_operator(&runtime, request).await;
+    assert!(
+        matches!(response.status, OperatorStatus::Ok),
+        "unexpected response: {response:?}"
+    );
+    let output = response
+        .cbor_output
+        .as_deref()
+        .context("expected CBOR output for success")?;
+    let value: Value = serde_cbor::from_slice(output)?;
+    assert_eq!(
+        value,
+        json!({
+            "config": {
+                "provider": "ollama",
+                "default_model": "llama3.2",
+                "base_url": "http://127.0.0.1:11434/v1"
+            },
+            "input": {
+                "message": "ping"
+            }
+        })
+    );
+    Ok(())
+}
+
 fn minimal_config(workspace: &Path) -> Result<Arc<HostConfig>> {
     let bindings_path = workspace.join("bindings.yaml");
     std::fs::write(
@@ -472,12 +552,23 @@ timers: []
 }
 
 async fn setup_runtime(pack_path: &Path, config: Arc<HostConfig>) -> Result<Arc<TenantRuntime>> {
+    let (runtime, _) = setup_runtime_with_state(pack_path, config).await?;
+    Ok(runtime)
+}
+
+async fn setup_runtime_with_state(
+    pack_path: &Path,
+    config: Arc<HostConfig>,
+) -> Result<(
+    Arc<TenantRuntime>,
+    greentic_runner_host::storage::DynStateStore,
+)> {
     let session_store = new_session_store();
     let session_host = session_host_from(Arc::clone(&session_store));
     let state_store = new_state_store();
     let state_host = state_host_from(Arc::clone(&state_store));
     let secrets = default_manager()?;
-    TenantRuntime::load(
+    let runtime = TenantRuntime::load(
         pack_path,
         config,
         None,
@@ -490,7 +581,8 @@ async fn setup_runtime(pack_path: &Path, config: Arc<HostConfig>) -> Result<Arc<
         state_host,
         secrets,
     )
-    .await
+    .await?;
+    Ok((runtime, state_store))
 }
 
 fn build_provider_pack(component_path: &Path, pack_path: &Path) -> Result<()> {
@@ -508,6 +600,126 @@ fn build_provider_pack(component_path: &Path, pack_path: &Path) -> Result<()> {
 }"#,
         None,
     )
+}
+
+fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Result<()> {
+    let mut extensions = BTreeMap::new();
+    let inline = ProviderExtensionInline {
+        providers: vec![ProviderDecl {
+            provider_type: PROVIDER_TYPE.to_string(),
+            capabilities: Vec::new(),
+            ops: vec!["process".to_string()],
+            config_schema_ref: "schemas/config.schema.json".into(),
+            state_schema_ref: Some("schemas/state.schema.json".into()),
+            runtime: ProviderRuntimeRef {
+                component_ref: "qa.process".into(),
+                export: "node".into(),
+                world: "greentic:component@0.4.0".into(),
+            },
+            docs_ref: None,
+        }],
+        ..Default::default()
+    };
+    extensions.insert(
+        PROVIDER_EXTENSION_ID.to_string(),
+        ExtensionRef {
+            kind: PROVIDER_EXTENSION_ID.to_string(),
+            version: "1.0.0".into(),
+            digest: None,
+            location: None,
+            inline: Some(ExtensionInline::Provider(inline)),
+        },
+    );
+
+    let manifest = PackManifest {
+        schema_version: "1.0".into(),
+        pack_id: "operator.component".parse()?,
+        name: Some("operator.component".into()),
+        version: Version::parse("0.1.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: vec![ComponentManifest {
+            id: "qa.process".parse()?,
+            version: Version::parse("0.1.0")?,
+            supports: Vec::new(),
+            world: "greentic:component@0.4.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities::default(),
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: ResourceHints::default(),
+            dev_flows: BTreeMap::new(),
+        }],
+        flows: Vec::new(),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        extensions: Some(extensions),
+    };
+
+    let mut writer =
+        ZipWriter::new(File::create(pack_path).context("create component provider pack archive")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    writer.start_file("manifest.cbor", options)?;
+    writer.write_all(&manifest_bytes)?;
+
+    writer.start_file("components/qa.process.wasm", options)?;
+    let mut component_file =
+        File::open(component_path).with_context(|| format!("Open {:?}", component_path))?;
+    copy(&mut component_file, &mut writer)?;
+
+    writer.start_file("schemas/config.schema.json", options)?;
+    writer.write_all(
+        br#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["message"],
+  "properties": {
+    "message": { "type": "string" }
+  },
+  "additionalProperties": false
+}"#,
+    )?;
+    writer.start_file("schemas/output.schema.json", options)?;
+    writer.write_all(
+        br#"{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["config", "input"],
+  "properties": {
+    "config": {
+      "type": "object",
+      "required": ["provider", "default_model", "base_url"],
+      "properties": {
+        "provider": { "type": "string" },
+        "default_model": { "type": "string" },
+        "base_url": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "input": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}"#,
+    )?;
+    writer.start_file("schemas/state.schema.json", options)?;
+    writer.write_all(br#"{ "type": "object", "additionalProperties": true }"#)?;
+    writer
+        .finish()
+        .context("finalise component provider pack")?;
+    Ok(())
 }
 
 fn build_provider_pack_with_schemas(
@@ -633,6 +845,39 @@ fn build_provider_component() -> Result<PathBuf> {
         cmd.args(&args)
             .status()
             .context("build provider component")?;
+    }
+    Ok(wasm)
+}
+
+fn build_qa_component() -> Result<PathBuf> {
+    let root = fixture_path("tests/fixtures/runner-components/qa_process");
+    let wasm = fixture_path(
+        "tests/fixtures/runner-components/target/wasm32-wasip2/release/qa_process.wasm",
+    );
+    if !wasm.exists() {
+        let offline = std::env::var("CARGO_NET_OFFLINE").ok();
+        let mut cmd = Command::new("cargo");
+        let mut args: Vec<String> = vec![
+            "build".into(),
+            "--release".into(),
+            "--target".into(),
+            "wasm32-wasip2".into(),
+            "--manifest-path".into(),
+            root.join("Cargo.toml")
+                .to_str()
+                .expect("manifest path")
+                .into(),
+        ];
+        if matches!(offline.as_deref(), Some("true")) {
+            args.insert(1, "--offline".into());
+        }
+        if let Some(val) = &offline {
+            cmd.env("CARGO_NET_OFFLINE", val);
+        }
+        let status = cmd.args(&args).status().context("build qa component")?;
+        if !status.success() {
+            anyhow::bail!("failed to build qa_process fixture");
+        }
     }
     Ok(wasm)
 }

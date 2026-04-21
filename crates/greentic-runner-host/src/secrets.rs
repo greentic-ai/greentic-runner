@@ -173,25 +173,42 @@ fn normalize_pack_segment(pack_id: &str) -> String {
         .collect()
 }
 
+pub fn canonicalize_secret_key(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|ch| {
+            let ch = ch.to_ascii_lowercase();
+            match ch {
+                'a'..='z' | '0'..='9' | '_' => ch,
+                _ => '_',
+            }
+        })
+        .collect()
+}
+
+fn normalize_team_segment(team: Option<&str>) -> String {
+    match team
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
+    {
+        Some(value) => value.to_string(),
+        None => "_".to_string(),
+    }
+}
+
 pub fn scoped_secret_path_for_pack(ctx: &TenantCtx, pack_id: &str, key: &str) -> Result<String> {
     let key = key.trim();
     if key.is_empty() {
         return Err(anyhow!("secret key must not be empty"));
     }
-    let safe_key = key.replace('/', ".").replace(' ', "_");
-    let user = ctx.user_id.as_ref().or(ctx.user.as_ref());
-    let name = if let Some(user_id) = user {
-        format!("user.{}.{}", user_id.as_str(), safe_key)
-    } else {
-        safe_key
-    };
+    let safe_key = canonicalize_secret_key(key);
     let team = ctx.team_id.as_ref().or(ctx.team.as_ref());
     let scope = SecretScope {
         env: ctx.env.as_str().to_string(),
         tenant: ctx.tenant.as_str().to_string(),
         team: team.map(|value| value.as_str().to_string()),
     };
-    let team_segment = scope.team.as_deref().unwrap_or("_");
+    let team_segment = normalize_team_segment(scope.team.as_deref());
     let pack_segment = pack_id.trim();
     if pack_segment.is_empty() {
         return Err(anyhow!("pack_id must not be empty for scoped secrets"));
@@ -199,7 +216,7 @@ pub fn scoped_secret_path_for_pack(ctx: &TenantCtx, pack_id: &str, key: &str) ->
     let pack_segment = normalize_pack_segment(pack_segment);
     Ok(format!(
         "secrets://{}/{}/{}/{}/{}",
-        scope.env, scope.tenant, team_segment, pack_segment, name
+        scope.env, scope.tenant, team_segment, pack_segment, safe_key
     ))
 }
 
@@ -261,7 +278,7 @@ mod tests {
             scoped_secret_path_for_pack(&tenant_ctx(), "My Pack/Prod", " API/KEY value ").unwrap();
         assert_eq!(
             path,
-            "secrets://local/tenant-a/team-a/my_pack_prod/user.user-a.API.KEY_value"
+            "secrets://local/tenant-a/team-a/my_pack_prod/api_key_value"
         );
     }
 
@@ -270,6 +287,37 @@ mod tests {
         let ctx = tenant_ctx();
         assert!(scoped_secret_path_for_pack(&ctx, "demo", "   ").is_err());
         assert!(scoped_secret_path_for_pack(&ctx, "   ", "key").is_err());
+    }
+
+    #[test]
+    fn scoped_secret_path_maps_default_team_to_underscore() {
+        let ctx = greentic_types::TenantCtx::new(
+            EnvId::new("dev").expect("env"),
+            TenantId::new("demo").expect("tenant"),
+        )
+        .with_team(Some(TeamId::new("default").expect("team")));
+        let path = scoped_secret_path_for_pack(&ctx, "ollama-runtime-repro", "ollama_api_key")
+            .expect("scoped secret path");
+        assert_eq!(
+            path,
+            "secrets://dev/demo/_/ollama-runtime-repro/ollama_api_key"
+        );
+    }
+
+    #[test]
+    fn scoped_secret_path_canonicalizes_provider_secret_keys() {
+        let ctx = greentic_types::TenantCtx::new(
+            EnvId::new("dev").expect("env"),
+            TenantId::new("demo").expect("tenant"),
+        )
+        .with_team(Some(TeamId::new("default").expect("team")))
+        .with_user(Some(UserId::new("operator").expect("user")));
+        let path = scoped_secret_path_for_pack(&ctx, "ollama-runtime-repro", "OLLAMA_API_KEY")
+            .expect("scoped secret path");
+        assert_eq!(
+            path,
+            "secrets://dev/demo/_/ollama-runtime-repro/ollama_api_key"
+        );
     }
 
     #[test]
