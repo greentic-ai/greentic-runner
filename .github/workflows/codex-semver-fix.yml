@@ -1,7 +1,8 @@
 name: Codex Semver Fix
-# Disabled temporarily — codex auto-remediation re-adds intentionally deleted code.
-# Re-enable after PR #235 is merged.
 on:
+  schedule:
+    # 05:01 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
+    - cron: "1 5 * * *"
   workflow_dispatch:
     inputs:
       branch:
@@ -18,6 +19,8 @@ concurrency:
 
 jobs:
   semver-fix:
+    # Do not run on fork PRs to avoid passing untrusted refs into privileged remediation workflows.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: greenticai/.github/.github/workflows/codex-semver-fix.yml@main
     with:
       branch: ${{ github.event.inputs.branch || '' }}
