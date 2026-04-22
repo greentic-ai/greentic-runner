@@ -89,7 +89,10 @@ This workspace produces a few important binaries and crates:
   The main HTTP runtime host.
 
 - `greentic-runner-cli`
-  A local execution tool for running a pack directly without a full bundle.
+  A legacy local execution tool for running a pack directly without a full
+  bundle. It is kept in the repo, but it is not part of the default published
+  runner binary set. Build it explicitly with `--features legacy-gen-bindings`
+  if you still need it.
 
 - `greentic-gen-bindings`
   A legacy helper that inspects a pack and emits a bindings seed.
