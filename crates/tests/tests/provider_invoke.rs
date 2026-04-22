@@ -515,6 +515,7 @@ fn build_flow(flow_id: &str, flow_kind: FlowKind, in_map: Value, out_map: Value)
             output: OutputMapping {
                 mapping: Value::Object(serde_json::Map::new()),
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
         },
@@ -551,6 +552,7 @@ fn build_component_exec_flow(flow_id: &str, message: &str) -> Result<Flow> {
             output: OutputMapping {
                 mapping: Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
         },

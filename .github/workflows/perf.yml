@@ -4,10 +4,13 @@ permissions:
   contents: read
 
 on:
-  pull_request:
   push:
     branches:
       - main
+  schedule:
+    # 04:41 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
+    - cron: "38 3 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -20,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
 

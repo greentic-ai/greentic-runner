@@ -88,7 +88,9 @@ use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 
 use crate::config::HostConfig;
 use crate::fault;
-use crate::secrets::{DynSecretsManager, read_secret_blocking, write_secret_blocking};
+use crate::secrets::{
+    DynSecretsManager, canonicalize_secret_key, read_secret_blocking, write_secret_blocking,
+};
 use crate::storage::state::STATE_PREFIX;
 use crate::storage::{DynSessionStore, DynStateStore};
 use crate::verify;
@@ -470,7 +472,8 @@ impl HostState {
             return Ok(value);
         }
         let ctx = self.secrets_tenant_ctx();
-        let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, key)
+        let canonical_key = canonicalize_secret_key(key);
+        let bytes = read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key)
             .context("failed to read secret from manager")?;
         let value = String::from_utf8(bytes).context("secret value is not valid UTF-8")?;
         Ok(value)
@@ -660,27 +663,14 @@ impl HostState {
     }
 }
 
-fn canonicalize_wasm_secret_key(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .map(|ch| {
-            let ch = ch.to_ascii_lowercase();
-            match ch {
-                'a'..='z' | '0'..='9' | '_' => ch,
-                _ => '_',
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod canonicalize_tests {
-    use super::canonicalize_wasm_secret_key;
+    use crate::secrets::canonicalize_secret_key;
 
     #[test]
     fn upper_snake_to_lower_snake() {
         assert_eq!(
-            canonicalize_wasm_secret_key("TELEGRAM_BOT_TOKEN"),
+            canonicalize_secret_key("TELEGRAM_BOT_TOKEN"),
             "telegram_bot_token"
         );
     }
@@ -688,14 +678,14 @@ mod canonicalize_tests {
     #[test]
     fn trim_and_replace_non_alphanumeric() {
         assert_eq!(
-            canonicalize_wasm_secret_key("  webex-bot-token  "),
+            canonicalize_secret_key("  webex-bot-token  "),
             "webex_bot_token"
         );
     }
 
     #[test]
     fn preserve_existing_lower_snake_with_extra_underscores() {
-        assert_eq!(canonicalize_wasm_secret_key("MiXeD__Case"), "mixed__case");
+        assert_eq!(canonicalize_secret_key("MiXeD__Case"), "mixed__case");
     }
 }
 
@@ -714,7 +704,7 @@ impl SecretsStoreHost for HostState {
             return Ok(Some(value.into_bytes()));
         }
         let ctx = self.secrets_tenant_ctx();
-        let canonical_key = canonicalize_wasm_secret_key(&key);
+        let canonical_key = canonicalize_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
@@ -740,7 +730,7 @@ impl SecretsStoreHostV1_1 for HostState {
             return Ok(Some(value.into_bytes()));
         }
         let ctx = self.secrets_tenant_ctx();
-        let canonical_key = canonicalize_wasm_secret_key(&key);
+        let canonical_key = canonicalize_secret_key(&key);
         match read_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key) {
             Ok(bytes) => Ok(Some(bytes)),
             Err(err) => {
@@ -768,7 +758,7 @@ impl SecretsStoreHostV1_1 for HostState {
             panic!("secret write denied for key {key}: policy");
         }
         let ctx = self.secrets_tenant_ctx();
-        let canonical_key = canonicalize_wasm_secret_key(&key);
+        let canonical_key = canonicalize_secret_key(&key);
         if let Err(err) =
             write_secret_blocking(&self.secrets, &ctx, &self.pack_id, &canonical_key, &value)
         {
@@ -1087,7 +1077,7 @@ fn load_manifest_and_flows(path: &Path) -> Result<ManifestLoad> {
             );
             let legacy: legacy_pack::PackManifest = serde_cbor::from_slice(&bytes)
                 .context("failed to decode legacy pack manifest from manifest.cbor")?;
-            let flows = load_legacy_flows_from_archive(&mut archive, path, &legacy)?;
+            let flows = load_legacy_flows_from_archive(&mut archive, &legacy)?;
             Ok(ManifestLoad::Legacy {
                 manifest: Box::new(legacy),
                 flows,
@@ -1137,12 +1127,10 @@ fn load_legacy_flows_from_dir(
 
 fn load_legacy_flows_from_archive(
     archive: &mut ZipArchive<File>,
-    pack_path: &Path,
     manifest: &legacy_pack::PackManifest,
 ) -> Result<PackFlows> {
     build_legacy_flows(manifest, |rel_path| {
-        read_entry(archive, rel_path)
-            .with_context(|| format!("missing flow json {} in {}", rel_path, pack_path.display()))
+        read_entry(archive, rel_path).with_context(|| format!("missing flow json {}", rel_path))
     })
 }
 
@@ -1156,7 +1144,7 @@ fn build_legacy_flows(
     for entry in &manifest.flows {
         let bytes = read_json(&entry.file_json)
             .with_context(|| format!("missing flow json {}", entry.file_json))?;
-        let doc = parse_flow_doc_with_legacy_aliases(&bytes, &entry.file_json)?;
+        let doc = parse_flow_doc_with_legacy_aliases(&bytes)?;
         let normalized = normalize_flow_doc(doc);
         let flow_ir = flow_doc_to_ir(normalized)?;
         let flow = flow_ir_to_flow(flow_ir)?;
@@ -1190,16 +1178,16 @@ fn build_legacy_flows(
     })
 }
 
-fn parse_flow_doc_with_legacy_aliases(bytes: &[u8], path: &str) -> Result<FlowDoc> {
-    let mut value: Value = serde_json::from_slice(bytes)
-        .with_context(|| format!("failed to decode flow doc {}", path))?;
+fn parse_flow_doc_with_legacy_aliases(bytes: &[u8]) -> Result<FlowDoc> {
+    let mut value: Value =
+        serde_json::from_slice(bytes).context("failed to decode flow doc JSON")?;
     if let Some(map) = value.as_object_mut()
         && !map.contains_key("type")
         && let Some(flow_type) = map.remove("flow_type")
     {
         map.insert("type".to_string(), flow_type);
     }
-    serde_json::from_value(value).with_context(|| format!("failed to decode flow doc {}", path))
+    serde_json::from_value(value).context("failed to decode flow doc structure")
 }
 
 pub struct ComponentState {
@@ -1887,7 +1875,7 @@ impl PackRuntime {
         component_ref: &str,
         ctx: ComponentExecCtx,
         operation: &str,
-        _config_json: Option<String>,
+        config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
         let pack_component = self
@@ -1908,7 +1896,9 @@ impl PackRuntime {
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
         let operation_owned = operation.to_string();
-        let input_owned = input_json;
+        let input_owned =
+            Self::merge_component_config_into_input_json(config_json.as_deref(), &input_json)
+                .context("merge component config into invocation payload")?;
         let ctx_owned = ctx;
 
         run_on_wasi_thread("component.invoke", move || {
@@ -1943,6 +1933,41 @@ impl PackRuntime {
             )?;
             HostState::convert_invoke_result(invoke_result)
         })
+    }
+
+    fn merge_component_config_into_input_json(
+        config_json: Option<&str>,
+        input_json: &str,
+    ) -> Result<String> {
+        let Some(config_json) = config_json else {
+            return Ok(input_json.to_string());
+        };
+
+        let config_value: Value =
+            serde_json::from_str(config_json).context("parse component config JSON")?;
+
+        if let Ok(mut invocation) =
+            serde_json::from_str::<greentic_types::InvocationEnvelope>(input_json)
+        {
+            let payload_value = serde_json::from_slice(&invocation.payload).unwrap_or_else(|_| {
+                Value::String(String::from_utf8_lossy(&invocation.payload).into_owned())
+            });
+            invocation.payload = serde_json::to_vec(&serde_json::json!({
+                "config": config_value,
+                "input": payload_value,
+            }))
+            .context("serialize merged invocation payload")?;
+            return serde_json::to_string(&invocation)
+                .context("serialize merged invocation envelope");
+        }
+
+        let input_value = serde_json::from_str(input_json)
+            .unwrap_or_else(|_| Value::String(input_json.to_string()));
+        serde_json::to_string(&serde_json::json!({
+            "config": config_value,
+            "input": input_value,
+        }))
+        .context("serialize merged component input")
     }
 
     pub fn resolve_provider(
@@ -2271,7 +2296,7 @@ impl PackRuntime {
                     &self.secrets,
                     &ctx,
                     &self.metadata.pack_id,
-                    req.key.as_str(),
+                    canonicalize_secret_key(req.key.as_str()).as_str(),
                 )
                 .is_err()
             })
@@ -2602,6 +2627,7 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 output: OutputMapping {
                     mapping: Value::Null,
                 },
+                err_map: None,
                 routing,
                 telemetry,
             },
@@ -2682,15 +2708,28 @@ fn infer_component_exec(
     .to_string();
 
     if let Value::Object(map) = payload {
+        let has_embedded_component =
+            map.get("component").is_some() || map.get("component_ref").is_some();
         let op = map
             .get("op")
             .or_else(|| map.get("operation"))
             .and_then(Value::as_str)
             .map(|s| s.to_string())
-            .unwrap_or_else(|| default_op.clone());
+            .unwrap_or_else(|| {
+                if has_embedded_component {
+                    component_ref.to_string()
+                } else {
+                    default_op.clone()
+                }
+            });
 
         let mut input = map.clone();
         let config = input.remove("config");
+        let canonical_input = if has_embedded_component {
+            input.get("input").cloned()
+        } else {
+            None
+        };
         let component = input
             .get("component")
             .or_else(|| input.get("component_ref"))
@@ -2701,7 +2740,8 @@ fn infer_component_exec(
         input.remove("component_ref");
         input.remove("op");
         input.remove("operation");
-        return (component, op, Value::Object(input), config);
+        let input = canonical_input.unwrap_or(Value::Object(input));
+        return (component, op, input, config);
     }
 
     (component_ref.to_string(), default_op, payload.clone(), None)
@@ -4070,6 +4110,83 @@ mod tests {
         );
         let input = payload.get("input").unwrap();
         assert_eq!(input, &json!({ "template": "Hi {{name}}" }));
+    }
+
+    #[test]
+    fn normalizes_canonical_operation_node_to_component_exec_with_config() {
+        let mut nodes = IndexMap::new();
+        let mut raw = IndexMap::new();
+        raw.insert(
+            "handle_message".into(),
+            json!({
+                "component": "oci://ghcr.io/greenticai/component/component-llm-openai:latest",
+                "config": {
+                    "provider": "ollama",
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "default_model": "llama3.2"
+                },
+                "input": {
+                    "messages": [{
+                        "role": "user",
+                        "content": "Say hello from Ollama."
+                    }]
+                }
+            }),
+        );
+        nodes.insert(
+            "llm".into(),
+            NodeDoc {
+                raw,
+                routing: json!([{"out": true}]),
+                ..Default::default()
+            },
+        );
+        let doc = FlowDoc {
+            id: "ollama-repro".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("llm".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            nodes,
+        };
+
+        let normalized = normalize_flow_doc(doc);
+        let node = normalized.nodes.get("llm").expect("node exists");
+        assert_eq!(node.operation.as_deref(), Some("component.exec"));
+        assert!(node.raw.is_empty());
+        let payload = node.payload.as_object().expect("payload object");
+        assert_eq!(
+            payload.get("component"),
+            Some(&Value::String(
+                "oci://ghcr.io/greenticai/component/component-llm-openai:latest".into()
+            ))
+        );
+        assert_eq!(
+            payload.get("operation"),
+            Some(&Value::String("handle_message".into()))
+        );
+        assert_eq!(
+            payload.get("config"),
+            Some(&json!({
+                "provider": "ollama",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "default_model": "llama3.2"
+            }))
+        );
+        assert_eq!(
+            payload.get("input"),
+            Some(&json!({
+                "messages": [{
+                    "role": "user",
+                    "content": "Say hello from Ollama."
+                }]
+            }))
+        );
     }
 }
 

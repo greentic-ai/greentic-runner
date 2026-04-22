@@ -20,7 +20,7 @@ pub async fn status(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
             let overlays = runtime
                 .overlays()
                 .into_iter()
-                .zip(runtime.overlay_digests().into_iter())
+                .zip(runtime.overlay_digests())
                 .map(|(overlay, digest)| {
                     let meta = overlay.metadata();
                     json!({
