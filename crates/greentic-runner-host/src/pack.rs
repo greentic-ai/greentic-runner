@@ -2470,6 +2470,8 @@ struct RuntimeNode {
     #[serde(default, alias = "payload", alias = "input")]
     operation_payload: Value,
     #[serde(default)]
+    config: Value,
+    #[serde(default)]
     routing: Option<Routing>,
     #[serde(default)]
     telemetry: Option<TelemetryHints>,
@@ -2609,6 +2611,14 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
         let node_id = NodeId::from_str(&id).with_context(|| format!("invalid node id `{id}`"))?;
         let component_id = ComponentId::from_str(&node.component_id)
             .with_context(|| format!("invalid component id `{}`", node.component_id))?;
+        let operation_payload = if node.config.is_null() {
+            node.operation_payload
+        } else {
+            serde_json::json!({
+                "input": node.operation_payload,
+                "config": node.config,
+            })
+        };
         let component = FlowComponentRef {
             id: component_id,
             pack_alias: None,
@@ -2622,7 +2632,7 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 id: node_id,
                 component,
                 input: InputMapping {
-                    mapping: node.operation_payload,
+                    mapping: operation_payload,
                 },
                 output: OutputMapping {
                     mapping: Value::Null,
