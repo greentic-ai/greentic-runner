@@ -60,6 +60,7 @@ walkdir.workspace = true
 
 [features]
 fault-injection = ["greentic-runner-host/fault-injection"]
+legacy-gen-bindings = []
 
 [dev-dependencies]
 greentic-flow.workspace = true
@@ -80,6 +81,7 @@ path = "src/main.rs"
 [[bin]]
 name = "greentic-gen-bindings"
 path = "src/bin/gen_bindings.rs"
+required-features = ["legacy-gen-bindings"]
 
 [[bin]]
 name = "greentic-runner-cli"

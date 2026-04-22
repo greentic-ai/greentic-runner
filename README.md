@@ -92,7 +92,10 @@ This workspace produces a few important binaries and crates:
   A local execution tool for running a pack directly without a full bundle.
 
 - `greentic-gen-bindings`
-  A helper that inspects a pack and emits a bindings seed.
+  A legacy helper that inspects a pack and emits a bindings seed.
+  It is kept in the repo, but it is not part of the default published runner
+  binary set. Build it explicitly with `--features legacy-gen-bindings` if you
+  still need it.
 
 - `greentic-runner-host`
   The core runtime crate where most of the real execution logic lives.
