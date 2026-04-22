@@ -9,7 +9,7 @@ on:
       - main
   schedule:
     # 04:41 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
-    - cron: "41 4 * * *"
+    - cron: "38 3 * * *"
   workflow_dispatch:
 
 concurrency:
