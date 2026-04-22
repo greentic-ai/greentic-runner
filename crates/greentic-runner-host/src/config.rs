@@ -191,7 +191,11 @@ impl HostConfig {
             flow_type_bindings: HashMap::new(),
             rate_limits: RateLimits::default(),
             retry: FlowRetryConfig::default(),
-            http_enabled: false,
+            // GTBind-backed embedded hosts do not populate flow_type_bindings,
+            // so the YAML-path heuristic cannot be used here. Keep outbound
+            // host HTTP enabled so components like component-llm-openai can
+            // reach their configured providers.
+            http_enabled: true,
             secrets_policy: SecretsPolicy::allow_all(),
             state_store_policy: StateStorePolicy::default(),
             webhook_policy: WebhookPolicy::default(),
@@ -426,6 +430,7 @@ fn default_retry_base_delay_ms() -> u64 {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::gtbind::{PackBinding, TenantBindings};
     use std::collections::HashMap;
     use std::path::PathBuf;
 
@@ -471,5 +476,24 @@ mod tests {
         assert_eq!(broker.nats_url, "nats://broker:4222");
         assert_eq!(broker.default_provider.as_deref(), Some("demo"));
         assert_eq!(broker.team.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn gtbind_configs_enable_outbound_http() {
+        let cfg = HostConfig::from_gtbind(TenantBindings {
+            tenant: "demo".into(),
+            packs: vec![PackBinding {
+                pack_id: "deep-research-demo".into(),
+                pack_ref: "deep-research-demo@0.1.0".into(),
+                pack_locator: None,
+                flows: vec!["main".into()],
+            }],
+            env_passthrough: Vec::new(),
+        });
+
+        assert!(
+            cfg.http_enabled,
+            "gtbind-backed tenants should allow outbound component HTTP"
+        );
     }
 }
