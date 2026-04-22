@@ -23,3 +23,13 @@ jobs:
         README.md
         LICENSE
     secrets: inherit
+
+  publish_crates:
+    name: Publish to crates.io
+    needs: [release]
+    permissions:
+      contents: read
+    uses: greenticai/.github/.github/workflows/crates-publish.yml@main
+    with:
+      crates: "runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
+    secrets: inherit
