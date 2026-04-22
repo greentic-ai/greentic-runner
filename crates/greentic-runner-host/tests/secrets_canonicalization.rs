@@ -69,6 +69,40 @@ fn host_gets_canonical_key() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[serial]
+fn host_direct_get_secret_uses_canonical_key() -> Result<()> {
+    let _guard = EnvGuard::set("GREENTIC_PROVIDER_CORE_ONLY", "0");
+    let config = write_minimal_config()?;
+    let manager = Arc::new(RecordingReadSecretsManager::default());
+    let secrets: DynSecretsManager = manager.clone();
+    let host_state = HostState::new(
+        "secrets-canonicalization".to_string(),
+        Arc::clone(&config),
+        Arc::new(BlockingClient::builder().build()?),
+        None,
+        None,
+        None,
+        secrets,
+        None,
+        None,
+        Some("component.alpha".to_string()),
+        false,
+    )?;
+
+    let result = host_state.get_secret("OLLAMA_API_KEY");
+    assert!(result.is_err());
+
+    let reads = manager.reads.lock().expect("reads lock");
+    assert_eq!(reads.len(), 1);
+    assert!(
+        reads[0].contains("ollama_api_key"),
+        "expected canonical key in path, got {}",
+        reads[0]
+    );
+    Ok(())
+}
+
 fn write_minimal_config() -> Result<Arc<HostConfig>> {
     let temp = TempDir::new()?;
     let path = temp.path().join("bindings.yaml");

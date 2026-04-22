@@ -145,6 +145,7 @@ fn map_node(node_id: NodeId, node_ir: NodeIR) -> Result<Node> {
         output: OutputMapping {
             mapping: Value::Object(JsonMap::new()),
         },
+        err_map: None,
         routing,
         telemetry: TelemetryHints::default(),
     })

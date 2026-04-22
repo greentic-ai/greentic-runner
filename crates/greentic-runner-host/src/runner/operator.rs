@@ -14,7 +14,6 @@ use tracing::{Level, span};
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use crate::operator_registry::OperatorResolveError;
-use crate::provider::ProviderBinding;
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::contract_cache::ContractSnapshot;
 use crate::runner::contract_introspection::introspect_component_contract;
@@ -623,7 +622,31 @@ pub async fn invoke_operator(
 
     let input_value = merge_input_with_attachments(input_value, attachments);
 
-    let component_ref = &binding.runtime.component_ref;
+    let registry_component_ref = &binding.runtime.component_ref;
+    let resolved = match runtime.resolve_component(registry_component_ref) {
+        Some(resolved) => resolved,
+        None => {
+            return OperatorResponse::error(
+                OperatorErrorCode::ComponentLoad,
+                format!(
+                    "component `{}` not found in tenant packs",
+                    registry_component_ref
+                ),
+            );
+        }
+    };
+    let pack = resolved.pack;
+    let provider_binding = match pack.resolve_provider(provider_id, provider_type) {
+        Ok(binding) => binding,
+        Err(err) => {
+            return OperatorResponse::error(
+                OperatorErrorCode::HostFailure,
+                format!("failed to resolve provider runtime: {err}"),
+            );
+        }
+    };
+
+    let component_ref = &provider_binding.component_ref;
     let resolved = match runtime.resolve_component(component_ref) {
         Some(resolved) => resolved,
         None => {
@@ -714,8 +737,8 @@ pub async fn invoke_operator(
                     &resolved_digest,
                     component_ref,
                     &invoke_op_id,
-                    &binding.runtime.world,
-                    &binding.runtime.export,
+                    &provider_binding.world,
+                    &provider_binding.export,
                     &loaded_input_schema,
                     &loaded_output_schema,
                     &loaded_config_schema,
@@ -825,17 +848,8 @@ pub async fn invoke_operator(
         .fetch_add(1, Ordering::Relaxed);
     let invoke_span = span!(Level::INFO, "invoke_component", component = %component_ref);
     let _invoke_guard = invoke_span.enter();
-    let result = if binding.runtime.world.starts_with("greentic:provider-core") {
+    let result = if provider_binding.world.starts_with("greentic:provider-core") {
         let input_bytes = input_json.clone().into_bytes();
-        let provider_binding = ProviderBinding {
-            provider_id: binding.provider_id.clone(),
-            provider_type: binding.provider_type.clone(),
-            component_ref: binding.runtime.component_ref.clone(),
-            export: binding.runtime.export.clone(),
-            world: binding.runtime.world.clone(),
-            config_json: None,
-            pack_ref: Some(binding.pack_ref.clone()),
-        };
         match pack
             .invoke_provider(&provider_binding, exec_ctx, &invoke_op_id, input_bytes)
             .await
@@ -858,7 +872,7 @@ pub async fn invoke_operator(
                 component_ref,
                 exec_ctx,
                 &invoke_op_id,
-                None,
+                provider_binding.config_json.clone(),
                 input_json.clone(),
             )
             .await

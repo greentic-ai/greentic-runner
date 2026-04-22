@@ -2563,6 +2563,7 @@ mod tests {
             output: OutputMapping {
                 mapping: Value::Null,
             },
+            err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
         };
@@ -2649,6 +2650,7 @@ mod tests {
                 output: OutputMapping {
                     mapping: Value::Null,
                 },
+                err_map: None,
                 routing: Routing::End,
                 telemetry: TelemetryHints::default(),
             };

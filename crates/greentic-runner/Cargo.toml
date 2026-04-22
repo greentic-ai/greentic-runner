@@ -12,7 +12,17 @@ keywords = ["greentic", "agent", "runner", "wasm", "mcp"]
 categories = ["wasm", "command-line-utilities", "network-programming"]
 
 [package.metadata.binstall]
-bin = ["greentic-runner", "greentic-runner-cli"]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tgz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
 
 [dependencies]
 anyhow.workspace = true
@@ -50,6 +60,7 @@ walkdir.workspace = true
 
 [features]
 fault-injection = ["greentic-runner-host/fault-injection"]
+legacy-gen-bindings = []
 
 [dev-dependencies]
 greentic-flow.workspace = true
@@ -70,6 +81,7 @@ path = "src/main.rs"
 [[bin]]
 name = "greentic-gen-bindings"
 path = "src/bin/gen_bindings.rs"
+required-features = ["legacy-gen-bindings"]
 
 [[bin]]
 name = "greentic-runner-cli"

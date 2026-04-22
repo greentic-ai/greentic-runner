@@ -38,7 +38,6 @@ greentic-state.workspace = true
 greentic-secrets-lib.workspace = true
 greentic-config.workspace = true
 greentic-config-types.workspace = true
-greentic-i18n.workspace = true
 hex.workspace = true
 humantime.workspace = true
 indexmap.workspace = true

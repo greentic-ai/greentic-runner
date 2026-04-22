@@ -1,25 +1,54 @@
 # Documentation Index
 
-Use this page as the top-level map for `greentic-runner` docs.
+Use this page as the simple map for the `greentic-runner` docs.
 
-## Start here (canonical)
+If you are new to this repository, do not start with the oldest design notes.
+Start with the document that matches your role.
 
-- `docs/vision/README.md` - Vision and navigation for canonical v0.6 usage.
-- `docs/vision/canonical-v0.6.md` - Canonical runtime model and recommended integration surface.
+## Start Here
 
-## Legacy and transition
+- [../README.md](../README.md)
+  Human-first overview of what this repository is, what it is for, and how it fits with the rest of Greentic.
 
-- `docs/vision/legacy.md` - Legacy surfaces and where to migrate.
-- `docs/vision/deprecations.md` - Explicit deprecation signals tracked in this repo.
+- [coding-agents.md](coding-agents.md)
+  Instructions for coding agents and contributors who need to work across `greentic-runner`, `gtc`, `greentic-pack`, and `greentic-dev` without mixing up responsibilities.
 
-## Operational references
+- [../crates/greentic-runner-host/README.md](../crates/greentic-runner-host/README.md)
+  Lower-level runtime details for people debugging execution internals.
 
-- `docs/runner-cache.md` - Component cache model, warmup, prune, and troubleshooting.
-- `docs/fault-injection.md` - Fault matrix format and local conformance runs.
-- `docs/pack-resolution-testing.md` - Property-testing commands and regression seeds.
+## Current Reference Docs
 
-## Historical snapshots (legacy-labeled)
+- [runner-cache.md](runner-cache.md)
+  Component cache behavior, warmup, pruning, and troubleshooting.
 
-- `docs/runner-host-inventory.md`
-- `docs/runner_current_behaviour.md`
-- `docs/pr08_scope.md`
+- [fault-injection.md](fault-injection.md)
+  Fault matrix format and local conformance testing.
+
+- [pack-resolution-testing.md](pack-resolution-testing.md)
+  Pack resolution property tests and regression seeds.
+
+## Older Design And Transition Notes
+
+These documents can still be useful, but they are not the best starting point for most readers and may describe transitions, historical plans, or older recommended surfaces.
+
+- [vision/README.md](vision/README.md)
+- [vision/canonical-v0.6.md](vision/canonical-v0.6.md)
+- [vision/legacy.md](vision/legacy.md)
+- [vision/deprecations.md](vision/deprecations.md)
+
+## Historical Snapshots
+
+These are reference notes for archaeology and comparison. Treat them as historical material rather than primary guidance.
+
+- [runner-host-inventory.md](runner-host-inventory.md)
+- [runner_current_behaviour.md](runner_current_behaviour.md)
+- [pr08_scope.md](pr08_scope.md)
+
+## If Documents Disagree
+
+Use this order:
+
+1. Current code
+2. Focused tests
+3. Crate-level docs
+4. Historical notes
