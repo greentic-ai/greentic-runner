@@ -1591,9 +1591,9 @@ dependencies = [
 
 [[package]]
 name = "fraction"
-version = "0.15.3"
+version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f158e3ff0a1b334408dc9fb811cd99b446986f4d8b741bb08f9df1604085ae7"
+checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
 dependencies = [
  "lazy_static",
  "num",
@@ -1864,9 +1864,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.5.4"
+version = "0.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8bf716686fd066ca3854f307e047d8e098a29854014a59bc5c8bff25bc2eaa6"
+checksum = "1b446830cfb00c30404b90d2bd118d542e9ba28b1ab5b69b06ffbf07aa3368cf"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "0.5.7"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2070,7 +2070,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "0.5.7"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2092,7 +2092,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "0.5.7"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "0.5.7"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4399,7 +4399,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "0.5.7"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

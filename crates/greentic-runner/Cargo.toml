@@ -86,3 +86,4 @@ required-features = ["legacy-gen-bindings"]
 [[bin]]
 name = "greentic-runner-cli"
 path = "src/bin/greentic-runner-cli.rs"
+required-features = ["legacy-gen-bindings"]
