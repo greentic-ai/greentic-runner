@@ -4,11 +4,9 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - main
+  # Nightly-only per plans/binary-bifurcation.md Phase A.8: push-trigger removed
+  # because post-merge perf runs were burning 15+ min without actionable signal.
   schedule:
-    # 04:41 UTC — staggered to avoid the 00/05/15/30/45 hot-spots.
     - cron: "38 3 * * *"
   workflow_dispatch:
 
