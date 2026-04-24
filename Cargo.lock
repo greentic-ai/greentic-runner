@@ -1864,9 +1864,52 @@ dependencies = [
 
 [[package]]
 name = "greentic-flow"
-version = "0.5.5"
+version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b446830cfb00c30404b90d2bd118d542e9ba28b1ab5b69b06ffbf07aa3368cf"
+checksum = "39dc2f13a03fd5f722c13217afa99a222c15b79a646c8069be30ad7c1847d704"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "ciborium",
+ "clap",
+ "dashmap",
+ "greentic-distributor-client",
+ "greentic-i18n-translator",
+ "greentic-interfaces-host",
+ "greentic-interfaces-wasmtime",
+ "greentic-qa-lib",
+ "greentic-types",
+ "handlebars",
+ "include_dir",
+ "indexmap 2.14.0",
+ "jsonschema 0.46.2",
+ "lazy_static",
+ "pathdiff",
+ "qa-spec",
+ "regex",
+ "reqwest 0.13.2",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_yaml_gtc",
+ "sha2 0.11.0",
+ "sys-locale",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "unic-langid",
+ "url",
+ "wasmtime",
+ "wasmtime-environ",
+ "wasmtime-wasi",
+]
+
+[[package]]
+name = "greentic-flow"
+version = "0.6.24888858655"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eab8a0ff7bac09341cf2fdcb5bffd4bf36c01a401db4d0a830842102e85e011"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1990,7 +2033,7 @@ dependencies = [
  "constant_time_eq 0.5.0",
  "ed25519-dalek",
  "getrandom 0.4.2",
- "greentic-flow",
+ "greentic-flow 0.5.7",
  "greentic-types",
  "hex",
  "indexmap 2.14.0",
@@ -2036,7 +2079,7 @@ dependencies = [
  "greentic-config",
  "greentic-config-types",
  "greentic-distributor-client",
- "greentic-flow",
+ "greentic-flow 0.6.24888858655",
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
@@ -2111,7 +2154,7 @@ dependencies = [
  "greentic-config",
  "greentic-config-types",
  "greentic-distributor-client",
- "greentic-flow",
+ "greentic-flow 0.6.24888858655",
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
@@ -2165,7 +2208,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "greentic-config-types",
- "greentic-flow",
+ "greentic-flow 0.6.24888858655",
  "greentic-runner-host",
  "greentic-types",
  "jsonschema 0.45.1",
@@ -3874,7 +3917,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
