@@ -37,6 +37,8 @@ greentic-interfaces-wasmtime.workspace = true
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic-config.workspace = true
 greentic-distributor-client.workspace = true
+greentic_pack.workspace = true
+wasmtime-environ.workspace = true
 humantime.workspace = true
 runner-core = { workspace = true }
 chrono.workspace = true
@@ -58,7 +60,18 @@ zip.workspace = true
 tempfile.workspace = true
 walkdir.workspace = true
 
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [features]
+# Passthrough feature flags so the `info` report can accurately partition host
+# capabilities into enabled/disabled. These stay disabled by default — enable
+# them on the host crate and mirror them here if you need them surfaced.
+default = ["verify"]
+verify = ["greentic-runner-host/verify"]
+telemetry = ["greentic-runner-host/telemetry"]
+session-redis = ["greentic-runner-host/session-redis"]
+component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
 
