@@ -3,7 +3,6 @@ mod cli;
 // Also compiled by the lib crate (`greentic_runner::info`) so unit tests run
 // without requiring a binary build. E5 wires a CLI subcommand against
 // `info::collect` / `info::human::render`.
-#[allow(dead_code)]
 mod info;
 use greentic_config::{ConfigFileFormat, ConfigLayer, ConfigResolver};
 use greentic_runner_host::cache::{
@@ -47,6 +46,12 @@ enum Command {
     Replay(cli::replay::ReplayArgs),
     Conformance(cli::conformance::ConformanceArgs),
     Contract(ContractArgs),
+    /// Describe this runner binary: version, supported imports, features.
+    Info {
+        /// Emit the info report as JSON.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -271,6 +276,17 @@ async fn run_with_cli(cli: Cli) -> anyhow::Result<()> {
             Command::Replay(args) => cli::replay::run(args).await,
             Command::Conformance(args) => cli::conformance::run(args).await,
             Command::Contract(args) => run_contract(args).await,
+            Command::Info { json } => {
+                let report = info::collect();
+                if json {
+                    let pretty = serde_json::to_string_pretty(&report)
+                        .context("serialize info report as JSON")?;
+                    println!("{pretty}");
+                } else {
+                    print!("{}", info::human::render(&report));
+                }
+                Ok(())
+            }
         };
     }
     let run = cli.run;
