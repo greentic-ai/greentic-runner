@@ -21,6 +21,7 @@ pub mod desktop {
 }
 
 pub mod gen_bindings;
+pub mod info;
 
 /// Launch the canonical HTTP host. This is equivalent to running the
 /// `greentic-runner` binary with the provided [`RunnerConfig`].
