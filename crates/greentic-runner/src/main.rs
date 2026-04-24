@@ -1,5 +1,10 @@
 use clap::{Parser, Subcommand, ValueEnum};
 mod cli;
+// Also compiled by the lib crate (`greentic_runner::info`) so unit tests run
+// without requiring a binary build. E5 wires a CLI subcommand against
+// `info::collect` / `info::human::render`.
+#[allow(dead_code)]
+mod info;
 use greentic_config::{ConfigFileFormat, ConfigLayer, ConfigResolver};
 use greentic_runner_host::cache::{
     ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProfile,
