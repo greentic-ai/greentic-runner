@@ -2040,6 +2040,7 @@ dependencies = [
  "greentic-interfaces",
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
+ "greentic-pack-lib",
  "greentic-runner-desktop",
  "greentic-runner-host",
  "greentic-state",
@@ -2064,6 +2065,7 @@ dependencies = [
  "walkdir",
  "wasmparser 0.246.2",
  "wasmtime",
+ "wasmtime-environ",
  "wasmtime-wasi",
  "zip",
 ]
