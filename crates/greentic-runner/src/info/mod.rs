@@ -3,9 +3,9 @@
 //! - [`report`] defines the [`InfoReport`] struct and the `collect()` function
 //!   that assembles it from compile-time env vars and hand-maintained interface
 //!   lists.
-//! - `human` (added in a follow-up commit) renders an [`InfoReport`] as a
-//!   concise human-readable string.
+//! - [`human`] renders an [`InfoReport`] as a concise human-readable string.
 
+pub mod human;
 pub mod report;
 
 #[allow(unused_imports)]
