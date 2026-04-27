@@ -8,17 +8,34 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  dev-publish:
-    uses: greenticai/.github/.github/workflows/dev-publish.yml@main
+  # Stage 1 — tests + version stamping. Outputs the stamped dev version
+  # {M.m.GITHUB_RUN_ID} consumed by binaries + publish.
+  dev-prepare:
+    uses: greenticai/.github/.github/workflows/dev-prepare.yml@main
     with:
-      crates: "greentic-i18n runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
       exclude-crates: "echo-secret component-v0-6-dummy"
       wasm-target: true
+
+  dev-binaries-greentic-runner:
+    needs: dev-prepare
+    uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
+    with:
+      package: greentic-runner
+      version: ${{ needs.dev-prepare.outputs.version }}
+
+  dev-publish:
+    needs: [dev-prepare, dev-binaries-greentic-runner]
+    uses: greenticai/.github/.github/workflows/dev-publish.yml@main
+    with:
+      version: ${{ needs.dev-prepare.outputs.version }}
+      crates: "runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
+      binary-crates: "greentic-runner"
+      dual-role-binary-crates: "greentic-runner"
     secrets: inherit
