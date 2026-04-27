@@ -12,8 +12,8 @@ edition = "2021"
 
 [workspace.dependencies]
 anyhow = "1"
-greentic-pack = ">=0.6.0-dev, <0.7.0-0"
-greentic-flow = ">=0.6.0-dev, <0.7.0-0"
+greentic-pack = ">=0.5.0-0, <0.6.0-0"
+greentic-flow = ">=0.5.0-0, <0.6.0-0"
 indexmap = "2"
 semver = "1"
 serde_json = "1"
