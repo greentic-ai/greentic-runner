@@ -5,12 +5,15 @@ use crate::runner::mocks::MocksConfig;
 use crate::trace::TraceConfig;
 use crate::validate::ValidationConfig;
 use anyhow::{Context, Result};
+use parking_lot::RwLock;
 use serde::Deserialize;
+use serde_json::Value;
 use serde_yaml_bw as serde_yaml;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -73,7 +76,13 @@ pub struct RateLimits {
 
 #[derive(Debug, Clone)]
 pub struct SecretsPolicy {
-    allowed: HashSet<String>,
+    /// Secret names allowed by the bindings file.
+    binding_allowed: HashSet<String>,
+    /// Secret names discovered at flow-load time from node configs that
+    /// reference secrets via fields ending in `_secret` (e.g.
+    /// `api_key_secret: "llm-api-key"`). Shared across all clones so that
+    /// flow loading can register names after policy construction.
+    flow_discovered: Arc<RwLock<HashSet<String>>>,
     allow_all: bool,
 }
 
@@ -246,25 +255,70 @@ impl HostConfig {
 
 impl SecretsPolicy {
     fn from_bindings(bindings: &BindingsFile) -> Self {
-        let allowed = bindings
+        let binding_allowed = bindings
             .flow_type_bindings
             .values()
             .flat_map(|binding| binding.secrets.iter().cloned())
             .collect::<HashSet<_>>();
         Self {
-            allowed,
+            binding_allowed,
+            flow_discovered: Arc::new(RwLock::new(HashSet::new())),
             allow_all: false,
         }
     }
 
     pub fn is_allowed(&self, key: &str) -> bool {
-        self.allow_all || self.allowed.contains(key)
+        if self.allow_all || self.binding_allowed.contains(key) {
+            return true;
+        }
+        self.flow_discovered.read().contains(key)
     }
 
     pub fn allow_all() -> Self {
         Self {
-            allowed: HashSet::new(),
+            binding_allowed: HashSet::new(),
+            flow_discovered: Arc::new(RwLock::new(HashSet::new())),
             allow_all: true,
+        }
+    }
+
+    /// Register a secret name discovered while loading a flow's node config.
+    ///
+    /// Components are gated by [`is_allowed`]; the bindings file is the
+    /// authoritative source, but flows that reference secrets directly via
+    /// node config fields (`api_key_secret: "llm-api-key"`) would otherwise
+    /// have their lookups denied even when the secret is provisioned. Calling
+    /// this from the pack flow loader closes that gap without changing the
+    /// component manifest contract.
+    pub fn register_flow_secret(&self, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        self.flow_discovered.write().insert(name.to_string());
+    }
+
+    /// Walk a JSON value (typically a flow node's config block) and register
+    /// any string-valued field whose key ends in `_secret`. Recurses through
+    /// nested objects and arrays.
+    pub fn register_flow_secret_refs(&self, value: &Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, val) in map {
+                    if key.ends_with("_secret")
+                        && let Value::String(name) = val
+                    {
+                        self.register_flow_secret(name);
+                    } else {
+                        self.register_flow_secret_refs(val);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    self.register_flow_secret_refs(item);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -454,6 +508,63 @@ mod tests {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
         }
+    }
+
+    #[test]
+    fn secrets_policy_register_flow_secret_refs_walks_nested_objects() {
+        let policy = SecretsPolicy {
+            binding_allowed: HashSet::new(),
+            flow_discovered: Arc::new(RwLock::new(HashSet::new())),
+            allow_all: false,
+        };
+
+        // Bare bindings deny anything by default.
+        assert!(!policy.is_allowed("llm-api-key"));
+
+        // Simulate a flow node config block carrying both a top-level
+        // *_secret reference and a nested one inside an arbitrary subtree.
+        let node_config = serde_json::json!({
+            "api_key_secret": "llm-api-key",
+            "provider": "openai",
+            "fallback": {
+                "secondary_api_key_secret": "openrouter-key",
+                "model": "gpt-4o",
+            },
+            "list": [
+                { "tertiary_secret": "another-key" },
+                { "non_secret_field": "ignored" },
+            ],
+            "ignored_field": ""
+        });
+
+        policy.register_flow_secret_refs(&node_config);
+
+        assert!(policy.is_allowed("llm-api-key"));
+        assert!(policy.is_allowed("openrouter-key"));
+        assert!(policy.is_allowed("another-key"));
+        assert!(!policy.is_allowed("non_secret_field"));
+        assert!(!policy.is_allowed("ignored"));
+    }
+
+    #[test]
+    fn secrets_policy_ignores_empty_or_non_string_secret_values() {
+        let policy = SecretsPolicy {
+            binding_allowed: HashSet::new(),
+            flow_discovered: Arc::new(RwLock::new(HashSet::new())),
+            allow_all: false,
+        };
+
+        let node_config = serde_json::json!({
+            "api_key_secret": "",
+            "fallback_secret": null,
+            "numeric_secret": 42,
+            "real_secret": "good-key",
+        });
+
+        policy.register_flow_secret_refs(&node_config);
+
+        assert!(policy.is_allowed("good-key"));
+        assert!(!policy.is_allowed(""));
     }
 
     #[test]
