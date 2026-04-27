@@ -1900,22 +1900,31 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
 
     // Pre-resolve i18n bundle: the WASM component cannot read pack assets
     // directly (no host resolver registered), so inline the i18n JSON into
-    // the invocation under `card_spec.i18n_inline`.
-    let bundle_path_owned = map
+    // the invocation under `card_spec.i18n_inline`. Defense-in-depth: when
+    // the card omits an explicit `i18n_bundle_path` we still try the
+    // conventional `assets/i18n/` location so cards that rely on
+    // auto-generated i18n keys (e.g. cards2pack output) keep working.
+    let configured_bundle_path = map
         .get("card_spec")
         .and_then(|spec| spec.get("i18n_bundle_path"))
         .and_then(Value::as_str)
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
 
-    if let Some(bundle_path) = bundle_path_owned {
-        let i18n_entries = load_i18n_bundle_entries(&bundle_path, |path| pack.read_asset(path));
+    let bundle_path = configured_bundle_path
+        .clone()
+        .unwrap_or_else(|| "assets/i18n".to_string());
 
-        if !i18n_entries.is_empty() {
-            let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
-            if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
-                spec.insert("i18n_inline".into(), Value::Object(i18n_entries));
+    let i18n_entries = load_i18n_bundle_entries(&bundle_path, |path| pack.read_asset(path));
+
+    if !i18n_entries.is_empty() {
+        let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
+        if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
+            spec.insert("i18n_inline".into(), Value::Object(i18n_entries));
+            if configured_bundle_path.is_some() {
                 tracing::info!(%bundle_path, ?locale_keys, "pre-resolved i18n bundle into card_spec.i18n_inline");
+            } else {
+                tracing::info!(%bundle_path, ?locale_keys, "auto-discovered i18n bundle and inlined into card_spec.i18n_inline");
             }
         }
     }
