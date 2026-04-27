@@ -16,19 +16,23 @@ concurrency:
 
 jobs:
   # Stage 1 — tests + version stamping. Outputs the stamped dev version
-  # {M.m.GITHUB_RUN_ID} consumed by binaries + publish.
+  # consumed by binaries + publish. Form is M.m.p-dev.{RUN_ID} for
+  # dual-role repos (require-pre-release: true) so dev library publishes
+  # sort below stable on crates.io; M.m.{RUN_ID} regular release for
+  # binary-only repos (no stable namespace to protect) and pure libraries.
   dev-prepare:
     uses: greenticai/.github/.github/workflows/dev-prepare.yml@main
     with:
       exclude-crates: "echo-secret component-v0-6-dummy"
       wasm-target: true
+      require-pre-release: true
 
   dev-binaries-greentic-runner:
     needs: dev-prepare
     uses: greenticai/.github/.github/workflows/dev-release-binaries.yml@main
     with:
       package: greentic-runner
-      version: ${{ needs.dev-prepare.outputs.version }}
+      version: ${{ needs.dev-prepare.outputs.binary-version }}
 
   dev-publish:
     needs: [dev-prepare, dev-binaries-greentic-runner]
@@ -36,6 +40,8 @@ jobs:
     with:
       version: ${{ needs.dev-prepare.outputs.version }}
       crates: "runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
+      binary-version: ${{ needs.dev-prepare.outputs.binary-version }}
       binary-crates: "greentic-runner"
       dual-role-binary-crates: "greentic-runner"
+      require-pre-release: true
     secrets: inherit
