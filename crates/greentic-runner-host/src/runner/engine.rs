@@ -924,6 +924,14 @@ impl FlowEngine {
         })?;
         let pack = Arc::clone(&self.packs[pack_idx]);
 
+        // Promote adaptive-card defaults from node config (default_card_asset /
+        // default_card_inline / default_source) into the invocation, so the
+        // component receives a valid `card_spec` field even when the user input
+        // is empty (e.g. webchat ConversationStart with no text). Without this,
+        // schema validation in the component reports AC_INVOCATION_MISSING_FIELD
+        // and the renderer falls back to a generic "Welcome" placeholder.
+        promote_card_config_to_invocation(&mut call.input, &call.config);
+
         // Pre-resolve card asset paths: read JSON files from the pack's assets
         // directory and inject as inline_json so the component doesn't need
         // WASI filesystem access.
@@ -1909,6 +1917,70 @@ fn is_card_invocation(input: &Value) -> bool {
         return map.contains_key("card_source") || map.contains_key("card_spec");
     }
     false
+}
+
+/// When the node config declares adaptive-card defaults (`default_card_asset`,
+/// `default_card_inline`, or `default_source`) but the runtime invocation has
+/// no `card_source`/`card_spec` yet, lift those defaults into the invocation.
+/// This produces a schema-valid invocation envelope so the component does not
+/// fall back to its generic "Welcome" placeholder.
+fn promote_card_config_to_invocation(input: &mut Value, config: &Value) {
+    if is_card_invocation(input) {
+        return;
+    }
+    let Value::Object(cfg) = config else { return };
+
+    let default_asset = cfg
+        .get("default_card_asset")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let default_inline = cfg
+        .get("default_card_inline")
+        .filter(|value| value.is_object() || value.is_array())
+        .cloned();
+    let default_source = cfg
+        .get("default_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+
+    if default_asset.is_none() && default_inline.is_none() && default_source.is_none() {
+        return;
+    }
+
+    let card_source = default_source.unwrap_or_else(|| {
+        if default_inline.is_some() {
+            "inline".to_string()
+        } else {
+            "asset".to_string()
+        }
+    });
+
+    let mut card_spec = serde_json::Map::new();
+    match card_source.as_str() {
+        "asset" => {
+            if let Some(path) = default_asset {
+                card_spec.insert("asset_path".into(), Value::String(path));
+            }
+        }
+        "inline" => {
+            if let Some(inline) = default_inline {
+                card_spec.insert("inline_json".into(), inline);
+            }
+        }
+        _ => {}
+    }
+
+    if !matches!(input, Value::Object(_)) {
+        *input = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = input {
+        map.insert("card_source".into(), Value::String(card_source));
+        map.insert("card_spec".into(), Value::Object(card_spec));
+    }
 }
 
 fn inject_card_locale(payload: &mut Value, entry: &Value) {
