@@ -129,6 +129,8 @@ enum NodeKind {
     ProviderInvoke,
     FlowCall,
     BuiltinEmit { kind: EmitKind },
+    BuiltinStateGet,
+    BuiltinStateSet,
     Wait,
 }
 
@@ -640,11 +642,94 @@ impl FlowEngine {
                 state.push_egress(payload.clone());
                 Ok(DispatchOutcome::complete(NodeOutput::new(payload)))
             }
+            NodeKind::BuiltinStateGet => self
+                .execute_state_get(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
+            NodeKind::BuiltinStateSet => self
+                .execute_state_set(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
             NodeKind::Wait => {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
         }
+    }
+
+    async fn execute_state_get(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
+        let key = Self::extract_state_key_helper(&payload)?;
+        let pack = self.pack_for_flow(ctx)?;
+        let store = pack
+            .state_store_handle()
+            .context("state store is not configured for this runtime")?;
+        let tenant_ctx = self.state_tenant_ctx(ctx)?;
+        let state_key = greentic_state::StateKey::new(&key);
+        let value = store
+            .get_json(
+                &tenant_ctx,
+                crate::storage::state::STATE_PREFIX,
+                &state_key,
+                None,
+            )
+            .with_context(|| format!("state.get failed for key `{key}`"))?;
+        let payload = serde_json::json!({
+            "key": key,
+            "value": value,
+            "found": value.is_some(),
+        });
+        Ok(NodeOutput::new(payload))
+    }
+
+    async fn execute_state_set(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
+        let key = Self::extract_state_key_helper(&payload)?;
+        let value = payload.get("value").cloned().unwrap_or(Value::Null);
+        let pack = self.pack_for_flow(ctx)?;
+        let store = pack
+            .state_store_handle()
+            .context("state store is not configured for this runtime")?;
+        let tenant_ctx = self.state_tenant_ctx(ctx)?;
+        let state_key = greentic_state::StateKey::new(&key);
+        store
+            .set_json(
+                &tenant_ctx,
+                crate::storage::state::STATE_PREFIX,
+                &state_key,
+                None,
+                &value,
+                None,
+            )
+            .with_context(|| format!("state.set failed for key `{key}`"))?;
+        let payload = serde_json::json!({ "key": key, "value": value });
+        Ok(NodeOutput::new(payload))
+    }
+
+    fn pack_for_flow(&self, ctx: &FlowContext<'_>) -> Result<&Arc<PackRuntime>> {
+        let key = FlowKey {
+            pack_id: ctx.pack_id.to_string(),
+            flow_id: ctx.flow_id.to_string(),
+        };
+        let idx = self.flow_sources.get(&key).with_context(|| {
+            format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
+        })?;
+        Ok(&self.packs[*idx])
+    }
+
+    fn extract_state_key_helper(payload: &Value) -> Result<String> {
+        payload
+            .get("key")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .filter(|k| !k.is_empty())
+            .context("state node payload missing required `key` (non-empty string)")
+    }
+
+    fn state_tenant_ctx(&self, ctx: &FlowContext<'_>) -> Result<greentic_types::TenantCtx> {
+        let env = greentic_types::EnvId::from_str(&self.default_env)
+            .with_context(|| format!("invalid env id `{}`", self.default_env))?;
+        let tenant = greentic_types::TenantId::from_str(ctx.tenant)
+            .with_context(|| format!("invalid tenant id `{}`", ctx.tenant))?;
+        Ok(greentic_types::TenantCtx::new(env, tenant))
     }
 
     async fn apply_jump(
@@ -1666,6 +1751,8 @@ impl From<Node> for HostNode {
                 "flow.call" => NodeKind::FlowCall,
                 "provider.invoke" => NodeKind::ProviderInvoke,
                 "session.wait" => NodeKind::Wait,
+                "state.get" => NodeKind::BuiltinStateGet,
+                "state.set" => NodeKind::BuiltinStateSet,
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -1680,6 +1767,8 @@ impl From<Node> for HostNode {
             NodeKind::ProviderInvoke => "provider.invoke".to_string(),
             NodeKind::FlowCall => "flow.call".to_string(),
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
+            NodeKind::BuiltinStateGet => "state.get".to_string(),
+            NodeKind::BuiltinStateSet => "state.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
