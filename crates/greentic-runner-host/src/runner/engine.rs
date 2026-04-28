@@ -203,6 +203,16 @@ impl FlowEngine {
                     pack_index = idx,
                     "registered flow"
                 );
+                if let Ok(flow_ir) = pack.load_flow(&flow.id) {
+                    for node in flow_ir.nodes.values() {
+                        config
+                            .secrets_policy
+                            .register_flow_secret_refs(&node.input.mapping);
+                        config
+                            .secrets_policy
+                            .register_flow_secret_refs(&node.output.mapping);
+                    }
+                }
                 flow_sources.insert(
                     FlowKey {
                         pack_id: flow.pack_id.clone(),
