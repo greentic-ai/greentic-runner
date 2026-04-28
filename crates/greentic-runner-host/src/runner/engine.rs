@@ -1924,11 +1924,19 @@ fn is_card_invocation(input: &Value) -> bool {
 /// no `card_source`/`card_spec` yet, lift those defaults into the invocation.
 /// This produces a schema-valid invocation envelope so the component does not
 /// fall back to its generic "Welcome" placeholder.
+///
+/// Adaptive-card defaults can arrive in either of two places depending on how
+/// the pack was compiled:
+/// - top-level `call.config` (post `split_operation_payload`)
+/// - nested `call.input.config` (when the node mapping kept the
+///   `{component, config}` shape and `split_operation_payload` left it intact)
 fn promote_card_config_to_invocation(input: &mut Value, config: &Value) {
     if is_card_invocation(input) {
         return;
     }
-    let Value::Object(cfg) = config else { return };
+
+    let cfg_map = card_defaults_source(input, config);
+    let Some(cfg) = cfg_map else { return };
 
     let default_asset = cfg
         .get("default_card_asset")
@@ -1981,6 +1989,25 @@ fn promote_card_config_to_invocation(input: &mut Value, config: &Value) {
         map.insert("card_source".into(), Value::String(card_source));
         map.insert("card_spec".into(), Value::Object(card_spec));
     }
+}
+
+/// Locate the adaptive-card defaults config object, preferring the top-level
+/// `call.config` when present, then falling back to a nested `input.config`
+/// (the shape produced when `split_operation_payload` leaves the mapping
+/// intact).
+fn card_defaults_source<'a>(
+    input: &'a Value,
+    config: &'a Value,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    if let Value::Object(map) = config {
+        return Some(map);
+    }
+    if let Value::Object(map) = input
+        && let Some(Value::Object(nested)) = map.get("config")
+    {
+        return Some(nested);
+    }
+    None
 }
 
 fn inject_card_locale(payload: &mut Value, entry: &Value) {
