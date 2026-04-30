@@ -1482,6 +1482,14 @@ impl PackRuntime {
         self.components.contains_key(component_ref)
     }
 
+    /// Returns a clonable handle to the pack's state store, when one is
+    /// configured. Used by the flow engine's built-in `state.get`/`state.set`
+    /// operators which call into the same store that WASM components read
+    /// through their `state.read`/`state.write` host imports.
+    pub fn state_store_handle(&self) -> Option<crate::storage::DynStateStore> {
+        self.state_store.clone()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn load(
         path: impl AsRef<Path>,

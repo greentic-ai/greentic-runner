@@ -129,6 +129,8 @@ enum NodeKind {
     ProviderInvoke,
     FlowCall,
     BuiltinEmit { kind: EmitKind },
+    BuiltinStateGet,
+    BuiltinStateSet,
     Wait,
 }
 
@@ -203,6 +205,16 @@ impl FlowEngine {
                     pack_index = idx,
                     "registered flow"
                 );
+                if let Ok(flow_ir) = pack.load_flow(&flow.id) {
+                    for node in flow_ir.nodes.values() {
+                        config
+                            .secrets_policy
+                            .register_flow_secret_refs(&node.input.mapping);
+                        config
+                            .secrets_policy
+                            .register_flow_secret_refs(&node.output.mapping);
+                    }
+                }
                 flow_sources.insert(
                     FlowKey {
                         pack_id: flow.pack_id.clone(),
@@ -630,11 +642,94 @@ impl FlowEngine {
                 state.push_egress(payload.clone());
                 Ok(DispatchOutcome::complete(NodeOutput::new(payload)))
             }
+            NodeKind::BuiltinStateGet => self
+                .execute_state_get(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
+            NodeKind::BuiltinStateSet => self
+                .execute_state_set(ctx, payload)
+                .await
+                .map(DispatchOutcome::complete),
             NodeKind::Wait => {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
         }
+    }
+
+    async fn execute_state_get(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
+        let key = Self::extract_state_key_helper(&payload)?;
+        let pack = self.pack_for_flow(ctx)?;
+        let store = pack
+            .state_store_handle()
+            .context("state store is not configured for this runtime")?;
+        let tenant_ctx = self.state_tenant_ctx(ctx)?;
+        let state_key = greentic_state::StateKey::new(&key);
+        let value = store
+            .get_json(
+                &tenant_ctx,
+                crate::storage::state::STATE_PREFIX,
+                &state_key,
+                None,
+            )
+            .with_context(|| format!("state.get failed for key `{key}`"))?;
+        let payload = serde_json::json!({
+            "key": key,
+            "value": value,
+            "found": value.is_some(),
+        });
+        Ok(NodeOutput::new(payload))
+    }
+
+    async fn execute_state_set(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
+        let key = Self::extract_state_key_helper(&payload)?;
+        let value = payload.get("value").cloned().unwrap_or(Value::Null);
+        let pack = self.pack_for_flow(ctx)?;
+        let store = pack
+            .state_store_handle()
+            .context("state store is not configured for this runtime")?;
+        let tenant_ctx = self.state_tenant_ctx(ctx)?;
+        let state_key = greentic_state::StateKey::new(&key);
+        store
+            .set_json(
+                &tenant_ctx,
+                crate::storage::state::STATE_PREFIX,
+                &state_key,
+                None,
+                &value,
+                None,
+            )
+            .with_context(|| format!("state.set failed for key `{key}`"))?;
+        let payload = serde_json::json!({ "key": key, "value": value });
+        Ok(NodeOutput::new(payload))
+    }
+
+    fn pack_for_flow(&self, ctx: &FlowContext<'_>) -> Result<&Arc<PackRuntime>> {
+        let key = FlowKey {
+            pack_id: ctx.pack_id.to_string(),
+            flow_id: ctx.flow_id.to_string(),
+        };
+        let idx = self.flow_sources.get(&key).with_context(|| {
+            format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
+        })?;
+        Ok(&self.packs[*idx])
+    }
+
+    fn extract_state_key_helper(payload: &Value) -> Result<String> {
+        payload
+            .get("key")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .filter(|k| !k.is_empty())
+            .context("state node payload missing required `key` (non-empty string)")
+    }
+
+    fn state_tenant_ctx(&self, ctx: &FlowContext<'_>) -> Result<greentic_types::TenantCtx> {
+        let env = greentic_types::EnvId::from_str(&self.default_env)
+            .with_context(|| format!("invalid env id `{}`", self.default_env))?;
+        let tenant = greentic_types::TenantId::from_str(ctx.tenant)
+            .with_context(|| format!("invalid tenant id `{}`", ctx.tenant))?;
+        Ok(greentic_types::TenantCtx::new(env, tenant))
     }
 
     async fn apply_jump(
@@ -828,6 +923,14 @@ impl FlowEngine {
             format!("flow {} (pack {}) not registered", ctx.flow_id, ctx.pack_id)
         })?;
         let pack = Arc::clone(&self.packs[pack_idx]);
+
+        // Promote adaptive-card defaults from node config (default_card_asset /
+        // default_card_inline / default_source) into the invocation, so the
+        // component receives a valid `card_spec` field even when the user input
+        // is empty (e.g. webchat ConversationStart with no text). Without this,
+        // schema validation in the component reports AC_INVOCATION_MISSING_FIELD
+        // and the renderer falls back to a generic "Welcome" placeholder.
+        promote_card_config_to_invocation(&mut call.input, &call.config);
 
         // Pre-resolve card asset paths: read JSON files from the pack's assets
         // directory and inject as inline_json so the component doesn't need
@@ -1656,6 +1759,8 @@ impl From<Node> for HostNode {
                 "flow.call" => NodeKind::FlowCall,
                 "provider.invoke" => NodeKind::ProviderInvoke,
                 "session.wait" => NodeKind::Wait,
+                "state.get" => NodeKind::BuiltinStateGet,
+                "state.set" => NodeKind::BuiltinStateSet,
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -1670,6 +1775,8 @@ impl From<Node> for HostNode {
             NodeKind::ProviderInvoke => "provider.invoke".to_string(),
             NodeKind::FlowCall => "flow.call".to_string(),
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
+            NodeKind::BuiltinStateGet => "state.get".to_string(),
+            NodeKind::BuiltinStateSet => "state.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
@@ -1812,6 +1919,97 @@ fn is_card_invocation(input: &Value) -> bool {
     false
 }
 
+/// When the node config declares adaptive-card defaults (`default_card_asset`,
+/// `default_card_inline`, or `default_source`) but the runtime invocation has
+/// no `card_source`/`card_spec` yet, lift those defaults into the invocation.
+/// This produces a schema-valid invocation envelope so the component does not
+/// fall back to its generic "Welcome" placeholder.
+///
+/// Adaptive-card defaults can arrive in either of two places depending on how
+/// the pack was compiled:
+/// - top-level `call.config` (post `split_operation_payload`)
+/// - nested `call.input.config` (when the node mapping kept the
+///   `{component, config}` shape and `split_operation_payload` left it intact)
+fn promote_card_config_to_invocation(input: &mut Value, config: &Value) {
+    if is_card_invocation(input) {
+        return;
+    }
+
+    let cfg_map = card_defaults_source(input, config);
+    let Some(cfg) = cfg_map else { return };
+
+    let default_asset = cfg
+        .get("default_card_asset")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let default_inline = cfg
+        .get("default_card_inline")
+        .filter(|value| value.is_object() || value.is_array())
+        .cloned();
+    let default_source = cfg
+        .get("default_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+
+    if default_asset.is_none() && default_inline.is_none() && default_source.is_none() {
+        return;
+    }
+
+    let card_source = default_source.unwrap_or_else(|| {
+        if default_inline.is_some() {
+            "inline".to_string()
+        } else {
+            "asset".to_string()
+        }
+    });
+
+    let mut card_spec = serde_json::Map::new();
+    match card_source.as_str() {
+        "asset" => {
+            if let Some(path) = default_asset {
+                card_spec.insert("asset_path".into(), Value::String(path));
+            }
+        }
+        "inline" => {
+            if let Some(inline) = default_inline {
+                card_spec.insert("inline_json".into(), inline);
+            }
+        }
+        _ => {}
+    }
+
+    if !matches!(input, Value::Object(_)) {
+        *input = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = input {
+        map.insert("card_source".into(), Value::String(card_source));
+        map.insert("card_spec".into(), Value::Object(card_spec));
+    }
+}
+
+/// Locate the adaptive-card defaults config object, preferring the top-level
+/// `call.config` when present, then falling back to a nested `input.config`
+/// (the shape produced when `split_operation_payload` leaves the mapping
+/// intact).
+fn card_defaults_source<'a>(
+    input: &'a Value,
+    config: &'a Value,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    if let Value::Object(map) = config {
+        return Some(map);
+    }
+    if let Value::Object(map) = input
+        && let Some(Value::Object(nested)) = map.get("config")
+    {
+        return Some(nested);
+    }
+    None
+}
+
 fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if !is_card_invocation(payload) {
         return;
@@ -1900,22 +2098,31 @@ fn resolve_card_spec_asset(value: &mut Value, pack: &crate::pack::PackRuntime) {
 
     // Pre-resolve i18n bundle: the WASM component cannot read pack assets
     // directly (no host resolver registered), so inline the i18n JSON into
-    // the invocation under `card_spec.i18n_inline`.
-    let bundle_path_owned = map
+    // the invocation under `card_spec.i18n_inline`. Defense-in-depth: when
+    // the card omits an explicit `i18n_bundle_path` we still try the
+    // conventional `assets/i18n/` location so cards that rely on
+    // auto-generated i18n keys (e.g. cards2pack output) keep working.
+    let configured_bundle_path = map
         .get("card_spec")
         .and_then(|spec| spec.get("i18n_bundle_path"))
         .and_then(Value::as_str)
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty());
 
-    if let Some(bundle_path) = bundle_path_owned {
-        let i18n_entries = load_i18n_bundle_entries(&bundle_path, |path| pack.read_asset(path));
+    let bundle_path = configured_bundle_path
+        .clone()
+        .unwrap_or_else(|| "assets/i18n".to_string());
 
-        if !i18n_entries.is_empty() {
-            let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
-            if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
-                spec.insert("i18n_inline".into(), Value::Object(i18n_entries));
+    let i18n_entries = load_i18n_bundle_entries(&bundle_path, |path| pack.read_asset(path));
+
+    if !i18n_entries.is_empty() {
+        let locale_keys: Vec<_> = i18n_entries.keys().cloned().collect();
+        if let Some(Value::Object(spec)) = map.get_mut("card_spec") {
+            spec.insert("i18n_inline".into(), Value::Object(i18n_entries));
+            if configured_bundle_path.is_some() {
                 tracing::info!(%bundle_path, ?locale_keys, "pre-resolved i18n bundle into card_spec.i18n_inline");
+            } else {
+                tracing::info!(%bundle_path, ?locale_keys, "auto-discovered i18n bundle and inlined into card_spec.i18n_inline");
             }
         }
     }
