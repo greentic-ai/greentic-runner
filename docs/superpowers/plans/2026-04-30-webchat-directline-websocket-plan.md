@@ -52,7 +52,7 @@
 
 ## Phase A — Alignment (Days 1-2, this PR)
 
-### Task 1: Spec + plan docs review with Maarten
+### Task 1: Spec + plan docs review
 
 **Files:**
 - `docs/superpowers/specs/2026-04-30-webchat-directline-websocket-design.md` (this work)
@@ -60,7 +60,7 @@
 
 - [x] Draft spec
 - [x] Draft plan
-- [ ] PR open + assigned to Maarten for review
+- [ ] PR open + assigned for stakeholder review
 - [ ] Address review comments (likely sections: §17 open questions, §13 rollout strategy)
 - [ ] Spec marked **Approved** in §1 status header
 
@@ -402,7 +402,7 @@
 - [ ] Section: replica drain mid-deploy — graceful drain procedure, alternatives if drain hangs
 - [ ] Section: stuck connections / pong timeout storms — diagnosis, mitigation
 - [ ] Section: token-expiring close storm (e.g. signing key rotation) — expected vs incident
-- [ ] **Verify:** Runbook reviewed by Bima
+- [ ] **Verify:** Runbook reviewed by an on-call owner
 
 ### Task 27: Tenant config flag for rollout
 
@@ -449,16 +449,16 @@ Before promoting from Phase B → C → D → E → F → G → H deployment, ve
 
 ## Effort summary
 
-| Phase | Days | Parallelizable | Owner suggestion |
-|-------|------|----------------|------------------|
-| A. Alignment | 1-2 | no (review-bound) | Bima → Maarten |
-| B. Core WS handler | 5 | partial (Tasks 4/5/6 sequential, 7 parallel) | Bima or assigned dev |
-| C. Redis backplane | 3 | partial | Same |
+| Phase | Days | Parallelizable | Owner |
+|-------|------|----------------|-------|
+| A. Alignment | 1-2 | no (review-bound) | Author → reviewer |
+| B. Core WS handler | 5 | partial (Tasks 4/5/6 sequential, 7 parallel) | Implementer |
+| C. Redis backplane | 3 | partial | Implementer |
 | D. Hardening | 2 | yes (Tasks 12-15 mostly independent) | Subagents |
 | E. Observability | 1 | yes | Subagent |
 | F. Tests | 3 | partial (unit ‖ integration ‖ chaos) | Subagents |
 | G. Cloud configs | 2 | yes (3 clouds independent) | Subagents per cloud |
-| H. Ops & rollout | 1 | no | Bima |
+| H. Ops & rollout | 1 | no | Implementer |
 
 **Critical path: A → B → C → F (multi-replica integration test) ≈ 12 days.** Phases D/E/G can fan out via subagents in parallel with C and F, compressing total wall-clock to ~13 days with subagent dispatch.
 

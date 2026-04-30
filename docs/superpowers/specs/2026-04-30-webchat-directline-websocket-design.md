@@ -2,8 +2,6 @@
 
 **Date:** 2026-04-30
 **Status:** Draft, pending review
-**Author:** Bima Pangestu (with Claude assistance)
-**Stakeholder:** Maarten (directive)
 **Related repos:** `greentic-runner`, `greentic-messaging-providers`, `greentic-runner-host`
 
 ---
@@ -24,7 +22,7 @@ Polling has measurable downsides at production scale:
 - **Latency floor:** clients see ≥500 ms reply latency from the polling interval, regardless of how fast the bot is.
 - **Wasted compute:** polling spins CPU on the runner per request even when there is no new activity.
 
-Maarten directed this to be implemented **production-ready, not demo-quality**.
+Platform direction is to ship this **production-ready, not demo-quality**.
 
 A separate, smaller fix (rate limit raised + IP-based bucketing on the token endpoint, client-side guest UUID + token cache) is already implemented on branch `fix/webchat-rate-limit-bucketing` of `greentic-messaging-providers`. That fix continues to be valuable as a **defence-in-depth layer** even after WebSocket ships, since polling remains as a fallback.
 
@@ -62,7 +60,7 @@ Polling remains supported as a fallback. No client-side change is required: sett
 | Transport | **WebSocket** (`Sec-WebSocket-Protocol: directline.botframework.com`) | Direct Line standard; native client support in `botframework-webchat`; ~5× cheaper than polling at 1000+ users (per cloud research). |
 | WS handler location | **`greentic-runner-host`** axum layer, not WASM component | WASM `ingest_http` is one-shot request/response — long-lived WS doesn't fit. axum has native `WebSocketUpgrade`; component still owns activity persistence + token verification. |
 | Cross-instance fan-out backplane | **Redis Pub/Sub** (managed service per cloud — ElastiCache / Memorystore / Azure Cache for Redis) | Industry standard (Slack, Discord, ASP.NET SignalR). All 3 target clouds offer first-class managed Redis. NATS rejected: greentic operator's `--nats off` default would force new infra; no managed NATS on AWS/GCP/Azure. Sticky sessions alone cannot solve the cross-instance push problem (confirmed across all 3 cloud docs). |
-| Backplane abstraction | **Strict Redis, no trait** | Per Bima's instruction; matches CLAUDE.md "don't introduce abstractions beyond what task requires". |
+| Backplane abstraction | **Strict Redis, no trait** | Matches CLAUDE.md guideline "don't introduce abstractions beyond what task requires". |
 | Frame format | Direct Line `ActivitySet` JSON, watermark-incremented | Microsoft spec; Web Chat library expects this. |
 | Keepalive | **Server ping every 25 s** (under all 3 cloud idle-timeout floors) | AWS ALB default 60 s, ACA default ingress 240 s, Cloud Run can drop after request-timeout — 25 s ping is safe for all. |
 | Auth | JWT in `?t=TOKEN` query string at upgrade; verify before accepting WS | Direct Line standard. Token already bound to `(env, tenant, conversationId)` via existing `verify_token` in `messaging-provider-webchat/src/directline/jwt.rs`. |
@@ -709,13 +707,13 @@ The Microsoft Direct Line conformance suite is referenced from the Web Chat clie
 - **Server-initiated activities (push without prior client message):** out. Direct Line v3 spec requires client to initiate the conversation.
 - **WS subprotocol negotiation beyond `directline.botframework.com`:** out. No custom protocols.
 - **PSUBSCRIBE wildcard subscriptions:** considered for future optimization if SUBSCRIBE/UNSUBSCRIBE traffic becomes a hot path.
-- **Custom backplane drivers (NATS, in-memory clustering):** explicitly rejected per Bima's instruction. Strict Redis only.
+- **Custom backplane drivers (NATS, in-memory clustering):** explicitly rejected. Strict Redis only.
 - **JS client changes:** none required. Microsoft Web Chat library handles transport selection.
 - **`runtime-bootstrap.js` modifications for WS:** none — Microsoft library negotiates transport directly. Existing JS guest_id + token cache fix continues to apply at the HTTP layer.
 
 ---
 
-## 18. Open questions for Maarten
+## 18. Open questions for stakeholder review
 
 1. **Single-region vs multi-region target:** v1 is single-region. Is multi-region active-active required within 6 months? If yes, design needs additional spec (Redis Global Datastore / cross-region pub/sub pattern).
 2. **Rollout cadence:** dogfood tenant first, or direct to internal staging? Recommended: dogfood first.
