@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-30
 **Status:** Draft, pending review
-**Related repos:** `greentic-runner`, `greentic-messaging-providers`, `greentic-runner-host`
+**Related repos:** `greentic-start` (impl host), `greentic-runner`, `greentic-messaging-providers`
 
 ---
 
@@ -58,7 +58,7 @@ Polling remains supported as a fallback. No client-side change is required: sett
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
 | Transport | **WebSocket** (`Sec-WebSocket-Protocol: directline.botframework.com`) | Direct Line standard; native client support in `botframework-webchat`; ~5× cheaper than polling at 1000+ users (per cloud research). |
-| WS handler location | **`greentic-runner-host`** axum layer, not WASM component | WASM `ingest_http` is one-shot request/response — long-lived WS doesn't fit. axum has native `WebSocketUpgrade`; component still owns activity persistence + token verification. |
+| WS handler location | **`greentic-start`** HTTP ingress (`src/http_ingress/`, raw hyper), not WASM component | The `/v1/messaging/webchat/{tenant}/...` ingress already lives in `greentic-start` over raw hyper (not axum); `greentic-runner-host` only serves admin/operator routes. WASM `ingest_http` is one-shot request/response and unfit for long-lived WS. WS upgrade uses `hyper::upgrade::on(req)` plus `tokio-tungstenite::WebSocketStream::from_raw_socket` (or the `hyper-tungstenite` helper). Component still owns activity persistence + token verification. |
 | Cross-instance fan-out backplane | **Redis Pub/Sub** (managed service per cloud — ElastiCache / Memorystore / Azure Cache for Redis) | Industry standard (Slack, Discord, ASP.NET SignalR). All 3 target clouds offer first-class managed Redis. NATS rejected: greentic operator's `--nats off` default would force new infra; no managed NATS on AWS/GCP/Azure. Sticky sessions alone cannot solve the cross-instance push problem (confirmed across all 3 cloud docs). |
 | Backplane abstraction | **Strict Redis, no trait** | Matches CLAUDE.md guideline "don't introduce abstractions beyond what task requires". |
 | Frame format | Direct Line `ActivitySet` JSON, watermark-incremented | Microsoft spec; Web Chat library expects this. |
@@ -68,7 +68,7 @@ Polling remains supported as a fallback. No client-side change is required: sett
 | Polling compatibility | **Keep polling endpoint** (`GET /v3/directline/conversations/{id}/activities?watermark=N`) operational and fully functional | Hard cutover would break clients in restrictive networks (corporate firewalls that strip WS upgrade). Polling = fallback path. |
 | Migration strategy | Server adds WS, client lib auto-detects via response `streamUrl`, no JS change | Microsoft `botframework-webchat` upgrade detection logic handles fallback automatically. |
 | Resource limits scope | Per-tenant connection cap, per-IP connection cap, idle timeout, frame size limit, slow-consumer drop | All required for production; sized via tenant config (default sensible). |
-| Observability | OpenTelemetry traces + Prometheus metrics + structured logs | Match existing greentic-runner-host telemetry layer (`greentic-telemetry` workspace feature). |
+| Observability | OpenTelemetry traces + Prometheus metrics + structured logs | Match the existing `tracing`-based observability surface inside `greentic-start` (and the shared `greentic-telemetry` integration). |
 | Graceful shutdown | SIGTERM → fail readiness probe → send `1001 Going Away` close frames → 30 s drain → exit 0 | Honors LB connection draining on all 3 clouds; clients auto-reconnect via Web Chat lib reconnect logic. |
 
 ---
@@ -95,8 +95,8 @@ Polling remains supported as a fallback. No client-side change is required: sett
         ▼                      ▼                      ▼
 ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
 │ Replica 1    │       │ Replica 2    │       │ Replica N    │
-│ (axum)       │       │ (axum)       │       │ (axum)       │
-│              │       │              │       │              │
+│ (greentic-   │       │ (greentic-   │       │ (greentic-   │
+│  start hyper)│       │  start hyper)│       │  start hyper)│
 │ - WS handler │       │ - WS handler │       │ - WS handler │
 │ - WASM pool  │       │ - WASM pool  │       │ - WASM pool  │
 │ - Redis sub  │       │ - Redis sub  │       │ - Redis sub  │
@@ -115,27 +115,27 @@ Polling remains supported as a fallback. No client-side change is required: sett
 
 ### 5.2 Push flow
 
-1. **Client connects:** `GET /v3/directline/conversations/{id}/stream?watermark=N&t=JWT` → axum upgrades to WS.
-2. **Auth:** runner-host extracts JWT from query, calls existing `verify_token` (signing key from secrets store), confirms `conv` claim matches path conversation ID, confirms `(env, tenant)` claims match the request's resolved context.
-3. **Watermark catch-up:** runner-host calls `messaging-provider-webchat`'s WASM via the existing `handle_get_activities` flow (same JSON contract as polling) with `watermark=N`. Replays missed activities to the client as a single `ActivitySet` frame.
-4. **Subscribe:** runner-host issues `SUBSCRIBE webchat:activity:{tenant}:{conv_id}` on the shared Redis client. Stores the `(conv_id, mpsc::Sender<Frame>)` in a per-replica connection registry.
+1. **Client connects:** `GET /v3/directline/conversations/{id}/stream?watermark=N&t=JWT` → `greentic-start` performs the hyper upgrade to WS via `hyper::upgrade::on(req)` + `tokio-tungstenite::WebSocketStream::from_raw_socket` (or `hyper-tungstenite`).
+2. **Auth:** the ingress handler extracts JWT from query, calls existing `verify_token` (signing key from secrets store), confirms `conv` claim matches path conversation ID, confirms `(env, tenant)` claims match the request's resolved context.
+3. **Watermark catch-up:** the ingress handler calls `messaging-provider-webchat`'s WASM via the existing `dispatch_http_ingress` flow (same JSON contract as polling) with `watermark=N`. Replays missed activities to the client as a single `ActivitySet` frame.
+4. **Subscribe:** the ingress handler issues `SUBSCRIBE webchat:activity:{tenant}:{conv_id}` on the shared Redis client. Stores the `(conv_id, mpsc::Sender<Frame>)` in a per-replica connection registry.
 5. **Bot reply path:**
    - Bot or pack flow POSTs an activity to `/v3/directline/conversations/{id}/activities` (HTTP, can land on any replica).
    - WASM component stores activity in state store + bumps watermark (existing logic, unchanged).
    - WASM emits `events: Vec<ChannelMessageEnvelope>` in `HttpOutV1` (existing behaviour).
-   - runner-host intercepts the `events` field after WASM returns, **publishes** `webchat:activity:{tenant}:{conv_id}` on Redis with the activity payload as the message body.
+   - The ingress handler intercepts the `events` field after WASM returns, **publishes** `webchat:activity:{tenant}:{conv_id}` on Redis with the activity payload as the message body.
    - Every replica subscribed to that channel receives the message via its `SUBSCRIBE` connection.
    - Each replica looks up its local connection registry — for any WS sender bound to that `conv_id`, it pushes the frame.
-6. **Client disconnect:** runner-host removes the entry from the registry; if no other connection on this replica subscribes to the channel, it `UNSUBSCRIBE`s.
+6. **Client disconnect:** the ingress handler removes the entry from the registry; if no other connection on this replica subscribes to the channel, it `UNSUBSCRIBE`s.
 
 ### 5.3 Why publish on the producing replica, not from the WASM component
 
 Two options were considered for the publish step:
 
 - **(a) WASM publishes directly:** would require a WIT host API (`pubsub::publish(channel, payload)`) — extension surface change in `greentic-interfaces`, blast radius far beyond webchat.
-- **(b) runner-host publishes on behalf of WASM:** zero WIT change. After the WASM component returns `HttpOutV1 { events, ... }`, the runner-host iterates events and publishes those that match `provider=messaging-webchat-gui` on the corresponding Redis channel.
+- **(b) The ingress handler publishes on behalf of WASM:** zero WIT change. After the WASM component returns `HttpOutV1 { events, ... }`, the ingress code iterates events and publishes those that match `provider=messaging-webchat-gui` on the corresponding Redis channel.
 
-**Decision: (b).** Smaller blast radius, no contract change, and matches the existing operator intercept pattern at `runner-host/src/runner/...` (envelope routing already happens there).
+**Decision: (b).** Smaller blast radius, no contract change, and matches the existing intercept pattern at `greentic-start/src/ingress_dispatch.rs` (envelope handling already happens there).
 
 ---
 
@@ -210,13 +210,13 @@ Same as polling: every activity has a monotonic `watermark` (string-encoded inte
 
 ### 7.1 Token at upgrade
 
-JWT is passed via `?t=TOKEN` query parameter (Direct Line standard). The runner-host's `WebSocketUpgrade` handler:
+JWT is passed via `?t=TOKEN` query parameter (Direct Line standard). The ingress handler's WS upgrade flow:
 
 1. Extracts `t` from query.
 2. Loads the signing key (from secrets store via the same path WASM uses).
 3. Calls `verify_token(&signing_key, &token)` — same function as `messaging-provider-webchat/src/directline/http.rs::verify_token`.
 4. Asserts `claims.conv == path conversation_id` (existing logic in `handle_reconnect_conversation`).
-5. Asserts `claims.ctx.env == request_env` and `claims.ctx.tenant == request_tenant` (resolved via runner-host's tenant resolver).
+5. Asserts `claims.ctx.env == request_env` and `claims.ctx.tenant == request_tenant` (resolved via ingress handler's tenant resolver).
 6. If any check fails, return `401` and **do not upgrade**.
 
 ### 7.2 Token TTL during connection
@@ -387,7 +387,7 @@ WARN ws_pong_timeout conv_id=abc-123 tenant=demo replica=r2 last_pong_age_ms=112
 ERROR ws_redis_publish_failed channel=webchat:activity:demo:abc-123 err="connection refused" fallback=local_only
 ```
 
-Span context propagation: when WASM `POST /activities` returns, the runner-host extracts the trace context from `HttpOutV1` headers (existing pattern) and uses it to correlate the publish event with the originating activity.
+Span context propagation: when WASM `POST /activities` returns, the ingress handler extracts the trace context from `HttpOutV1` headers (existing pattern) and uses it to correlate the publish event with the originating activity.
 
 ---
 
@@ -421,7 +421,7 @@ runner:
 
 ### 11.3 In-flight HTTP requests
 
-Existing axum `serve_with_graceful_shutdown` already handles non-WS requests. WS drain is layered on top via the WS registry — see implementation plan task list.
+Existing hyper-based ingress shutdown in `greentic-start` already handles non-WS requests via the broadcast `oneshot` shutdown signal. WS drain is layered on top via the WS registry — see implementation plan task list.
 
 ---
 
@@ -584,7 +584,7 @@ docker run -d --name greentic-redis -p 6379:6379 redis:7-alpine
 REDIS_URL=redis://127.0.0.1:6379 cargo run --bin greentic-runner
 ```
 
-For single-instance local dev, Redis can be skipped — runner-host detects empty `REDIS_URL` and falls back to in-memory broadcast (works for one replica only). This **MUST NOT** be used in production; runner emits a warning log on startup.
+For single-instance local dev, Redis can be skipped — ingress handler detects empty `REDIS_URL` and falls back to in-memory broadcast (works for one replica only). This **MUST NOT** be used in production; runner emits a warning log on startup.
 
 ---
 
@@ -632,10 +632,10 @@ Sub-project 1 should land **before** sub-project 2 deploys to staging, so the st
 | Slow consumer (mobile on EDGE) | `mpsc` send returns full | Drop connection with `1011`; metric `slow_consumer`. Client reconnects on better network. |
 | Token expires mid-connection | Server timer at TTL-3min | Send `1008 token_expiring`; client refreshes token + reconnects. |
 | Pong timeout | No pong within 10 s of ping | Close `1011`; client reconnects. |
-| WASM component crashes | runner-host catches panic | WS path unaffected (axum layer is upstream of WASM). Returns appropriate HTTP error to ingest path. |
+| WASM component crashes | ingress handler catches panic | WS path unaffected (the hyper ingress layer is upstream of WASM). Returns appropriate HTTP error to ingest path. |
 | Replica crash / scale-in | `1001 Going Away` close on shutdown OR connection reset | Web Chat lib auto-reconnects to a different replica. Watermark catch-up replays missed activities. |
 | Network partition between replica and Redis | Redis subscriber connection drops | `ConnectionManager` auto-reconnects + RE-SUBSCRIBEs. During partition, push latency increases for cross-replica traffic; same-replica traffic unaffected. |
-| Conversation watermark gap (replica missed messages during Redis outage) | Watermark in stored state differs from incoming | On reconnect, runner-host runs catch-up replay (Section 5.2 step 3) — same path as initial upgrade. No special case. |
+| Conversation watermark gap (replica missed messages during Redis outage) | Watermark in stored state differs from incoming | On reconnect, ingress handler runs catch-up replay (Section 5.2 step 3) — same path as initial upgrade. No special case. |
 | Origin spoof | Allowlist check at upgrade | 403 Forbidden; metric `webchat_ws_origin_rejected_total`. |
 | DOS via mass upgrade attempts | Per-IP upgrade rate limit | 429; metric `webchat_ws_upgrade_rate_limited_total`. |
 
@@ -652,12 +652,12 @@ Sub-project 1 should land **before** sub-project 2 deploys to staging, so the st
 - Slow-consumer detection
 - Pong timeout state machine
 
-Target: 100% coverage of the new `runner-host/src/http/webchat_ws.rs` module (or whatever the final filename is).
+Target: 100% coverage of the new `greentic-start/src/http_ingress/webchat_ws.rs` module (or whatever the final filename is).
 
 ### 15.2 Integration
 
 - End-to-end: client connects → bot replies → client receives frame
-- Multi-replica via in-process `axum::Router` × 2 + embedded Redis (testcontainers): client A on replica 1, bot reply produced via replica 2's HTTP path → client A receives the frame within 200 ms
+- Multi-replica via two in-process `greentic-start` HTTP ingress instances + embedded Redis (testcontainers): client A on replica 1, bot reply produced via replica 2's HTTP path → client A receives the frame within 200 ms
 - Graceful shutdown drains all WS within budget
 - Token expiry triggers `1008 token_expiring`
 - Origin allowlist rejects spoof
@@ -767,5 +767,8 @@ The Microsoft Direct Line conformance suite is referenced from the Web Chat clie
 
 - `greentic-messaging-providers/components/messaging-provider-webchat/src/directline/http.rs` (current Direct Line server)
 - `greentic-messaging-providers/components/messaging-provider-webchat/src/directline/jwt.rs` (token signing/verification)
-- `greentic-runner/crates/greentic-runner-host/src/http/` (axum HTTP layer — target for WS handler)
+- `greentic-start/src/http_ingress/` (hyper-based HTTP ingress — target for WS handler)
+- `greentic-start/src/http_routes.rs` (route table for `/v1/messaging/webchat/{tenant}/v3/directline/{path*}`)
+- `greentic-start/src/ingress_dispatch.rs` (existing intercept point for `HttpOutV1.events` — extension target for the Redis publish hook)
+- `greentic-runner-host/src/http/` (axum admin/operator routes — separate from customer ingress)
 - `greentic-types/src/messaging/universal_dto.rs` (`HttpInV1`, `HttpOutV1`, `ChannelMessageEnvelope`)

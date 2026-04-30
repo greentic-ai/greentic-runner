@@ -4,11 +4,11 @@
 >
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Production-ready Direct Line v3 WebSocket transport in `greentic-runner-host`, with managed-Redis pub/sub fan-out for multi-replica horizontal scale, full graceful shutdown integration, resource limits, observability, and AWS/GCP/Azure deployment configs.
+**Goal:** Production-ready Direct Line v3 WebSocket transport in `greentic-start` (the existing hyper-based HTTP ingress for `/v1/messaging/...`), with managed-Redis pub/sub fan-out for multi-replica horizontal scale, full graceful shutdown integration, resource limits, observability, and AWS/GCP/Azure deployment configs.
 
-**Architecture:** axum `WebSocketUpgrade` handler in `greentic-runner-host/src/http/`, JWT-authenticated at upgrade via existing `verify_token` (linked from `webchat-directline-core` crate). Per-replica connection registry with bounded `mpsc` channels. Redis Pub/Sub backplane for cross-replica push (`webchat:activity:{tenant}:{conv_id}` channels). Server-emitted activities intercepted from `HttpOutV1.events` after WASM `ingest_http` returns and published to Redis. SIGTERM-aware graceful drain.
+**Architecture:** Hyper-based WS upgrade in `greentic-start/src/http_ingress/webchat_ws/`, using `hyper::upgrade::on(req)` plus `tokio-tungstenite::WebSocketStream::from_raw_socket` (or the `hyper-tungstenite` helper). JWT-authenticated at upgrade via existing `verify_token` (linked from `webchat-directline-core` crate). Per-replica connection registry with bounded `mpsc` channels. Redis Pub/Sub backplane for cross-replica push (`webchat:activity:{tenant}:{conv_id}` channels). Server-emitted activities intercepted from `HttpOutV1.events` after WASM `ingest_http` returns and published to Redis. SIGTERM-aware graceful drain via the existing oneshot signal.
 
-**Tech stack:** Rust 1.94, axum 0.8 (built-in `WebSocketUpgrade`), `tokio-tungstenite` (transitive via axum), `redis` 0.27+ async (`tokio` features + `connection-manager`), `serde_json`, `tracing`, `metrics` crate (existing in greentic-telemetry).
+**Tech stack:** Rust 1.95 (greentic-start MSRV), hyper 1 (already used), `hyper-tungstenite` 0.17 + `tokio-tungstenite` 0.24 for the WS layer, `redis` 0.27+ async (`tokio-comp`, `connection-manager`, `tls-native-tls` features), `serde_json`, `tracing`, `metrics` (via shared `greentic-telemetry`).
 
 **Total estimated effort:** 13-18 days across 8 phases. Phases C/D/E parallelizable across subagents.
 
@@ -16,37 +16,48 @@
 
 ## File structure
 
-### New files
+> **Implementation host:** `greentic-start` (standalone crate, raw hyper). The `/v1/messaging/...` ingress already lives there; `greentic-runner-host` only serves admin/operator routes and is NOT the right host for customer ingress changes. All paths below are relative to the `greentic-start` repo root unless otherwise noted. Cloud deploy configs and the runbook live in `greentic-runner` since they describe the operator container produced by that repo.
+
+### New files (in `greentic-start`)
 
 | Path | Purpose |
 |------|---------|
-| `crates/greentic-runner-host/src/http/webchat_ws.rs` | axum handler, registry, frame loop |
-| `crates/greentic-runner-host/src/http/webchat_ws/registry.rs` | per-replica `HashMap<ConvId, Vec<WsSender>>` + refcounted Redis subs |
-| `crates/greentic-runner-host/src/http/webchat_ws/redis_backplane.rs` | publisher + subscriber abstraction over `redis::aio::ConnectionManager` |
-| `crates/greentic-runner-host/src/http/webchat_ws/auth.rs` | JWT extraction + `verify_token` integration |
-| `crates/greentic-runner-host/src/http/webchat_ws/limits.rs` | per-tenant / per-IP / per-replica connection caps |
-| `crates/greentic-runner-host/src/http/webchat_ws/metrics.rs` | Prometheus metric definitions + helpers |
-| `crates/greentic-runner-host/tests/webchat_ws_e2e.rs` | end-to-end integration test (single replica) |
-| `crates/greentic-runner-host/tests/webchat_ws_multi_replica.rs` | two-replica + Redis testcontainers test |
-| `crates/greentic-runner-host/tests/webchat_ws_chaos.rs` | network partition / Redis kill / slow consumer scenarios |
-| `crates/greentic-runner-host/benches/webchat_ws_load.rs` | criterion bench: 10k concurrent connections |
+| `src/http_ingress/webchat_ws/mod.rs` | hyper-based WS upgrade handler, registry, frame loop |
+| `src/http_ingress/webchat_ws/registry.rs` | per-replica `HashMap<ConvId, Vec<WsSender>>` + refcounted Redis subs |
+| `src/http_ingress/webchat_ws/redis_backplane.rs` | publisher + subscriber over `redis::aio::ConnectionManager` |
+| `src/http_ingress/webchat_ws/auth.rs` | JWT extraction + `verify_token` integration |
+| `src/http_ingress/webchat_ws/limits.rs` | per-tenant / per-IP / per-replica connection caps |
+| `src/http_ingress/webchat_ws/metrics.rs` | Prometheus metric definitions + helpers |
+| `tests/webchat_ws_e2e.rs` | end-to-end integration test (single replica) |
+| `tests/webchat_ws_multi_replica.rs` | two-replica + Redis testcontainers test |
+| `tests/webchat_ws_chaos.rs` | network partition / Redis kill / slow consumer scenarios |
+| `benches/webchat_ws_load.rs` | criterion bench: 10k concurrent connections |
+
+### New files (in `greentic-runner`)
+
+| Path | Purpose |
+|------|---------|
 | `deploy/aws/webchat-ws.tf` | Terraform: ALB tweaks, target group, ECS task `stopTimeout`, ElastiCache Serverless |
-| `deploy/gcp/webchat-ws.sh` | `gcloud run deploy` script with WS-tuned flags + Memorystore connect |
-| `deploy/azure/webchat-ws.bicep` | Bicep: premium ingress, container app scale rules, Azure Cache for Redis |
+| `deploy/gcp/webchat-ws.sh` (+ `webchat-ws.service.yaml`) | `gcloud run deploy` with WS-tuned flags + Memorystore + sample Knative manifest |
+| `deploy/azure/webchat-ws.bicep` (+ `webchat-ws.parameters.json`) | Bicep: premium ingress, container app scale rules, Azure Cache for Redis |
 | `docs/runbooks/webchat-ws.md` | on-call runbook: connection-pool saturation, Redis outage response, replica drain mid-deploy |
 
-### Modified files
+### Modified files (in `greentic-start`)
 
 | Path | Change |
 |------|--------|
-| `Cargo.toml` (workspace) | add `redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-native-tls"] }` |
-| `crates/greentic-runner-host/Cargo.toml` | depend on workspace `redis`; new feature flag `webchat-ws` (default on) |
-| `crates/greentic-runner-host/src/http/mod.rs` | `pub mod webchat_ws;` + register route |
-| `crates/greentic-runner-host/src/http/router.rs` | add `/v3/directline/conversations/:id/stream` handler binding |
-| `crates/greentic-runner-host/src/host.rs` | inject Redis backplane into host state |
-| `crates/greentic-runner-host/src/runtime.rs` | hook envelope-emission interceptor to publish on Redis after WASM `ingest_http` returns events |
-| `crates/greentic-runner-host/src/lib.rs` | re-export `webchat_ws` types if needed by callers |
-| `components/messaging-provider-webchat/src/directline/http.rs` (in `greentic-messaging-providers`) | implement `POST /v3/directline/tokens/refresh` (currently 404) |
+| `Cargo.toml` | add `redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-native-tls", "tokio-native-tls-comp"] }`, `tokio-tungstenite = "0.24"`, `hyper-tungstenite = "0.17"`, `tokio-stream = "0.1"`. New feature flag `webchat-ws` (default on). |
+| `src/http_ingress/mod.rs` | inspect `Upgrade: websocket` header and route the request into the new module before normal HTTP dispatch |
+| `src/http_routes.rs` | add explicit `/v1/messaging/webchat/{tenant}/v3/directline/conversations/{conv_id}/stream` route entry (already covered by the wildcard but should be elevated for routing clarity + WS-specific behavior) |
+| `src/ingress_dispatch.rs` | hook envelope-emission interceptor to publish on Redis after WASM `ingest_http` returns events for `provider=messaging-webchat-gui` |
+| `src/messaging_app.rs` | inject Redis backplane handle into `HttpIngressState` |
+| `src/lib.rs` | re-export `webchat_ws` types if needed by callers |
+
+### Modified files (in `greentic-messaging-providers`)
+
+| Path | Change |
+|------|--------|
+| `components/messaging-provider-webchat/src/directline/http.rs` | implement `POST /v3/directline/tokens/refresh` (currently 404) |
 
 ---
 
@@ -72,38 +83,38 @@
 
 **Files:**
 - Modify: workspace `Cargo.toml`
-- Modify: `crates/greentic-runner-host/Cargo.toml`
+- Modify: `Cargo.toml`
 
 - [ ] **Step 1:** Add to `[workspace.dependencies]`:
   ```toml
   redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls-native-tls"], default-features = false }
   ```
-- [ ] **Step 2:** Add to `greentic-runner-host` `[dependencies]`: `redis.workspace = true`
-- [ ] **Step 3:** Add feature `webchat-ws = []` (default-on) to `greentic-runner-host`
-- [ ] **Verify:** `cargo build -p greentic-runner-host` succeeds
-- [ ] **Verify:** `cargo build -p greentic-runner-host --no-default-features` (without `webchat-ws`) succeeds — proves feature gate works
+- [ ] **Step 2:** Add to the `[dependencies]` table: `redis.workspace = true`
+- [ ] **Step 3:** Add feature `webchat-ws = []` (default-on) to greentic-start
+- [ ] **Verify:** `cargo build -p greentic-start` succeeds
+- [ ] **Verify:** `cargo build -p greentic-start --no-default-features` (without `webchat-ws`) succeeds — proves feature gate works
 
 ### Task 3: Module skeleton
 
 **Files:**
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/auth.rs`
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/registry.rs`
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/redis_backplane.rs`
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/limits.rs`
-- Create: `crates/greentic-runner-host/src/http/webchat_ws/metrics.rs`
-- Modify: `crates/greentic-runner-host/src/http/mod.rs`
+- Create: `src/http_ingress/webchat_ws/mod.rs`
+- Create: `src/http_ingress/webchat_ws/auth.rs`
+- Create: `src/http_ingress/webchat_ws/registry.rs`
+- Create: `src/http_ingress/webchat_ws/redis_backplane.rs`
+- Create: `src/http_ingress/webchat_ws/limits.rs`
+- Create: `src/http_ingress/webchat_ws/metrics.rs`
+- Modify: `src/http_ingress/mod.rs`
 
 - [ ] **Step 1:** Create empty modules with `pub` re-exports stub
 - [ ] **Step 2:** Wire into `http/mod.rs` behind `#[cfg(feature = "webchat-ws")]`
-- [ ] **Verify:** `cargo build -p greentic-runner-host`
+- [ ] **Verify:** `cargo build -p greentic-start`
 
 ### Task 4: WS upgrade handler with JWT auth
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/auth.rs`
-- Modify: `crates/greentic-runner-host/src/http/router.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/auth.rs`
+- Modify: `src/http_routes.rs`
 
 - [ ] **Step 1:** Implement `auth.rs`:
   - `extract_token_from_query(uri: &Uri) -> Option<String>` — parse `?t=`
@@ -132,7 +143,7 @@
 ### Task 5: Connection registry
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/registry.rs`
+- Modify: `src/http_ingress/webchat_ws/registry.rs`
 
 - [ ] **Step 1:** Define `ConnKey { tenant: String, conv_id: String }`
 - [ ] **Step 2:** Define `ConnRegistry`:
@@ -150,7 +161,7 @@
 ### Task 6: Watermark catch-up replay
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
 
 - [ ] **Step 1:** On socket open, read `watermark=N` from query
 - [ ] **Step 2:** Construct synthetic `HttpInV1` matching the polling `GET /activities` shape
@@ -162,7 +173,7 @@
 ### Task 7: Keepalive ping/pong
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
 
 - [ ] **Step 1:** Spawn ping task: `tokio::time::interval(Duration::from_secs(25))`
 - [ ] **Step 2:** Track `last_pong_at: Arc<AtomicU64>`
@@ -177,7 +188,7 @@
 ### Task 8: Redis publisher
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/redis_backplane.rs`
+- Modify: `src/http_ingress/webchat_ws/redis_backplane.rs`
 
 - [ ] **Step 1:** Define `Backplane { manager: redis::aio::ConnectionManager }` constructor from URL
 - [ ] **Step 2:** Implement `publish(channel: &str, payload: &[u8])` with retry + structured-log on failure
@@ -187,7 +198,7 @@
 ### Task 9: Redis subscriber loop
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/redis_backplane.rs`
+- Modify: `src/http_ingress/webchat_ws/redis_backplane.rs`
 
 - [ ] **Step 1:** Maintain dedicated subscriber connection (Pub/Sub mode blocks other commands)
 - [ ] **Step 2:** Spawn task that reads messages from subscriber and dispatches to `ConnRegistry::push(key_from_channel, payload)`
@@ -197,7 +208,7 @@
 ### Task 10: Hook publish into envelope emission
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/runtime.rs` (or wherever `HttpOutV1` events are processed)
+- Modify: `src/ingress_dispatch.rs` (or wherever `HttpOutV1` events are processed)
 
 - [ ] **Step 1:** Locate the path where runner-host receives `HttpOutV1` from WASM `ingest_http` and routes envelopes
 - [ ] **Step 2:** Add an interceptor: for each envelope where `metadata.get("provider") == Some("messaging-webchat-gui")`, derive channel from `(metadata.tenant, conversation_id)` and call `Backplane::publish`
@@ -207,8 +218,8 @@
 ### Task 11: Subscribe/unsubscribe lifecycle integration
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/registry.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/registry.rs`
 
 - [ ] **Step 1:** On `ConnRegistry::register(key, _)` returning `true` (first conn for this key), call `Backplane::subscribe(channel)`
 - [ ] **Step 2:** On `ConnRegistry::unregister(key, _)` returning `true` (last conn), call `Backplane::unsubscribe(channel)`
@@ -221,7 +232,7 @@
 ### Task 12: Resource limits
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/limits.rs`
+- Modify: `src/http_ingress/webchat_ws/limits.rs`
 
 - [ ] **Step 1:** Per-tenant connection cap (default 10000, configurable)
 - [ ] **Step 2:** Per-replica connection cap (default 5000)
@@ -234,7 +245,7 @@
 ### Task 13: Origin allowlist
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/limits.rs`
+- Modify: `src/http_ingress/webchat_ws/limits.rs`
 - Modify: tenant config schema
 
 - [ ] **Step 1:** Read `webchat.ws_origin_allowlist` from tenant config
@@ -258,7 +269,7 @@
 ### Task 15: Token-expiring close
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
 
 - [ ] **Step 1:** On socket open, schedule `tokio::time::sleep_until(claims.exp - 180s)`
 - [ ] **Step 2:** On wake, send `Close { code: 1008, reason: "token_expiring" }` and let read/write loops terminate naturally
@@ -271,7 +282,7 @@
 ### Task 16: Prometheus metrics
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/metrics.rs`
+- Modify: `src/http_ingress/webchat_ws/metrics.rs`
 
 - [ ] **Step 1:** Define metrics per spec §10.1:
   - `webchat_ws_connections_active` (gauge, labels: tenant, env)
@@ -287,7 +298,7 @@
 ### Task 17: Tracing & structured logs
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs`
+- Modify: `src/http_ingress/webchat_ws/mod.rs`
 
 - [ ] **Step 1:** Create per-connection span: `info_span!("webchat_ws", conv_id, tenant, env, replica_id)`
 - [ ] **Step 2:** Log open/close at INFO with full context
@@ -302,37 +313,37 @@
 ### Task 18: Unit tests
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/{auth,registry,limits,redis_backplane,metrics}.rs`
+- Modify: `src/http_ingress/webchat_ws/{auth,registry,limits,redis_backplane,metrics}.rs`
 
 - [ ] All edge cases per spec §15.1
-- [ ] **Verify:** `cargo test -p greentic-runner-host webchat_ws::` covers all modules; `cargo llvm-cov` shows ≥95% line coverage on new files
+- [ ] **Verify:** `cargo test -p greentic-start webchat_ws::` covers all modules; `cargo llvm-cov` shows ≥95% line coverage on new files
 
 ### Task 19: Integration tests (single replica)
 
 **Files:**
-- Create: `crates/greentic-runner-host/tests/webchat_ws_e2e.rs`
+- Create: `tests/webchat_ws_e2e.rs`
 
 - [ ] End-to-end: client connects → POST activity → client receives frame
 - [ ] Token expiry triggers `1008 token_expiring`
 - [ ] Origin allowlist rejects spoof
 - [ ] Per-IP upgrade rate limit triggers 429
 - [ ] Graceful shutdown drains all WS within budget
-- [ ] **Verify:** All scenarios pass with `cargo test -p greentic-runner-host --test webchat_ws_e2e`
+- [ ] **Verify:** All scenarios pass with `cargo test -p greentic-start --test webchat_ws_e2e`
 
 ### Task 20: Integration tests (multi-replica)
 
 **Files:**
-- Create: `crates/greentic-runner-host/tests/webchat_ws_multi_replica.rs`
+- Create: `tests/webchat_ws_multi_replica.rs`
 
-- [ ] Spin two `axum::Router` instances + Redis testcontainers
+- [ ] Spin two `hyper Service` instances + Redis testcontainers
 - [ ] Client A on replica 1, bot reply produced via replica 2's HTTP path → verify delivery within 200 ms
 - [ ] Watermark catch-up: simulate 1000 missed messages, verify all delivered in order
-- [ ] **Verify:** `cargo test -p greentic-runner-host --test webchat_ws_multi_replica`
+- [ ] **Verify:** `cargo test -p greentic-start --test webchat_ws_multi_replica`
 
 ### Task 21: Chaos tests
 
 **Files:**
-- Create: `crates/greentic-runner-host/tests/webchat_ws_chaos.rs`
+- Create: `tests/webchat_ws_chaos.rs`
 
 - [ ] Kill Redis container mid-traffic → verify reconnect + RE-SUBSCRIBE
 - [ ] Force replica restart with active connections → clients reconnect within 5 s
@@ -342,7 +353,7 @@
 ### Task 22: Load benchmark
 
 **Files:**
-- Create: `crates/greentic-runner-host/benches/webchat_ws_load.rs`
+- Create: `benches/webchat_ws_load.rs`
 
 - [ ] Criterion bench with 1k / 5k / 10k concurrent WS
 - [ ] Measure: upgrade rate, push latency p50/p99, memory per connection
@@ -408,7 +419,7 @@
 
 **Files:**
 - Modify: tenant config schema in `messaging-provider-webchat-gui`
-- Modify: `crates/greentic-runner-host/src/http/webchat_ws/mod.rs` (gate handler on flag)
+- Modify: `src/http_ingress/webchat_ws/mod.rs` (gate handler on flag)
 
 - [ ] Add `messaging-webchat-gui.websocket_enabled: bool` (default `false`)
 - [ ] When false, the `/stream` endpoint returns 501 (preserves current behaviour)
