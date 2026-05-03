@@ -4137,7 +4137,7 @@ mod tests {
         raw.insert(
             "handle_message".into(),
             json!({
-                "component": "oci://ghcr.io/greenticai/component/component-llm-openai:latest",
+                "component": "oci://ghcr.io/greenticai/component/component-llm-openai:stable",
                 "config": {
                     "provider": "ollama",
                     "base_url": "http://127.0.0.1:11434/v1",
@@ -4181,7 +4181,7 @@ mod tests {
         assert_eq!(
             payload.get("component"),
             Some(&Value::String(
-                "oci://ghcr.io/greenticai/component/component-llm-openai:latest".into()
+                "oci://ghcr.io/greenticai/component/component-llm-openai:stable".into()
             ))
         );
         assert_eq!(
