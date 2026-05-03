@@ -192,7 +192,7 @@ features = [
 ]
 
 [workspace.dependencies.wit-bindgen]
-version = "0.55"
+version = "0.57"
 default-features = false
 
 [workspace.dependencies.uuid]
