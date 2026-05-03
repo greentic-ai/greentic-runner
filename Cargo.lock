@@ -2132,7 +2132,7 @@ dependencies = [
  "humantime",
  "indexmap 2.14.0",
  "jsonschema 0.45.1",
- "lru 0.16.4",
+ "lru",
  "once_cell",
  "parking_lot",
  "proptest",
@@ -2211,7 +2211,7 @@ dependencies = [
  "greentic-secrets-spec",
  "greentic-types",
  "hkdf",
- "lru 0.17.0",
+ "lru",
  "once_cell",
  "rand 0.10.1",
  "reqwest 0.13.3",
@@ -3161,15 +3161,6 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
-
-[[package]]
-name = "lru"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
-dependencies = [
- "hashbrown 0.16.1",
-]
 
 [[package]]
 name = "lru"
