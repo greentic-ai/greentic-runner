@@ -1,0 +1,47 @@
+name: RC Build
+
+# Builds the greentic-runner binary as a release candidate for the
+# stable-e2e-gate. Dispatched by stable-rc-build.yml against a
+# release/v{X.Y.Z} branch.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Release branch to build from (e.g. release/v0.4.59)"
+        required: true
+        type: string
+      tag:
+        description: "RC tag to create (e.g. v0.4.59-rc.{run_id})"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Release branch to build from (e.g. release/v0.4.59)"
+        required: true
+        type: string
+      tag:
+        description: "RC tag to create (e.g. v0.4.59-rc.{run_id})"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: greenticai/.github/.github/workflows/release-binaries-rc.yml@main
+    with:
+      package: greentic-runner
+      binary: greentic-runner
+      ref: ${{ inputs.ref }}
+      tag: ${{ inputs.tag }}
+      extra-files: |
+        README.md
+        LICENSE
+    secrets: inherit
