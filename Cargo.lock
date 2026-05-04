@@ -2068,7 +2068,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "walkdir",
- "wasmparser 0.246.2",
+ "wasmparser 0.248.0",
  "wasmtime",
  "wasmtime-environ",
  "wasmtime-wasi",
@@ -2154,7 +2154,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
- "wasmparser 0.246.2",
+ "wasmparser 0.248.0",
  "wasmtime",
  "wasmtime-environ",
  "wasmtime-wasi",
@@ -2463,6 +2463,8 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -6088,7 +6090,6 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap 2.14.0",
  "semver",
- "serde",
 ]
 
 [[package]]
@@ -6110,8 +6111,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa4439c5eee9df71ee0c6efb37f63b1fcb1fec38f85f5142c54e7ed05d33091a"
 dependencies = [
  "bitflags",
+ "hashbrown 0.17.0",
  "indexmap 2.14.0",
  "semver",
+ "serde",
 ]
 
 [[package]]
