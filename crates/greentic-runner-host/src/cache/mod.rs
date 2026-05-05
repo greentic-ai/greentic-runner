@@ -192,14 +192,43 @@ impl CacheManager {
 
     pub async fn warmup(
         &self,
-        _engine: &Engine,
+        engine: &Engine,
         items: &[WarmupItem],
-        _mode: WarmupMode,
+        mode: WarmupMode,
     ) -> Result<WarmupReport> {
-        Ok(WarmupReport {
-            warmed: items.len() as u64,
-            skipped: 0,
-        })
+        let mut warmed: u64 = 0;
+        let mut skipped: u64 = 0;
+
+        for item in items {
+            if self.config.disk_enabled
+                && let Ok(Some(_)) = self.disk.try_read(&item.key)
+            {
+                skipped += 1;
+                continue;
+            }
+
+            let outcome = (|| -> Result<()> {
+                let serialized = engine.precompile_component(&item.bytes)?;
+                self.metrics.compiles.fetch_add(1, Ordering::Relaxed);
+                if self.config.disk_enabled {
+                    let meta = ArtifactMetadata::new(
+                        &self.profile,
+                        item.key.wasm_digest.clone(),
+                        serialized.len() as u64,
+                    );
+                    self.disk.write_atomic(&item.key, &serialized, &meta)?;
+                }
+                Ok(())
+            })();
+
+            match (outcome, mode) {
+                (Ok(()), _) => warmed += 1,
+                (Err(_), WarmupMode::BestEffort) => skipped += 1,
+                (Err(e), WarmupMode::Strict) => return Err(e),
+            }
+        }
+
+        Ok(WarmupReport { warmed, skipped })
     }
 
     pub fn doctor(&self) -> CacheDoctorReport {
@@ -218,6 +247,7 @@ impl CacheManager {
 #[derive(Clone, Debug)]
 pub struct WarmupItem {
     pub key: ArtifactKey,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
