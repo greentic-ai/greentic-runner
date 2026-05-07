@@ -205,7 +205,10 @@ async fn doctor_warmup_and_prune_report_expected_defaults() {
     let warmup = cache
         .warmup(
             &engine,
-            &[crate::cache::WarmupItem { key }],
+            &[crate::cache::WarmupItem {
+                key,
+                bytes: fixture_bytes(),
+            }],
             crate::cache::WarmupMode::BestEffort,
         )
         .await
@@ -220,4 +223,56 @@ async fn doctor_warmup_and_prune_report_expected_defaults() {
 
     let prune = cache.prune_disk(true).await.expect("prune");
     assert_eq!(prune.removed_entries, 0);
+}
+
+#[tokio::test]
+async fn warmup_writes_cwasm_to_disk_and_skips_existing() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let config = CacheConfig {
+        root: temp.path().to_path_buf(),
+        disk_enabled: true,
+        memory_enabled: false,
+        ..CacheConfig::default()
+    };
+    let cache = CacheManager::new(config.clone(), profile.clone());
+    let key = ArtifactKey::new(
+        profile.id().to_string(),
+        "sha256:warmup-precompile".to_string(),
+    );
+    let bytes = fixture_bytes();
+
+    let report = cache
+        .warmup(
+            &engine,
+            &[crate::cache::WarmupItem {
+                key: key.clone(),
+                bytes: bytes.clone(),
+            }],
+            crate::cache::WarmupMode::Strict,
+        )
+        .await
+        .expect("warmup");
+    assert_eq!(report.warmed, 1);
+    assert_eq!(report.skipped, 0);
+
+    let artifact_path = config
+        .disk_root(profile.id())
+        .join("artifacts/sha256_warmup-precompile.cwasm");
+    assert!(
+        artifact_path.exists(),
+        "expected cwasm at {artifact_path:?}"
+    );
+
+    let report2 = cache
+        .warmup(
+            &engine,
+            &[crate::cache::WarmupItem { key, bytes }],
+            crate::cache::WarmupMode::Strict,
+        )
+        .await
+        .expect("second warmup");
+    assert_eq!(report2.warmed, 0);
+    assert_eq!(report2.skipped, 1);
 }
