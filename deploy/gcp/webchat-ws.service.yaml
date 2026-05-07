@@ -1,0 +1,124 @@
+# =============================================================================
+#  Greentic WebChat operator — Cloud Run service manifest (declarative GitOps)
+# -----------------------------------------------------------------------------
+#  Spec source of truth:
+#    docs/superpowers/specs/2026-04-30-webchat-directline-websocket-design.md
+#  Implements the GCP variant from spec section 12.2. Use this manifest with:
+#
+#    gcloud run services replace deploy/gcp/webchat-ws.service.yaml \
+#      --region=${REGION} --project=${PROJECT_ID}
+#
+#  Placeholders to substitute via `sed -i` or your CI templating layer
+#  (the bash script `webchat-ws.sh` does this imperatively instead):
+#
+#    __PROJECT_ID__       — target GCP project id
+#    __REGION__           — Cloud Run region (default europe-west1)
+#    __OPERATOR_IMAGE__   — Artifact Registry image, fully qualified
+#    __VPC_NETWORK__      — projects/PROJECT/global/networks/NAME
+#    __VPC_SUBNET__       — projects/PROJECT/regions/REGION/subnetworks/NAME
+#    __SERVICE_ACCOUNT__  — runtime SA email
+#    __REDIS_HOST__       — Memorystore private IP (resolved post-create)
+#    __REDIS_PORT__       — Memorystore port (typically 6379)
+#    __REDIS_AUTH_SECRET__ — Secret Manager secret id holding the AUTH string
+#
+#  Example sed pipeline:
+#    sed -e "s|__PROJECT_ID__|${PROJECT_ID}|g" \
+#        -e "s|__REGION__|${REGION}|g" \
+#        -e "s|__OPERATOR_IMAGE__|${OPERATOR_IMAGE}|g" \
+#        -e "s|__VPC_NETWORK__|${VPC_NETWORK}|g" \
+#        -e "s|__VPC_SUBNET__|${VPC_SUBNET}|g" \
+#        -e "s|__SERVICE_ACCOUNT__|${SERVICE_ACCOUNT}|g" \
+#        -e "s|__REDIS_HOST__|${REDIS_HOST}|g" \
+#        -e "s|__REDIS_PORT__|${REDIS_PORT}|g" \
+#        -e "s|__REDIS_AUTH_SECRET__|${REDIS_AUTH_SECRET}|g" \
+#        deploy/gcp/webchat-ws.service.yaml | \
+#      gcloud run services replace - --region="${REGION}" --project="${PROJECT_ID}"
+# =============================================================================
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: greentic-webchat
+  namespace: __PROJECT_ID__
+  labels:
+    app: greentic-webchat
+    component: messaging-provider-webchat
+    transport: websocket
+  annotations:
+    # Region is encoded in the gcloud invocation; this annotation is informational.
+    run.googleapis.com/region: __REGION__
+    # Allow ingress from the public internet — required for browser WS clients.
+    run.googleapis.com/ingress: all
+spec:
+  template:
+    metadata:
+      # Revision-scoped annotations (Cloud Run reads these per template, NOT
+      # at the Service level).
+      annotations:
+        # gen2 execution env: full Linux + reliable SIGTERM trap.
+        # Spec 11.1 graceful shutdown sequence relies on SIGTERM handling.
+        run.googleapis.com/execution-environment: gen2
+
+        # Instance-based billing → no CPU throttling between requests, which
+        # is required for steady WS load (spec 12.2).
+        run.googleapis.com/cpu-throttling: "false"
+
+        # Best-effort sticky cookie (spec 5.1). Redis backplane (spec 8) covers
+        # gaps when stickiness fails (spec 16 risk register).
+        run.googleapis.com/sessionAffinity: "true"
+
+        # Direct VPC egress — modern replacement for the legacy Serverless VPC
+        # Connector. Required for private-IP access to Memorystore (spec 8.1).
+        run.googleapis.com/network-interfaces: >-
+          [{"network":"__VPC_NETWORK__","subnetwork":"__VPC_SUBNET__"}]
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+
+        # Scaling bounds. min=2 avoids cold-start drops on the first morning
+        # WS connect; max=20 caps blast radius (spec 12.2).
+        autoscaling.knative.dev/minScale: "2"
+        autoscaling.knative.dev/maxScale: "20"
+    spec:
+      # 60 min hard ceiling. Token TTL (~30 min, spec 7.2) forces a client
+      # reconnect well before this cap — the cap is purely a backstop.
+      timeoutSeconds: 3600
+
+      # 1 WS occupies 1 concurrent request slot. Cloud Run default 80 is too
+      # tight for the per-replica connection pool sized in spec 9.
+      containerConcurrency: 250
+
+      serviceAccountName: __SERVICE_ACCOUNT__
+
+      containers:
+        - name: webchat
+          image: __OPERATOR_IMAGE__
+          ports:
+            # Single h2c port omitted on purpose — see comment block below.
+            - name: http1
+              containerPort: 8080
+          # NOTE: do NOT add `name: h2c` here. End-to-end HTTP/2 breaks the
+          # WS upgrade in the Microsoft Web Chat library (spec 12.2 explicit
+          # warning). Cloud Run's `name: http1` enforces HTTP/1.1 → upgrade
+          # works; clients still get HTTPS termination at the LB.
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: REDIS_HOST
+              value: __REDIS_HOST__
+            - name: REDIS_PORT
+              value: "__REDIS_PORT__"
+            - name: RUST_LOG
+              value: info,greentic_runner=debug
+            - name: WEBCHAT_WS_ENABLED
+              value: "true"
+            - name: REDIS_AUTH
+              valueFrom:
+                secretKeyRef:
+                  # Spec 8.1: Memorystore auth + transit encryption are mandatory
+                  # in production. The AUTH string is generated on instance
+                  # create and mirrored into Secret Manager by webchat-ws.sh.
+                  name: __REDIS_AUTH_SECRET__
+                  key: latest
+  traffic:
+    - percent: 100
+      latestRevision: true
