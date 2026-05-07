@@ -181,6 +181,14 @@ fn build_component_v06_fixture() -> Result<PathBuf> {
         if let Some(val) = &offline {
             cmd.env("CARGO_NET_OFFLINE", val);
         }
+        // wasm32-wasip2 has no `profiler_builtins`; strip any inherited coverage
+        // instrumentation flags so the spawned build does not try to link it.
+        cmd.env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("LLVM_PROFILE_FILE")
+            .env_remove("CARGO_TARGET_DIR");
         let status = cmd.args(&args).status().context("build v0.6 component")?;
         if !status.success() {
             anyhow::bail!("failed to build component-v0-6 fixture");
