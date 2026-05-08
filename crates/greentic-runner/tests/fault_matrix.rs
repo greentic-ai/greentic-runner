@@ -52,6 +52,7 @@ impl Drop for EnvGuard {
 #[serial]
 async fn conformance_fault_matrix_passes() -> Result<()> {
     let _backend_guard = EnvGuard::set("SECRETS_BACKEND", "env");
+    ensure_state_store_component()?;
     let temp = TempDir::new()?;
     let packs_dir = temp.path().join("packs");
     fs::create_dir_all(&packs_dir)?;
@@ -183,4 +184,49 @@ fn fixture_path(relative: &str) -> PathBuf {
         .join("..")
         .join("..")
         .join(relative)
+}
+
+fn ensure_state_store_component() -> Result<PathBuf> {
+    let crates_root = fixture_path("tests/fixtures/runner-components");
+    let target_root = crates_root.join("target-test");
+    let crate_name = "state_store_component";
+    let base = target_root.join("wasm32-wasip2").join("release");
+    let candidates = [
+        base.join(format!("{crate_name}.wasm")),
+        base.join("deps").join(format!("{crate_name}.wasm")),
+    ];
+    if let Some(found) = candidates.iter().find(|p| p.exists()) {
+        return Ok(found.clone());
+    }
+
+    let crate_dir = crates_root.join(crate_name);
+    let status = Command::new("cargo")
+        .env("CARGO_NET_OFFLINE", "true")
+        .env("CARGO_TARGET_DIR", &target_root)
+        // wasm32-wasip2 has no `profiler_builtins`; strip any inherited
+        // coverage instrumentation flags so the spawned build does not try
+        // to link it under `cargo llvm-cov`.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("LLVM_PROFILE_FILE")
+        .current_dir(&crate_dir)
+        .args([
+            "build",
+            "--offline",
+            "--target",
+            "wasm32-wasip2",
+            "--release",
+        ])
+        .status()
+        .with_context(|| format!("failed to build component crate {crate_name}"))?;
+    if !status.success() {
+        anyhow::bail!("component build failed for {crate_name}");
+    }
+
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| anyhow::anyhow!("component artifact not found after build for {crate_name}"))
 }
