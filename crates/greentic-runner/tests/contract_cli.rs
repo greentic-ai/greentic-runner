@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use greentic_types::{
     ComponentCapabilities, ComponentManifest, ComponentProfiles, PackKind, PackManifest,
     ResourceHints, encode_pack_manifest,
@@ -161,9 +161,38 @@ fn build_component_pack_v06(component_path: &Path, pack_path: &Path) -> Result<(
 }
 
 fn fixture_component_v06_path() -> Result<PathBuf> {
-    let root = workspace_root().join("tests/assets/component-v0-6-dummy");
-    let wasm = root.join("target/wasm32-wasip2/release/component_v0_6_dummy.wasm");
-    if !wasm.exists() {
+    let workspace = workspace_root();
+    let root = workspace.join("tests/assets/component-v0-6-dummy");
+    let rel = Path::new("wasm32-wasip2/release/component_v0_6_dummy.wasm");
+
+    let find_wasm = || -> Option<PathBuf> {
+        // 1) Explicit Cargo target dir (common in CI).
+        if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+            let target_dir = PathBuf::from(target_dir);
+            let base = if target_dir.is_absolute() {
+                target_dir
+            } else {
+                workspace.join(target_dir)
+            };
+            if let Some(found) = search_target_dir(&base, rel) {
+                return Some(found);
+            }
+        }
+
+        // 2) Default workspace target dir (workspace member builds land here).
+        if let Some(found) = search_target_dir(&workspace.join("target"), rel) {
+            return Some(found);
+        }
+
+        // 3) Legacy/manual fixture-local target dir (older behavior).
+        search_target_dir(&root.join("target"), rel)
+    };
+
+    if let Some(wasm) = find_wasm() {
+        return Ok(wasm);
+    }
+
+    {
         let offline = std::env::var("CARGO_NET_OFFLINE").ok();
         let mut cmd = Command::new("cargo");
         let mut args: Vec<String> = vec![
@@ -183,12 +212,46 @@ fn fixture_component_v06_path() -> Result<PathBuf> {
         if let Some(val) = &offline {
             cmd.env("CARGO_NET_OFFLINE", val);
         }
+        // wasm32-wasip2 has no `profiler_builtins`; strip any inherited coverage
+        // instrumentation flags so the spawned build does not try to link it.
+        cmd.env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("LLVM_PROFILE_FILE")
+            .env_remove("CARGO_TARGET_DIR");
         let status = cmd.args(&args).status().context("build v0.6 component")?;
         if !status.success() {
             anyhow::bail!("failed to build component-v0-6 fixture");
         }
     }
-    Ok(wasm)
+
+    find_wasm().ok_or_else(|| {
+        anyhow!(
+            "built v0.6 fixture but couldn't find wasm artifact (expected under a cargo target dir)"
+        )
+    })
+}
+
+fn search_target_dir(base: &Path, rel: &Path) -> Option<PathBuf> {
+    let direct = base.join(rel);
+    if direct.exists() {
+        return Some(direct);
+    }
+
+    // CI often uses `--target-dir target/<name>`; scan `target/*/wasm32-wasip2/...`.
+    let entries = std::fs::read_dir(base).ok()?;
+    for entry in entries.flatten() {
+        let ft = entry.file_type().ok()?;
+        if !ft.is_dir() {
+            continue;
+        }
+        let cand = entry.path().join(rel);
+        if cand.exists() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 fn fixture_path(name: &str) -> PathBuf {
