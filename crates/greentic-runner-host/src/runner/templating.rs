@@ -51,9 +51,16 @@ fn render_template_string(raw: &str, ctx: &Value, options: TemplateOptions) -> R
     if let Some(expr) = extract_exact_expression(raw)
         && let Some(path) = parse_path_expression(expr)
     {
-        return resolve_path(ctx, &path)
-            .cloned()
-            .ok_or_else(|| anyhow!("template expression `{expr}` not found"));
+        return Ok(match resolve_path(ctx, &path) {
+            Some(value) => value.clone(),
+            None => {
+                tracing::warn!(
+                    template = expr,
+                    "template expression resolved to empty (path not found)"
+                );
+                Value::String(String::new())
+            }
+        });
     }
 
     if raw.contains("{{") {
@@ -253,6 +260,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rendered, json!(3));
+    }
+
+    #[test]
+    fn missing_exact_path_renders_empty_string() {
+        let ctx = json!({
+            "entry": { "input": { "metadata": { "user_question": "what" } } },
+            "prev": {},
+            "node": {},
+            "state": {},
+        });
+        let rendered = render_template_value(
+            &Value::String("{{entry.input.metadata.provider}}".to_string()),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(rendered, Value::String(String::new()));
     }
 
     #[test]
