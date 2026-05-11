@@ -20,7 +20,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.5.15"
+version = "1.1.0-dev.0"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -28,12 +28,12 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = ">=0.5.0-0, <0.6.0-0"
-greentic-session = ">=0.5.0-0, <0.6.0-0"
-greentic-state = ">=0.5.0-0, <0.6.0-0"
-greentic-config = ">=0.5.0-0, <0.6.0-0"
-greentic-config-types = ">=0.5.0-0, <0.6.0-0"
-greentic-secrets-lib = ">=0.5.0-0, <0.6.0-0"
+greentic-flow = ">=1.1.0-dev, <1.2.0-0"
+greentic-session = ">=1.1.0-dev, <1.2.0-0"
+greentic-state = ">=1.1.0-dev, <1.2.0-0"
+greentic-config = ">=1.1.0-dev, <1.2.0-0"
+greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
+greentic-secrets-lib = ">=1.1.0-dev, <1.2.0-0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -62,7 +62,7 @@ tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
 toml = "1"
-greentic-telemetry = ">=0.5.0-0, <0.6.0-0"
+greentic-telemetry = ">=1.1.0-dev, <1.2.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "43"
 wasmtime-wasi-tls = "43"
@@ -98,7 +98,7 @@ features = [
 ]
 
 [workspace.dependencies.greentic-types]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 features = [
     "std",
@@ -109,48 +109,48 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-distributor-client]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 features = [
     "dist-client",
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-oauth-sdk]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-oauth-host]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
