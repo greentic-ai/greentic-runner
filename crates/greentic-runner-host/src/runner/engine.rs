@@ -406,8 +406,17 @@ impl FlowEngine {
             .unwrap_or_else(|| snapshot.flow_id.clone());
         let flow_ir = self.get_or_load_flow(ctx.pack_id, &resume_flow).await?;
         let mut state = snapshot.state;
-        state.replace_input(input);
-        state.ensure_entry();
+        // Replace BOTH `input` AND `entry` with the new activity. The
+        // routing context (built by `build_routing_context`) reads
+        // `entry.input.metadata.*` for the synthesised `response.*` fields
+        // that conditional routes test against — keeping the snapshot's
+        // stale entry would make `response.action` perpetually empty and
+        // every condition fail, looping the user back to the wait point
+        // forever. `replace_input` only touches `state.input`, so we have
+        // to refresh `entry` ourselves; `ensure_entry` is a no-op once
+        // entry is non-null.
+        state.replace_input(input.clone());
+        state.entry = input;
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
             .await
     }
@@ -517,37 +526,79 @@ impl FlowEngine {
 
             match control {
                 NodeControl::Continue => {
-                    let (next, should_exit) = match &node.routing {
-                        Routing::Next { node_id } => (Some(node_id.clone()), false),
-                        Routing::End | Routing::Reply => (None, true),
-                        Routing::Branch { default, .. } => (default.clone(), default.is_none()),
+                    enum NextDecision {
+                        Next(NodeId),
+                        End,
+                        Wait,
+                    }
+                    let decision = match &node.routing {
+                        Routing::Next { node_id } => NextDecision::Next(node_id.clone()),
+                        Routing::End | Routing::Reply => NextDecision::End,
+                        Routing::Branch { default, .. } => match default {
+                            Some(target) => NextDecision::Next(target.clone()),
+                            None => NextDecision::End,
+                        },
                         Routing::Custom(raw) => {
-                            evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
+                            match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
+                            {
+                                CustomRoutingDecision::Next(nid) => NextDecision::Next(nid),
+                                CustomRoutingDecision::End => NextDecision::End,
+                                CustomRoutingDecision::Wait => NextDecision::Wait,
+                            }
                         }
                     };
 
-                    if should_exit {
-                        return Ok(FlowExecution::completed(
-                            state.finalize_with(Some(output.payload.clone())),
-                        ));
-                    }
-
-                    match next {
-                        Some(n) => current = n,
-                        None => {
+                    match decision {
+                        NextDecision::Next(n) => current = n,
+                        NextDecision::End => {
                             return Ok(FlowExecution::completed(
                                 state.finalize_with(Some(output.payload.clone())),
+                            ));
+                        }
+                        NextDecision::Wait => {
+                            // Conditional routing fell through. Pause at the
+                            // current node so the next inbound activity
+                            // resumes here and re-evaluates this node's
+                            // routing with the user's new submit payload.
+                            let mut snapshot_state = state.clone();
+                            snapshot_state.clear_egress();
+                            let snapshot = FlowSnapshot {
+                                pack_id: step_ctx.pack_id.to_string(),
+                                flow_id: step_ctx.flow_id.to_string(),
+                                next_flow: (current_flow_id != step_ctx.flow_id)
+                                    .then_some(current_flow_id.clone()),
+                                next_node: node_id.as_str().to_string(),
+                                state: snapshot_state,
+                            };
+                            let output_value = state.finalize_with(Some(output.payload.clone()));
+                            return Ok(FlowExecution::waiting(
+                                output_value,
+                                FlowWait {
+                                    reason: Some(format!(
+                                        "awaiting user submit at node `{}`",
+                                        node_id.as_str()
+                                    )),
+                                    snapshot,
+                                },
                             ));
                         }
                     }
                 }
                 NodeControl::Wait { reason } => {
-                    let (next, _) = match &node.routing {
-                        Routing::Next { node_id } => (Some(node_id.clone()), false),
-                        Routing::End | Routing::Reply => (None, true),
-                        Routing::Branch { default, .. } => (default.clone(), default.is_none()),
+                    let next: Option<NodeId> = match &node.routing {
+                        Routing::Next { node_id } => Some(node_id.clone()),
+                        Routing::End | Routing::Reply => None,
+                        Routing::Branch { default, .. } => default.clone(),
                         Routing::Custom(raw) => {
-                            evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
+                            match evaluate_custom_routing(raw, &output, &state, &flow_ir, &node_id)
+                            {
+                                CustomRoutingDecision::Next(nid) => Some(nid),
+                                // session.wait operator must have an
+                                // explicit forward target — both End and
+                                // Wait decisions collapse to "no next" and
+                                // surface the same error below.
+                                CustomRoutingDecision::End | CustomRoutingDecision::Wait => None,
+                            }
                         }
                     };
                     let resume_target = next.ok_or_else(|| {
@@ -1357,6 +1408,10 @@ impl ExecutionState {
         }
     }
 
+    /// Refresh `entry` from `input` if the snapshot was loaded without an
+    /// entry value. Kept for backwards compatibility with snapshots
+    /// persisted before the entry-refresh fix in `FlowEngine::resume`.
+    #[allow(dead_code)]
     fn ensure_entry(&mut self) {
         if self.entry.is_null() {
             self.entry = self.input.clone();
@@ -2185,7 +2240,23 @@ where
     i18n_entries
 }
 
-/// Evaluate custom routing (conditional routes) against node output and input.
+/// Outcome of `evaluate_custom_routing` for a node's `Routing::Custom` array.
+///
+/// `Next` advances the flow to the named target. `End` terminates the run.
+/// `Wait` pauses the run at the current node so the next inbound activity
+/// resumes here and re-evaluates the routing with the new context — this is
+/// what allows messaging flows (welcome → ... → confirm) to behave like a
+/// live conversation instead of restarting at the entry point on every
+/// click.
+#[derive(Debug)]
+pub(crate) enum CustomRoutingDecision {
+    Next(NodeId),
+    End,
+    Wait,
+}
+
+/// Evaluate a node's `Routing::Custom` array against the current execution
+/// context.
 ///
 /// Parses `Routing::Custom(Value)` as an array of `{condition, to}` objects.
 /// Conditions are simple equality expressions like `response.action == "about"`.
@@ -2202,7 +2273,7 @@ fn evaluate_custom_routing(
     state: &ExecutionState,
     flow_ir: &HostFlow,
     node_id: &NodeId,
-) -> (Option<NodeId>, bool) {
+) -> CustomRoutingDecision {
     let routes = match raw.as_array() {
         Some(arr) => arr,
         None => {
@@ -2211,7 +2282,7 @@ fn evaluate_custom_routing(
                 node_id = %node_id,
                 "custom routing is not an array; terminating"
             );
-            return (None, true);
+            return CustomRoutingDecision::End;
         }
     };
 
@@ -2219,11 +2290,13 @@ fn evaluate_custom_routing(
     // Start with output payload, then overlay entry and synthesised "response".
     let ctx = build_routing_context(output, state);
 
+    let mut has_condition = false;
     for route in routes {
         let condition = route.get("condition").and_then(|v| v.as_str());
         let to = route.get("to").and_then(|v| v.as_str());
 
         if let Some(cond) = condition {
+            has_condition = true;
             if evaluate_simple_condition(cond, &ctx)
                 && let Some(target) = to
                 && let Ok(nid) = NodeId::new(target)
@@ -2235,7 +2308,7 @@ fn evaluate_custom_routing(
                     target = target,
                     "conditional route matched"
                 );
-                return (Some(nid), false);
+                return CustomRoutingDecision::Next(nid);
             }
         } else if let Some(target) = to
             && let Ok(nid) = NodeId::new(target)
@@ -2246,16 +2319,31 @@ fn evaluate_custom_routing(
                 target = target,
                 "default route taken"
             );
-            return (Some(nid), false);
+            return CustomRoutingDecision::Next(nid);
         }
     }
 
-    tracing::warn!(
-        flow_id = %flow_ir.id,
-        node_id = %node_id,
-        "no conditional route matched; terminating"
-    );
-    (None, true)
+    // Fall-through. When the routing array contained at least one
+    // conditional entry, treat the unmatched fall-through as a pause: the
+    // user's next submission should be re-evaluated against this same
+    // node's routing rather than restarting the flow from the entry point.
+    // Routing arrays with no conditions at all (pure unconditional `out`
+    // terminators) remain true ends.
+    if has_condition {
+        tracing::debug!(
+            flow_id = %flow_ir.id,
+            node_id = %node_id,
+            "no conditional route matched; pausing run at current node for resume"
+        );
+        CustomRoutingDecision::Wait
+    } else {
+        tracing::warn!(
+            flow_id = %flow_ir.id,
+            node_id = %node_id,
+            "no route matched and no conditions present; terminating"
+        );
+        CustomRoutingDecision::End
+    }
 }
 
 /// Evaluate a simple condition expression like `response.action == "about"`.
@@ -3012,6 +3100,47 @@ mod tests {
             ))
             .unwrap_err();
         assert_eq!(err.to_string(), "redirect_limit");
+    }
+
+    /// Regression: a `Routing::Custom` array containing at least one
+    /// conditional entry must pause (return `Wait`) when no condition
+    /// matches, instead of terminating. Concrete bug it guards against:
+    /// every card click used to terminate the flow because the entry-card's
+    /// routing array didn't enumerate every downstream action, so users got
+    /// looped back to the entry on every interaction.
+    #[test]
+    fn evaluate_custom_routing_waits_when_conditional_falls_through() {
+        let raw_routing = json!([
+            { "condition": "response.action == \"go\"", "to": "next" },
+            { "out": true }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+        };
+        let current_node = NodeId::from_str("current").unwrap();
+        let output = NodeOutput::new(Value::Null);
+
+        // First case: empty action -> conditional does not match, must wait.
+        let mut state_empty = ExecutionState::new(json!({ "metadata": { "action": "" } }));
+        state_empty.entry = json!({ "metadata": { "action": "" } });
+        let decision_empty =
+            evaluate_custom_routing(&raw_routing, &output, &state_empty, &flow_ir, &current_node);
+        assert!(
+            matches!(decision_empty, CustomRoutingDecision::Wait),
+            "expected Wait on conditional fall-through, got {decision_empty:?}"
+        );
+
+        // Second case: action == "go" -> conditional matches, must advance.
+        let mut state_go = ExecutionState::new(json!({ "metadata": { "action": "go" } }));
+        state_go.entry = json!({ "metadata": { "action": "go" } });
+        let decision_go =
+            evaluate_custom_routing(&raw_routing, &output, &state_go, &flow_ir, &current_node);
+        match decision_go {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "next"),
+            other => panic!("expected Next(\"next\"), got {other:?}"),
+        }
     }
 }
 
