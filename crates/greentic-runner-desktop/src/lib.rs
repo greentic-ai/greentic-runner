@@ -126,6 +126,17 @@ pub struct RunOptions {
     /// providers in other packs (e.g., OAuth broker from a capability pack).
     pub cross_pack_resolver:
         Option<Arc<dyn greentic_runner_host::runner::engine::CrossPackResolver>>,
+    /// Directory where suspended `FlowSnapshot`s are persisted between
+    /// activities so a conversational flow can resume at the node the
+    /// previous run paused at (instead of restarting from the entry).
+    ///
+    /// Snapshots are keyed by `ctx.session_id`, so the caller must populate
+    /// `ctx.session_id` with a stable per-conversation identifier (e.g.
+    /// `{tenant}:{flow}:{conversation_id}`) for resume to engage. When
+    /// either this directory or `session_id` is missing, the runner
+    /// behaves exactly as before: a `FlowExecution::waiting` result is
+    /// surfaced as an `Err` and the snapshot is dropped.
+    pub session_state_dir: Option<PathBuf>,
 }
 
 impl Default for RunOptions {
@@ -265,6 +276,7 @@ pub fn desktop_defaults() -> RunOptions {
         allow_missing_hash: false,
         secrets_manager: None,
         cross_pack_resolver: None,
+        session_state_dir: None,
     }
 }
 
@@ -447,17 +459,63 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         mocks: Some(mock_ref),
     };
 
-    let execution = engine.execute(ctx, opts.input.clone()).await;
+    // Resume support: if the caller wired up a session_state_dir AND ctx
+    // carries a session_id, load any persisted snapshot for that session
+    // and resume the engine from there. Without either signal we fall
+    // back to a fresh execution at the flow entry.
+    let session_snapshot_path = session_snapshot_file(
+        opts.session_state_dir.as_deref(),
+        resolved_profile.session_id.as_str(),
+    );
+    let resume_snapshot = session_snapshot_path
+        .as_deref()
+        .and_then(load_session_snapshot);
+
+    let execution = if let Some(snapshot) = resume_snapshot {
+        engine.resume(ctx, snapshot, opts.input.clone()).await
+    } else {
+        engine.execute(ctx, opts.input.clone()).await
+    };
     let finished_at = OffsetDateTime::now_utc();
 
     let status = match execution {
         Ok(result) => match result.status {
-            greentic_runner_host::runner::engine::FlowStatus::Completed => RunCompletion::Ok,
+            greentic_runner_host::runner::engine::FlowStatus::Completed => {
+                // Flow ran to a real terminator — discard any stale resume
+                // snapshot so the next activity starts fresh at the entry.
+                if let Some(path) = session_snapshot_path.as_deref() {
+                    let _ = std::fs::remove_file(path);
+                }
+                RunCompletion::Ok
+            }
             greentic_runner_host::runner::engine::FlowStatus::Waiting(wait) => {
                 let reason = wait
                     .reason
+                    .clone()
                     .unwrap_or_else(|| "flow paused unexpectedly".to_string());
-                RunCompletion::Err(anyhow::anyhow!(reason))
+                if let Some(path) = session_snapshot_path.as_deref() {
+                    if let Err(err) = save_session_snapshot(path, &wait.snapshot) {
+                        // Persisting the snapshot is best-effort — losing
+                        // it just means the next activity restarts at the
+                        // entry, which is the pre-fix behaviour. Surface
+                        // the failure to the operator log via the run
+                        // result error and continue.
+                        RunCompletion::Err(anyhow::anyhow!(
+                            "{reason} (and failed to persist resume snapshot to {}: {err})",
+                            path.display()
+                        ))
+                    } else {
+                        // Successfully paused. Surface the run as Ok so
+                        // greentic-start can emit the rendered card and
+                        // wait for the user's next submission.
+                        RunCompletion::Ok
+                    }
+                } else {
+                    // No persistence configured — preserve the legacy
+                    // behaviour (treat pause as an error so the caller at
+                    // least sees that the run did not complete).
+                    RunCompletion::Err(anyhow::anyhow!(reason))
+                }
             }
         },
         Err(err) => RunCompletion::Err(err),
@@ -470,6 +528,56 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         .with_context(|| format!("failed to write run summary {}", run_json_path.display()))?;
 
     Ok(result)
+}
+
+/// Resolve the snapshot file path for a given session id.
+///
+/// Returns `None` if the caller didn't wire up `session_state_dir` or the
+/// session_id is empty/non-resumable — both cases mean "no persistence,
+/// run with fresh state".
+fn session_snapshot_file(session_state_dir: Option<&Path>, session_id: &str) -> Option<PathBuf> {
+    let dir = session_state_dir?;
+    if session_id.is_empty() {
+        return None;
+    }
+    let safe_id: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(dir.join(format!("{safe_id}.snapshot.json")))
+}
+
+/// Load a persisted `FlowSnapshot` from disk if one exists. Returns `None`
+/// when the file is missing or unreadable — the caller falls back to a
+/// fresh execution in that case (which is also the pre-resume behaviour).
+fn load_session_snapshot(
+    path: &Path,
+) -> Option<greentic_runner_host::runner::engine::FlowSnapshot> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist a `FlowSnapshot` to disk for later resume. Errors propagate to
+/// the caller so the run can surface "we paused but lost the snapshot" as
+/// a hard error rather than silently looping back to the flow entry.
+fn save_session_snapshot(
+    path: &Path,
+    snapshot: &greentic_runner_host::runner::engine::FlowSnapshot,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create session snapshot dir {}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(snapshot)
+        .with_context(|| "serialize session snapshot for persistence")?;
+    fs::write(path, bytes).with_context(|| format!("write session snapshot {}", path.display()))?;
+    Ok(())
 }
 
 fn apply_otlp_hook(hook: &OtlpHook) {
@@ -1497,6 +1605,58 @@ mod tests {
         let (redacted, paths) = redact_value(&original, "$");
         assert_eq!(redacted, original);
         assert!(paths.is_empty());
+    }
+
+    /// Regression: `save_session_snapshot` + `load_session_snapshot` must
+    /// round-trip an arbitrary `FlowSnapshot` byte-for-byte through JSON so
+    /// that resume sees exactly what was persisted at pause time. If
+    /// serialization ever drops a field (e.g. `next_flow` or any
+    /// `ExecutionState` member) the resumed run would silently restart at
+    /// the entry — which is the exact bug this whole change set fixes.
+    #[test]
+    fn session_snapshot_round_trip_through_disk() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let snapshot_path = tmp.path().join("session-1.snapshot.json");
+
+        let snapshot_json = json!({
+            "pack_id": "pack.demo",
+            "flow_id": "flow.welcome",
+            "next_node": "card-confirm",
+            "state": {
+                "entry": { "metadata": { "action": "confirm" } },
+                "input": { "metadata": { "action": "confirm" } },
+                "nodes": {},
+                "egress": [],
+                "redirect_count": 0
+            }
+        });
+        let original: greentic_runner_host::runner::engine::FlowSnapshot =
+            serde_json::from_value(snapshot_json.clone()).expect("deserialize seed snapshot");
+
+        save_session_snapshot(&snapshot_path, &original).expect("save snapshot");
+        let reloaded = load_session_snapshot(&snapshot_path).expect("load snapshot");
+
+        let original_value = serde_json::to_value(&original).unwrap();
+        let reloaded_value = serde_json::to_value(&reloaded).unwrap();
+        assert_eq!(
+            original_value, reloaded_value,
+            "snapshot must round-trip byte-for-byte through disk"
+        );
+    }
+
+    #[test]
+    fn session_snapshot_file_sanitizes_session_id() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let path = session_snapshot_file(Some(tmp.path()), "tenant/team:user-1.session")
+            .expect("snapshot path");
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("file name");
+        // `/` -> `_`, but `:`, `-`, `.` are preserved.
+        assert_eq!(file_name, "tenant_team:user-1.session.snapshot.json");
+        assert!(session_snapshot_file(None, "any").is_none());
+        assert!(session_snapshot_file(Some(tmp.path()), "").is_none());
     }
 
     #[test]
