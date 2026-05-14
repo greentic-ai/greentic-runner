@@ -903,6 +903,18 @@ mod tests {
         }
     }
 
+    fn args_for_report(report_path: Option<PathBuf>) -> ConformanceArgs {
+        ConformanceArgs {
+            packs: PathBuf::from("/tmp/unused"),
+            report: report_path,
+            level: ConformanceLevel::L1,
+            provider: None,
+            fail_fast: false,
+            trace: false,
+            faults: None,
+        }
+    }
+
     #[test]
     fn summarize_counts_pass_and_fail() {
         let summary = summarize(
@@ -913,6 +925,23 @@ mod tests {
         assert_eq!(summary.total, 2);
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn summarize_handles_empty_and_all_passing() {
+        let empty = summarize(&[], ConformanceLevel::L0);
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.passed, 0);
+        assert_eq!(empty.failed, 0);
+        assert_eq!(empty.level, "L0");
+
+        let all_pass = summarize(
+            &[sample_report("pass"), sample_report("pass")],
+            ConformanceLevel::L2,
+        );
+        assert_eq!(all_pass.passed, 2);
+        assert_eq!(all_pass.failed, 0);
+        assert_eq!(all_pass.level, "L2");
     }
 
     #[test]
@@ -929,11 +958,24 @@ mod tests {
     }
 
     #[test]
+    fn discover_packs_errors_on_missing_directory() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing = temp.path().join("does-not-exist");
+        let err = discover_packs(&missing).unwrap_err();
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
     fn helper_filters_and_activity_builder_behave() {
         assert!(matches_prefix("messaging-demo"));
+        assert!(matches_prefix("events-demo"));
+        assert!(matches_prefix("secrets-demo"));
         assert!(!matches_prefix("other-demo"));
         assert!(matches_provider("provider-slack", Some("slack")));
         assert!(!matches_provider("provider-webex", Some("slack")));
+        assert!(matches_provider("anything", None));
+        assert_eq!(level_label(ConformanceLevel::L0), "L0");
+        assert_eq!(level_label(ConformanceLevel::L1), "L1");
         assert_eq!(level_label(ConformanceLevel::L2), "L2");
 
         let activity = build_activity("pack.demo", "flow.demo", "message", Some("session-1"));
@@ -941,12 +983,108 @@ mod tests {
         assert_eq!(activity.flow_id(), Some("flow.demo"));
         assert_eq!(activity.flow_type(), Some("message"));
         assert_eq!(activity.session_id(), Some("session-1"));
+
+        let no_session = build_activity("pack.demo", "flow.demo", "message", None);
+        assert!(no_session.session_id().is_none());
     }
 
     #[test]
     fn structured_check_and_build_host_work() {
         let replies = vec![Activity::custom("one", serde_json::json!({"ok": true}))];
         assert!(is_structured(&replies));
+        // Empty list is vacuously structured.
+        assert!(is_structured(&[]));
         assert!(build_host(false).is_ok());
+        assert!(build_host(true).is_ok());
+    }
+
+    #[test]
+    fn emit_report_writes_pretty_json_to_path() -> Result<()> {
+        let temp = TempDir::new()?;
+        let nested = temp.path().join("nested/deeper");
+        let report_path = nested.join("report.json");
+        let args = args_for_report(Some(report_path.clone()));
+        let reports = vec![sample_report("pass"), sample_report("fail")];
+        emit_report(&args, reports)?;
+        assert!(report_path.exists(), "parent directory should be created");
+        let contents = fs::read_to_string(&report_path)?;
+        let parsed: Value = serde_json::from_str(&contents)?;
+        assert_eq!(parsed["summary"]["total"], 2);
+        assert_eq!(parsed["summary"]["passed"], 1);
+        assert_eq!(parsed["summary"]["failed"], 1);
+        assert_eq!(parsed["summary"]["level"], "L1");
+        assert_eq!(parsed["packs"][0]["status"], "pass");
+        Ok(())
+    }
+
+    #[test]
+    fn emit_report_prints_to_stdout_when_no_path() -> Result<()> {
+        let args = args_for_report(None);
+        // Should not panic or error when path is None (output goes to stdout).
+        emit_report(&args, vec![sample_report("pass")])
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn find_pack_path_matches_by_stem_then_substring() {
+        let alpha = PathBuf::from("/packs/messaging-conformance.gtpack");
+        let beta = PathBuf::from("/packs/other-pack.gtpack");
+        let gamma = PathBuf::from("/packs/something-with-fragment-inside.gtpack");
+        let paths = vec![alpha.clone(), beta.clone(), gamma.clone()];
+
+        // Exact stem match wins.
+        assert_eq!(find_pack_path(&paths, "messaging-conformance"), Some(alpha));
+        // Falls back to substring match when no stem matches.
+        assert_eq!(find_pack_path(&paths, "fragment"), Some(gamma));
+        // Returns None when neither match.
+        assert_eq!(find_pack_path(&paths, "absent"), None);
+    }
+
+    #[cfg(feature = "fault-injection")]
+    #[test]
+    fn write_fault_artifacts_creates_expected_files() -> Result<()> {
+        let temp = TempDir::new()?;
+        // write_fault_artifacts writes under target/fault-artifacts/<case_name>/<ts>/.
+        // Switch CWD to the tempdir so we don't pollute the real target dir.
+        let prev_cwd = std::env::current_dir()?;
+        std::env::set_current_dir(temp.path())?;
+        let result = (|| {
+            let case = FaultCase {
+                name: "case under test".to_string(),
+                pack: "messaging-conformance".to_string(),
+                flow: None,
+                faults: Vec::new(),
+                expect: FaultExpect {
+                    retries: 0,
+                    status: "pass".into(),
+                    dlq: false,
+                },
+                seed: None,
+            };
+            let inputs = serde_json::json!({"k": "v"});
+            let result = serde_json::json!({"status": "fail"});
+            let trace_src = temp.path().join("trace.txt");
+            fs::write(&trace_src, b"trace-bytes")?;
+            write_fault_artifacts(&case, &inputs, &result, Some(trace_src))?;
+
+            let root = temp.path().join("target").join("fault-artifacts");
+            let case_dir = root.join("case_under_test");
+            assert!(case_dir.exists(), "case dir should exist");
+            let timestamps: Vec<PathBuf> = fs::read_dir(&case_dir)?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .collect();
+            assert_eq!(timestamps.len(), 1, "exactly one timestamped run dir");
+            let run_dir = &timestamps[0];
+            assert!(run_dir.join("faults.json").exists());
+            assert!(run_dir.join("inputs.json").exists());
+            assert!(run_dir.join("result.json").exists());
+            assert!(run_dir.join("trace.txt").exists());
+            // No trace path: should still write the three JSON files.
+            write_fault_artifacts(&case, &inputs, &result, None)?;
+            Ok::<(), anyhow::Error>(())
+        })();
+        std::env::set_current_dir(prev_cwd)?;
+        result
     }
 }
