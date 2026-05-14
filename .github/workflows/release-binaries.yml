@@ -19,6 +19,7 @@ jobs:
     with:
       package: greentic-runner
       binary: greentic-runner
+      windows-archive-format: zip
       extra-files: |
         README.md
         LICENSE

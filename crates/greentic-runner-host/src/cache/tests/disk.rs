@@ -46,6 +46,32 @@ fn disk_cache_write_and_read_roundtrip() {
 }
 
 #[test]
+fn disk_cache_artifact_digest_filename_is_path_safe() {
+    let temp = TempDir::new().expect("temp dir");
+    let engine = wasmtime::Engine::default();
+    let profile = EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+    let root = build_cache_root(&temp, &profile);
+    let cache = DiskCache::new(root.clone(), profile.clone(), None);
+
+    let digest = "sha256:abc".to_string();
+    let key = ArtifactKey::new(profile.id().to_string(), digest.clone());
+    let bytes = b"hello".to_vec();
+    let meta = ArtifactMetadata::new(&profile, digest.clone(), bytes.len() as u64);
+    cache.write_atomic(&key, &bytes, &meta).expect("write");
+
+    let (artifact_path, meta_path) = artifact_paths(&root, &digest);
+    assert_eq!(
+        artifact_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("artifact filename"),
+        "sha256_abc.cwasm"
+    );
+    assert!(artifact_path.exists());
+    assert!(meta_path.exists());
+}
+
+#[test]
 fn disk_cache_metadata_mismatch_is_miss() {
     let temp = TempDir::new().expect("temp dir");
     let engine = wasmtime::Engine::default();
