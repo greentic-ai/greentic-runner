@@ -72,17 +72,44 @@ impl RuntimeKey {
             revision_id: Some(revision_id),
         }
     }
+
+    /// `true` for the tenant-only key produced by [`legacy`](Self::legacy).
+    pub fn is_legacy(&self) -> bool {
+        self.deployment_id.is_none() && self.bundle_id.is_none() && self.revision_id.is_none()
+    }
+}
+
+/// Build the next runtime map for a legacy (tenant-only) reload: install the
+/// freshly-resolved `legacy` entries and carry over every revision-keyed entry
+/// untouched. Revision runtimes are owned by the deployment lifecycle (B3/B4),
+/// not the pack watcher, so a tenant-pack reload must not evict them.
+fn merge_legacy_reload<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    mut legacy: HashMap<RuntimeKey, V>,
+) -> HashMap<RuntimeKey, V> {
+    for (key, value) in prev {
+        if !key.is_legacy() {
+            legacy.insert(key.clone(), value.clone());
+        }
+    }
+    legacy
 }
 
 /// Atomically swapped view of live tenant runtimes.
+///
+/// Reads are lock-free via `ArcSwap`. Mutations serialize on `write_lock` so a
+/// read-modify-write swap (e.g. a watcher reload preserving revision entries)
+/// cannot interleave with a concurrent insert and clobber the other's update.
 pub struct ActivePacks {
     inner: ArcSwap<HashMap<RuntimeKey, Arc<TenantRuntime>>>,
+    write_lock: Mutex<()>,
 }
 
 impl ActivePacks {
     pub fn new() -> Self {
         Self {
             inner: ArcSwap::from_pointee(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
@@ -115,7 +142,29 @@ impl ActivePacks {
         self.inner.load_full()
     }
 
+    /// Insert (or replace) a single tenant-only runtime, preserving all other
+    /// entries — including revision-keyed ones.
+    pub fn insert_pack(&self, tenant: &str, runtime: Arc<TenantRuntime>) {
+        let _guard = self.write_lock.lock();
+        let mut next = (*self.inner.load_full()).clone();
+        next.insert(RuntimeKey::legacy(tenant), runtime);
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Swap in a freshly-resolved set of tenant-only (legacy) runtimes while
+    /// carrying over every revision-keyed entry. Used by the pack watcher, whose
+    /// index is authoritative for tenant packs but not for deployment revisions.
+    pub fn replace_legacy(&self, legacy: HashMap<RuntimeKey, Arc<TenantRuntime>>) {
+        let _guard = self.write_lock.lock();
+        let prev = self.inner.load_full();
+        let next = merge_legacy_reload(&prev, legacy);
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Replace the entire map, dropping every entry (legacy and revision alike).
+    /// Used for full host stop.
     pub fn replace(&self, next: HashMap<RuntimeKey, Arc<TenantRuntime>>) {
+        let _guard = self.write_lock.lock();
         self.inner.store(Arc::new(next));
     }
 
@@ -495,6 +544,31 @@ mod runtime_key_tests {
         let same = RuntimeKey::revision("acme", deployment, bundle, rev_a);
         assert_ne!(key_a, key_b);
         assert_eq!(key_a, same);
+    }
+
+    #[test]
+    fn legacy_reload_preserves_revision_entries() {
+        let revision_key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1); // stale legacy, refreshed below
+        prev.insert(RuntimeKey::legacy("retired"), 2); // dropped: not in new index
+        prev.insert(revision_key.clone(), 99); // revision runtime: must survive
+
+        let mut legacy: HashMap<RuntimeKey, u32> = HashMap::new();
+        legacy.insert(RuntimeKey::legacy("acme"), 10);
+        legacy.insert(RuntimeKey::legacy("newcomer"), 20);
+
+        let next = merge_legacy_reload(&prev, legacy);
+
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&10));
+        assert_eq!(next.get(&RuntimeKey::legacy("newcomer")), Some(&20));
+        assert_eq!(next.get(&RuntimeKey::legacy("retired")), None);
+        assert_eq!(next.get(&revision_key), Some(&99));
     }
 
     #[test]

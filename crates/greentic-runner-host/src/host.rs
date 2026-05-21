@@ -14,7 +14,7 @@ use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
 use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
-use crate::runtime::{ActivePacks, RuntimeKey, TenantRuntime};
+use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
 use crate::storage::{
     DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
@@ -162,9 +162,7 @@ impl RunnerHost {
             .prepare_runtime(tenant, pack_path, archive_source)
             .await
             .with_context(|| format!("failed to load tenant {tenant}"))?;
-        let mut next = (*self.active.snapshot()).clone();
-        next.insert(RuntimeKey::legacy(tenant), runtime);
-        self.active.replace(next);
+        self.active.insert_pack(tenant, runtime);
         tracing::info!(tenant, pack = %pack_path.display(), "pack loaded");
         Ok(())
     }

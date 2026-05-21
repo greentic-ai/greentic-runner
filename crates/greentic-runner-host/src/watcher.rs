@@ -209,7 +209,7 @@ async fn reload_once(
 
         next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
     }
-    active.replace(next);
+    active.replace_legacy(next);
     health.record_reload_success();
     tracing::info!("pack reload completed successfully");
     Ok(())
