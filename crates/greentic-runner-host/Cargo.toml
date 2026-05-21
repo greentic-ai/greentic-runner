@@ -33,6 +33,7 @@ greentic-interfaces.workspace = true
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
 greentic-distributor-client.workspace = true
+greentic-deploy-spec.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
 greentic-secrets-lib.workspace = true
