@@ -28,13 +28,55 @@ use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
 use crate::trace::PackTraceInfo;
 use crate::wasi::RunnerWasiPolicy;
+use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::SecretRequirement;
 
 const RUNTIME_SECRETS_PACK_ID: &str = "_runner";
 
+/// Key identifying a live runtime in [`ActivePacks`].
+///
+/// Until the deployment producer lands (B3/B4), runtimes are inserted with
+/// `deployment_id`/`bundle_id`/`revision_id` all `None` via [`RuntimeKey::legacy`]
+/// — the tenant-only path. Once revisions route, the producer keys them with
+/// [`RuntimeKey::revision`] and dispatch resolves via [`ActivePacks::load_revision`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimeKey {
+    pub tenant: String,
+    pub deployment_id: Option<DeploymentId>,
+    pub bundle_id: Option<BundleId>,
+    pub revision_id: Option<RevisionId>,
+}
+
+impl RuntimeKey {
+    /// Tenant-only key for the pre-revision-routing path.
+    pub fn legacy(tenant: impl Into<String>) -> Self {
+        Self {
+            tenant: tenant.into(),
+            deployment_id: None,
+            bundle_id: None,
+            revision_id: None,
+        }
+    }
+
+    /// Fully-qualified key for a specific deployment/bundle/revision.
+    pub fn revision(
+        tenant: impl Into<String>,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            deployment_id: Some(deployment_id),
+            bundle_id: Some(bundle_id),
+            revision_id: Some(revision_id),
+        }
+    }
+}
+
 /// Atomically swapped view of live tenant runtimes.
 pub struct ActivePacks {
-    inner: ArcSwap<HashMap<String, Arc<TenantRuntime>>>,
+    inner: ArcSwap<HashMap<RuntimeKey, Arc<TenantRuntime>>>,
 }
 
 impl ActivePacks {
@@ -44,15 +86,36 @@ impl ActivePacks {
         }
     }
 
-    pub fn load(&self, tenant: &str) -> Option<Arc<TenantRuntime>> {
-        self.inner.load().get(tenant).cloned()
+    /// Look up the tenant-only (legacy) runtime. Compatibility helper for the
+    /// pre-revision-routing path; see [`load_revision`](Self::load_revision).
+    pub fn load_pack(&self, tenant: &str) -> Option<Arc<TenantRuntime>> {
+        self.inner.load().get(&RuntimeKey::legacy(tenant)).cloned()
     }
 
-    pub fn snapshot(&self) -> Arc<HashMap<String, Arc<TenantRuntime>>> {
+    /// Look up the runtime for a specific deployment/bundle/revision.
+    pub fn load_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Option<Arc<TenantRuntime>> {
+        self.inner
+            .load()
+            .get(&RuntimeKey::revision(
+                tenant,
+                deployment_id,
+                bundle_id,
+                revision_id,
+            ))
+            .cloned()
+    }
+
+    pub fn snapshot(&self) -> Arc<HashMap<RuntimeKey, Arc<TenantRuntime>>> {
         self.inner.load_full()
     }
 
-    pub fn replace(&self, next: HashMap<String, Arc<TenantRuntime>>) {
+    pub fn replace(&self, next: HashMap<RuntimeKey, Arc<TenantRuntime>>) {
         self.inner.store(Arc::new(next));
     }
 
@@ -397,5 +460,61 @@ impl Drop for TenantRuntime {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_key_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_keys_match_only_on_tenant() {
+        assert_eq!(RuntimeKey::legacy("acme"), RuntimeKey::legacy("acme"));
+        assert_ne!(RuntimeKey::legacy("acme"), RuntimeKey::legacy("other"));
+    }
+
+    #[test]
+    fn legacy_and_revision_keys_never_collide() {
+        let key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        assert_ne!(RuntimeKey::legacy("acme"), key);
+    }
+
+    #[test]
+    fn revision_keys_distinguish_revision_id() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_b);
+        let same = RuntimeKey::revision("acme", deployment, bundle, rev_a);
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a, same);
+    }
+
+    #[test]
+    fn map_lookup_separates_legacy_from_revision() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let revision = RevisionId::new();
+
+        let mut map: HashMap<RuntimeKey, u32> = HashMap::new();
+        map.insert(RuntimeKey::legacy("acme"), 1);
+        map.insert(
+            RuntimeKey::revision("acme", deployment, bundle.clone(), revision),
+            2,
+        );
+
+        assert_eq!(map.get(&RuntimeKey::legacy("acme")), Some(&1));
+        assert_eq!(
+            map.get(&RuntimeKey::revision("acme", deployment, bundle, revision)),
+            Some(&2)
+        );
+        assert_eq!(map.get(&RuntimeKey::legacy("ghost")), None);
     }
 }

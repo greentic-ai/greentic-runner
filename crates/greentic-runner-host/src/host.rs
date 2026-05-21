@@ -14,7 +14,7 @@ use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
 use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
-use crate::runtime::{ActivePacks, TenantRuntime};
+use crate::runtime::{ActivePacks, RuntimeKey, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
 use crate::storage::{
     DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
@@ -163,7 +163,7 @@ impl RunnerHost {
             .await
             .with_context(|| format!("failed to load tenant {tenant}"))?;
         let mut next = (*self.active.snapshot()).clone();
-        next.insert(tenant.to_string(), runtime);
+        next.insert(RuntimeKey::legacy(tenant), runtime);
         self.active.replace(next);
         tracing::info!(tenant, pack = %pack_path.display(), "pack loaded");
         Ok(())
@@ -172,7 +172,7 @@ impl RunnerHost {
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
         let runtime = self
             .active
-            .load(tenant)
+            .load_pack(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
         let (pack_id, flow_id) = resolve_flow_id(&runtime, &activity)?;
         let action = activity.action().map(|value| value.to_string());
@@ -218,7 +218,7 @@ impl RunnerHost {
 
     pub async fn tenant(&self, tenant: &str) -> Option<TenantHandle> {
         self.active
-            .load(tenant)
+            .load_pack(tenant)
             .map(|runtime| TenantHandle { runtime })
     }
 

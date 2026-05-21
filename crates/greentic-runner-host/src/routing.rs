@@ -186,7 +186,7 @@ where
                     axum::Json(json!({ "error": err.to_string() })),
                 )
             })?;
-            let runtime = server_state.active.load(&tenant).ok_or_else(|| {
+            let runtime = server_state.active.load_pack(&tenant).ok_or_else(|| {
                 (
                     StatusCode::NOT_FOUND,
                     axum::Json(json!({ "error": "tenant not loaded" })),
