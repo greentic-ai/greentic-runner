@@ -35,10 +35,9 @@ const RUNTIME_SECRETS_PACK_ID: &str = "_runner";
 
 /// Key identifying a live runtime in [`ActivePacks`].
 ///
-/// Until the deployment producer lands (B3/B4), runtimes are inserted with
-/// `deployment_id`/`bundle_id`/`revision_id` all `None` via [`RuntimeKey::legacy`]
-/// — the tenant-only path. Once revisions route, the producer keys them with
-/// [`RuntimeKey::revision`] and dispatch resolves via [`ActivePacks::load_revision`].
+/// Tenant-only entries use [`RuntimeKey::legacy`] (all id fields `None`);
+/// fully-qualified entries use [`RuntimeKey::revision`] (all `Some`). The two
+/// forms never collide, so both can coexist in the same map.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RuntimeKey {
     pub tenant: String,
@@ -81,8 +80,8 @@ impl RuntimeKey {
 
 /// Build the next runtime map for a legacy (tenant-only) reload: install the
 /// freshly-resolved `legacy` entries and carry over every revision-keyed entry
-/// untouched. Revision runtimes are owned by the deployment lifecycle (B3/B4),
-/// not the pack watcher, so a tenant-pack reload must not evict them.
+/// untouched. Revision runtimes are owned by the deployment lifecycle, not the
+/// pack watcher, so a tenant-pack reload must not evict them.
 fn merge_legacy_reload<V: Clone>(
     prev: &HashMap<RuntimeKey, V>,
     mut legacy: HashMap<RuntimeKey, V>,
