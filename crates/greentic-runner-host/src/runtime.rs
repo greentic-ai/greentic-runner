@@ -94,6 +94,20 @@ fn merge_legacy_reload<V: Clone>(
     legacy
 }
 
+/// Pure swap helper for [`ActivePacks::remove_revision`]: clone the prev map
+/// minus `key`, return it alongside the removed value. `None` when the key was
+/// absent so the caller can skip the `ArcSwap` store. Generic over `V` so the
+/// swap logic is testable without standing up a real `TenantRuntime`.
+fn remove_keyed_entry<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    key: &RuntimeKey,
+) -> Option<(HashMap<RuntimeKey, V>, V)> {
+    let removed = prev.get(key)?.clone();
+    let mut next = prev.clone();
+    next.remove(key);
+    Some((next, removed))
+}
+
 /// Atomically swapped view of live tenant runtimes.
 ///
 /// Reads are lock-free via `ArcSwap`. Mutations serialize on `write_lock` so a
@@ -158,6 +172,26 @@ impl ActivePacks {
         let prev = self.inner.load_full();
         let next = merge_legacy_reload(&prev, legacy);
         self.inner.store(Arc::new(next));
+    }
+
+    /// Remove and return the runtime for a single revision-keyed entry,
+    /// preserving every other entry (legacy and revision alike). Used by the
+    /// drain coordinator (`gtc op revisions drain`) after the drain window
+    /// closes to tear down exactly the one revision being retired. `None` if
+    /// no such entry was present — idempotent for safe re-runs.
+    pub fn remove_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Option<Arc<TenantRuntime>> {
+        let _guard = self.write_lock.lock();
+        let prev = self.inner.load_full();
+        let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
+        let (next, removed) = remove_keyed_entry(&prev, &key)?;
+        self.inner.store(Arc::new(next));
+        Some(removed)
     }
 
     /// Replace the entire map, dropping every entry (legacy and revision alike).
@@ -568,6 +602,58 @@ mod runtime_key_tests {
         assert_eq!(next.get(&RuntimeKey::legacy("newcomer")), Some(&20));
         assert_eq!(next.get(&RuntimeKey::legacy("retired")), None);
         assert_eq!(next.get(&revision_key), Some(&99));
+    }
+
+    #[test]
+    fn remove_keyed_entry_pops_only_the_targeted_key() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle, rev_b);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1);
+        prev.insert(key_a.clone(), 10);
+        prev.insert(key_b.clone(), 20);
+
+        let (next, removed) = remove_keyed_entry(&prev, &key_a).expect("present");
+        assert_eq!(removed, 10);
+        assert_eq!(next.get(&key_a), None);
+        assert_eq!(next.get(&key_b), Some(&20));
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&1));
+    }
+
+    #[test]
+    fn remove_keyed_entry_returns_none_for_missing_key() {
+        let prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        let ghost = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        assert!(remove_keyed_entry(&prev, &ghost).is_none());
+    }
+
+    #[test]
+    fn remove_keyed_entry_leaves_other_deployments_alone() {
+        let bundle = BundleId::from("bundle-a");
+        let dep_a = DeploymentId::new();
+        let dep_b = DeploymentId::new();
+        let rev = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", dep_a, bundle.clone(), rev);
+        let key_b = RuntimeKey::revision("acme", dep_b, bundle, rev);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(key_a.clone(), 100);
+        prev.insert(key_b.clone(), 200);
+
+        let (next, removed) = remove_keyed_entry(&prev, &key_a).expect("present");
+        assert_eq!(removed, 100);
+        assert_eq!(next.get(&key_b), Some(&200));
+        assert_eq!(next.len(), 1);
     }
 
     #[test]
