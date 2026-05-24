@@ -642,7 +642,11 @@ mod duration_ms {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u128(d.as_millis())
+        // as_millis() returns u128; AgentLimits durations are bounded
+        // by operator config and never approach u64::MAX (~584M years).
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = d.as_millis() as u64;
+        s.serialize_u64(ms)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_millis(u64::deserialize(d)?))
@@ -684,6 +688,8 @@ mod tests {
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(round.agent_id, original.agent_id);
         assert_eq!(round.limits.max_iter, 8);
+        assert_eq!(round.limits.timeout, Duration::from_secs(60));
+        assert_eq!(round.limits.llm_retry_backoff, Duration::from_millis(250));
     }
 }
 ```
