@@ -1,64 +1,138 @@
-// Minimal stubs — Task 1.4 replaces this with the full implementation.
-// These types satisfy the compile-time contract for `error.rs` tests and
-// the `lib.rs` re-exports (`AgentConfig`, `AgentLimits`, `LlmProviderRef`,
-// `ToolRef`).
+//! Per-agent configuration delivered by [`crate::ConfigProvider`].
+//!
+//! Defaults live in `AgentLimits::default()` per spec §5.2.
+//! Override per-tenant via the admin designer config UI; the runtime
+//! receives the resolved struct via the cached provider.
 
-/// Reference to an LLM provider and the model to use.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct LlmProviderRef {
-    /// Provider name (e.g. `"openai"`, `"anthropic"`).
-    pub provider: String,
-    /// Model identifier (e.g. `"gpt-4o"`, `"claude-3-5-sonnet"`).
-    pub model: String,
-}
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
-/// Reference to a tool available to the agent.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+/// Reference to a tool exposed by a `greentic-ext-runtime` extension.
+/// Composer extensions emit short names; runner-host derives full IDs
+/// (extension_id + tool_name) via `ExtensionRuntime::list_tools` before
+/// constructing the `AgentConfig` (see runner-host Phase 4).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRef {
-    /// Tool name as registered with the extension runtime.
-    pub name: String,
+    pub extension_id: String,
+    pub tool_name: String,
 }
 
-/// Per-agent runtime limits (token budgets, iteration caps, etc.).
-///
-/// All fields are optional so callers can use `..AgentLimits::default()` to
-/// fill in only the fields they care about.
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmProviderRef {
+    pub provider: String, // "openai" | "anthropic" | ...
+    pub model: String,    // "gpt-4o-mini" | "claude-3-haiku" | ...
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub agent_id: String,
+    pub system_prompt: String,
+    pub tools: Vec<ToolRef>,
+    pub llm: LlmProviderRef,
+    pub limits: AgentLimits,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentLimits {
-    /// Tenant-supplied override for the LLM-unavailability user message.
-    /// When `None` the built-in default from [`crate::error::AgentError::user_facing_message`]
-    /// is used.
+    /// Maximum Plan-Act-Observe iterations per step. Default: 8.
+    pub max_iter: u32,
+
+    /// Wall-clock timeout for the entire `step()` call. Default: 60s.
+    #[serde(with = "duration_secs")]
+    pub timeout: Duration,
+
+    /// Maximum retained conversation history turns. Default: 20.
+    /// Truncation drops oldest user-assistant pairs; system prompt
+    /// preserved.
+    pub max_history_turns: u32,
+
+    /// LLM retry attempts before declaring provider unavailable.
+    /// Default: 3.
+    pub llm_retry_attempts: u32,
+
+    /// Initial backoff for LLM retries; exponential. Default: 250ms.
+    #[serde(with = "duration_ms")]
+    pub llm_retry_backoff: Duration,
+
+    /// Tenant-configurable user-facing message when LLM is unavailable
+    /// after all retries.
     pub provider_failure_message: Option<String>,
 
-    /// Maximum Plan-Act-Observe iterations per step. `None` = runtime default.
-    pub max_iterations: Option<u32>,
-
-    /// Per-step wall-clock timeout in seconds. `None` = runtime default.
-    pub step_timeout_secs: Option<u64>,
-
-    /// Daily token budget across all sessions for this agent. `None` = unlimited.
-    pub daily_token_budget: Option<u64>,
+    /// Daily token cap per tenant. `None` = uncapped (MVP default).
+    pub daily_token_cap_per_tenant: Option<u32>,
 }
 
-/// Full agent configuration loaded by [`crate::ConfigProvider`].
-///
-/// Task 1.4 will extend this struct with additional fields (e.g. persona,
-/// memory profile, guardrails). The shape here is intentionally minimal so
-/// the error-module tests compile today.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct AgentConfig {
-    /// Stable agent identifier scoped to the owning tenant.
-    pub agent_id: String,
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            max_iter: 8,
+            timeout: Duration::from_secs(60),
+            max_history_turns: 20,
+            llm_retry_attempts: 3,
+            llm_retry_backoff: Duration::from_millis(250),
+            provider_failure_message: None,
+            daily_token_cap_per_tenant: None,
+        }
+    }
+}
 
-    /// System prompt injected as the first message in every LLM call.
-    pub system_prompt: String,
+mod duration_secs {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_secs(u64::deserialize(d)?))
+    }
+}
 
-    /// Tools available to this agent.
-    pub tools: Vec<ToolRef>,
+mod duration_ms {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u128(d.as_millis())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_millis(u64::deserialize(d)?))
+    }
+}
 
-    /// LLM provider and model selection.
-    pub llm: LlmProviderRef,
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
 
-    /// Runtime limits for this agent.
-    pub limits: AgentLimits,
+    #[test]
+    fn defaults_match_spec_5_2() {
+        let l = AgentLimits::default();
+        assert_eq!(l.max_iter, 8);
+        assert_eq!(l.timeout, Duration::from_secs(60));
+        assert_eq!(l.max_history_turns, 20);
+        assert_eq!(l.llm_retry_attempts, 3);
+        assert_eq!(l.llm_retry_backoff, Duration::from_millis(250));
+        assert!(l.provider_failure_message.is_none());
+        assert!(l.daily_token_cap_per_tenant.is_none());
+    }
+
+    #[test]
+    fn agent_config_roundtrips_through_json() {
+        let original = AgentConfig {
+            agent_id: "a-1".into(),
+            system_prompt: "be helpful".into(),
+            tools: vec![ToolRef {
+                extension_id: "http".into(),
+                tool_name: "fetch".into(),
+            }],
+            llm: LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o-mini".into(),
+            },
+            limits: AgentLimits::default(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let round: AgentConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(round.agent_id, original.agent_id);
+        assert_eq!(round.limits.max_iter, 8);
+    }
 }
