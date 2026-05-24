@@ -29,7 +29,7 @@ pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
-pub use telemetry::{StepTelemetryCtx, Telemetry};
+pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
 
 use std::sync::Arc;
