@@ -1,0 +1,29 @@
+[package]
+name        = "greentic-aw-runtime"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
+publish     = false
+
+[features]
+default   = []
+test-mock = []
+
+[dependencies]
+anyhow              = { workspace = true }
+async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
+chrono              = { version = "0.4", features = ["serde"] }
+futures             = { workspace = true }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.8-research" }
+greentic-state      = { workspace = true }
+greentic-telemetry  = { workspace = true }
+serde               = { version = "1", features = ["derive"] }
+serde_json          = { workspace = true }
+thiserror           = { workspace = true }
+tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing             = { workspace = true }
+uuid                = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
