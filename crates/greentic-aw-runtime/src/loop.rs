@@ -12,5 +12,7 @@ pub async fn run_step(
     _agent_id: &str,
     _message: AgentInput,
 ) -> Result<AgentOutput, AgentError> {
-    Err(AgentError::Internal("run_step not yet implemented".to_owned()))
+    Err(AgentError::Internal(
+        "run_step not yet implemented".to_owned(),
+    ))
 }

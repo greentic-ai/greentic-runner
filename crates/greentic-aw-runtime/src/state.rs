@@ -22,7 +22,13 @@ pub trait AgentStateStore: Send + Sync {
         &self,
         tenant: &TenantContext,
         session_id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConversationState>, StateError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Option<ConversationState>, StateError>>
+                + Send
+                + '_,
+        >,
+    >;
 
     fn save(
         &self,
@@ -35,5 +41,7 @@ pub trait AgentStateStore: Send + Sync {
         &self,
         tenant: &TenantContext,
         session_id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SessionLock, StateError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<SessionLock, StateError>> + Send + '_>,
+    >;
 }

@@ -40,33 +40,40 @@ use std::sync::Arc;
 /// (config, state, LLM, telemetry) plus a shared `Arc<ExtensionRuntime>`
 /// for tool dispatch. Call [`AgentRuntime::step`] per inbound user
 /// message.
+#[allow(dead_code)] // fields consumed by loop::run_step — stub until Task 1.11
 pub struct AgentRuntime {
     pub(crate) config_provider: Arc<dyn ConfigProvider>,
-    pub(crate) state_store:     Arc<dyn AgentStateStore>,
-    pub(crate) ext_runtime:     Arc<greentic_ext_runtime::ExtensionRuntime>,
-    pub(crate) llm:             Arc<dyn LlmBackend>,
-    pub(crate) telemetry:       Arc<dyn Telemetry>,
+    pub(crate) state_store: Arc<dyn AgentStateStore>,
+    pub(crate) ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
+    pub(crate) llm: Arc<dyn LlmBackend>,
+    pub(crate) telemetry: Arc<dyn Telemetry>,
 }
 
 impl AgentRuntime {
     pub fn new(
         config_provider: Arc<dyn ConfigProvider>,
-        state_store:     Arc<dyn AgentStateStore>,
-        ext_runtime:     Arc<greentic_ext_runtime::ExtensionRuntime>,
-        llm:             Arc<dyn LlmBackend>,
-        telemetry:       Arc<dyn Telemetry>,
+        state_store: Arc<dyn AgentStateStore>,
+        ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
+        llm: Arc<dyn LlmBackend>,
+        telemetry: Arc<dyn Telemetry>,
     ) -> Self {
-        Self { config_provider, state_store, ext_runtime, llm, telemetry }
+        Self {
+            config_provider,
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+        }
     }
 
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].
     pub async fn step(
         &self,
-        tenant:     TenantContext,
+        tenant: TenantContext,
         session_id: &str,
-        agent_id:   &str,
-        message:    AgentInput,
+        agent_id: &str,
+        message: AgentInput,
     ) -> Result<AgentOutput, AgentError> {
         r#loop::run_step(self, tenant, session_id, agent_id, message).await
     }
@@ -81,8 +88,8 @@ pub struct AgentInput {
 /// Outbound reply produced by [`AgentRuntime::step`].
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AgentOutput {
-    pub reply:         String,
-    pub trail:         Vec<AgentStep>,
+    pub reply: String,
+    pub trail: Vec<AgentStep>,
     pub terminated_by: TerminationReason,
 }
 
@@ -92,8 +99,20 @@ pub struct AgentOutput {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentStep {
-    ToolCall { name: String, call_id: String, result: serde_json::Value },
-    ToolCallReused { name: String, call_id: String },
-    ToolCallBlocked { name: String, reason: String },
-    Reply { text: String },
+    ToolCall {
+        name: String,
+        call_id: String,
+        result: serde_json::Value,
+    },
+    ToolCallReused {
+        name: String,
+        call_id: String,
+    },
+    ToolCallBlocked {
+        name: String,
+        reason: String,
+    },
+    Reply {
+        text: String,
+    },
 }

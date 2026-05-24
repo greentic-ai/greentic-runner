@@ -1,7 +1,7 @@
 // placeholder — filled in subsequent tasks
 
-use crate::error::ConfigError;
 use crate::config::AgentConfig;
+use crate::error::ConfigError;
 use crate::tenant::TenantContext;
 
 /// Loads [`AgentConfig`] for a given tenant + agent pair (Task 1.6).
@@ -14,5 +14,7 @@ pub trait ConfigProvider: Send + Sync {
         &self,
         tenant: &TenantContext,
         agent_id: &str,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentConfig, ConfigError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AgentConfig, ConfigError>> + Send + '_>,
+    >;
 }

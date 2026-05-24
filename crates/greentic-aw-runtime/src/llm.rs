@@ -17,7 +17,9 @@ pub trait LlmBackend: Send + Sync {
     fn complete(
         &self,
         request: LlmRequest,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LlmResponse, LlmError>> + Send + '_>>;
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<LlmResponse, LlmError>> + Send + '_>,
+    >;
 }
 
 /// Wraps an [`LlmBackend`] with exponential-backoff retry logic (Task 1.7).
