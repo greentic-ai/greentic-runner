@@ -24,7 +24,7 @@ pub mod tools;
 pub mod mock;
 
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
-pub use config_provider::ConfigProvider;
+pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
