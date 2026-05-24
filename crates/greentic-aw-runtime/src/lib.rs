@@ -40,10 +40,10 @@ use std::sync::Arc;
 /// (config, state, LLM, telemetry) plus a shared `Arc<ExtensionRuntime>`
 /// for tool dispatch. Call [`AgentRuntime::step`] per inbound user
 /// message.
-#[allow(dead_code)] // fields consumed by loop::run_step — stub until Task 1.11
 pub struct AgentRuntime {
     pub(crate) config_provider: Arc<dyn ConfigProvider>,
     pub(crate) state_store: Arc<dyn AgentStateStore>,
+    #[allow(dead_code)] // Phase 3 tool dispatch will read this
     pub(crate) ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) telemetry: Arc<dyn Telemetry>,

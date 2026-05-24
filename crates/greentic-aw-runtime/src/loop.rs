@@ -58,9 +58,7 @@ pub async fn run_step(
     let trail = vec![AgentStep::Reply {
         text: reply.clone(),
     }];
-    // tokens_in and tokens_out are u32; widening to u64 is lossless.
-    #[allow(clippy::cast_lossless)]
-    let total_tokens = (response.tokens_in as u64) + (response.tokens_out as u64);
+    let total_tokens = u64::from(response.tokens_in) + u64::from(response.tokens_out);
     runtime.telemetry.record_step(&StepTelemetryCtx {
         tenant_id: tenant.tenant_id.clone(),
         env_id: tenant.env_id.clone(),
