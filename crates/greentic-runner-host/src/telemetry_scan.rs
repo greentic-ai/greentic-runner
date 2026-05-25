@@ -123,7 +123,11 @@ fn split_optional_timestamp(line: &str) -> (&str, &str) {
     if line.len() >= 24
         && line.as_bytes().get(10) == Some(&b'T')
         && line.as_bytes().get(23) == Some(&b'Z')
-        && line.as_bytes().get(24).map(|c| c.is_ascii_whitespace()).unwrap_or(false)
+        && line
+            .as_bytes()
+            .get(24)
+            .map(|c| c.is_ascii_whitespace())
+            .unwrap_or(false)
     {
         (&line[..24], &line[24..])
     } else {
@@ -169,7 +173,10 @@ fn split_message_and_fields(rest: &str) -> (&str, Option<&str>) {
 }
 
 fn parse_fields(block: &str) -> Vec<(&str, &str)> {
-    block.split(", ").filter_map(|kv| kv.split_once('=')).collect()
+    block
+        .split(", ")
+        .filter_map(|kv| kv.split_once('='))
+        .collect()
 }
 
 /// Re-emit a parsed line through the `tracing` pipeline so it lands in any
@@ -403,10 +410,7 @@ impl AsyncWrite for TelemetryLineSink {
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -439,10 +443,7 @@ mod tests {
         assert_eq!(p.component, "messaging.webchat-gui");
         assert_eq!(p.file_line, "components/foo/src/lib.rs:160");
         assert_eq!(p.message, "span-start: send_payload");
-        assert_eq!(
-            p.fields,
-            vec![("id", "1"), ("event_kind", "send_payload")]
-        );
+        assert_eq!(p.fields, vec![("id", "1"), ("event_kind", "send_payload")]);
     }
 
     #[test]
