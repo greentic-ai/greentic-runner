@@ -88,7 +88,16 @@ impl RunnerWasiPolicy {
     pub(crate) fn instantiate(&self) -> Result<WasiCtx> {
         let mut builder = WasiCtxBuilder::new();
         if self.inherit_stdio {
-            builder.inherit_stdio();
+            // Route component stdout/stderr through the telemetry scanner so
+            // structured guest fallback lines from greentic-telemetry land in
+            // the host tracing pipeline (and from there in any configured
+            // OTLP exporter) rather than escaping as free-form text. Lines
+            // that don't match the telemetry format are forwarded verbatim
+            // to the host's real stdout/stderr, preserving legacy println!
+            // visibility.
+            builder.stdout(crate::telemetry_scan::TelemetryStream::stdout());
+            builder.stderr(crate::telemetry_scan::TelemetryStream::stderr());
+            builder.inherit_stdin();
         }
         let env_pairs = self.collect_env();
         if !env_pairs.is_empty() {
