@@ -178,7 +178,7 @@ default-features = false
 features = ["component-model", "cranelift", "runtime", "std"]
 
 [workspace.dependencies.wasmtime-environ]
-version = "43"
+version = "45"
 
 [workspace.dependencies.wasmtime-wasi]
 version = "43"
