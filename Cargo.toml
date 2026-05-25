@@ -181,7 +181,7 @@ features = ["component-model", "cranelift", "runtime", "std"]
 version = "43"
 
 [workspace.dependencies.wasmtime-wasi]
-version = "43"
+version = "45"
 default-features = false
 features = ["p2"]
 
