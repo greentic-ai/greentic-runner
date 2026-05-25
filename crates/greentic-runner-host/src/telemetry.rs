@@ -1,4 +1,4 @@
-use greentic_types::telemetry::set_current_tenant_ctx;
+use greentic_types::telemetry::{attr_keys, set_current_tenant_ctx};
 use greentic_types::{EnvId, TenantCtx, TenantId};
 use rand::{RngExt, rng};
 use std::str::FromStr;
@@ -66,10 +66,118 @@ pub fn set_flow_context(
     set_current_tenant_ctx(&ctx);
 }
 
+/// Deploy-spec rollout identifiers stamped onto the per-invocation
+/// [`TenantCtx`] for telemetry attribution (B11). All optional — the producer
+/// (the revision dispatcher resolving a deployment/revision) is Phase D, so
+/// today these are `None` and [`stamp_rollout_ids`] is a no-op.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutIds {
+    pub customer_id: Option<String>,
+    pub deployment_id: Option<String>,
+    pub bundle_id: Option<String>,
+    pub revision_id: Option<String>,
+}
+
+impl RolloutIds {
+    /// True when no identifier is set (the common case until Phase D wires the
+    /// dispatcher producer).
+    pub fn is_empty(&self) -> bool {
+        self.customer_id.is_none()
+            && self.deployment_id.is_none()
+            && self.bundle_id.is_none()
+            && self.revision_id.is_none()
+    }
+}
+
+/// Stamp the present rollout IDs onto `ctx.attributes` under the canonical
+/// [`attr_keys`](greentic_types::telemetry::attr_keys), so the telemetry bridge
+/// (`set_current_tenant_ctx`) copies them into `TelemetryCtx` for spans/logs.
+/// Absent IDs are left untouched — this never clears an existing attribute.
+pub fn stamp_rollout_ids(ctx: &mut TenantCtx, ids: &RolloutIds) {
+    if let Some(v) = &ids.customer_id {
+        ctx.attributes
+            .insert(attr_keys::CUSTOMER_ID.to_string(), v.clone());
+    }
+    if let Some(v) = &ids.deployment_id {
+        ctx.attributes
+            .insert(attr_keys::DEPLOYMENT_ID.to_string(), v.clone());
+    }
+    if let Some(v) = &ids.bundle_id {
+        ctx.attributes
+            .insert(attr_keys::BUNDLE_ID.to_string(), v.clone());
+    }
+    if let Some(v) = &ids.revision_id {
+        ctx.attributes
+            .insert(attr_keys::REVISION_ID.to_string(), v.clone());
+    }
+}
+
 pub fn backoff_delay_ms(base: u64, attempt: u32) -> u64 {
     let multiplier = 1_u64 << attempt.min(10);
     let exp = base.saturating_mul(multiplier);
     let mut rng = rng();
     let jitter = rng.random_range(0..=exp.min(1000));
     exp + jitter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> TenantCtx {
+        tenant_context("prod-eu", "acme", None, None, None, None)
+    }
+
+    #[test]
+    fn stamp_sets_present_ids_under_canonical_keys() {
+        let mut c = ctx();
+        let ids = RolloutIds {
+            customer_id: Some("cust-acme".into()),
+            deployment_id: Some("01JTKS".into()),
+            bundle_id: Some("customer.support".into()),
+            revision_id: Some("01JTKR".into()),
+        };
+        stamp_rollout_ids(&mut c, &ids);
+        assert_eq!(
+            c.attributes.get(attr_keys::CUSTOMER_ID).map(String::as_str),
+            Some("cust-acme")
+        );
+        assert_eq!(
+            c.attributes
+                .get(attr_keys::DEPLOYMENT_ID)
+                .map(String::as_str),
+            Some("01JTKS")
+        );
+        assert_eq!(
+            c.attributes.get(attr_keys::BUNDLE_ID).map(String::as_str),
+            Some("customer.support")
+        );
+        assert_eq!(
+            c.attributes.get(attr_keys::REVISION_ID).map(String::as_str),
+            Some("01JTKR")
+        );
+    }
+
+    #[test]
+    fn stamp_empty_is_noop() {
+        let mut c = ctx();
+        let before = c.attributes.len();
+        stamp_rollout_ids(&mut c, &RolloutIds::default());
+        assert_eq!(c.attributes.len(), before);
+        assert!(RolloutIds::default().is_empty());
+    }
+
+    #[test]
+    fn stamp_only_sets_present_subset() {
+        let mut c = ctx();
+        stamp_rollout_ids(
+            &mut c,
+            &RolloutIds {
+                deployment_id: Some("01JTKS".into()),
+                ..Default::default()
+            },
+        );
+        assert!(c.attributes.contains_key(attr_keys::DEPLOYMENT_ID));
+        assert!(!c.attributes.contains_key(attr_keys::CUSTOMER_ID));
+    }
 }
