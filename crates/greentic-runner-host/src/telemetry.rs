@@ -89,26 +89,29 @@ impl RolloutIds {
     }
 }
 
-/// Stamp the present rollout IDs onto `ctx.attributes` under the canonical
+/// Stamp the rollout IDs onto `ctx.attributes` under the canonical
 /// [`attr_keys`](greentic_types::telemetry::attr_keys), so the telemetry bridge
 /// (`set_current_tenant_ctx`) copies them into `TelemetryCtx` for spans/logs.
-/// Absent IDs are left untouched — this never clears an existing attribute.
+///
+/// Authoritative over these four keys: a present ID is written, an absent one
+/// is cleared. Stamping is therefore safe to re-run on a reused `TenantCtx`
+/// (e.g. a session that migrates between revisions) — an ID dropped on a
+/// re-stamp won't linger as a stale attribute from an earlier stamp.
 pub fn stamp_rollout_ids(ctx: &mut TenantCtx, ids: &RolloutIds) {
-    if let Some(v) = &ids.customer_id {
-        ctx.attributes
-            .insert(attr_keys::CUSTOMER_ID.to_string(), v.clone());
-    }
-    if let Some(v) = &ids.deployment_id {
-        ctx.attributes
-            .insert(attr_keys::DEPLOYMENT_ID.to_string(), v.clone());
-    }
-    if let Some(v) = &ids.bundle_id {
-        ctx.attributes
-            .insert(attr_keys::BUNDLE_ID.to_string(), v.clone());
-    }
-    if let Some(v) = &ids.revision_id {
-        ctx.attributes
-            .insert(attr_keys::REVISION_ID.to_string(), v.clone());
+    set_or_clear(ctx, attr_keys::CUSTOMER_ID, ids.customer_id.as_deref());
+    set_or_clear(ctx, attr_keys::DEPLOYMENT_ID, ids.deployment_id.as_deref());
+    set_or_clear(ctx, attr_keys::BUNDLE_ID, ids.bundle_id.as_deref());
+    set_or_clear(ctx, attr_keys::REVISION_ID, ids.revision_id.as_deref());
+}
+
+fn set_or_clear(ctx: &mut TenantCtx, key: &str, value: Option<&str>) {
+    match value {
+        Some(v) => {
+            ctx.attributes.insert(key.to_string(), v.to_string());
+        }
+        None => {
+            ctx.attributes.remove(key);
+        }
     }
 }
 
@@ -179,5 +182,35 @@ mod tests {
         );
         assert!(c.attributes.contains_key(attr_keys::DEPLOYMENT_ID));
         assert!(!c.attributes.contains_key(attr_keys::CUSTOMER_ID));
+    }
+
+    #[test]
+    fn stamp_clears_stale_ids_on_restamp() {
+        let mut c = ctx();
+        stamp_rollout_ids(
+            &mut c,
+            &RolloutIds {
+                customer_id: Some("cust-acme".into()),
+                deployment_id: Some("01JTKS".into()),
+                bundle_id: Some("customer.support".into()),
+                revision_id: Some("01JTKR".into()),
+            },
+        );
+        // Re-stamp with only a new revision (e.g. a session migrating revisions):
+        // the other three IDs must be cleared, not left stale from the first stamp.
+        stamp_rollout_ids(
+            &mut c,
+            &RolloutIds {
+                revision_id: Some("01JTKZ".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            c.attributes.get(attr_keys::REVISION_ID).map(String::as_str),
+            Some("01JTKZ")
+        );
+        assert!(!c.attributes.contains_key(attr_keys::CUSTOMER_ID));
+        assert!(!c.attributes.contains_key(attr_keys::DEPLOYMENT_ID));
+        assert!(!c.attributes.contains_key(attr_keys::BUNDLE_ID));
     }
 }
