@@ -59,3 +59,145 @@ async fn load_returns_empty_state_when_no_record_exists() {
     assert_eq!(loaded.session_id, session);
     assert!(loaded.messages.is_empty());
 }
+
+#[tokio::test]
+async fn load_returns_schema_incompatible_when_version_in_future() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+    let store = RedisAgentStateStore::connect(&url).await.unwrap();
+    let tc = TenantContext::new("test-acme", "test-prod");
+    let session = format!("future-{}", uuid::Uuid::new_v4());
+
+    // Direct Redis write of a state blob with schema_version=99.
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let key = format!("aw:test-acme:test-prod:{session}:state");
+    let payload = serde_json::json!({
+        "schema_version": 99,
+        "session_id": session,
+        "tenant_id":  "test-acme",
+        "env_id":     "test-prod",
+        "messages":   [],
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    });
+    use redis::AsyncCommands;
+    let _: () = conn.set_ex(&key, payload.to_string(), 60).await.unwrap();
+
+    let err = store.load(&tc, &session).await.unwrap_err();
+    match err {
+        greentic_aw_runtime::error::StateError::SchemaIncompatible { found, supported } => {
+            assert_eq!(found, 99);
+            assert_eq!(supported, 1);
+        }
+        other => panic!("expected SchemaIncompatible, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn second_acquire_lock_blocks_until_first_releases() {
+    let Some(_) = redis_url() else {
+        return;
+    };
+    let store_a = make_store().await;
+    let store_b = make_store().await;
+    let tc = TenantContext::new("test-acme", "test-prod");
+    let session = format!("lock-{}", uuid::Uuid::new_v4());
+
+    let lock1 = store_a
+        .acquire_lock(&tc, &session, std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    // Concurrent acquire from store_b should time out within ~500ms.
+    let started = std::time::Instant::now();
+    let result = store_b
+        .acquire_lock(&tc, &session, std::time::Duration::from_millis(500))
+        .await;
+    assert!(started.elapsed() >= std::time::Duration::from_millis(400));
+    assert!(matches!(
+        result,
+        Err(greentic_aw_runtime::error::StateError::LockTimeout(_))
+    ));
+
+    drop(lock1);
+    // After drop, the lock releases (best-effort) within ~200ms.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let lock2 = store_b
+        .acquire_lock(&tc, &session, std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+    drop(lock2);
+}
+
+#[tokio::test]
+async fn lock_refresh_extends_ttl() {
+    let Some(url) = redis_url() else {
+        return;
+    };
+    let store = make_store().await;
+    let tc = TenantContext::new("test-acme", "test-prod");
+    let session = format!("refresh-{}", uuid::Uuid::new_v4());
+
+    let lock = store
+        .acquire_lock(&tc, &session, std::time::Duration::from_millis(500))
+        .await
+        .unwrap();
+
+    // Inspect the raw TTL.
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let key = format!("aw:test-acme:test-prod:{session}:lock");
+    use redis::AsyncCommands;
+    let ttl_before: i64 = conn.ttl(&key).await.unwrap();
+    assert!(
+        ttl_before > 80,
+        "expected initial TTL ~90s, got {ttl_before}"
+    );
+
+    // Wait, then refresh.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    lock.refresh().await.unwrap();
+    let ttl_after: i64 = conn.ttl(&key).await.unwrap();
+    assert!(
+        ttl_after > ttl_before - 1,
+        "refresh should reset TTL to ~90, got {ttl_after}"
+    );
+    drop(lock);
+}
+
+#[tokio::test]
+#[allow(clippy::panic)] // diagnostic else-branch in test — intentional
+async fn two_tenants_share_redis_without_cross_talk() {
+    let Some(_) = redis_url() else {
+        return;
+    };
+    let store = make_store().await;
+    let a = TenantContext::new("acme", "prod");
+    let b = TenantContext::new("beta", "prod");
+    let session = format!("shared-{}", uuid::Uuid::new_v4());
+
+    let mut state_a = ConversationState::empty(&a, &session);
+    state_a.messages.push(ChatMessage::User {
+        content: "from-acme".into(),
+    });
+    store.save(&a, &session, &state_a).await.unwrap();
+
+    let mut state_b = ConversationState::empty(&b, &session);
+    state_b.messages.push(ChatMessage::User {
+        content: "from-beta".into(),
+    });
+    store.save(&b, &session, &state_b).await.unwrap();
+
+    let loaded_a = store.load(&a, &session).await.unwrap();
+    let loaded_b = store.load(&b, &session).await.unwrap();
+    if let (ChatMessage::User { content: ca }, ChatMessage::User { content: cb }) =
+        (&loaded_a.messages[0], &loaded_b.messages[0])
+    {
+        assert_eq!(ca, "from-acme");
+        assert_eq!(cb, "from-beta");
+    } else {
+        panic!("expected User messages on both tenants");
+    }
+}
