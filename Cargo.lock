@@ -1902,6 +1902,7 @@ dependencies = [
  "greentic-state",
  "greentic-telemetry 1.1.0-dev.25375809033",
  "redis",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
