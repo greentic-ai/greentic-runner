@@ -86,6 +86,7 @@ mod tests {
     use crate::llm::LlmResponse;
     use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
     use crate::tenant::TenantContext;
+    use crate::{AgentInput, AgentRuntime};
 
     fn cfg() -> AgentConfig {
         AgentConfig {
@@ -101,20 +102,8 @@ mod tests {
     }
 
     /// Happy-path loop test: one LLM call → reply, telemetry recorded.
-    ///
-    /// Marked `#[ignore]` because `greentic_ext_runtime::ExtensionRuntime::for_test()`
-    /// does not yet exist in the pinned `v1.2.8-research` tag.
-    /// See <https://github.com/greentic-biz/greentic-designer-extensions/issues/66>.
-    /// When the upstream shim lands: remove `#[ignore]`, restore the full body
-    /// from the commit message / issue comments, and delete this placeholder.
     #[tokio::test]
-    #[ignore = "needs ExtensionRuntime::for_test() shim from greentic-ext-runtime — see https://github.com/greentic-biz/greentic-designer-extensions/issues/66"]
     async fn happy_path_returns_llm_reply() {
-        // ExtensionRuntime::for_test() does not yet exist in v1.2.8-research.
-        // The full test body (AgentRuntime::new + step + assertions) lives in
-        // the issue linked in the #[ignore] attribute above. This placeholder
-        // keeps the test visible in `cargo test -- --list` so Phase 3 devs
-        // know it exists without needing to hunt the git log.
         let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
             content: Some("hi from llm".into()),
             tool_calls: vec![],
@@ -127,6 +116,22 @@ mod tests {
         let tc = TenantContext::new("acme", "prod");
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
-        let _ = (cp, store, llm, telemetry, tc);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry.clone());
+
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "hi from llm");
+        assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
     }
 }

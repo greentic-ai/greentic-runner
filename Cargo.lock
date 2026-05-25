@@ -1971,7 +1971,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "1.2.8"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.8-research#be942ca89faabe26329a5dc70277836a9572c815"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.10-research#58b98884a9331adbce9ce4d8e076f2e535faeefc"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1994,9 +1994,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.2.1-research"
+version = "1.2.3-research"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dd994ac7f30d020d687d0bfe66b79216c6ca6c9a80e73ed7714b3e9d2b2cb24b"
+checksum = "02faefc200f17874d4b541e277831571a0f26fb48846d484e9cd630e6bcbe8bb"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -15,7 +15,7 @@ anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 chrono              = { version = "0.4", features = ["serde"] }
 futures             = { workspace = true }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.8-research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.10-research" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
