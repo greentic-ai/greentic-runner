@@ -1,128 +1,101 @@
 [workspace]
 members = [
     "crates/greentic-runner",
-    "crates/greentic-runner-host",
     "crates/greentic-runner-desktop",
-    "crates/tests",
+    "crates/greentic-runner-host",
     "crates/runner-core",
-    "tests/fixtures/packs/secrets_store_smoke/components",
+    "crates/tests",
     "tests/assets/component-v0-6-dummy",
+    "tests/fixtures/packs/secrets_store_smoke/components",
 ]
 resolver = "2"
 exclude = [
-    "tests/fixtures/oauth-broker-component",
+    "tests/assets/provider-core-dummy",
     "tests/fixtures/component-echo",
+    "tests/fixtures/oauth-broker-component",
     "tests/fixtures/runner-components",
     "tests/fixtures/wasi-p2-smoke",
-    "tests/assets/provider-core-dummy",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.5.17"
+version = "0.5.18"
 
 [workspace.dependencies]
+anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
-anyhow = "1"
 base64 = "0.22"
+blake3 = "1"
+bytes = "1"
+criterion = "0.8"
+cron = "0.16"
+dashmap = "6"
 futures = "0.3"
-greentic-flow = ">=0.5.0-0, <0.6.0-0"
-greentic-session = ">=0.5.0-0, <0.6.0-0"
-greentic-state = ">=0.5.0-0, <0.6.0-0"
 greentic-config = ">=0.5.0-0, <0.6.0-0"
 greentic-config-types = ">=0.5.0-0, <0.6.0-0"
+greentic-flow = ">=0.5.0-0, <0.6.0-0"
 greentic-secrets-lib = ">=0.5.0-0, <0.6.0-0"
+greentic-session = ">=0.5.0-0, <0.6.0-0"
+greentic-state = ">=0.5.0-0, <0.6.0-0"
+greentic-telemetry = ">=0.5.0-0, <0.6.0-0"
+handlebars = "6"
 hex = "0.4"
+hmac = "0.13"
 humantime = "2.1"
+indexmap = "2"
+jsonschema = "0.46"
 lru = "0.18"
 once_cell = "1"
 parking_lot = "0.12"
+proptest = "1"
 rand = "0.10"
-serde_json = "1"
+semver = "1"
 serde_cbor = "0.11"
+serde_json = "1"
+serial_test = "3"
+sha1 = "0.11"
 sha2 = "0.11"
+tempfile = "3"
 thiserror = "2.0"
+tiny_http = "0.12"
 tokio-util = "0.7"
+toml = "1"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
-wasmparser = "0.248"
-cron = "0.16"
 url = "2"
-indexmap = "2"
-bytes = "1"
-criterion = "0.8"
-hmac = "0.13"
-sha1 = "0.11"
-blake3 = "1"
-semver = "1"
-tempfile = "3"
-tiny_http = "0.12"
-serial_test = "3"
-toml = "1"
-greentic-telemetry = ">=0.5.0-0, <0.6.0-0"
 walkdir = "2"
+wasmparser = "0.248"
 wasmtime-wasi-http = "43"
 wasmtime-wasi-tls = "43"
-jsonschema = "0.46"
-handlebars = "6"
-dashmap = "6"
-proptest = "1"
 
 [workspace.dependencies.axum]
 version = "0.8"
-features = [
-    "macros",
-    "json",
-]
-
-[workspace.dependencies.clap]
-version = "4"
-features = [
-    "derive",
-]
+features = ["macros", "json"]
 
 [workspace.dependencies.chrono]
 version = "0.4"
 default-features = false
-features = [
-    "clock",
-]
+features = ["clock"]
+
+[workspace.dependencies.clap]
+version = "4"
+features = ["derive"]
 
 [workspace.dependencies.ed25519-dalek]
 version = "2"
-features = [
-    "pkcs8",
-]
-
-[workspace.dependencies.greentic-types]
-version = ">=0.5.0-0, <0.6.0-0"
-default-features = false
-features = [
-    "std",
-    "serde",
-    "time",
-    "otel-keys",
-]
-
-[workspace.dependencies.greentic_pack]
-package = "greentic-pack-lib"
-version = ">=0.5.0-0, <0.6.0-0"
+features = ["pkcs8"]
 
 [workspace.dependencies.greentic-distributor-client]
 version = ">=0.5.0-0, <0.6.0-0"
-features = [
-    "dist-client",
-]
+features = ["dist-client"]
 
 [workspace.dependencies.greentic-interfaces]
 version = ">=0.5.0-0, <0.6.0-0"
 default-features = false
-features = [
-    "bindings-rust",
-]
+features = ["bindings-rust"]
 
 [workspace.dependencies.greentic-interfaces-guest]
 version = ">=0.5.0-0, <0.6.0-0"
@@ -134,38 +107,45 @@ version = ">=0.5.0-0, <0.6.0-0"
 [workspace.dependencies.greentic-interfaces-wasmtime]
 version = ">=0.5.0-0, <0.6.0-0"
 
-[workspace.dependencies.greentic-oauth-sdk]
-version = ">=0.5.0-0, <0.6.0-0"
-
 [workspace.dependencies.greentic-oauth-host]
 version = ">=0.5.0-0, <0.6.0-0"
 
-[workspace.dependencies.greentic-runner-host]
-path = "crates/greentic-runner-host"
+[workspace.dependencies.greentic-oauth-sdk]
 version = ">=0.5.0-0, <0.6.0-0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
 version = ">=0.5.0-0, <0.6.0-0"
 
-[workspace.dependencies.runner-core]
-path = "crates/runner-core"
+[workspace.dependencies.greentic-runner-host]
+path = "crates/greentic-runner-host"
 version = ">=0.5.0-0, <0.6.0-0"
+
+[workspace.dependencies.greentic-types]
+version = ">=0.5.0-0, <0.6.0-0"
+default-features = false
+features = ["std", "serde", "time", "otel-keys"]
+
+[workspace.dependencies.greentic_pack]
+package = "greentic-pack-lib"
+version = ">=0.5.0-0, <0.6.0-0"
+
+[workspace.dependencies.insta]
+version = "1"
+features = ["json"]
 
 [workspace.dependencies.reqwest]
 version = "0.13"
 default-features = false
-features = [
-    "json",
-    "rustls",
-    "blocking",
-]
+features = ["json", "rustls", "blocking"]
+
+[workspace.dependencies.runner-core]
+path = "crates/runner-core"
+version = ">=0.5.0-0, <0.6.0-0"
 
 [workspace.dependencies.serde]
 version = "1.0"
-features = [
-    "derive",
-]
+features = ["derive"]
 
 [workspace.dependencies.serde_yaml_bw]
 package = "serde_yaml_gtc"
@@ -173,10 +153,7 @@ version = "2.5.2"
 
 [workspace.dependencies.time]
 version = "0.3"
-features = [
-    "macros",
-    "serde-well-known",
-]
+features = ["macros", "serde-well-known"]
 
 [workspace.dependencies.tokio]
 version = "1"
@@ -191,48 +168,31 @@ features = [
     "fs",
 ]
 
-[workspace.dependencies.wit-bindgen]
-version = "0.57"
-default-features = false
-
 [workspace.dependencies.uuid]
 version = "1"
-features = [
-    "v4",
-]
-
-[workspace.dependencies.zip]
-version = "8"
-default-features = false
-features = [
-    "deflate-flate2",
-]
+features = ["v4"]
 
 [workspace.dependencies.wasmtime]
 version = "43"
 default-features = false
-features = [
-    "component-model",
-    "cranelift",
-    "runtime",
-    "std",
-]
-
-[workspace.dependencies.wasmtime-wasi]
-version = "43"
-default-features = false
-features = [
-    "p2",
-]
+features = ["component-model", "cranelift", "runtime", "std"]
 
 [workspace.dependencies.wasmtime-environ]
 version = "43"
 
-[workspace.dependencies.insta]
-version = "1"
-features = [
-    "json",
-]
+[workspace.dependencies.wasmtime-wasi]
+version = "43"
+default-features = false
+features = ["p2"]
+
+[workspace.dependencies.wit-bindgen]
+version = "0.57"
+default-features = false
+
+[workspace.dependencies.zip]
+version = "8"
+default-features = false
+features = ["deflate-flate2"]
 
 [profile.release.package.echo-secret]
 opt-level = "z"
