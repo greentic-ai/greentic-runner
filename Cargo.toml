@@ -69,7 +69,7 @@ url = "2"
 walkdir = "2"
 wasmparser = "0.248"
 wasmtime-wasi-http = "43"
-wasmtime-wasi-tls = "43"
+wasmtime-wasi-tls = "45"
 
 [workspace.dependencies.axum]
 version = "0.8"
