@@ -67,7 +67,7 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2"
 walkdir = "2"
-wasmparser = "0.248"
+wasmparser = "0.250"
 wasmtime-wasi-http = "43"
 wasmtime-wasi-tls = "43"
 
