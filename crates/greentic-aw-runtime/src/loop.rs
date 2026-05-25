@@ -40,7 +40,7 @@ pub async fn run_step(
     let request = LlmRequest {
         system_prompt: config.system_prompt.clone(),
         history: state.messages.clone(),
-        tools: list_tools_for_llm(&config.tools),
+        tools: list_tools_for_llm(&runtime.ext_runtime, &config.tools),
         provider: config.llm.clone(),
     };
     let response = runtime.llm.complete(request).await?;
