@@ -34,6 +34,10 @@ pub struct HostConfig {
     pub trace: TraceConfig,
     pub validation: ValidationConfig,
     pub operator_policy: OperatorPolicy,
+    /// Operator-declared Digital Worker agent configs, keyed by `agent_id`.
+    /// Sourced from the `agents:` section of the bindings YAML and consumed
+    /// by the production `ConfigProvider` (Task 4.3).
+    pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +59,11 @@ pub struct BindingsFile {
     pub state_store: StateStorePolicy,
     #[serde(default)]
     pub operator: OperatorPolicyConfig,
+    /// Digital Worker agent configs keyed by `agent_id`. The whole section is
+    /// optional; each value must be a complete `AgentConfig` (all `limits`
+    /// fields are required — `AgentLimits` has no serde defaults).
+    #[serde(default)]
+    pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -190,6 +199,7 @@ impl HostConfig {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::from_config(bindings.operator.clone()),
+            agents: bindings.agents.clone(),
         })
     }
 
@@ -216,6 +226,10 @@ impl HostConfig {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            // TODO(phase-4): TenantBindings (gtbind) has no agents section yet.
+            // When embedded gtbind hosts need Digital Worker agents, extend
+            // TenantBindings to carry them and populate this map here.
+            agents: HashMap::new(),
         }
     }
 
@@ -507,7 +521,57 @@ mod tests {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            agents: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn load_from_path_parses_agents_section() {
+        // All seven `limits` fields are required: AgentLimits has no serde
+        // defaults, so operator-authored YAML must spell each one out.
+        let yaml = r#"
+tenant: acme
+agents:
+  greeter:
+    agent_id: greeter
+    system_prompt: "You are a greeter."
+    tools: []
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+    limits:
+      max_iter: 8
+      timeout: 60
+      max_history_turns: 20
+      llm_retry_attempts: 3
+      llm_retry_backoff: 250
+      provider_failure_message: null
+      daily_token_cap_per_tenant: null
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = HostConfig::load_from_path(&path).unwrap();
+        assert!(cfg.agents.contains_key("greeter"));
+        let greeter = &cfg.agents["greeter"];
+        assert_eq!(greeter.system_prompt, "You are a greeter.");
+        assert_eq!(greeter.limits.max_iter, 8);
+        // duration_secs / duration_ms custom serde maps the integers above.
+        assert_eq!(greeter.limits.timeout, std::time::Duration::from_secs(60));
+        assert_eq!(
+            greeter.limits.llm_retry_backoff,
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn load_from_path_omitted_agents_section_yields_empty_map() {
+        let yaml = "tenant: acme\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = HostConfig::load_from_path(&path).unwrap();
+        assert!(cfg.agents.is_empty());
     }
 
     #[test]

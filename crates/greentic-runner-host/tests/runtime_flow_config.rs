@@ -81,6 +81,7 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        agents: std::collections::HashMap::new(),
     }
 }
 
