@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod config_provider;
+pub mod cost;
 pub mod error;
 pub mod llm;
 pub mod llm_openai;
@@ -26,6 +27,9 @@ pub mod mock;
 
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
+#[cfg(feature = "test-mock")]
+pub use cost::MockTokenMeter;
+pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_openai::OpenAiLlmBackend;
