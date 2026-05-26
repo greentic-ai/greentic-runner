@@ -18,7 +18,9 @@ use super::templating::{TemplateOptions, render_template_value};
 use crate::config::{FlowRetryConfig, HostConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
 use crate::runner::invocation::{InvocationMeta, build_invocation_envelope};
-use crate::telemetry::{FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context};
+use crate::telemetry::{
+    FlowSpanAttributes, RolloutIds, annotate_span, backoff_delay_ms, set_flow_context,
+};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::validate::{
@@ -53,6 +55,11 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    /// Rollout identifiers of the revision-keyed runtime this engine belongs to,
+    /// stamped onto every per-invocation `TenantCtx` for telemetry attribution
+    /// (C5.4). Empty for tenant-only (legacy) runtimes; the Phase-D revision
+    /// dispatcher supplies real IDs via [`with_rollout_ids`](Self::with_rollout_ids).
+    rollout_ids: RolloutIds,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -277,7 +284,18 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         })
+    }
+
+    /// Bind the rollout identifiers of the revision-keyed runtime this engine
+    /// serves, so every invocation's telemetry carries deployment/bundle/
+    /// revision attribution (C5.4). Called by the Phase-D revision dispatcher
+    /// when it constructs a revision runtime; tenant-only runtimes leave the
+    /// default (empty) IDs.
+    pub fn with_rollout_ids(mut self, rollout_ids: RolloutIds) -> Self {
+        self.rollout_ids = rollout_ids;
+        self
     }
 
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
@@ -334,14 +352,6 @@ impl FlowEngine {
                 tool: ctx.tool,
                 action: ctx.action,
             },
-        );
-        set_flow_context(
-            &self.default_env,
-            ctx.tenant,
-            ctx.flow_id,
-            ctx.node_id,
-            ctx.provider_id,
-            ctx.session_id,
         );
         let retry_config = ctx.retry_config;
         let original_input = input;
@@ -436,6 +446,20 @@ impl FlowEngine {
         resume_from: Option<String>,
         mut current_flow_id: String,
     ) -> Result<FlowExecution> {
+        // Establish the per-invocation telemetry context here (the shared choke
+        // point for both `execute` and `resume`), stamping the live pack id plus
+        // any rollout identifiers from the owning revision runtime (C5.4) so the
+        // bridge projects them into every span/log this flow emits.
+        set_flow_context(
+            &self.default_env,
+            ctx.tenant,
+            ctx.flow_id,
+            ctx.node_id,
+            ctx.provider_id,
+            ctx.session_id,
+            ctx.pack_id,
+            &self.rollout_ids,
+        );
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
                 .with_context(|| format!("invalid resume node id `{node}`"))?,
@@ -2473,6 +2497,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         }
     }
 
@@ -2893,6 +2918,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -2983,6 +3009,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         }
     }
 
@@ -3004,6 +3031,20 @@ mod tests {
             observer: None,
             mocks: None,
         }
+    }
+
+    #[test]
+    fn with_rollout_ids_binds_revision_identity() {
+        let engine = minimal_engine().with_rollout_ids(RolloutIds {
+            customer_id: Some("cust-acme".into()),
+            deployment_id: Some("01JTKS".into()),
+            bundle_id: Some("customer.support".into()),
+            revision_id: Some("01JTKR".into()),
+        });
+        assert_eq!(engine.rollout_ids.revision_id.as_deref(), Some("01JTKR"));
+        assert_eq!(engine.rollout_ids.deployment_id.as_deref(), Some("01JTKS"));
+        // A freshly-built engine carries no rollout identity (legacy runtime).
+        assert!(minimal_engine().rollout_ids.is_empty());
     }
 
     #[test]

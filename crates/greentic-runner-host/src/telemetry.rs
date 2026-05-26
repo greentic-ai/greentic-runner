@@ -54,6 +54,35 @@ pub fn tenant_context(
     ctx
 }
 
+/// Build the per-invocation tenant context for a flow execution, stamping the
+/// resolved `pack_id` and any rollout identifiers onto `attributes` so the
+/// telemetry bridge (`set_current_tenant_ctx`) projects them into spans/logs.
+///
+/// `pack_id` is always live (the engine knows it per invocation). The rollout
+/// IDs come from the engine's owning revision-keyed runtime and are empty until
+/// the Phase-D revision dispatcher constructs revision runtimes. Pure so the
+/// stamping can be unit-tested without the task-local slot.
+#[allow(clippy::too_many_arguments)]
+fn flow_tenant_ctx(
+    env: &str,
+    tenant: &str,
+    flow_id: &str,
+    node_id: Option<&str>,
+    provider_id: Option<&str>,
+    session_id: Option<&str>,
+    pack_id: &str,
+    rollout: &RolloutIds,
+) -> TenantCtx {
+    let mut ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+    if !pack_id.is_empty() {
+        ctx.attributes
+            .insert(attr_keys::PACK_ID.to_string(), pack_id.to_string());
+    }
+    stamp_rollout_ids(&mut ctx, rollout);
+    ctx
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn set_flow_context(
     env: &str,
     tenant: &str,
@@ -61,8 +90,19 @@ pub fn set_flow_context(
     node_id: Option<&str>,
     provider_id: Option<&str>,
     session_id: Option<&str>,
+    pack_id: &str,
+    rollout: &RolloutIds,
 ) {
-    let ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+    let ctx = flow_tenant_ctx(
+        env,
+        tenant,
+        flow_id,
+        node_id,
+        provider_id,
+        session_id,
+        pack_id,
+        rollout,
+    );
     set_current_tenant_ctx(&ctx);
 }
 
@@ -182,6 +222,76 @@ mod tests {
         );
         assert!(c.attributes.contains_key(attr_keys::DEPLOYMENT_ID));
         assert!(!c.attributes.contains_key(attr_keys::CUSTOMER_ID));
+    }
+
+    #[test]
+    fn flow_ctx_stamps_pack_id_live() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "customer.support@1.2.0",
+            &RolloutIds::default(),
+        );
+        assert_eq!(
+            ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
+            Some("customer.support@1.2.0")
+        );
+        // No revision runtime today → rollout IDs absent.
+        assert!(!ctx.attributes.contains_key(attr_keys::REVISION_ID));
+    }
+
+    #[test]
+    fn flow_ctx_stamps_pack_id_and_rollout_ids() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "customer.support@1.2.0",
+            &RolloutIds {
+                customer_id: Some("cust-acme".into()),
+                deployment_id: Some("01JTKS".into()),
+                bundle_id: Some("customer.support".into()),
+                revision_id: Some("01JTKR".into()),
+            },
+        );
+        assert_eq!(
+            ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
+            Some("customer.support@1.2.0")
+        );
+        assert_eq!(
+            ctx.attributes
+                .get(attr_keys::REVISION_ID)
+                .map(String::as_str),
+            Some("01JTKR")
+        );
+        assert_eq!(
+            ctx.attributes
+                .get(attr_keys::DEPLOYMENT_ID)
+                .map(String::as_str),
+            Some("01JTKS")
+        );
+    }
+
+    #[test]
+    fn flow_ctx_skips_empty_pack_id() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "",
+            &RolloutIds::default(),
+        );
+        assert!(!ctx.attributes.contains_key(attr_keys::PACK_ID));
     }
 
     #[test]
