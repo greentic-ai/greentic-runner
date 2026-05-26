@@ -31,6 +31,7 @@ use crate::trace::PackTraceInfo;
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::SecretRequirement;
+use runner_core::packs::PackDigest;
 
 const RUNTIME_SECRETS_PACK_ID: &str = "_runner";
 
@@ -183,6 +184,14 @@ impl ActivePacks {
     /// This is the producer the deployment warm path calls once a revision's
     /// packs are loaded; the pack watcher's [`replace_legacy`](Self::replace_legacy)
     /// then carries the entry across tenant-pack reloads untouched.
+    ///
+    /// Fails closed when the runtime's identity does not match the key it would
+    /// be stored under: a wiring bug that files one tenant's runtime under
+    /// another tenant's revision (breaking isolation) or stores a runtime whose
+    /// telemetry reports a different revision than it routes (breaking rollout
+    /// attribution) is rejected here rather than silently serving traffic under
+    /// the wrong identity. Pairs with [`TenantRuntime::load_revision`], which
+    /// derives the runtime's rollout identity from these same ids.
     pub fn insert_revision(
         &self,
         tenant: &str,
@@ -190,11 +199,35 @@ impl ActivePacks {
         bundle_id: BundleId,
         revision_id: RevisionId,
         runtime: Arc<TenantRuntime>,
-    ) {
+    ) -> Result<()> {
+        if runtime.tenant() != tenant {
+            bail!(
+                "revision runtime tenant `{}` does not match key tenant `{tenant}`",
+                runtime.tenant()
+            );
+        }
+        let ids = runtime.engine().rollout_ids();
+        let key_deployment = deployment_id.to_string();
+        let key_bundle = bundle_id.as_str();
+        let key_revision = revision_id.to_string();
+        if ids.deployment_id.as_deref() != Some(key_deployment.as_str())
+            || ids.bundle_id.as_deref() != Some(key_bundle)
+            || ids.revision_id.as_deref() != Some(key_revision.as_str())
+        {
+            bail!(
+                "revision runtime rollout identity (deployment={:?}, bundle={:?}, revision={:?}) \
+                 does not match key (deployment=`{key_deployment}`, bundle=`{key_bundle}`, \
+                 revision=`{key_revision}`)",
+                ids.deployment_id,
+                ids.bundle_id,
+                ids.revision_id
+            );
+        }
         let _guard = self.write_lock.lock();
         let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
         let next = insert_keyed_entry(&self.inner.load_full(), key, runtime);
         self.inner.store(Arc::new(next));
+        Ok(())
     }
 
     /// Swap in a freshly-resolved set of tenant-only (legacy) runtimes while
@@ -273,6 +306,17 @@ pub struct ResolvedComponent {
     pub pack: Arc<PackRuntime>,
 }
 
+/// One pinned pack of a deployment revision: the on-disk path plus the
+/// `algo:value` content digest the deployment staged it under.
+/// [`TenantRuntime::load_revision`] fails closed when the file no longer
+/// matches the digest, defending the stage→warm window against a swapped or
+/// stale cache path.
+#[derive(Clone, Debug)]
+pub struct RevisionPackRef {
+    pub path: PathBuf,
+    pub digest: String,
+}
+
 /// Block on a future whether or not we're already inside a tokio runtime.
 pub fn block_on<F: Future<Output = R>, R>(future: F) -> R {
     if let Ok(handle) = Handle::try_current() {
@@ -323,14 +367,21 @@ impl TenantRuntime {
         .await
     }
 
-    /// Build a revision-keyed runtime from an explicit, ordered list of pack
-    /// paths (the resolved `pack_list` of a deployment revision). The first
-    /// path is the main pack; the rest are overlays. `rollout` stamps the
-    /// deployment / bundle / revision / customer identity onto every flow span
-    /// this runtime emits — the producer side of the C5 telemetry seam.
+    /// Build a revision-keyed runtime from its pinned pack list (the resolved
+    /// `pack_list` of a deployment revision). The first entry is the main pack;
+    /// the rest are overlays.
+    ///
+    /// Fails closed if any pack file no longer matches the digest the
+    /// deployment pinned it under — defending the stage→warm window against a
+    /// swapped or stale cache path. The verified digests are threaded into the
+    /// runtime so admin status, traces, and contract hashes report the real
+    /// content (parity with the legacy index path). The rollout telemetry
+    /// identity is **derived from** `deployment_id` / `bundle_id` /
+    /// `revision_id` / `customer_id`, so the engine's attribution cannot drift
+    /// from the key the runtime is later inserted under.
     #[allow(clippy::too_many_arguments)]
     pub async fn load_revision(
-        pack_paths: &[PathBuf],
+        pack_refs: &[RevisionPackRef],
         config: Arc<HostConfig>,
         mocks: Option<Arc<MockLayer>>,
         wasi_policy: Arc<RunnerWasiPolicy>,
@@ -339,18 +390,40 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
-        rollout: RolloutIds,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        customer_id: Option<String>,
     ) -> Result<Arc<Self>> {
-        if pack_paths.is_empty() {
+        if pack_refs.is_empty() {
             bail!(
                 "revision runtime for tenant {} requires at least one pack",
                 config.tenant
             );
         }
-        let mut packs = Vec::with_capacity(pack_paths.len());
-        for pack_path in pack_paths {
+        let mut packs = Vec::with_capacity(pack_refs.len());
+        for pack_ref in pack_refs {
+            let expected = PackDigest::parse(&pack_ref.digest).with_context(|| {
+                format!(
+                    "revision pack `{}` has an invalid digest `{}`",
+                    pack_ref.path.display(),
+                    pack_ref.digest
+                )
+            })?;
+            if !expected.matches_file(&pack_ref.path).with_context(|| {
+                format!(
+                    "hashing revision pack `{}` for digest verification",
+                    pack_ref.path.display()
+                )
+            })? {
+                bail!(
+                    "revision pack `{}` does not match pinned digest `{}`",
+                    pack_ref.path.display(),
+                    pack_ref.digest
+                );
+            }
             let pack = Self::load_pack_runtime(
-                pack_path,
+                &pack_ref.path,
                 &config,
                 mocks.clone(),
                 None,
@@ -360,8 +433,14 @@ impl TenantRuntime {
                 &secrets_manager,
             )
             .await?;
-            packs.push((pack, None));
+            packs.push((pack, Some(expected.raw_string())));
         }
+        let rollout = RolloutIds {
+            customer_id,
+            deployment_id: Some(deployment_id.to_string()),
+            bundle_id: Some(bundle_id.as_str().to_string()),
+            revision_id: Some(revision_id.to_string()),
+        };
         Self::from_packs_with_rollout(
             config,
             packs,
@@ -557,6 +636,13 @@ impl TenantRuntime {
 
     pub fn overlays(&self) -> Vec<Arc<PackRuntime>> {
         self.packs.iter().skip(1).cloned().collect()
+    }
+
+    /// Resolved content digest of each loaded pack, index-aligned with the pack
+    /// list. `Some` for revision runtimes (verified at load) and the legacy
+    /// index path; `None` only when a digest was unavailable.
+    pub fn pack_digests(&self) -> &[Option<String>] {
+        &self.digests
     }
 
     pub fn engine(&self) -> &Arc<FlowEngine> {
