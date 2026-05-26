@@ -118,7 +118,10 @@ mod tests {
         let cp = Arc::new(cp);
 
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
-        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry.clone());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime =
+            AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
 
         let out = runtime
             .step(

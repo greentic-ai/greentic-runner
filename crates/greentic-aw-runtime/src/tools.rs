@@ -9,13 +9,17 @@
 //! result is committed so a state-save failure cannot cause a
 //! double-dispatch on the next `step()` (idempotency ledger).
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use greentic_ext_runtime::ExtensionRuntime;
+use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ToolRef;
-use crate::error::AgentError;
+use crate::error::{AgentError, StateError};
 use crate::llm::LlmToolSchema;
 use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
@@ -98,6 +102,96 @@ pub struct ToolLedgerEntry {
 
 pub fn ledger_key(tenant: &TenantContext, session_id: &str, call_id: &str) -> String {
     format!("{}:{session_id}:tool_calls:{call_id}", tenant.key_prefix())
+}
+
+/// Idempotency ledger for tool calls. Records tool results keyed by
+/// `tool_call_id` so a state-save failure does not cause a duplicate
+/// dispatch (re-sending the same email, etc.) on the next `step()`.
+///
+/// Dyn-safe (`Arc<dyn ToolLedger>`); production uses [`RedisToolLedger`],
+/// tests use `NoopToolLedger` (from the `test-mock` module).
+pub trait ToolLedger: Send + Sync {
+    /// Return a previously-recorded result for this call_id, or `None`.
+    fn get<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>;
+
+    /// Record a tool result (TTL 7 days).
+    fn record<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+        result: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>>;
+}
+
+const LEDGER_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Production tool ledger backed by a multiplexed `ConnectionManager`.
+///
+/// Shares the Redis instance with `RedisAgentStateStore` via
+/// `RedisAgentStateStore::manager()`. The manager is `Clone` (cheap,
+/// reference-counted) so per-call clones open no new connections.
+pub struct RedisToolLedger {
+    manager: ConnectionManager,
+}
+
+impl RedisToolLedger {
+    pub fn new(manager: ConnectionManager) -> Self {
+        Self { manager }
+    }
+}
+
+impl ToolLedger for RedisToolLedger {
+    fn get<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            let mut conn = self.manager.clone();
+            let raw: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Redis(format!("ledger get: {e}")))?;
+            match raw {
+                Some(json) => {
+                    let entry: ToolLedgerEntry = serde_json::from_str(&json)
+                        .map_err(|e| StateError::Decode(format!("ledger decode: {e}")))?;
+                    Ok(Some(entry.result))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn record<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+        result: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            let entry = ToolLedgerEntry { result };
+            let json = serde_json::to_string(&entry)
+                .map_err(|e| StateError::Decode(format!("ledger encode: {e}")))?;
+            let mut conn = self.manager.clone();
+            let _: () = conn
+                .set_ex(&key, json, LEDGER_TTL_SECS)
+                .await
+                .map_err(|e| StateError::Redis(format!("ledger set_ex: {e}")))?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

@@ -37,22 +37,28 @@ pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
+pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
 /// The main entry point for executing a single agentic step.
 ///
-/// Construct via [`AgentRuntime::new`] with the four trait objects
-/// (config, state, LLM, telemetry) plus a shared `Arc<ExtensionRuntime>`
-/// for tool dispatch. Call [`AgentRuntime::step`] per inbound user
-/// message.
+/// Construct via [`AgentRuntime::new`] with the trait objects (config,
+/// state, LLM, telemetry, token_meter, ledger) plus a shared
+/// `Arc<ExtensionRuntime>` for tool dispatch. Call [`AgentRuntime::step`]
+/// per inbound user message.
 pub struct AgentRuntime {
     pub(crate) config_provider: Arc<dyn ConfigProvider>,
     pub(crate) state_store: Arc<dyn AgentStateStore>,
-    #[allow(dead_code)] // Phase 3 tool dispatch will read this
     pub(crate) ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
+    // read by full loop in Task 3.4b
+    #[allow(dead_code)]
+    pub(crate) token_meter: Arc<dyn TokenMeter>,
+    // read by full loop in Task 3.4b
+    #[allow(dead_code)]
+    pub(crate) ledger: Arc<dyn ToolLedger>,
 }
 
 impl AgentRuntime {
@@ -62,6 +68,8 @@ impl AgentRuntime {
         ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
         llm: Arc<dyn LlmBackend>,
         telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
     ) -> Self {
         Self {
             config_provider,
@@ -69,6 +77,8 @@ impl AgentRuntime {
             ext_runtime,
             llm,
             telemetry,
+            token_meter,
+            ledger,
         }
     }
 
