@@ -2262,6 +2262,7 @@ dependencies = [
  "greentic-config",
  "greentic-config-types",
  "greentic-distributor-client",
+ "greentic-ext-runtime",
  "greentic-flow",
  "greentic-interfaces",
  "greentic-interfaces-host",
