@@ -27,6 +27,7 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.10-research" }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
@@ -87,7 +88,6 @@ once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", features = ["test-mock"] }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.10-research" }
 
 [[bench]]
 name = "perf"
