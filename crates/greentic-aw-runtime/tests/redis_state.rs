@@ -46,6 +46,43 @@ async fn save_then_load_roundtrips_state() {
 }
 
 #[tokio::test]
+#[allow(clippy::panic)] // diagnostic else-branch in test — intentional
+async fn state_survives_store_drop_and_rebuild() {
+    // Acceptance §8.5 #6: conversation state persists across a runtime
+    // drop/rebuild (simulating a runner-host restart).
+    let Some(url) = redis_url() else {
+        eprintln!("REDIS_URL unset; skipping");
+        return;
+    };
+    let tenant = TenantContext::new("acme", "prod");
+    let session = format!("restart-{}", uuid::Uuid::new_v4());
+
+    // First "runner instance": save a conversation, then drop the store.
+    {
+        let store = RedisAgentStateStore::connect(&url).await.unwrap();
+        let mut state = ConversationState::empty(&tenant, &session);
+        state.messages.push(ChatMessage::User {
+            content: "remember me".into(),
+        });
+        store.save(&tenant, &session, &state).await.unwrap();
+    } // store dropped — simulates a runner restart
+
+    // Second "runner instance": a fresh store loads the persisted state.
+    let store2 = RedisAgentStateStore::connect(&url).await.unwrap();
+    let loaded = store2.load(&tenant, &session).await.unwrap();
+    let has_msg = loaded.messages.iter().any(|m| {
+        matches!(
+            m,
+            ChatMessage::User { content } if content == "remember me"
+        )
+    });
+    assert!(
+        has_msg,
+        "conversation state must persist across store drop/rebuild"
+    );
+}
+
+#[tokio::test]
 async fn load_returns_empty_state_when_no_record_exists() {
     let Some(_) = redis_url() else {
         return;
