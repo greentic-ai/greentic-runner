@@ -86,6 +86,12 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+# C5.4 export regression: a real OTLP exporter to prove gt.* attribution reaches
+# exported spans. Versions match greentic-telemetry's OTel stack.
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [[bench]]
 name = "perf"

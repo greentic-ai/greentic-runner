@@ -334,7 +334,13 @@ impl FlowEngine {
         Ok(host_flow)
     }
 
-    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    /// Create the `flow.execute` span and install per-invocation telemetry:
+    /// declared span fields, the task-local tenant context, and the **exported**
+    /// `gt.*` attribution — the live `pack_id` plus any rollout identifiers from
+    /// the owning revision runtime (C5.4). Returned for the caller to
+    /// `.instrument()`. Both `execute` and `resume` route through here so every
+    /// per-invocation entry point carries the same attribution.
+    fn flow_execute_span(&self, ctx: &FlowContext<'_>) -> tracing::Span {
         let span = tracing::info_span!(
             "flow.execute",
             tenant = tracing::field::Empty,
@@ -353,6 +359,22 @@ impl FlowEngine {
                 action: ctx.action,
             },
         );
+        set_flow_context(
+            &span,
+            &self.default_env,
+            ctx.tenant,
+            ctx.flow_id,
+            ctx.node_id,
+            ctx.provider_id,
+            ctx.session_id,
+            ctx.pack_id,
+            &self.rollout_ids,
+        );
+        span
+    }
+
+    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
         let mut ctx = ctx;
@@ -427,7 +449,9 @@ impl FlowEngine {
         // entry is non-null.
         state.replace_input(input.clone());
         state.entry = input;
+        let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+            .instrument(span)
             .await
     }
 
@@ -446,20 +470,6 @@ impl FlowEngine {
         resume_from: Option<String>,
         mut current_flow_id: String,
     ) -> Result<FlowExecution> {
-        // Establish the per-invocation telemetry context here (the shared choke
-        // point for both `execute` and `resume`), stamping the live pack id plus
-        // any rollout identifiers from the owning revision runtime (C5.4) so the
-        // bridge projects them into every span/log this flow emits.
-        set_flow_context(
-            &self.default_env,
-            ctx.tenant,
-            ctx.flow_id,
-            ctx.node_id,
-            ctx.provider_id,
-            ctx.session_id,
-            ctx.pack_id,
-            &self.rollout_ids,
-        );
         let mut current = match resume_from {
             Some(node) => NodeId::from_str(&node)
                 .with_context(|| format!("invalid resume node id `{node}`"))?,
