@@ -53,11 +53,7 @@ pub struct AgentRuntime {
     pub(crate) ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
-    // read by full loop in Task 3.4b
-    #[allow(dead_code)]
     pub(crate) token_meter: Arc<dyn TokenMeter>,
-    // read by full loop in Task 3.4b
-    #[allow(dead_code)]
     pub(crate) ledger: Arc<dyn ToolLedger>,
 }
 

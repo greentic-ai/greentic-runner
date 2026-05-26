@@ -135,10 +135,34 @@ pub async fn run_step(
                     }
                 }
 
-                // --- Dispatch (blocking WASM via spawn_blocking inside dispatch_tool_call) ---
-                let result = dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await?;
+                // --- Dispatch (blocking WASM via spawn_blocking) ---
+                // Tool dispatch errors are NOT termination (spec §6): surface
+                // the error as a Tool observation so the LLM can react, then
+                // continue. Failed calls are NOT recorded in the ledger
+                // (they should remain retryable on the next turn).
+                let result =
+                    match dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                error = %e, tool = %call.tool_name,
+                                "tool dispatch failed; recording as observation and continuing"
+                            );
+                            let err_obs = serde_json::json!({ "error": e.to_string() });
+                            state.messages.push(ChatMessage::Tool {
+                                call_id: call.call_id.clone(),
+                                content: err_obs.clone(),
+                            });
+                            trail.push(AgentStep::ToolCall {
+                                name: call.tool_name.clone(),
+                                call_id: call.call_id.clone(),
+                                result: err_obs,
+                            });
+                            continue;
+                        }
+                    };
 
-                // Record in ledger before continuing (best-effort).
+                // Record successful result in ledger (best-effort).
                 if let Err(e) = runtime
                     .ledger
                     .record(&tenant, session_id, &call.call_id, result.clone())
