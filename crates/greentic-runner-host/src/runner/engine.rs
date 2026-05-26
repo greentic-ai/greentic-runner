@@ -298,6 +298,13 @@ impl FlowEngine {
         self
     }
 
+    /// The rollout identifiers bound to this engine (read counterpart to
+    /// [`with_rollout_ids`](Self::with_rollout_ids)). Empty by default for the
+    /// legacy tenant-only path.
+    pub fn rollout_ids(&self) -> &RolloutIds {
+        &self.rollout_ids
+    }
+
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
