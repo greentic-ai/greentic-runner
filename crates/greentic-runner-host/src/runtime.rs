@@ -196,11 +196,14 @@ impl TenantRuntime {
                 },
             );
         }
-        let engine = Arc::new(
-            FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
-                .await
-                .context("failed to prime flow engine")?,
-        );
+        let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+            .await
+            .context("failed to prime flow engine")?;
+        if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(&config).await {
+            engine.set_agent_node_handler(handler);
+            tracing::info!("DwAgent runtime wired into FlowEngine");
+        }
+        let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
                 Arc::clone(&config),
