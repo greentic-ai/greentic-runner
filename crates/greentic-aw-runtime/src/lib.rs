@@ -16,6 +16,7 @@ pub mod error;
 pub mod llm;
 pub mod llm_openai;
 pub mod r#loop;
+pub mod manifest_tools;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;

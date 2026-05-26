@@ -1898,6 +1898,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "greentic-dw-manifest",
  "greentic-ext-runtime",
  "greentic-state",
  "greentic-telemetry 1.1.0-dev.25375809033",
@@ -1909,6 +1910,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "greentic-cap-types"
+version = "1.1.0-dev.25375479373"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "087c48224d8deb687e85a6309b1d7d2ca5db66e555904a202ce5be1be1659a05"
+dependencies = [
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1967,6 +1980,44 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "greentic-dw-manifest"
+version = "1.1.0-dev.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+dependencies = [
+ "greentic-cap-types",
+ "greentic-dw-planning",
+ "greentic-dw-types",
+ "greentic-extension-sdk-contract",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "greentic-dw-planning"
+version = "1.1.0-dev.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+dependencies = [
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "greentic-dw-types"
+version = "1.1.0-dev.0"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+dependencies = [
+ "greentic-cap-types",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

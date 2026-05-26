@@ -642,7 +642,11 @@ mod duration_ms {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
     pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_u128(d.as_millis())
+        // as_millis() returns u128; AgentLimits durations are bounded
+        // by operator config and never approach u64::MAX (~584M years).
+        #[allow(clippy::cast_possible_truncation)]
+        let ms = d.as_millis() as u64;
+        s.serialize_u64(ms)
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_millis(u64::deserialize(d)?))
@@ -684,6 +688,8 @@ mod tests {
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(round.agent_id, original.agent_id);
         assert_eq!(round.limits.max_iter, 8);
+        assert_eq!(round.limits.timeout, Duration::from_secs(60));
+        assert_eq!(round.limits.llm_retry_backoff, Duration::from_millis(250));
     }
 }
 ```
@@ -1843,7 +1849,6 @@ For Phase 1 we only need a placeholder so `pub use` in lib.rs compiles. Phase 2 
 
 use std::pin::Pin;
 use std::future::Future;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::StateError;
@@ -1852,15 +1857,17 @@ use crate::state::{
 };
 use crate::tenant::TenantContext;
 
-/// Production state store backed by the workspace `greentic-state`
-/// Redis client. Phase 2 implements `load`, `save`, `acquire_lock`.
+/// Production state store backed by `redis::aio::ConnectionManager`
+/// (the `redis` crate directly — NOT via `greentic-state`, which is
+/// sync-only). Phase 2 implements `load`, `save`, `acquire_lock`.
 pub struct RedisAgentStateStore {
-    // Phase 2 holds an Arc<greentic_state::RedisPool> here.
+    // Phase 2 holds a redis::aio::ConnectionManager here.
     _placeholder: (),
 }
 
 impl RedisAgentStateStore {
-    /// Phase 2 replaces this with `new(pool: Arc<RedisPool>) -> Self`.
+    /// Phase 2 replaces this with `new(client: redis::Client) -> impl Future<Output=Result<Self>>`
+    /// and a `connect(url: &str)` convenience constructor.
     pub fn placeholder() -> Self {
         Self { _placeholder: () }
     }
@@ -1964,7 +1971,7 @@ After PR1 merges, fast-forward `develop` per workspace CLAUDE.md rule.
 
 **PR gate:** Integration tests green against a real Redis instance (`docker compose up -d redis` from `greentic-integration` or any local Redis on `localhost:6379`). Lock behaviour verified under concurrent step calls.
 
-**Pre-Phase-2:** Before starting, peek at `greentic-state` Redis pool surface — file: `/Users/bimapangestu/Desktop/Works/personal/greentic/greentic-state/src/lib.rs`. Find the public type used to obtain a Redis connection (likely `greentic_state::RedisPool` or `greentic_state::Client`). All code blocks below use the placeholder name `greentic_state::RedisPool` — replace with the actual type if it differs.
+**Pre-Phase-2:** Confirmed via inspection (2026-05-25): `greentic-state` exposes `RedisStateStore` (sync, single-connection-via-mutex) — NOT an async pool. Phase 2 therefore uses `redis::aio::ConnectionManager` directly via the `redis` crate, sharing the underlying Redis instance with `greentic-state` but with a distinct `aw:*` key namespace (spec §5.5). All code blocks below use the actual `redis::Client` + `ConnectionManager` API.
 
 ### Task 2.1: Add greentic-state dep + write the load test
 
@@ -1975,13 +1982,21 @@ After PR1 merges, fast-forward `develop` per workspace CLAUDE.md rule.
 
 - [ ] **Step 1: Wire the dependency**
 
-Modify `crates/greentic-aw-runtime/Cargo.toml` `[dependencies]` section — `greentic-state` is already added in Task 1.1. Verify the workspace pin resolves the same version as `greentic-runner-host` uses:
+Add the `redis` crate as a direct dependency on `greentic-aw-runtime` (NOT via `greentic-state`, which exposes only a synchronous `RedisStateStore` wrapping `redis::Client`):
 
-```bash
-cargo tree -p greentic-aw-runtime --depth 1 | grep greentic-state
+```diff
+ [dependencies]
++redis = { version = "1", features = ["tokio-comp", "aio", "connection-manager", "script"] }
+ ...
 ```
 
-Expected: One line `greentic-state v...` matching the version in `greentic-runner-host`.
+The `greentic-state` workspace dep stays in Cargo.toml (we may need its `TenantCtx` type), but its `RedisStateStore` is NOT reused — AW state lives under a distinct `aw:*` Redis key namespace per spec §5.5 and uses its own async connection manager.
+
+Verify the new dep resolves and that the workspace already has `redis = "1"` in transitive deps so version pinning is consistent:
+
+```bash
+cargo tree -p greentic-aw-runtime --depth 2 | grep redis
+```
 
 - [ ] **Step 2: Write a failing integration test**
 
@@ -2069,12 +2084,13 @@ git commit -m "test(aw-runtime): failing integration test for Redis state save/l
 ```rust
 //! Redis-backed `AgentStateStore` impl.
 
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use greentic_state::{RedisPool, Connection};
+use redis::{AsyncCommands, Client, Script};
+use redis::aio::ConnectionManager;
 
 use crate::error::StateError;
 use crate::state::{
@@ -2083,24 +2099,63 @@ use crate::state::{
 };
 use crate::tenant::TenantContext;
 
-const STATE_TTL_SECS:  u64 = 7 * 24 * 60 * 60; // 7 days
-const LOCK_TTL_SECS:   u64 = 90;
-const LOCK_POLL_MS:    u64 = 50;
+const STATE_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+const LOCK_TTL_SECS:  u64 = 90;
+const LOCK_POLL_MS:   u64 = 50;
+
+/// Lua script ensuring we only release the lock if we still own it.
+const LOCK_RELEASE_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+else
+    return 0
+end
+"#;
+
+/// Lua script: refresh TTL only if we still own the lock.
+const LOCK_REFRESH_LUA: &str = r#"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+else
+    return 0
+end
+"#;
 
 pub struct RedisAgentStateStore {
-    pool: Arc<RedisPool>,
+    client: Client,
+    /// Shared async connection manager. Auto-reconnects on disconnect.
+    conn: ConnectionManager,
+    release_script: Arc<Script>,
+    refresh_script: Arc<Script>,
 }
 
 impl RedisAgentStateStore {
-    pub fn new(pool: Arc<RedisPool>) -> Self {
-        Self { pool }
+    /// Build a store from an existing `redis::Client`. Use this when
+    /// sharing the underlying client across multiple stores (e.g. AW
+    /// + greentic-state pointing at the same Redis instance).
+    pub async fn new(client: Client) -> Result<Self, StateError> {
+        let conn = ConnectionManager::new(client.clone())
+            .await
+            .map_err(|e| StateError::Redis(format!("connection manager: {e}")))?;
+        Ok(Self {
+            client,
+            conn,
+            release_script: Arc::new(Script::new(LOCK_RELEASE_LUA)),
+            refresh_script: Arc::new(Script::new(LOCK_REFRESH_LUA)),
+        })
     }
 
+    /// Convenience: connect from a URL string.
     pub async fn connect(url: &str) -> Result<Self, StateError> {
-        let pool = RedisPool::connect(url)
-            .await
-            .map_err(|e| StateError::Redis(format!("connect: {e}")))?;
-        Ok(Self { pool: Arc::new(pool) })
+        let client = Client::open(url)
+            .map_err(|e| StateError::Redis(format!("open client: {e}")))?;
+        Self::new(client).await
+    }
+
+    /// Expose the underlying `redis::Client` so callers (token meter,
+    /// idempotency ledger) can share it without re-opening.
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     fn state_key(tenant: &TenantContext, session_id: &str) -> String {
@@ -2110,140 +2165,153 @@ impl RedisAgentStateStore {
     fn lock_key(tenant: &TenantContext, session_id: &str) -> String {
         format!("{}:{session_id}:lock", tenant.key_prefix())
     }
-
-    async fn conn(&self) -> Result<Connection, StateError> {
-        self.pool.get().await.map_err(|e| StateError::Redis(format!("pool: {e}")))
-    }
 }
 
 impl AgentStateStore for RedisAgentStateStore {
-    async fn load(
-        &self,
-        tenant:     &TenantContext,
-        session_id: &str,
-    ) -> Result<ConversationState, StateError> {
+    fn load<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<ConversationState, StateError>> + Send + 'a>> {
         let key = Self::state_key(tenant, session_id);
-        let mut conn = self.conn().await?;
-        let raw: Option<String> = conn
-            .get(&key)
-            .await
-            .map_err(|e| StateError::Redis(format!("get: {e}")))?;
-        let Some(json) = raw else {
-            return Ok(ConversationState::empty(tenant, session_id));
+        let mut conn = self.conn.clone();
+        Box::pin(async move {
+            let raw: Option<String> = conn
+                .get(&key)
+                .await
+                .map_err(|e| StateError::Redis(format!("get: {e}")))?;
+            let Some(json) = raw else {
+                return Ok(ConversationState::empty(tenant, session_id));
+            };
+            let state: ConversationState = serde_json::from_str(&json)
+                .map_err(|e| StateError::Decode(format!("state json: {e}")))?;
+            if state.schema_version > STATE_SCHEMA_VERSION {
+                return Err(StateError::SchemaIncompatible {
+                    found:     state.schema_version,
+                    supported: STATE_SCHEMA_VERSION,
+                });
+            }
+            Ok(state)
+        })
+    }
+
+    fn save<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        state: &'a ConversationState,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        let key = Self::state_key(tenant, session_id);
+        let mut conn = self.conn.clone();
+        let json = match serde_json::to_string(state) {
+            Ok(j) => j,
+            Err(e) => return Box::pin(async move {
+                Err(StateError::Decode(format!("state json: {e}")))
+            }),
         };
-        let state: ConversationState = serde_json::from_str(&json)
-            .map_err(|e| StateError::Decode(format!("state json: {e}")))?;
-        if state.schema_version > STATE_SCHEMA_VERSION {
-            return Err(StateError::SchemaIncompatible {
-                found:     state.schema_version,
-                supported: STATE_SCHEMA_VERSION,
-            });
-        }
-        Ok(state)
+        Box::pin(async move {
+            let _: () = conn
+                .set_ex(&key, &json, STATE_TTL_SECS)
+                .await
+                .map_err(|e| StateError::Redis(format!("set_ex: {e}")))?;
+            Ok(())
+        })
     }
 
-    async fn save(
-        &self,
-        tenant:     &TenantContext,
-        session_id: &str,
-        state:      &ConversationState,
-    ) -> Result<(), StateError> {
-        let key = Self::state_key(tenant, session_id);
-        let json = serde_json::to_string(state)
-            .map_err(|e| StateError::Decode(format!("state json: {e}")))?;
-        let mut conn = self.conn().await?;
-        conn.set_ex(&key, &json, STATE_TTL_SECS)
-            .await
-            .map_err(|e| StateError::Redis(format!("set_ex: {e}")))?;
-        Ok(())
-    }
-
-    async fn acquire_lock(
-        &self,
-        tenant:     &TenantContext,
-        session_id: &str,
-        wait:       Duration,
-    ) -> Result<SessionLock, StateError> {
+    fn acquire_lock<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        wait: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<SessionLock, StateError>> + Send + 'a>> {
         let key = Self::lock_key(tenant, session_id);
         let value = uuid::Uuid::new_v4().to_string();
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            let mut conn = self.conn().await?;
-            let acquired: bool = conn
-                .set_nx_ex(&key, &value, LOCK_TTL_SECS)
-                .await
-                .map_err(|e| StateError::Redis(format!("set nx: {e}")))?;
-            if acquired {
-                let inner = RedisSessionLock {
-                    pool:  self.pool.clone(),
-                    key,
-                    value,
-                };
-                return Ok(SessionLock::new(Box::new(inner)));
+        let mut conn = self.conn.clone();
+        let release_script = self.release_script.clone();
+        let refresh_script = self.refresh_script.clone();
+        Box::pin(async move {
+            let deadline = Instant::now() + wait;
+            loop {
+                // SET key value NX EX 90 — returns "OK" on success, nil on
+                // already-locked. The redis crate maps to bool.
+                let acquired: bool = redis::cmd("SET")
+                    .arg(&key)
+                    .arg(&value)
+                    .arg("NX")
+                    .arg("EX")
+                    .arg(LOCK_TTL_SECS)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| StateError::Redis(format!("set nx: {e}")))?;
+                if acquired {
+                    let inner = RedisSessionLock {
+                        conn:           conn.clone(),
+                        key,
+                        value,
+                        release_script,
+                        refresh_script,
+                    };
+                    return Ok(SessionLock::new(Box::new(inner)));
+                }
+                if Instant::now() >= deadline {
+                    return Err(StateError::LockTimeout(wait));
+                }
+                tokio::time::sleep(Duration::from_millis(LOCK_POLL_MS)).await;
             }
-            if std::time::Instant::now() >= deadline {
-                return Err(StateError::LockTimeout(wait));
-            }
-            tokio::time::sleep(Duration::from_millis(LOCK_POLL_MS)).await;
-        }
+        })
     }
 }
 
 struct RedisSessionLock {
-    pool:  Arc<RedisPool>,
-    key:   String,
-    value: String, // owner token; release only if value still matches (safety against TTL expiry races)
+    conn:           ConnectionManager,
+    key:            String,
+    value:          String, // ownership token; release only if value matches
+    release_script: Arc<Script>,
+    refresh_script: Arc<Script>,
 }
 
 impl SessionLockInner for RedisSessionLock {
     fn refresh<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        let mut conn = self.conn.clone();
+        let script = self.refresh_script.clone();
+        let key = self.key.clone();
+        let value = self.value.clone();
         Box::pin(async move {
-            let mut conn = self.pool.get().await
-                .map_err(|e| StateError::Redis(format!("pool: {e}")))?;
-            // Refresh TTL only if we still hold the lock (check-and-set via Lua).
-            let script = r#"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    return redis.call('EXPIRE', KEYS[1], ARGV[2])
-                else
-                    return 0
-                end
-            "#;
-            let refreshed: i64 = conn
-                .eval(script, &[&self.key], &[&self.value, &LOCK_TTL_SECS.to_string()])
+            let refreshed: i64 = script
+                .key(&key)
+                .arg(&value)
+                .arg(LOCK_TTL_SECS)
+                .invoke_async(&mut conn)
                 .await
-                .map_err(|e| StateError::Redis(format!("refresh eval: {e}")))?;
+                .map_err(|e| StateError::Redis(format!("refresh: {e}")))?;
             if refreshed == 1 {
                 Ok(())
             } else {
-                Err(StateError::Redis("lock no longer owned by this holder".into()))
+                Err(StateError::Redis(
+                    "lock no longer owned by this holder".into(),
+                ))
             }
         })
     }
 
     fn release(&self) {
-        // Best-effort sync release; uses a blocking adapter on the pool.
-        // If pool exposes only async API, spawn a detached task.
-        let pool = self.pool.clone();
+        // Best-effort sync release: detach a task on the runtime.
+        let mut conn = self.conn.clone();
+        let script = self.release_script.clone();
         let key = self.key.clone();
         let value = self.value.clone();
         tokio::spawn(async move {
-            let Ok(mut conn) = pool.get().await else { return };
-            let script = r#"
-                if redis.call('GET', KEYS[1]) == ARGV[1] then
-                    return redis.call('DEL', KEYS[1])
-                else
-                    return 0
-                end
-            "#;
-            let _: Result<i64, _> = conn.eval(script, &[&key], &[&value]).await;
+            let _: Result<i64, _> = script
+                .key(&key)
+                .arg(&value)
+                .invoke_async(&mut conn)
+                .await;
         });
     }
 }
 ```
-
-> **Note on `greentic-state` API shape:** the code above assumes `RedisPool::connect(url)`, `pool.get()` returning a connection, `conn.get/set_ex/set_nx_ex/eval`. Check the actual `greentic_state` surface and adapt — if `RedisPool` uses `redis::aio::ConnectionManager` directly, swap the `mut conn = self.conn().await?` lines for direct `redis::cmd("GET").arg(&key).query_async(&mut conn).await` calls. Same Lua scripts apply either way.
 
 - [ ] **Step 2: Run the tests against real Redis**
 
@@ -2279,12 +2347,8 @@ async fn load_returns_schema_incompatible_when_version_in_future() {
     let session = format!("future-{}", uuid::Uuid::new_v4());
 
     // Direct Redis write of a state with schema_version=99
-    let mut conn = greentic_state::RedisPool::connect(&url)
-        .await
-        .unwrap()
-        .get()
-        .await
-        .unwrap();
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     let key = format!("aw:test-acme:test-prod:{session}:state");
     let payload = serde_json::json!({
         "schema_version": 99,
@@ -2400,12 +2464,8 @@ async fn lock_refresh_extends_ttl() {
         .unwrap();
 
     // Inspect the raw TTL via redis.
-    let mut conn = greentic_state::RedisPool::connect(&url)
-        .await
-        .unwrap()
-        .get()
-        .await
-        .unwrap();
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
     let key = format!("aw:test-acme:test-prod:{session}:lock");
     let ttl_before: i64 = conn.ttl(&key).await.unwrap();
     assert!(ttl_before > 80, "expected initial TTL ~90s, got {ttl_before}");
@@ -2988,7 +3048,8 @@ git commit -m "feat(aw-runtime): tools.rs — invoke_tool via spawn_blocking + i
 use std::sync::Arc;
 
 use chrono::Utc;
-use greentic_state::RedisPool;
+use redis::AsyncCommands;
+use redis::aio::ConnectionManager;
 
 use crate::error::StateError;
 use crate::tenant::TenantContext;
@@ -3005,12 +3066,14 @@ pub trait TokenMeter: Send + Sync {
 }
 
 pub struct RedisTokenMeter {
-    pool: Arc<RedisPool>,
+    conn: ConnectionManager,
 }
 
 impl RedisTokenMeter {
-    pub fn new(pool: Arc<RedisPool>) -> Self {
-        Self { pool }
+    /// Build from an existing `ConnectionManager` (share with `RedisAgentStateStore`
+    /// by calling `store.client()` + `ConnectionManager::new`).
+    pub fn new(conn: ConnectionManager) -> Self {
+        Self { conn }
     }
 
     fn key(tenant: &TenantContext) -> String {
@@ -3022,8 +3085,7 @@ impl RedisTokenMeter {
 impl TokenMeter for RedisTokenMeter {
     async fn current(&self, tenant: &TenantContext) -> Result<u64, StateError> {
         let key = Self::key(tenant);
-        let mut conn = self.pool.get().await
-            .map_err(|e| StateError::Redis(format!("pool: {e}")))?;
+        let mut conn = self.conn.clone();
         let value: Option<u64> = conn.get(&key).await
             .map_err(|e| StateError::Redis(format!("get: {e}")))?;
         Ok(value.unwrap_or(0))
@@ -3031,11 +3093,10 @@ impl TokenMeter for RedisTokenMeter {
 
     async fn add(&self, tenant: &TenantContext, tokens: u64) -> Result<(), StateError> {
         let key = Self::key(tenant);
-        let mut conn = self.pool.get().await
-            .map_err(|e| StateError::Redis(format!("pool: {e}")))?;
-        conn.incrby(&key, tokens as i64).await
-            .map_err(|e| StateError::Redis(format!("incrby: {e}")))?;
-        conn.expire(&key, 86_400).await
+        let mut conn = self.conn.clone();
+        conn.incr(&key, tokens as i64).await
+            .map_err(|e| StateError::Redis(format!("incr: {e}")))?;
+        conn.expire(&key, 86_400i64).await
             .map_err(|e| StateError::Redis(format!("expire: {e}")))?;
         Ok(())
     }
@@ -3103,7 +3164,9 @@ Modify `crates/greentic-aw-runtime/src/lib.rs`:
      pub(crate) llm:             Arc<dyn LlmBackend>,
      pub(crate) telemetry:       Arc<dyn Telemetry>,
 +    pub(crate) token_meter:     Arc<dyn TokenMeter>,
-+    pub(crate) ledger_pool:     Arc<greentic_state::RedisPool>,
++    /// Async connection manager for the tool-call idempotency ledger.
++    /// Obtained from a `redis::Client` shared with `RedisAgentStateStore`.
++    pub(crate) ledger_conn:     redis::aio::ConnectionManager,
  }
 
  impl AgentRuntime {
@@ -3114,10 +3177,10 @@ Modify `crates/greentic-aw-runtime/src/lib.rs`:
          llm:             Arc<dyn LlmBackend>,
          telemetry:       Arc<dyn Telemetry>,
 +        token_meter:     Arc<dyn TokenMeter>,
-+        ledger_pool:     Arc<greentic_state::RedisPool>,
++        ledger_conn:     redis::aio::ConnectionManager,
      ) -> Self {
 -        Self { config_provider, state_store, ext_runtime, llm, telemetry }
-+        Self { config_provider, state_store, ext_runtime, llm, telemetry, token_meter, ledger_pool }
++        Self { config_provider, state_store, ext_runtime, llm, telemetry, token_meter, ledger_conn }
      }
 ```
 
@@ -3239,11 +3302,13 @@ pub async fn run_step(
 
                 // ---- Idempotency check ----
                 let lkey = ledger_key(&tenant, session_id, &call.call_id);
-                let mut conn = match runtime.ledger_pool.get().await {
-                    Ok(c) => c,
+                let mut conn = runtime.ledger_conn.clone();
+                // ConnectionManager auto-reconnects; a transient Redis error is
+                // non-fatal — fall through to dispatch so the user gets a reply.
+                let cached: Option<String> = match conn.get(&lkey).await {
+                    Ok(v) => v,
                     Err(e) => {
-                        warn!(error = %e, "ledger pool unavailable; bypassing idempotency");
-                        // fall through to dispatch
+                        warn!(error = %e, "ledger get failed; bypassing idempotency");
                         let result = dispatch_or_record(
                             &runtime,
                             &tenant,
@@ -3255,8 +3320,6 @@ pub async fn run_step(
                         continue;
                     }
                 };
-                let cached: Option<String> = conn.get(&lkey).await
-                    .map_err(|e| AgentError::ToolDispatch(format!("ledger get: {e}")))?;
                 if let Some(raw) = cached {
                     let entry: ToolLedgerEntry = serde_json::from_str(&raw)
                         .map_err(|e| AgentError::ToolDispatch(format!("ledger decode: {e}")))?;
@@ -3332,9 +3395,9 @@ async fn dispatch_or_record(
         let entry = ToolLedgerEntry { result: result.clone() };
         let json = serde_json::to_string(&entry)
             .map_err(|e| AgentError::ToolDispatch(format!("ledger encode: {e}")))?;
-        if let Ok(mut conn) = runtime.ledger_pool.get().await {
-            let _ = conn.set_ex(&key, &json, 7 * 24 * 60 * 60).await;
-        }
+        let mut conn = runtime.ledger_conn.clone();
+        // Best-effort write; ignore errors (idempotency ledger is advisory).
+        let _: Result<(), _> = conn.set_ex(&key, &json, 7u64 * 24 * 60 * 60).await;
     }
     Ok(result)
 }
@@ -3443,18 +3506,25 @@ fn build_runtime(
     cp.insert(&tc, "a", cfg_inner);
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(0));
-    // ledger_pool: use a stub that fails — loop falls back to non-cached dispatch.
-    // We rely on the Phase 3 loop catching pool errors and bypassing idempotency.
-    let ledger_pool = Arc::new(stub_pool());
+    // ledger_conn: use a ConnectionManager pointed at a non-existent Redis so
+    // every get/set errors. Loop must tolerate it and fall through to dispatch.
+    // "redis://127.0.0.1:1" — port 1 is never open; errors immediately.
+    let ledger_client = redis::Client::open("redis://127.0.0.1:1").unwrap();
+    // ConnectionManager::new may itself fail; if it does, tests that don't
+    // exercise idempotency still pass because the mock stores absorb all state.
+    // Use a lazy/deferred approach: wrap the client in an Option and only
+    // materialize the ConnectionManager in tests that need it.
+    // For now: build a real ConnectionManager in an async context. Since
+    // build_runtime is sync, callers that need a live ledger_conn should call
+    // the async variant `build_runtime_async`. This sync helper embeds a
+    // tokio::runtime::Handle::current().block_on for the manager init.
+    let ledger_conn = tokio::runtime::Handle::current()
+        .block_on(redis::aio::ConnectionManager::new(ledger_client))
+        .unwrap_or_else(|_| panic!("could not create stub ConnectionManager"));
 
     let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
-    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter.clone(), ledger_pool);
+    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter.clone(), ledger_conn);
     (rt, telemetry, token_meter)
-}
-
-fn stub_pool() -> greentic_state::RedisPool {
-    // Returns a pool whose get() always errors. Loop must tolerate it.
-    greentic_state::RedisPool::stub_failing()
 }
 
 #[tokio::test]
@@ -3532,9 +3602,12 @@ async fn token_budget_exceeded_returns_error() {
     cp.insert(&tc, "a", cfg);
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(100)); // already above cap
-    let ledger_pool = Arc::new(stub_pool());
+    let ledger_client = redis::Client::open("redis://127.0.0.1:1").unwrap();
+    let ledger_conn = tokio::runtime::Handle::current()
+        .block_on(redis::aio::ConnectionManager::new(ledger_client))
+        .unwrap_or_else(|_| panic!("stub ConnectionManager"));
     let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
-    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger_pool);
+    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger_conn);
     let err = rt.step(tc, "s", "a", AgentInput { text: "x".into() }).await.unwrap_err();
     assert!(matches!(err, greentic_aw_runtime::error::AgentError::TokenBudgetExceeded));
 }
@@ -3569,7 +3642,7 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
 
 - [ ] **Step 2: Add the `for_test`/`stub_failing` shims**
 
-If `greentic_ext_runtime::ExtensionRuntime::for_test()` or `greentic_state::RedisPool::stub_failing()` does not exist, **gate Phase 3 on adding them upstream**. File issues:
+If `greentic_ext_runtime::ExtensionRuntime::for_test()` does not exist, **gate Phase 3 on adding it upstream**. File an issue:
 
 ```bash
 cd /Users/bimapangestu/Desktop/Works/personal/greentic/greentic-designer-extensions
@@ -3577,13 +3650,9 @@ gh issue create --title "Add ExtensionRuntime::for_test() shim for downstream te
   --body "greentic-aw-runtime needs a no-op ExtensionRuntime constructor for unit tests under \`--features test-mock\`. Add a \`pub fn for_test() -> Self\` that returns an instance with no extensions loaded; invoke_tool returns NotFound."
 ```
 
-```bash
-cd /Users/bimapangestu/Desktop/Works/personal/greentic/greentic-state
-gh issue create --title "Add RedisPool::stub_failing() shim for downstream test crates" \
-  --body "greentic-aw-runtime needs a RedisPool stub whose get() always errors, for testing fallback paths when the pool is unavailable."
-```
+Note: No special upstream stub type is needed for the ledger — Phase 2 and the loop tests use `redis::Client::open("redis://127.0.0.1:1")` (port 1 is never open) as the stub client, and the `ConnectionManager` will error on every command, exercising the same fallback paths without requiring any upstream change to `greentic-state`.
 
-When both shims land, bump dependency tags and re-run.
+When the `ExtensionRuntime::for_test()` shim lands, bump the dependency tag and re-run.
 
 - [ ] **Step 3: Run the scripted-loop tests**
 
@@ -4371,7 +4440,12 @@ pub async fn dispatch_user_message(
     // tab, see Task 5.4 (persistent store keyed on session_uuid).
     let store = Arc::new(MockAgentStateStore::new());
     let token_meter = Arc::new(MockTokenMeter::new(0));
-    let ledger_pool = Arc::new(greentic_state::RedisPool::stub_failing());
+    // Stub ledger: port 1 is never open → ConnectionManager errors on every call
+    // → loop falls back to non-cached dispatch, which is correct for the playground.
+    let ledger_client = redis::Client::open("redis://127.0.0.1:1").unwrap();
+    let ledger_conn = tokio::runtime::Handle::current()
+        .block_on(redis::aio::ConnectionManager::new(ledger_client))
+        .unwrap_or_else(|_| panic!("stub ConnectionManager for playground"));
     let telemetry = Arc::new(MockTelemetry::new());
 
     let rt = AgentRuntime::new(
@@ -4381,7 +4455,7 @@ pub async fn dispatch_user_message(
         llm,
         telemetry,
         token_meter,
-        ledger_pool,
+        ledger_conn,
     );
 
     match rt
@@ -4743,7 +4817,8 @@ These are all already covered by tests written in earlier phases. Verify each:
   async fn tool_idempotency_ledger_blocks_double_dispatch() {
       let Some(url) = redis_url() else { return; };
       // Direct Redis: pre-populate the ledger key
-      let mut conn = greentic_state::RedisPool::connect(&url).await.unwrap().get().await.unwrap();
+      let client = redis::Client::open(url.as_str()).unwrap();
+      let mut conn = redis::aio::ConnectionManager::new(client).await.unwrap();
       let key = "aw:acme:prod:sess-idem:tool_calls:tc1";
       let entry = serde_json::json!({ "result": { "ok": true } }).to_string();
       conn.set_ex(key, &entry, 60).await.unwrap();
@@ -4895,8 +4970,9 @@ git commit -m "test(integration): banking-id composer → AgentConfig → real r
 #[tokio::test]
 async fn daily_token_cap_enforced_against_real_redis() {
     let Some(url) = std::env::var("REDIS_URL").ok() else { return; };
-    let pool = Arc::new(greentic_state::RedisPool::connect(&url).await.unwrap());
-    let meter = RedisTokenMeter::new(pool.clone());
+    let client = redis::Client::open(url.as_str()).unwrap();
+    let conn = redis::aio::ConnectionManager::new(client).await.unwrap();
+    let meter = RedisTokenMeter::new(conn);
     let tenant = TenantContext::new("cap-test", format!("env-{}", uuid::Uuid::new_v4()));
 
     // Pre-set the counter past the cap
