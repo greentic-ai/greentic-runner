@@ -1,0 +1,283 @@
+//! Plan-Act-Observe agent loop. Spec §5.3.
+
+use std::time::{Duration, Instant};
+
+use tracing::warn;
+
+use crate::error::{AgentError, LlmError, TerminationReason};
+use crate::llm::LlmRequest;
+use crate::state::{ChatMessage, ConversationState};
+use crate::telemetry::StepTelemetryCtx;
+use crate::tenant::TenantContext;
+use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
+use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep};
+
+pub async fn run_step(
+    runtime: &AgentRuntime,
+    tenant: TenantContext,
+    session_id: &str,
+    agent_id: &str,
+    message: AgentInput,
+) -> Result<AgentOutput, AgentError> {
+    let started = Instant::now();
+    let config = runtime
+        .config_provider
+        .agent_config(&tenant, agent_id)
+        .await?;
+
+    // --- Cost budget gate (spec Decision 14) ---
+    if let Some(cap) = config.limits.daily_token_cap_per_tenant {
+        let used = runtime.token_meter.current(&tenant).await?;
+        if used >= u64::from(cap) {
+            return Err(AgentError::TokenBudgetExceeded);
+        }
+    }
+
+    // --- Acquire distributed lock (default wait 5s) ---
+    let lock = runtime
+        .state_store
+        .acquire_lock(&tenant, session_id, Duration::from_secs(5))
+        .await
+        .map_err(|e| match e {
+            crate::error::StateError::LockTimeout(_) => AgentError::LockTimeout,
+            other => AgentError::StateLoad(other),
+        })?;
+
+    // --- Load state (best-effort; empty on failure) ---
+    let mut state = match runtime.state_store.load(&tenant, session_id).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "state load failed; proceeding with empty state");
+            ConversationState::empty(&tenant, session_id)
+        }
+    };
+    state.messages.push(ChatMessage::User {
+        content: message.text,
+    });
+
+    let mut total_tokens: u64 = 0;
+    let mut trail: Vec<AgentStep> = Vec::new();
+    let mut terminated_by = TerminationReason::MaxIterations;
+    let mut iterations: u32 = 0;
+    let mut reply = String::new();
+
+    for iter in 0..config.limits.max_iter {
+        iterations = iter + 1;
+
+        // Extend the lock TTL each iteration; losing the extension is
+        // preferable to aborting a partially-complete turn.
+        if let Err(e) = lock.refresh().await {
+            warn!(error = %e, "lock refresh failed; continuing");
+        }
+
+        if started.elapsed() >= config.limits.timeout {
+            terminated_by = TerminationReason::Timeout;
+            break;
+        }
+
+        let tools_schema = list_tools_for_llm(&runtime.ext_runtime, &config.tools);
+        let request = LlmRequest {
+            system_prompt: config.system_prompt.clone(),
+            history: state.messages.clone(),
+            tools: tools_schema,
+            provider: config.llm.clone(),
+        };
+
+        let response = match runtime.llm.complete(request).await {
+            Ok(r) => r,
+            Err(LlmError::ServiceUnavailable) => {
+                let _ = runtime.state_store.save(&tenant, session_id, &state).await;
+                return Err(AgentError::LlmProviderUnavailable);
+            }
+            Err(other) => {
+                let _ = runtime.state_store.save(&tenant, session_id, &state).await;
+                return Err(AgentError::Llm(other));
+            }
+        };
+
+        let step_tokens = u64::from(response.tokens_in) + u64::from(response.tokens_out);
+        total_tokens += step_tokens;
+        if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
+            warn!(error = %e, "token meter add failed; continuing");
+        }
+
+        // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
+        if !response.tool_calls.is_empty() {
+            for call in response.tool_calls {
+                if !is_tool_allowed(&call, &config.tools) {
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: serde_json::json!({ "error": "tool not allowed for this agent" }),
+                    });
+                    trail.push(AgentStep::ToolCallBlocked {
+                        name: call.tool_name.clone(),
+                        reason: "not in allow-list".into(),
+                    });
+                    continue;
+                }
+
+                // --- Idempotency: reuse a previously-recorded result ---
+                match runtime.ledger.get(&tenant, session_id, &call.call_id).await {
+                    Ok(Some(cached)) => {
+                        state.messages.push(ChatMessage::Tool {
+                            call_id: call.call_id.clone(),
+                            content: cached,
+                        });
+                        trail.push(AgentStep::ToolCallReused {
+                            name: call.tool_name.clone(),
+                            call_id: call.call_id.clone(),
+                        });
+                        continue;
+                    }
+                    Ok(None) => {} // fall through to dispatch
+                    Err(e) => {
+                        warn!(error = %e, "ledger get failed; dispatching without idempotency");
+                    }
+                }
+
+                // --- Dispatch (blocking WASM via spawn_blocking) ---
+                // Tool dispatch errors are NOT termination (spec §6): surface
+                // the error as a Tool observation so the LLM can react, then
+                // continue. Failed calls are NOT recorded in the ledger
+                // (they should remain retryable on the next turn).
+                let result =
+                    match dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                error = %e, tool = %call.tool_name,
+                                "tool dispatch failed; recording as observation and continuing"
+                            );
+                            let err_obs = serde_json::json!({ "error": e.to_string() });
+                            state.messages.push(ChatMessage::Tool {
+                                call_id: call.call_id.clone(),
+                                content: err_obs.clone(),
+                            });
+                            trail.push(AgentStep::ToolCall {
+                                name: call.tool_name.clone(),
+                                call_id: call.call_id.clone(),
+                                result: err_obs,
+                            });
+                            continue;
+                        }
+                    };
+
+                // Record successful result in ledger (best-effort).
+                if let Err(e) = runtime
+                    .ledger
+                    .record(&tenant, session_id, &call.call_id, result.clone())
+                    .await
+                {
+                    warn!(error = %e, "ledger record failed; continuing");
+                }
+
+                state.messages.push(ChatMessage::Tool {
+                    call_id: call.call_id.clone(),
+                    content: result.clone(),
+                });
+                trail.push(AgentStep::ToolCall {
+                    name: call.tool_name.clone(),
+                    call_id: call.call_id,
+                    result,
+                });
+            }
+            continue; // next LLM turn with tool observations
+        }
+
+        // --- No tool calls: final reply ---
+        reply = response.content.unwrap_or_default();
+        state.messages.push(ChatMessage::Assistant {
+            content: reply.clone(),
+            tool_calls: vec![],
+        });
+        trail.push(AgentStep::Reply {
+            text: reply.clone(),
+        });
+        terminated_by = TerminationReason::FinalReply;
+        break;
+    }
+
+    state.truncate_history(config.limits.max_history_turns);
+    if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+        warn!(error = %e, "state save failed at end of step");
+    }
+
+    runtime.telemetry.record_step(&StepTelemetryCtx {
+        tenant_id: tenant.tenant_id.clone(),
+        env_id: tenant.env_id.clone(),
+        session_id: session_id.to_string(),
+        agent_id: agent_id.to_string(),
+        terminated_by: terminated_by.clone(),
+        iterations,
+        total_tokens,
+        duration: started.elapsed(),
+    });
+
+    Ok(AgentOutput {
+        reply,
+        trail,
+        terminated_by,
+    })
+}
+
+#[cfg(all(test, feature = "test-mock"))]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
+    use crate::llm::LlmResponse;
+    use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
+    use crate::tenant::TenantContext;
+    use crate::{AgentInput, AgentRuntime};
+
+    fn cfg() -> AgentConfig {
+        AgentConfig {
+            agent_id: "a".into(),
+            system_prompt: "sys".into(),
+            tools: vec![],
+            llm: LlmProviderRef {
+                provider: "openai".into(),
+                model: "m".into(),
+            },
+            limits: AgentLimits::default(),
+        }
+    }
+
+    /// Happy-path loop test: one LLM call → reply, telemetry recorded.
+    #[tokio::test]
+    async fn happy_path_returns_llm_reply() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("hi from llm".into()),
+            tool_calls: vec![],
+            tokens_in: 10,
+            tokens_out: 20,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime =
+            AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
+
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "hi from llm");
+        assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+    }
+}
