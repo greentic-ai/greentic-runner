@@ -426,7 +426,12 @@ mod export_tests {
         let _ = provider.shutdown();
 
         let spans = exported.lock().unwrap_or_else(|e| e.into_inner());
-        let span = spans.last().expect("flow.execute span exported");
+        // Assert on the named span, not just the last one — a future extra span
+        // from the subscriber stack would otherwise yield confusing failures.
+        let span = spans
+            .iter()
+            .find(|s| s.name == "flow.execute")
+            .expect("flow.execute span exported");
         assert_eq!(
             attr_value(span, attr_keys::PACK_ID).as_deref(),
             Some("customer.support@1.2.0"),
@@ -439,6 +444,10 @@ mod export_tests {
         assert_eq!(
             attr_value(span, attr_keys::DEPLOYMENT_ID).as_deref(),
             Some("01JTKS")
+        );
+        assert_eq!(
+            attr_value(span, attr_keys::BUNDLE_ID).as_deref(),
+            Some("customer.support")
         );
         assert_eq!(
             attr_value(span, attr_keys::CUSTOMER_ID).as_deref(),
