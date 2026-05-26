@@ -410,6 +410,16 @@ impl TenantRuntime {
                     pack_ref.digest
                 )
             })?;
+            // `matches_file` always hashes with SHA-256, so a digest pinned under
+            // any other algorithm could never match — reject it with a clear
+            // message rather than the misleading "does not match" below.
+            if expected.algorithm() != "sha256" {
+                bail!(
+                    "revision pack `{}` pins unsupported digest algorithm `{}`; only sha256 is supported",
+                    pack_ref.path.display(),
+                    expected.algorithm()
+                );
+            }
             if !expected.matches_file(&pack_ref.path).with_context(|| {
                 format!(
                     "hashing revision pack `{}` for digest verification",
@@ -525,7 +535,7 @@ impl TenantRuntime {
     /// revision / customer identity. [`from_packs`](Self::from_packs) is the
     /// legacy (tenant-only) path and passes [`RolloutIds::default`].
     #[allow(clippy::too_many_arguments)]
-    pub async fn from_packs_with_rollout(
+    pub(crate) async fn from_packs_with_rollout(
         config: Arc<HostConfig>,
         packs: Vec<(Arc<PackRuntime>, Option<String>)>,
         mocks: Option<Arc<MockLayer>>,

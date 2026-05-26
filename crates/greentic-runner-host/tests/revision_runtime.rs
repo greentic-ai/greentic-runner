@@ -103,6 +103,33 @@ async fn build_revision(
     .await
 }
 
+/// A true legacy (tenant-only) runtime: built via `TenantRuntime::load` with the
+/// default (empty) rollout identity, matching how the pack watcher constructs
+/// tenant runtimes in production.
+async fn build_legacy() -> Result<Arc<TenantRuntime>> {
+    let pack = fixture_pack();
+    let config = host_config(&pack);
+    let session_store = new_session_store();
+    let session_host = session_host_from(Arc::clone(&session_store));
+    let state_store = new_state_store();
+    let state_host = state_host_from(Arc::clone(&state_store));
+    let manager = default_manager().context("default manager")?;
+    TenantRuntime::load(
+        &pack,
+        config,
+        None,
+        Some(pack.as_path()),
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        session_host,
+        session_store,
+        state_store,
+        state_host,
+        manager,
+    )
+    .await
+}
+
 #[tokio::test]
 async fn load_revision_derives_rollout_identity_and_records_digests() -> Result<()> {
     let refs = pinned_pack_refs()?;
@@ -159,21 +186,44 @@ async fn load_revision_rejects_digest_mismatch() -> Result<()> {
 }
 
 #[tokio::test]
+async fn load_revision_rejects_unsupported_digest_algorithm() -> Result<()> {
+    // Well-formed `algo:value`, but an algorithm the verifier can never produce.
+    let wrong_algo = vec![RevisionPackRef {
+        path: fixture_pack(),
+        digest: "sha512:abc".into(),
+    }];
+    let Err(err) = build_revision(
+        &wrong_algo,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await
+    else {
+        panic!("unsupported digest algorithm must be rejected");
+    };
+    assert!(
+        format!("{err:#}").contains("unsupported digest algorithm"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn insert_revision_round_trips_and_preserves_legacy() -> Result<()> {
     let active = ActivePacks::new();
     let deployment = DeploymentId::new();
     let bundle = BundleId::from("customer.support");
     let revision = RevisionId::new();
 
-    // A pre-existing legacy (tenant-only) runtime must survive the insert.
-    let legacy = build_revision(
-        &pinned_pack_refs()?,
-        deployment,
-        bundle.clone(),
-        revision,
-        None,
-    )
-    .await?;
+    // A pre-existing legacy (tenant-only) runtime — real production shape, with
+    // no rollout identity — must survive the revision insert.
+    let legacy = build_legacy().await?;
+    assert!(
+        legacy.engine().rollout_ids().is_empty(),
+        "legacy runtime must carry no rollout identity"
+    );
     active.insert_pack(TENANT, legacy);
 
     let runtime = build_revision(
