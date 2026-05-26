@@ -26,6 +26,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
+greentic-aw-runtime = { path = "../greentic-aw-runtime" }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true

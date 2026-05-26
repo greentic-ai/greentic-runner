@@ -53,6 +53,7 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -132,6 +133,7 @@ enum NodeKind {
     BuiltinStateGet,
     BuiltinStateSet,
     Wait,
+    DwAgent { agent_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +279,7 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            agent_node_handler: None,
         })
     }
 
@@ -284,6 +287,15 @@ impl FlowEngine {
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
         self.cross_pack_resolver = Some(resolver);
+    }
+
+    /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
+    /// runtime. Constructed by the runner binary (Task 4.3).
+    pub fn set_agent_node_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
+    ) {
+        self.agent_node_handler = Some(handler);
     }
 
     async fn get_or_load_flow(&self, pack_id: &str, flow_id: &str) -> Result<HostFlow> {
@@ -705,7 +717,34 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
+            NodeKind::DwAgent { agent_id } => self
+                .execute_dw_agent(ctx, agent_id, payload)
+                .await
+                .map(DispatchOutcome::complete),
         }
+    }
+
+    async fn execute_dw_agent(
+        &self,
+        ctx: &FlowContext<'_>,
+        agent_id: &str,
+        payload: Value,
+    ) -> Result<NodeOutput> {
+        let handler = self
+            .agent_node_handler
+            .as_ref()
+            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
+        let session_id = ctx.session_id.unwrap_or("");
+        let result = handler
+            .execute(
+                ctx.tenant,
+                &self.default_env,
+                agent_id,
+                session_id,
+                &payload,
+            )
+            .await?;
+        Ok(NodeOutput::new(result))
     }
 
     async fn execute_state_get(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
@@ -1763,7 +1802,8 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("flow.")
             || full_ref.starts_with("emit.")
             || full_ref.starts_with("session.")
-            || full_ref.starts_with("provider.");
+            || full_ref.starts_with("provider.")
+            || full_ref.starts_with("dw.");
         let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
             (full_ref, node.component.operation.clone())
         } else if let Some(dot) = full_ref.rfind('.') {
@@ -1816,6 +1856,9 @@ impl From<Node> for HostNode {
                 "session.wait" => NodeKind::Wait,
                 "state.get" => NodeKind::BuiltinStateGet,
                 "state.set" => NodeKind::BuiltinStateSet,
+                "dw.agent" => NodeKind::DwAgent {
+                    agent_id: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -1833,6 +1876,7 @@ impl From<Node> for HostNode {
             NodeKind::BuiltinStateGet => "state.get".to_string(),
             NodeKind::BuiltinStateSet => "state.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
+            NodeKind::DwAgent { .. } => "dw.agent".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -2473,6 +2517,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            agent_node_handler: None,
         }
     }
 
@@ -2893,6 +2938,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            agent_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -2983,6 +3029,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            agent_node_handler: None,
         }
     }
 
