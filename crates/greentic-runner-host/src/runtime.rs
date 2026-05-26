@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +26,7 @@ use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, canonicalize_secret_key, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
+use crate::telemetry::RolloutIds;
 use crate::trace::PackTraceInfo;
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
@@ -108,6 +109,19 @@ fn remove_keyed_entry<V: Clone>(
     Some((next, removed))
 }
 
+/// Pure swap helper for [`ActivePacks::insert_revision`]: clone the prev map
+/// and insert `value` under `key`, returning the next map. Generic over `V` so
+/// the swap logic is testable without standing up a real `TenantRuntime`.
+fn insert_keyed_entry<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    key: RuntimeKey,
+    value: V,
+) -> HashMap<RuntimeKey, V> {
+    let mut next = prev.clone();
+    next.insert(key, value);
+    next
+}
+
 /// Atomically swapped view of live tenant runtimes.
 ///
 /// Reads are lock-free via `ArcSwap`. Mutations serialize on `write_lock` so a
@@ -161,6 +175,25 @@ impl ActivePacks {
         let _guard = self.write_lock.lock();
         let mut next = (*self.inner.load_full()).clone();
         next.insert(RuntimeKey::legacy(tenant), runtime);
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Insert (or replace) a single revision-keyed runtime, preserving every
+    /// other entry — the tenant-only legacy entry and sibling revisions alike.
+    /// This is the producer the deployment warm path calls once a revision's
+    /// packs are loaded; the pack watcher's [`replace_legacy`](Self::replace_legacy)
+    /// then carries the entry across tenant-pack reloads untouched.
+    pub fn insert_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        runtime: Arc<TenantRuntime>,
+    ) {
+        let _guard = self.write_lock.lock();
+        let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
+        let next = insert_keyed_entry(&self.inner.load_full(), key, runtime);
         self.inner.store(Arc::new(next));
     }
 
@@ -266,30 +299,17 @@ impl TenantRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
     ) -> Result<Arc<Self>> {
-        let oauth_config = config.oauth_broker_config();
-        let pack = Arc::new(
-            PackRuntime::load(
-                pack_path,
-                Arc::clone(&config),
-                mocks.clone(),
-                archive_source,
-                Some(Arc::clone(&session_store)),
-                Some(Arc::clone(&state_store)),
-                Arc::clone(&wasi_policy),
-                Arc::clone(&secrets_manager),
-                oauth_config.clone(),
-                true,
-                ComponentResolution::default(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to load pack {} for tenant {}",
-                    pack_path.display(),
-                    config.tenant
-                )
-            })?,
-        );
+        let pack = Self::load_pack_runtime(
+            pack_path,
+            &config,
+            mocks.clone(),
+            archive_source,
+            &wasi_policy,
+            &session_store,
+            &state_store,
+            &secrets_manager,
+        )
+        .await?;
         Self::from_packs(
             config,
             vec![(pack, digest)],
@@ -303,8 +323,130 @@ impl TenantRuntime {
         .await
     }
 
+    /// Build a revision-keyed runtime from an explicit, ordered list of pack
+    /// paths (the resolved `pack_list` of a deployment revision). The first
+    /// path is the main pack; the rest are overlays. `rollout` stamps the
+    /// deployment / bundle / revision / customer identity onto every flow span
+    /// this runtime emits — the producer side of the C5 telemetry seam.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_revision(
+        pack_paths: &[PathBuf],
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        rollout: RolloutIds,
+    ) -> Result<Arc<Self>> {
+        if pack_paths.is_empty() {
+            bail!(
+                "revision runtime for tenant {} requires at least one pack",
+                config.tenant
+            );
+        }
+        let mut packs = Vec::with_capacity(pack_paths.len());
+        for pack_path in pack_paths {
+            let pack = Self::load_pack_runtime(
+                pack_path,
+                &config,
+                mocks.clone(),
+                None,
+                &wasi_policy,
+                &session_store,
+                &state_store,
+                &secrets_manager,
+            )
+            .await?;
+            packs.push((pack, None));
+        }
+        Self::from_packs_with_rollout(
+            config,
+            packs,
+            mocks,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            rollout,
+        )
+        .await
+    }
+
+    /// Load a single [`PackRuntime`] from a path, sharing the tenant's session /
+    /// state / secrets backends. Shared by [`load`](Self::load) (one pack) and
+    /// [`load_revision`](Self::load_revision) (the revision's pack list).
+    #[allow(clippy::too_many_arguments)]
+    async fn load_pack_runtime(
+        pack_path: &Path,
+        config: &Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        archive_source: Option<&Path>,
+        wasi_policy: &Arc<RunnerWasiPolicy>,
+        session_store: &DynSessionStore,
+        state_store: &DynStateStore,
+        secrets_manager: &DynSecretsManager,
+    ) -> Result<Arc<PackRuntime>> {
+        let oauth_config = config.oauth_broker_config();
+        Ok(Arc::new(
+            PackRuntime::load(
+                pack_path,
+                Arc::clone(config),
+                mocks,
+                archive_source,
+                Some(Arc::clone(session_store)),
+                Some(Arc::clone(state_store)),
+                Arc::clone(wasi_policy),
+                Arc::clone(secrets_manager),
+                oauth_config,
+                true,
+                ComponentResolution::default(),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load pack {} for tenant {}",
+                    pack_path.display(),
+                    config.tenant
+                )
+            })?,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn from_packs(
+        config: Arc<HostConfig>,
+        packs: Vec<(Arc<PackRuntime>, Option<String>)>,
+        mocks: Option<Arc<MockLayer>>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+    ) -> Result<Arc<Self>> {
+        Self::from_packs_with_rollout(
+            config,
+            packs,
+            mocks,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            RolloutIds::default(),
+        )
+        .await
+    }
+
+    /// Like [`from_packs`](Self::from_packs) but stamps `rollout` onto the flow
+    /// engine so every span this runtime emits carries the deployment / bundle /
+    /// revision / customer identity. [`from_packs`](Self::from_packs) is the
+    /// legacy (tenant-only) path and passes [`RolloutIds::default`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_packs_with_rollout(
         config: Arc<HostConfig>,
         packs: Vec<(Arc<PackRuntime>, Option<String>)>,
         mocks: Option<Arc<MockLayer>>,
@@ -313,6 +455,7 @@ impl TenantRuntime {
         _state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        rollout: RolloutIds,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -344,7 +487,8 @@ impl TenantRuntime {
         let engine = Arc::new(
             FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
                 .await
-                .context("failed to prime flow engine")?,
+                .context("failed to prime flow engine")?
+                .with_rollout_ids(rollout),
         );
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
@@ -675,5 +819,44 @@ mod runtime_key_tests {
             Some(&2)
         );
         assert_eq!(map.get(&RuntimeKey::legacy("ghost")), None);
+    }
+
+    #[test]
+    fn insert_keyed_entry_adds_revision_preserving_legacy_and_siblings() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle, rev_b);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1);
+        prev.insert(key_a.clone(), 10);
+
+        let next = insert_keyed_entry(&prev, key_b.clone(), 20);
+
+        // New revision lands; legacy entry and the sibling revision survive.
+        assert_eq!(next.get(&key_b), Some(&20));
+        assert_eq!(next.get(&key_a), Some(&10));
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&1));
+        assert_eq!(next.len(), 3);
+    }
+
+    #[test]
+    fn insert_keyed_entry_replaces_existing_revision() {
+        let key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(key.clone(), 10);
+
+        let next = insert_keyed_entry(&prev, key.clone(), 99);
+
+        assert_eq!(next.get(&key), Some(&99));
+        assert_eq!(next.len(), 1);
     }
 }
