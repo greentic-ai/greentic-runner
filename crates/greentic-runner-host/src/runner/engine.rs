@@ -2970,6 +2970,148 @@ mod tests {
         assert_eq!(ends[0], json!({ "message": "logged" }));
     }
 
+    #[test]
+    fn dw_agent_node_routes_to_handler_and_returns_reply() {
+        use crate::runner::agent_node::{AgentNodeHandler, RuntimeAgentNodeHandler};
+        use greentic_aw_runtime::cost::MockTokenMeter;
+        use greentic_aw_runtime::llm::LlmResponse;
+        use greentic_aw_runtime::mock::{
+            MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
+        };
+        use greentic_aw_runtime::{
+            AgentConfig, AgentLimits, AgentRuntime, LlmProviderRef, TenantContext,
+        };
+
+        // --- mock-backed AgentRuntime: the LLM replies "pong" in one step ---
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("pong".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+
+        // The dispatch builds TenantContext::new(ctx.tenant, default_env) =
+        // ("demo", "local"). MockConfigProvider keys by
+        // `format!("{}:{agent_id}", tenant.key_prefix())` = "aw:demo:local:greeter",
+        // so seed with the SAME tenant+env+agent_id the engine will look up.
+        let config_provider = MockConfigProvider::new();
+        let tenant = TenantContext::new("demo", "local");
+        config_provider.insert(
+            &tenant,
+            "greeter",
+            AgentConfig {
+                agent_id: "greeter".into(),
+                system_prompt: "sys".into(),
+                tools: vec![],
+                llm: LlmProviderRef {
+                    provider: "mock".into(),
+                    model: "m".into(),
+                },
+                limits: AgentLimits::default(),
+            },
+        );
+        let config_provider = Arc::new(config_provider);
+        let token_meter = Arc::new(MockTokenMeter::new(0));
+        let ledger = Arc::new(NoopToolLedger);
+        let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let runtime = Arc::new(AgentRuntime::new(
+            config_provider,
+            store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+        ));
+        let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(runtime));
+
+        // --- flow with a single dw.agent node (operation = agent_id) ---
+        let node_id = NodeId::from_str("agent").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "ping" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("dw.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "dw.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            agent_node_handler: Some(handler),
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "dw.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-1"),
+            provider_id: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(ctx, json!({ "user_text": "ping" })))
+            .unwrap();
+        assert!(matches!(result.status, FlowStatus::Completed));
+
+        // The dw.agent node output is {"reply", "trail", "terminated_by"}; the
+        // engine finalises a single-node flow's egress into an array wrapping it.
+        let output_str = serde_json::to_string(&result.output).unwrap();
+        assert!(
+            output_str.contains("pong"),
+            "expected agent reply in flow output, got: {output_str}"
+        );
+    }
+
     fn host_flow_for_test(
         flow_id: &str,
         node_ids: &[&str],
