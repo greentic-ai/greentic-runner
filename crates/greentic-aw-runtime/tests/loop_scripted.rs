@@ -221,3 +221,37 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
     assert_eq!(out.reply, "the real answer");
     assert_ne!(out.reply, "internal reasoning");
 }
+
+#[tokio::test]
+async fn llm_provider_unavailable_after_retries_returns_error() {
+    use greentic_aw_runtime::error::LlmError;
+    use greentic_aw_runtime::llm::{LlmBackend, RetryingLlmBackend};
+
+    // Scripted backend returns ServiceUnavailable 3 times; RetryingLlmBackend
+    // (attempts=3, tiny backoff) exhausts all retries → loop returns
+    // LlmProviderUnavailable.
+    let inner = MockLlmBackend::new(vec![
+        Err(LlmError::ServiceUnavailable),
+        Err(LlmError::ServiceUnavailable),
+        Err(LlmError::ServiceUnavailable),
+    ]);
+    let llm: Arc<dyn LlmBackend> =
+        Arc::new(RetryingLlmBackend::new(inner, 3, Duration::from_millis(1)));
+
+    let store = Arc::new(MockAgentStateStore::new());
+    let telemetry = Arc::new(MockTelemetry::new());
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", cfg(8, 60_000, vec![], None));
+    let cp = Arc::new(cp);
+    let token_meter = Arc::new(MockTokenMeter::new(0));
+    let ledger = Arc::new(NoopToolLedger);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger);
+
+    let err = rt
+        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::LlmProviderUnavailable));
+}
