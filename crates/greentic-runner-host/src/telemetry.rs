@@ -54,16 +54,73 @@ pub fn tenant_context(
     ctx
 }
 
-pub fn set_flow_context(
+/// Build the per-invocation tenant context for a flow execution, stamping the
+/// resolved `pack_id` and any rollout identifiers onto `attributes`.
+///
+/// `pack_id` is always live (the engine knows it per invocation). The rollout
+/// IDs come from the engine's owning revision-keyed runtime and are empty until
+/// the Phase-D revision dispatcher constructs revision runtimes. Pure so the
+/// stamping can be unit-tested without the task-local slot.
+#[allow(clippy::too_many_arguments)]
+fn flow_tenant_ctx(
     env: &str,
     tenant: &str,
     flow_id: &str,
     node_id: Option<&str>,
     provider_id: Option<&str>,
     session_id: Option<&str>,
+    pack_id: &str,
+    rollout: &RolloutIds,
+) -> TenantCtx {
+    let mut ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+    if !pack_id.is_empty() {
+        ctx.attributes
+            .insert(attr_keys::PACK_ID.to_string(), pack_id.to_string());
+    }
+    stamp_rollout_ids(&mut ctx, rollout);
+    ctx
+}
+
+/// Install per-invocation telemetry for `span`: stamp the tenant context (live
+/// `pack_id` + rollout IDs) into the task-local slot, and export the `gt.*`
+/// attribution as real OpenTelemetry attributes on `span`.
+///
+/// The export step is load-bearing: greentic-telemetry's `ContextLayer` only
+/// stashes the task-local context in span extensions for capture layers — it
+/// does NOT record `gt.*` onto exported spans (`Span::record` is a no-op for
+/// callsite-unknown fields). The supported export primitive is
+/// `greentic_telemetry::annotate_span`, which sets the attributes directly on
+/// the owned span handle; without it the IDs never reach exported telemetry.
+#[allow(clippy::too_many_arguments)]
+pub fn set_flow_context(
+    span: &Span,
+    env: &str,
+    tenant: &str,
+    flow_id: &str,
+    node_id: Option<&str>,
+    provider_id: Option<&str>,
+    session_id: Option<&str>,
+    pack_id: &str,
+    rollout: &RolloutIds,
 ) {
-    let ctx = tenant_context(env, tenant, Some(flow_id), node_id, provider_id, session_id);
+    let ctx = flow_tenant_ctx(
+        env,
+        tenant,
+        flow_id,
+        node_id,
+        provider_id,
+        session_id,
+        pack_id,
+        rollout,
+    );
     set_current_tenant_ctx(&ctx);
+    #[cfg(feature = "telemetry")]
+    greentic_telemetry::annotate_span(
+        span,
+        &greentic_types::telemetry::tenant_ctx_to_telemetry(&ctx),
+    );
+    #[cfg(not(feature = "telemetry"))]
+    let _ = span;
 }
 
 /// Deploy-spec rollout identifiers stamped onto the per-invocation
@@ -185,6 +242,76 @@ mod tests {
     }
 
     #[test]
+    fn flow_ctx_stamps_pack_id_live() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "customer.support@1.2.0",
+            &RolloutIds::default(),
+        );
+        assert_eq!(
+            ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
+            Some("customer.support@1.2.0")
+        );
+        // No revision runtime today → rollout IDs absent.
+        assert!(!ctx.attributes.contains_key(attr_keys::REVISION_ID));
+    }
+
+    #[test]
+    fn flow_ctx_stamps_pack_id_and_rollout_ids() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "customer.support@1.2.0",
+            &RolloutIds {
+                customer_id: Some("cust-acme".into()),
+                deployment_id: Some("01JTKS".into()),
+                bundle_id: Some("customer.support".into()),
+                revision_id: Some("01JTKR".into()),
+            },
+        );
+        assert_eq!(
+            ctx.attributes.get(attr_keys::PACK_ID).map(String::as_str),
+            Some("customer.support@1.2.0")
+        );
+        assert_eq!(
+            ctx.attributes
+                .get(attr_keys::REVISION_ID)
+                .map(String::as_str),
+            Some("01JTKR")
+        );
+        assert_eq!(
+            ctx.attributes
+                .get(attr_keys::DEPLOYMENT_ID)
+                .map(String::as_str),
+            Some("01JTKS")
+        );
+    }
+
+    #[test]
+    fn flow_ctx_skips_empty_pack_id() {
+        let ctx = flow_tenant_ctx(
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            None,
+            "",
+            &RolloutIds::default(),
+        );
+        assert!(!ctx.attributes.contains_key(attr_keys::PACK_ID));
+    }
+
+    #[test]
     fn stamp_clears_stale_ids_on_restamp() {
         let mut c = ctx();
         stamp_rollout_ids(
@@ -212,5 +339,119 @@ mod tests {
         assert!(!c.attributes.contains_key(attr_keys::CUSTOMER_ID));
         assert!(!c.attributes.contains_key(attr_keys::DEPLOYMENT_ID));
         assert!(!c.attributes.contains_key(attr_keys::BUNDLE_ID));
+    }
+}
+
+/// End-to-end export regression (C5.4): proves the stamped `gt.*` attribution
+/// actually reaches an **exported** OTLP span — not just the task-local slot.
+/// Guards against the failure mode where `set_current_tenant_ctx` is called but
+/// no `annotate_span` export happens, so production spans omit pack/rollout
+/// attribution while pure-context tests still pass.
+#[cfg(all(test, feature = "telemetry"))]
+mod export_tests {
+    use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+    use std::sync::{Arc, Mutex};
+    use tracing::subscriber;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug)]
+    struct TestExporter {
+        spans: Arc<Mutex<Vec<SpanData>>>,
+    }
+
+    impl SpanExporter for TestExporter {
+        fn export(
+            &self,
+            batch: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            let spans = self.spans.clone();
+            async move {
+                spans
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(batch);
+                Ok(())
+            }
+        }
+    }
+
+    fn attr_value(span: &SpanData, key: &str) -> Option<String> {
+        span.attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == key)
+            .map(|kv| kv.value.to_string())
+    }
+
+    #[test]
+    fn set_flow_context_exports_pack_id_and_rollout_ids() {
+        let exported = Arc::new(Mutex::new(Vec::new()));
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(TestExporter {
+                spans: exported.clone(),
+            })
+            .build();
+        let tracer = provider.tracer("c5.4-flow-export");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = subscriber::set_default(subscriber);
+
+        // A span whose callsite declares NONE of the gt.* fields — exactly the
+        // `flow.execute` situation. `set_flow_context` must export them anyway.
+        let span = tracing::info_span!("flow.execute");
+        set_flow_context(
+            &span,
+            "prod-eu",
+            "acme",
+            "support",
+            None,
+            None,
+            Some("sess-1"),
+            "customer.support@1.2.0",
+            &RolloutIds {
+                customer_id: Some("cust-acme".into()),
+                deployment_id: Some("01JTKS".into()),
+                bundle_id: Some("customer.support".into()),
+                revision_id: Some("01JTKR".into()),
+            },
+        );
+        {
+            let _enter = span.enter();
+        }
+        drop(span);
+
+        let _ = provider.force_flush();
+        let _ = provider.shutdown();
+
+        let spans = exported.lock().unwrap_or_else(|e| e.into_inner());
+        // Assert on the named span, not just the last one — a future extra span
+        // from the subscriber stack would otherwise yield confusing failures.
+        let span = spans
+            .iter()
+            .find(|s| s.name == "flow.execute")
+            .expect("flow.execute span exported");
+        assert_eq!(
+            attr_value(span, attr_keys::PACK_ID).as_deref(),
+            Some("customer.support@1.2.0"),
+            "pack_id must reach the exported span"
+        );
+        assert_eq!(
+            attr_value(span, attr_keys::REVISION_ID).as_deref(),
+            Some("01JTKR")
+        );
+        assert_eq!(
+            attr_value(span, attr_keys::DEPLOYMENT_ID).as_deref(),
+            Some("01JTKS")
+        );
+        assert_eq!(
+            attr_value(span, attr_keys::BUNDLE_ID).as_deref(),
+            Some("customer.support")
+        );
+        assert_eq!(
+            attr_value(span, attr_keys::CUSTOMER_ID).as_deref(),
+            Some("cust-acme")
+        );
     }
 }

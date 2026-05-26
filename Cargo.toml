@@ -63,7 +63,9 @@ tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
 toml = "1"
-greentic-telemetry = ">=1.1.0-dev, <1.2.0-0"
+# Floor pinned to the C5.1 publish: `TelemetryCtx::kv()` must include
+# `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
+greentic-telemetry = ">=1.1.0-dev.26432434860, <1.2.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "43"
 wasmtime-wasi-tls = "43"
@@ -98,8 +100,10 @@ features = [
     "pkcs8",
 ]
 
+# Floor pinned to the C5.2 publish: the runner stamps `attr_keys::PACK_ID` onto
+# the per-invocation TenantCtx (C5.4), which earlier dev publishes lack.
 [workspace.dependencies.greentic-types]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-dev.26451269983, <1.2.0-0"
 default-features = false
 features = [
     "std",
