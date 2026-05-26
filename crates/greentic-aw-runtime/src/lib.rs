@@ -11,8 +11,10 @@
 
 pub mod config;
 pub mod config_provider;
+pub mod cost;
 pub mod error;
 pub mod llm;
+pub mod llm_openai;
 pub mod r#loop;
 pub mod state;
 pub mod state_redis;
@@ -25,28 +27,34 @@ pub mod mock;
 
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
+#[cfg(feature = "test-mock")]
+pub use cost::MockTokenMeter;
+pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
+pub use llm_openai::OpenAiLlmBackend;
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
+pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
 /// The main entry point for executing a single agentic step.
 ///
-/// Construct via [`AgentRuntime::new`] with the four trait objects
-/// (config, state, LLM, telemetry) plus a shared `Arc<ExtensionRuntime>`
-/// for tool dispatch. Call [`AgentRuntime::step`] per inbound user
-/// message.
+/// Construct via [`AgentRuntime::new`] with the trait objects (config,
+/// state, LLM, telemetry, token_meter, ledger) plus a shared
+/// `Arc<ExtensionRuntime>` for tool dispatch. Call [`AgentRuntime::step`]
+/// per inbound user message.
 pub struct AgentRuntime {
     pub(crate) config_provider: Arc<dyn ConfigProvider>,
     pub(crate) state_store: Arc<dyn AgentStateStore>,
-    #[allow(dead_code)] // Phase 3 tool dispatch will read this
     pub(crate) ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
+    pub(crate) token_meter: Arc<dyn TokenMeter>,
+    pub(crate) ledger: Arc<dyn ToolLedger>,
 }
 
 impl AgentRuntime {
@@ -56,6 +64,8 @@ impl AgentRuntime {
         ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
         llm: Arc<dyn LlmBackend>,
         telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
     ) -> Self {
         Self {
             config_provider,
@@ -63,6 +73,8 @@ impl AgentRuntime {
             ext_runtime,
             llm,
             telemetry,
+            token_meter,
+            ledger,
         }
     }
 

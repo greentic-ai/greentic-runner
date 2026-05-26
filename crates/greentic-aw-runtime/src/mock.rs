@@ -199,6 +199,33 @@ mod inner {
         }
     }
 
+    /// Ledger that never records anything — every `get` returns `None`,
+    /// so the loop always dispatches. Used by unit tests that don't want
+    /// Redis-backed idempotency.
+    pub struct NoopToolLedger;
+
+    impl crate::tools::ToolLedger for NoopToolLedger {
+        fn get<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+            _session_id: &'a str,
+            _call_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn record<'a>(
+            &'a self,
+            _tenant: &'a TenantContext,
+            _session_id: &'a str,
+            _call_id: &'a str,
+            _result: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// Convenience: assert a [`TerminationReason`] matches the expected value.
     pub fn assert_terminated_by(actual: &TerminationReason, expected: &TerminationReason) {
         assert_eq!(actual, expected, "expected {expected:?}, got {actual:?}");
@@ -206,5 +233,6 @@ mod inner {
 }
 
 pub use inner::{
-    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, assert_terminated_by,
+    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
+    assert_terminated_by,
 };
