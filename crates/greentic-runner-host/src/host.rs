@@ -184,6 +184,26 @@ impl RunnerHost {
     /// several concurrent revisions under a traffic split, so the legacy
     /// tenant-only lookup cannot disambiguate them — the ingress revision
     /// dispatcher selects the revision and calls this.
+    ///
+    /// # Session isolation contract
+    ///
+    /// This method runs the selected revision's runtime against **whatever
+    /// session/state stores that runtime was built with** (at
+    /// [`TenantRuntime::load_revision`] time). It does *not* add a revision
+    /// dimension to the session key: the session/resume/state backend keys on
+    /// `(env, tenant, user)` plus pack/flow, **not** on the revision. If two
+    /// live revisions of the same pack for one tenant share a single session
+    /// backend, a `wait`/resume snapshot created by revision A can be fetched —
+    /// or clobbered — by revision B during a traffic split, retry, or
+    /// rebalance, resuming a snapshot against a different flow graph.
+    ///
+    /// Callers that load more than one revision per tenant onto one host
+    /// (i.e. every traffic-split producer) **MUST give each revision an
+    /// isolated session and state store** (a per-revision store instance, or a
+    /// revision-namespaced backend) when calling `load_revision`. The shared
+    /// `RunnerHost` stores (`session_store()`/`state_store()`) are only safe to
+    /// reuse across revisions when at most one revision is ever live per
+    /// tenant. The greentic-start activation path enforces this.
     pub async fn handle_activity_for_revision(
         &self,
         tenant: &str,
