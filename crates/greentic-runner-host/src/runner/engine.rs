@@ -366,6 +366,19 @@ impl FlowEngine {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
+                            // User-facing session flows surface the terminal
+                            // error as a metadata-only Ok envelope so the
+                            // messaging provider renders it instead of leaking
+                            // raw engine text to the chat.
+                            if ctx.session_id.is_some() {
+                                return Ok(FlowExecution::completed(json!({
+                                    "metadata": {
+                                        "error_kind": "flow_execution_failed",
+                                        "error_message": err.to_string(),
+                                        "flow_id": ctx.flow_id,
+                                    }
+                                })));
+                            }
                             return Err(err);
                         }
                         let delay = backoff_delay_ms(retry_config.base_delay_ms, attempt - 1);
@@ -514,6 +527,9 @@ impl FlowEngine {
                     if let Some(observer) = step_ctx.observer {
                         observer.on_node_error(&event, err.as_ref());
                     }
+                    // Propagate so `execute()`'s retry loop can retry transient
+                    // failures, then convert to a metadata-only Ok envelope at
+                    // the top level once retries are exhausted (session flows).
                     return Err(err);
                 }
             };
@@ -551,9 +567,12 @@ impl FlowEngine {
                     match decision {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
-                            return Ok(FlowExecution::completed(
-                                state.finalize_with(Some(output.payload.clone())),
-                            ));
+                            let nodes_snapshot = state.nodes.clone();
+                            let final_output = state.finalize_with(Some(output.payload.clone()));
+                            return Ok(FlowExecution::completed(lift_first_node_error_from_nodes(
+                                final_output,
+                                &nodes_snapshot,
+                            )));
                         }
                         NextDecision::Wait => {
                             // Conditional routing fell through. Pause at the
@@ -640,7 +659,12 @@ impl FlowEngine {
                         "needs_user": needs_user,
                     });
                     state.push_egress(response);
-                    return Ok(FlowExecution::completed(state.finalize_with(None)));
+                    let nodes_snapshot = state.nodes.clone();
+                    let final_output = state.finalize_with(None);
+                    return Ok(FlowExecution::completed(lift_first_node_error_from_nodes(
+                        final_output,
+                        &nodes_snapshot,
+                    )));
                 }
             }
         }
@@ -1057,6 +1081,19 @@ impl FlowEngine {
         if let Some((code, message)) = component_error(&value) {
             bail!(
                 "component {} failed: {}: {}",
+                call.component_ref,
+                code,
+                message
+            );
+        }
+        // MCP-shaped tool errors (greentic-mcp-generator's tool_error_with_status)
+        // come back as a top-level `{ "error": { "code", "message", "status" } }`
+        // value with the WIT envelope still ok=true (because the wasm guest
+        // returned normally). Treat them the same as a component_error so the
+        // engine error-envelope lift path surfaces the failure to the user.
+        if let Some((code, message)) = mcp_tool_error(&value) {
+            bail!(
+                "component {} returned tool error: {}: {}",
                 call.component_ref,
                 code,
                 message
@@ -1496,6 +1533,24 @@ impl NodeOutput {
             meta: Value::Null,
         }
     }
+
+    /// `ok=false` output stashing error context in `meta.error`. Currently
+    /// only used by `lift_first_node_error_from_nodes` tests — kept around so
+    /// drive_flow can resume populating it once we have a hook for it.
+    #[allow(dead_code)]
+    fn with_error(node_id: &str, err: &(dyn std::error::Error + 'static)) -> Self {
+        Self {
+            ok: false,
+            payload: Value::Null,
+            meta: json!({
+                "error": {
+                    "kind": "flow_node_failed",
+                    "message": err.to_string(),
+                    "node_id": node_id,
+                }
+            }),
+        }
+    }
 }
 
 struct DispatchOutcome {
@@ -1599,6 +1654,33 @@ fn component_error(value: &Value) -> Option<(String, String)> {
         .and_then(Value::as_str)
         .unwrap_or("component reported error");
     Some((code.to_string(), message.to_string()))
+}
+
+/// MCP tool-error wire shape from greentic-mcp-generator's `tool_error_with_status`:
+/// `{ "error": { "code", "message", "status" } }`. The component returned ok=true at
+/// the WIT level (the HTTP failure was caught and serialized), so the regular
+/// component_error path doesn't catch it.
+fn mcp_tool_error(value: &Value) -> Option<(String, String)> {
+    let obj = value.as_object()?;
+    // Must be the error shape: no `result` field, just `error`.
+    if obj.contains_key("result") {
+        return None;
+    }
+    let err = obj.get("error")?.as_object()?;
+    let code = err
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_error");
+    let raw_message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("tool returned an error");
+    let status = err.get("status").and_then(Value::as_u64);
+    let message = match status {
+        Some(s) => format!("{raw_message} (status {s})"),
+        None => raw_message.to_string(),
+    };
+    Some((code.to_string(), message))
 }
 
 fn extract_wait_reason(payload: &Value) -> Option<String> {
@@ -3142,6 +3224,203 @@ mod tests {
             other => panic!("expected Next(\"next\"), got {other:?}"),
         }
     }
+
+    #[test]
+    fn node_output_with_error_marks_ok_false_and_stashes_in_meta() {
+        let err: Box<dyn std::error::Error + 'static> =
+            Box::<dyn std::error::Error + 'static>::from("weatherapi returned 401 Unauthorized");
+        let out = NodeOutput::with_error("call_weather", err.as_ref());
+        assert!(!out.ok);
+        assert_eq!(out.payload, Value::Null);
+        assert_eq!(out.meta["error"]["kind"], "flow_node_failed");
+        assert_eq!(out.meta["error"]["node_id"], "call_weather");
+        assert_eq!(
+            out.meta["error"]["message"],
+            "weatherapi returned 401 Unauthorized"
+        );
+    }
+
+    #[test]
+    fn lift_first_node_error_promotes_node_meta_to_output_metadata() {
+        // Two nodes ran; the first failed, the second produced a default-
+        // looking output (flow author wrote no error routing). The executor
+        // must lift the first failure into output.metadata so the messaging
+        // provider renders the error card without any flow-author changes.
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        let err: Box<dyn std::error::Error + 'static> =
+            Box::<dyn std::error::Error + 'static>::from("weatherapi returned 401 Unauthorized");
+        nodes.insert(
+            "call_weather".to_string(),
+            NodeOutput::with_error("call_weather", err.as_ref()),
+        );
+        nodes.insert(
+            "render_current_card".to_string(),
+            NodeOutput::new(json!({ "text": "message" })),
+        );
+
+        let final_output = json!({ "text": "message" });
+        let enriched = lift_first_node_error_from_nodes(final_output, &nodes);
+        assert_eq!(
+            enriched["metadata"]["error_kind"], "flow_node_failed",
+            "first failing node's kind must be lifted"
+        );
+        assert_eq!(
+            enriched["metadata"]["error_message"],
+            "weatherapi returned 401 Unauthorized"
+        );
+        assert_eq!(enriched["metadata"]["node_id"], "call_weather");
+        // Preserves the original payload bits so downstream renderers still
+        // see what the flow produced.
+        assert_eq!(enriched["text"], "message");
+    }
+
+    #[test]
+    fn lift_first_node_error_is_noop_when_all_nodes_ok() {
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert(
+            "ok_node".to_string(),
+            NodeOutput::new(json!({ "text": "all good" })),
+        );
+        let output = json!({ "text": "all good" });
+        let lifted = lift_first_node_error_from_nodes(output.clone(), &nodes);
+        assert_eq!(lifted, output);
+    }
+
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
+        // Flow whose start node is missing — drive_flow will return Err on
+        // node lookup. With session_id present, execute() must convert that
+        // to a Completed FlowExecution carrying error_kind/error_message in
+        // output.metadata so the chat user sees the error card.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: pack_id_str.to_string(),
+                    flow_id: flow_id_str.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: pack_id_str,
+            flow_id: flow_id_str,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("conv-1"),
+            provider_id: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result = engine
+            .execute(ctx, Value::Null)
+            .await
+            .expect("must not propagate Err");
+        assert!(matches!(result.status, FlowStatus::Completed));
+        assert_eq!(
+            result.output["metadata"]["error_kind"],
+            "flow_execution_failed"
+        );
+        let msg = result.output["metadata"]["error_message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!msg.is_empty(), "error_message must be populated");
+        assert_eq!(result.output["metadata"]["flow_id"], "broken.flow");
+    }
+
+    #[test]
+    fn mcp_tool_error_recognises_generator_error_shape() {
+        // greentic-mcp-generator's tool_error_with_status emits this exact
+        // shape when the upstream HTTP call to weatherapi.com returns 401.
+        let value = json!({
+            "error": {
+                "code": "tool_error",
+                "message": "API request returned status 401",
+                "status": 401
+            }
+        });
+        let (code, message) = mcp_tool_error(&value).expect("must detect MCP error shape");
+        assert_eq!(code, "tool_error");
+        assert!(message.contains("API request returned status 401"));
+        assert!(message.contains("(status 401)"));
+    }
+
+    #[test]
+    fn mcp_tool_error_skips_success_responses() {
+        // A success response uses `result`, not `error`.
+        let value = json!({ "result": { "current": { "temp_c": 19.0 } } });
+        assert!(mcp_tool_error(&value).is_none());
+    }
+
+    #[test]
+    fn mcp_tool_error_skips_non_object_and_unrelated_shapes() {
+        assert!(mcp_tool_error(&Value::Null).is_none());
+        assert!(mcp_tool_error(&json!({"unrelated": true})).is_none());
+        // `error` must be an object; a string isn't enough.
+        assert!(mcp_tool_error(&json!({"error": "oops"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_non_user_facing_flow_failure_still_propagates() {
+        // No session_id => internal job. Errors still propagate as Err so
+        // operator alerting / metrics pipelines stay intact.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: pack_id_str.to_string(),
+                    flow_id: flow_id_str.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: pack_id_str,
+            flow_id: flow_id_str,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result = engine.execute(ctx, Value::Null).await;
+        assert!(result.is_err(), "non-user-facing flow must propagate Err");
+    }
 }
 
 use tracing::Instrument;
@@ -3165,6 +3444,65 @@ pub struct FlowContext<'a> {
 pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
+}
+
+/// Look across all node outputs, find the first one that finished with
+/// `ok=false`, and lift its `meta.error` fields into
+/// `output.metadata.error_kind` / `.error_message` / `.node_id`. Returns the
+/// (possibly enriched) output unchanged otherwise.
+///
+/// This is how the executor "shows" an unhandled flow-node failure to the
+/// caller without the flow author having to add error routing: the chat-side
+/// provider (messaging-providers `extract_error_envelope`) picks the lifted
+/// fields off `output.metadata` and renders a styled error card.
+///
+/// Takes a borrow of the node-output map rather than the whole
+/// `ExecutionState` because the callers have already consumed `state` via
+/// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
+/// front and pass it in here.
+fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
+    let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
+        return output;
+    };
+    let err_meta = failed.meta.get("error");
+    let message = err_meta
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("flow node failed");
+    let kind = err_meta
+        .and_then(|e| e.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("flow_node_failed");
+
+    let mut output = match output {
+        Value::Object(map) => map,
+        Value::Null => JsonMap::new(),
+        other => {
+            let mut wrap = JsonMap::new();
+            wrap.insert("payload".to_string(), other);
+            wrap
+        }
+    };
+    let metadata_entry = output
+        .entry("metadata".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    let metadata_map = match metadata_entry {
+        Value::Object(map) => map,
+        _ => {
+            *metadata_entry = Value::Object(JsonMap::new());
+            metadata_entry.as_object_mut().unwrap()
+        }
+    };
+    metadata_map
+        .entry("error_kind".to_string())
+        .or_insert(Value::String(kind.to_string()));
+    metadata_map
+        .entry("error_message".to_string())
+        .or_insert(Value::String(message.to_string()));
+    metadata_map
+        .entry("node_id".to_string())
+        .or_insert(Value::String(node_id.clone()));
+    Value::Object(output)
 }
 
 fn should_retry(err: &anyhow::Error) -> bool {
