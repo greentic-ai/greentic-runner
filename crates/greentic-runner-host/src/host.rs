@@ -215,7 +215,12 @@ impl RunnerHost {
         let runtime = self
             .active
             .load_revision(tenant, deployment_id, bundle_id, revision_id)
-            .with_context(|| format!("revision runtime not loaded for tenant {tenant}"))?;
+            .with_context(|| {
+                format!(
+                    "revision runtime not loaded for tenant {tenant} \
+                     (deployment {deployment_id}, revision {revision_id})"
+                )
+            })?;
         self.dispatch_activity(&runtime, tenant, activity).await
     }
 
@@ -225,7 +230,7 @@ impl RunnerHost {
     /// and reply shaping never drift between them.
     async fn dispatch_activity(
         &self,
-        runtime: &Arc<TenantRuntime>,
+        runtime: &TenantRuntime,
         tenant: &str,
         activity: Activity,
     ) -> Result<Vec<Activity>> {
