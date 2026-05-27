@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
-use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
     WebhookPolicy,
@@ -25,6 +24,7 @@ use greentic_runner_host::storage::{
 use greentic_runner_host::telemetry::RolloutIds;
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
+use greentic_runner_host::{Activity, HostBuilder, RunnerWasiPolicy};
 use runner_core::packs::PackDigest;
 
 const TENANT: &str = "acme";
@@ -271,6 +271,104 @@ async fn insert_revision_rejects_tenant_mismatch() -> Result<()> {
     };
     assert!(
         format!("{err:#}").contains("does not match key tenant"),
+        "{err:#}"
+    );
+    Ok(())
+}
+
+/// Build a minimal multi-tenant host. Revision execution looks the runtime up
+/// in `active_packs()` and runs *that runtime's* own state machine, so the
+/// host's stores are not on the execution path — it only needs the tenant
+/// registered so `HostBuilder::build` accepts it.
+fn build_host() -> Result<greentic_runner_host::RunnerHost> {
+    let config = (*host_config(&fixture_pack())).clone();
+    HostBuilder::new().with_config(config).build()
+}
+
+#[tokio::test]
+async fn handle_activity_for_revision_dispatches_like_the_legacy_path() -> Result<()> {
+    // Both entry points funnel through `dispatch_activity`, so a revision-keyed
+    // runtime must execute identically to the same pack loaded as a legacy
+    // tenant runtime. We assert parity with the legacy path (already proven to
+    // emit replies in `host_integration::host_executes_demo_pack_flow`) rather
+    // than a fixed reply, so the test tracks the shared dispatch contract — the
+    // one thing this method adds, the revision lookup — not fixture-flow output.
+    let host = build_host()?;
+    let deployment = DeploymentId::new();
+    let bundle = BundleId::from("customer.support");
+    let revision = RevisionId::new();
+
+    // The same fixture pack, loaded both ways: legacy tenant-only and
+    // revision-keyed, both retrievable from the one host's `ActivePacks`.
+    host.active_packs()
+        .insert_pack(TENANT, build_legacy().await?);
+    let rev_runtime = build_revision(
+        &pinned_pack_refs()?,
+        deployment,
+        bundle.clone(),
+        revision,
+        None,
+    )
+    .await?;
+    host.active_packs().insert_revision(
+        TENANT,
+        deployment,
+        bundle.clone(),
+        revision,
+        rev_runtime,
+    )?;
+
+    let activity = || {
+        Activity::text("hello")
+            .with_tenant(TENANT)
+            .from_user("user-1")
+    };
+    let legacy = host.handle_activity(TENANT, activity()).await;
+    let revisioned = host
+        .handle_activity_for_revision(TENANT, deployment, bundle, revision, activity())
+        .await;
+
+    assert_eq!(
+        legacy.is_ok(),
+        revisioned.is_ok(),
+        "revision dispatch must match the legacy path: legacy={legacy:?} revision={revisioned:?}"
+    );
+    match (legacy, revisioned) {
+        (Ok(l), Ok(r)) => assert_eq!(
+            l.is_empty(),
+            r.is_empty(),
+            "revision replies must match legacy reply shape"
+        ),
+        (Err(l), Err(r)) => assert_eq!(
+            format!("{l:#}"),
+            format!("{r:#}"),
+            "any divergence must be in the shared flow path, not the revision lookup"
+        ),
+        _ => unreachable!("is_ok parity asserted above"),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn handle_activity_for_revision_errors_when_not_loaded() -> Result<()> {
+    // A host with a registered tenant but no revision inserted: the revision
+    // lookup must fail closed rather than fall back to the legacy entry.
+    let host = build_host()?;
+    let activity = Activity::text("nobody home").with_tenant(TENANT);
+    let Err(err) = host
+        .handle_activity_for_revision(
+            TENANT,
+            DeploymentId::new(),
+            BundleId::from("customer.support"),
+            RevisionId::new(),
+            activity,
+        )
+        .await
+    else {
+        panic!("an unloaded revision must not execute");
+    };
+    assert!(
+        format!("{err:#}").contains("revision runtime not loaded"),
         "{err:#}"
     );
     Ok(())

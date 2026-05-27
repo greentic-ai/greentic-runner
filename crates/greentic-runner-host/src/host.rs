@@ -21,6 +21,7 @@ use crate::storage::{
     state_host_from,
 };
 use crate::wasi::RunnerWasiPolicy;
+use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 
 #[cfg(feature = "telemetry")]
 #[derive(Clone, Debug)]
@@ -172,7 +173,43 @@ impl RunnerHost {
             .active
             .load_pack(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
-        let (pack_id, flow_id) = resolve_flow_id(&runtime, &activity)?;
+        self.dispatch_activity(&runtime, tenant, activity).await
+    }
+
+    /// Execute an activity against a specific deployment/bundle/revision runtime.
+    ///
+    /// Unlike [`handle_activity`](Self::handle_activity), which resolves the
+    /// tenant-only (legacy) runtime, this targets a fully-qualified revision
+    /// entry inserted by [`ActivePacks::insert_revision`]. A tenant can host
+    /// several concurrent revisions under a traffic split, so the legacy
+    /// tenant-only lookup cannot disambiguate them — the ingress revision
+    /// dispatcher selects the revision and calls this.
+    pub async fn handle_activity_for_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        activity: Activity,
+    ) -> Result<Vec<Activity>> {
+        let runtime = self
+            .active
+            .load_revision(tenant, deployment_id, bundle_id, revision_id)
+            .with_context(|| format!("revision runtime not loaded for tenant {tenant}"))?;
+        self.dispatch_activity(&runtime, tenant, activity).await
+    }
+
+    /// Shared activity-execution body: resolve the flow, build the canonical
+    /// ingress envelope, run the state machine, and normalize replies. Both the
+    /// legacy and revision entry points funnel through here so flow resolution
+    /// and reply shaping never drift between them.
+    async fn dispatch_activity(
+        &self,
+        runtime: &Arc<TenantRuntime>,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<Vec<Activity>> {
+        let (pack_id, flow_id) = resolve_flow_id(runtime, &activity)?;
         let action = activity.action().map(|value| value.to_string());
         let session = activity.session_id().map(|value| value.to_string());
         let provider = activity.provider_id().map(|value| value.to_string());
