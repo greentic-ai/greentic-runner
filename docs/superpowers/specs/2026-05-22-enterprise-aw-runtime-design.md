@@ -671,3 +671,26 @@ Even within the MVP, work splits naturally into six phased PRs to keep blast rad
 | 6 | 1 wk | Acceptance testing, e2e with real extensions, bug fixes, §8.5 checklist sign-off | All acceptance criteria met |
 
 Each phase produces a standalone mergeable PR. Later phases have no compile-time dependency on earlier phases being merged (use git branch deps where needed), but semantic dependencies exist — Phase 4 cannot ship before Phase 1–3 are functionally complete.
+
+## 14. Acceptance Tracking
+
+Maps each §8.5 acceptance criterion to the exact automated test that proves it, plus the PR/phase that landed it. Status: ✅ verified by an automated test / ⏸ deferred.
+
+| # | §8.5 criterion | Status | Proving test (name · file) | Landed in |
+|---|---|---|---|---|
+| 1 | Flow `WebChat → DwAgent → reply` deployable + functional | ✅ | `dw_agent_node_routes_to_handler_and_returns_reply` · `crates/greentic-runner-host/src/runner/engine.rs` | PR #362 (Phase 4) |
+| 2 | Designer playground produces identical agent behaviour | ✅ | `roundtrip_through_agent_runtime_returns_mocked_reply` · `tests/dw_test_chat.rs` (separate **greentic-designer** repo, merged to its `research`) | PR designer#337 (Phase 5) |
+| 3 | Multi-tenant: 2 tenants, same Redis, zero cross-talk | ✅ | `two_tenants_share_redis_without_cross_talk` · `crates/greentic-aw-runtime/tests/redis_state.rs` | PR #360 (Phase 2) |
+| 4 | Plan-Act-Observe with 1+ tool call observed end-to-end | ✅ | `tool_dispatch_error_becomes_observation_then_reply`, `mixed_text_and_tool_calls_executes_tool_discards_text`, `tool_not_allowed_becomes_observation_then_reply` · `crates/greentic-aw-runtime/tests/loop_scripted.rs` | PR #348 (Phase 1) |
+| 5 | Max iter + timeout enforcement | ✅ | `max_iterations_terminates_loop`, `timeout_terminates_loop` · `crates/greentic-aw-runtime/tests/loop_scripted.rs` | PR #348 (Phase 1) |
+| 6 | State persists across runner restart | ✅ | `state_survives_store_drop_and_rebuild` · `crates/greentic-aw-runtime/tests/redis_state.rs` | PR #364 (Phase 6, this PR) |
+| 7 | `aw.step` telemetry span per step (`terminated_by`, `iterations`, `total_tokens`) | ✅ | `record_step_invokes_telemetry_with_context` · `crates/greentic-aw-runtime/src/telemetry.rs` (unit test asserting span attributes); loop emits via `runtime.telemetry.record_step(&StepTelemetryCtx { … })` at `crates/greentic-aw-runtime/src/loop.rs:205`. Verifies the span is **emitted** with the right attributes through the `Telemetry` trait; full OTel-collector export is integration-only. | PR #348 (Phase 1) |
+| 8 | Banking-id composer's generated config → real reply | ⏸ **DEFERRED** | — (see rationale below) | Follow-up sub-project |
+| 9 | Daily token cap enforcement with real Redis | ✅ | `add_then_current_accumulates_per_tenant_day` · `crates/greentic-aw-runtime/tests/cost_meter.rs` (real Redis accumulation) + `token_budget_exceeded_returns_error` · `crates/greentic-aw-runtime/tests/loop_scripted.rs` (budget-exceeded gate logic) | PR #348/#360 (Phase 1/2) |
+| 10 | Tool idempotency: double-dispatch regression | ✅ | `redis_ledger_records_and_reuses_result_no_redispatch` · `crates/greentic-aw-runtime/tests/tool_ledger.rs` | PR #364 (Phase 6, this PR) |
+
+**Coverage summary:** 9/10 acceptance criteria verified by automated tests across PRs #348 / #360 / #362 / #363 / #364 (runner) + #337 (designer); #8 deferred.
+
+### #8 deferred — banking-id composer → real reply
+
+> **#8 (banking-id composer → real reply) deferred as a follow-up sub-project.** Wiring a WASM DW-composer's `AnswerDocument` output through to a live agent reply spans the composer extension, the `greentic-dw-manifest` snapshot, `manifest_to_tool_refs` (already landed, PR #363), the `DwFormState → AgentConfig` mapper (PR designer#337), and the runtime. This cross-repo integration warrants its own brainstorm → spec → plan cycle rather than a tacked-on acceptance test. The constituent pieces are in place; the end-to-end composer wiring is the next sub-project.
