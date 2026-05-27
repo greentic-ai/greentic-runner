@@ -113,7 +113,7 @@ pub fn collect() -> InfoReport {
     let mut disabled = Vec::new();
     for (feat, on) in [
         ("verify", cfg!(feature = "verify")),
-        ("telemetry", cfg!(feature = "telemetry")),
+        ("telemetry", true),
         ("session-redis", cfg!(feature = "session-redis")),
         ("fault-injection", cfg!(feature = "fault-injection")),
         (

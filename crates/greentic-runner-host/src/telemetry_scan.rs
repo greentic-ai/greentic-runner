@@ -21,7 +21,6 @@
 //! That keeps the runner safe to enable in front of any component
 //! (telemetry-aware or not).
 
-#[cfg(feature = "telemetry")]
 use tracing::{Level as TracingLevel, debug, error, info, trace, warn};
 
 /// Severity level parsed from a fallback line.
@@ -180,9 +179,7 @@ fn parse_fields(block: &str) -> Vec<(&str, &str)> {
 }
 
 /// Re-emit a parsed line through the `tracing` pipeline so it lands in any
-/// OTLP exporter / subscriber configured by the host. Compiles to a no-op
-/// when the `telemetry` feature is disabled.
-#[cfg(feature = "telemetry")]
+/// subscriber configured by the host (system.log, OTLP exporter, etc.).
 pub fn emit_as_tracing(line: &TelemetryLine<'_>) {
     let fields_json = fields_to_json(&line.fields);
     let component = line.component;
@@ -224,15 +221,10 @@ pub fn emit_as_tracing(line: &TelemetryLine<'_>) {
             "{message}"
         ),
     }
-    // Quiet the unused-variable warning for the level when telemetry is on
-    // but no subscriber is installed.
+    // Quiet the unused-variable warning if no subscriber is installed yet.
     let _ = TracingLevel::INFO;
 }
 
-#[cfg(not(feature = "telemetry"))]
-pub fn emit_as_tracing(_line: &TelemetryLine<'_>) {}
-
-#[cfg(feature = "telemetry")]
 fn fields_to_json(fields: &[(&str, &str)]) -> String {
     let mut out = String::with_capacity(fields.len() * 16);
     out.push('{');
@@ -250,7 +242,6 @@ fn fields_to_json(fields: &[(&str, &str)]) -> String {
     out
 }
 
-#[cfg(feature = "telemetry")]
 fn escape_json(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {

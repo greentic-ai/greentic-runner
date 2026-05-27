@@ -641,8 +641,24 @@ async fn run_fault_case(
     };
     match run_result {
         Ok(replies) => {
-            actual_status = "pass".to_string();
-            replies_payload = serde_json::to_value(replies).unwrap_or(Value::Null);
+            replies_payload = serde_json::to_value(&replies).unwrap_or(Value::Null);
+            // Session flows surface node failures as an Ok reply carrying
+            // metadata.error_kind. Re-classify as "fail" so fault scenarios
+            // that expect fail still match.
+            let envelope = replies_payload
+                .as_array()
+                .and_then(|arr| arr.iter().find_map(extract_error_envelope))
+                .or_else(|| extract_error_envelope(&replies_payload));
+            if let Some((kind, message)) = envelope {
+                actual_status = "fail".to_string();
+                error_message = Some(message.clone());
+                diagnostics.push(Diagnostic {
+                    code: "flow_error_envelope".to_string(),
+                    message: format!("{kind}: {message}"),
+                });
+            } else {
+                actual_status = "pass".to_string();
+            }
         }
         Err(err) => {
             error_message = Some(err.to_string());
@@ -804,6 +820,32 @@ fn build_activity(
         activity = activity.with_session(session);
     }
     activity
+}
+
+/// Look for `error_kind` + `error_message` at any of the carrier paths an
+/// Activity reply may nest them under (`payload.metadata`, `metadata`, root).
+fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
+    let candidates = [
+        value.get("payload").and_then(|p| p.get("metadata")),
+        value.get("metadata"),
+        Some(value),
+    ];
+    for metadata in candidates.into_iter().flatten() {
+        let kind = metadata
+            .get("error_kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let message = metadata
+            .get("error_message")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let (Some(k), Some(m)) = (kind, message) {
+            return Some((k.to_string(), m.to_string()));
+        }
+    }
+    None
 }
 
 fn is_structured(replies: &[Activity]) -> bool {
