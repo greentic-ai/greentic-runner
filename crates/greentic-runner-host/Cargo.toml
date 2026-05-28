@@ -16,6 +16,10 @@ verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
+# Declared but off by default. C5.4 introduced #[cfg(feature = "telemetry")]
+# gates around greentic_telemetry::annotate_span calls; turning the gate on
+# activates explicit span annotation (greentic-telemetry is always linked).
+telemetry = []
 
 [dependencies]
 async-trait.workspace = true
