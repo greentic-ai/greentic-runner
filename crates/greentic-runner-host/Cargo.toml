@@ -12,7 +12,6 @@ categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
 default = ["verify"]
-telemetry = ["dep:greentic-telemetry"]
 verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
@@ -77,7 +76,7 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 wasmtime-wasi-tls = { workspace = true }
-greentic-telemetry = { workspace = true, optional = true }
+greentic-telemetry = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true

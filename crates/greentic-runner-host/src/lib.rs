@@ -15,12 +15,10 @@ use std::time::Duration;
 use crate::secrets::SecretsBackend;
 use anyhow::{Context, Result, anyhow};
 use greentic_config::ResolvedConfig;
-#[cfg(feature = "telemetry")]
 use greentic_config_types::TelemetryExporterKind;
 use greentic_config_types::{
     NetworkConfig, PackSourceConfig, PacksConfig, PathsConfig, TelemetryConfig,
 };
-#[cfg(feature = "telemetry")]
 use greentic_telemetry::export::{ExportConfig as TelemetryExportConfig, ExportMode, Sampling};
 use runner_core::env::PackConfig;
 use serde_json::json;
@@ -47,6 +45,7 @@ pub mod runtime_wasmtime;
 pub mod secrets;
 pub mod storage;
 pub mod telemetry;
+pub mod telemetry_scan;
 #[cfg(feature = "fault-injection")]
 pub mod testing;
 pub mod trace;
@@ -376,7 +375,6 @@ fn pack_config_from(
     Ok(cfg)
 }
 
-#[cfg(feature = "telemetry")]
 fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     if !cfg.enabled || matches!(cfg.exporter, TelemetryExporterKind::None) {
         return None;
@@ -400,11 +398,6 @@ fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     })
 }
 
-#[cfg(not(feature = "telemetry"))]
-fn telemetry_from(_cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
-    None
-}
-
 /// Run the unified Greentic runner host until shutdown.
 pub async fn run(cfg: RunnerConfig) -> Result<()> {
     let RunnerConfig {
@@ -421,8 +414,6 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         trace,
         validation,
     } = cfg;
-    #[cfg(not(feature = "telemetry"))]
-    let _ = telemetry;
 
     let mut builder = HostBuilder::new();
     for bindings in tenant_bindings.into_values() {
@@ -431,7 +422,6 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         host_config.validation = validation.clone();
         builder = builder.with_config(host_config);
     }
-    #[cfg(feature = "telemetry")]
     if let Some(telemetry) = telemetry.clone() {
         builder = builder.with_telemetry(telemetry);
     }

@@ -23,20 +23,15 @@ use crate::storage::{
 use crate::wasi::RunnerWasiPolicy;
 use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 
-#[cfg(feature = "telemetry")]
 #[derive(Clone, Debug)]
 pub struct TelemetryCfg {
     pub config: greentic_telemetry::TelemetryConfig,
     pub export: greentic_telemetry::export::ExportConfig,
 }
-#[cfg(not(feature = "telemetry"))]
-#[derive(Clone, Debug)]
-pub struct TelemetryCfg;
 
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
-    #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
@@ -46,7 +41,6 @@ impl HostBuilder {
     pub fn new() -> Self {
         Self {
             configs: HashMap::new(),
-            #[cfg(feature = "telemetry")]
             telemetry: None,
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
@@ -58,7 +52,6 @@ impl HostBuilder {
         self
     }
 
-    #[cfg(feature = "telemetry")]
     pub fn with_telemetry(mut self, telemetry: TelemetryCfg) -> Self {
         self.telemetry = Some(telemetry);
         self
@@ -102,7 +95,6 @@ impl HostBuilder {
             state_host,
             wasi_policy,
             secrets_manager: secrets,
-            #[cfg(feature = "telemetry")]
             telemetry: self.telemetry,
         })
     }
@@ -125,7 +117,6 @@ pub struct RunnerHost {
     state_host: Arc<dyn StateHost>,
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
-    #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
 }
 
@@ -137,14 +128,7 @@ pub struct TenantHandle {
 
 impl RunnerHost {
     pub async fn start(&self) -> Result<()> {
-        #[cfg(feature = "telemetry")]
-        {
-            boot::init(&self.health, self.telemetry.as_ref())?;
-        }
-        #[cfg(not(feature = "telemetry"))]
-        {
-            boot::init(&self.health, None)?;
-        }
+        boot::init(&self.health, self.telemetry.as_ref())?;
         Ok(())
     }
 
