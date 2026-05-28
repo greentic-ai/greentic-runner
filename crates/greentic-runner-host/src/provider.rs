@@ -220,7 +220,7 @@ fn extract_inline_providers(manifest: &PackManifest) -> Result<Vec<ProviderExtDe
     // to one decl and the actual runtime invocation to another.
     inline
         .validate_basic()
-        .map_err(|err| anyhow!("provider extension inline failed validation: {err}"))?;
+        .context("provider extension inline failed validation")?;
 
     let providers = inline
         .providers

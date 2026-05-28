@@ -150,7 +150,9 @@ fn registry_rejects_pack_with_duplicate_provider_id() {
     ])
     .err()
     .expect("duplicate provider_id rejected at registry construction");
-    let msg = err.to_string();
+    // anyhow's `.context()` only prints the outer message via `{}`; use
+    // `{:#}` (or chain()) to get the underlying GreenticError text.
+    let msg = format!("{err:#}");
     assert!(
         msg.contains("validation") && msg.contains("duplicate provider_id"),
         "expected validation failure naming duplicate provider_id, got: {msg}"
@@ -165,7 +167,7 @@ fn registry_rejects_pack_with_cross_namespace_collision() {
     let err = registry_for(vec![decl("teams", None), decl("slack", Some("teams"))])
         .err()
         .expect("cross-namespace collision rejected at registry construction");
-    let msg = err.to_string();
+    let msg = format!("{err:#}");
     assert!(
         msg.contains("validation") && msg.contains("provider_id 'teams'"),
         "expected collision validation failure, got: {msg}"

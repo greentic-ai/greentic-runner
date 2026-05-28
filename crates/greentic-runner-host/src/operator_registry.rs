@@ -97,22 +97,29 @@ impl OperatorRegistry {
         provider_type: Option<&str>,
         op_id: &str,
     ) -> Result<&OperatorBinding, OperatorResolveError> {
-        // M1.1b: post-cutover, `per_provider_id` only contains decls that
-        // explicitly declared a `provider_id`. State-store-backed instances
-        // (resolved via ProviderRegistry::load_instance) carry an id that
-        // OperatorRegistry has never seen at build time. When the caller
-        // supplies both `provider_id` and `provider_type`, fall through to
-        // the type index on id miss so ops are still resolvable.
-        if let Some(id) = provider_id
-            && let Some(ops) = self.per_provider_id.get(id)
-        {
+        // Strict identity semantics: a caller supplying `provider_id` opts
+        // into id-keyed lookup. If the id is unknown to this registry, fail
+        // loudly rather than silently rebinding to the type index (which
+        // would route a stale/typo'd instance id to a generic type-level
+        // binding with different config). State-store-backed instances —
+        // which never appear in `per_provider_id` because the registry is
+        // built from inline pack decls only — are resolved by the
+        // invoke_operator probe (operator.rs), which retries with
+        // (None, Some(derived_type)) once it learns the type from the
+        // instance file.
+        if let Some(id) = provider_id {
+            let ops = self
+                .per_provider_id
+                .get(id)
+                .ok_or(OperatorResolveError::ProviderNotFound)?;
             return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
         }
         if let Some(ty) = provider_type {
-            if let Some(ops) = self.per_provider_type.get(ty) {
-                return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
-            }
-            return Err(OperatorResolveError::ProviderNotFound);
+            let ops = self
+                .per_provider_type
+                .get(ty)
+                .ok_or(OperatorResolveError::ProviderNotFound)?;
+            return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
         }
         Err(OperatorResolveError::ProviderNotFound)
     }
