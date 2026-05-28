@@ -45,6 +45,7 @@ parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
 runner-core.workspace = true
+rustls.workspace = true
 serde = { workspace = true }
 serde_cbor.workspace = true
 serde_json.workspace = true

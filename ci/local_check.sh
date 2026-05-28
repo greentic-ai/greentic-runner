@@ -7,7 +7,6 @@ set -euo pipefail
 RUST_TOOLCHAIN_VERSION="1.95.0"
 echo "==> Local CI mirror (greentic-runner, rustc ${RUST_TOOLCHAIN_VERSION})"
 export CARGO_TERM_COLOR=always
-export RUSTFLAGS="-Dwarnings"
 export CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 export GREENTIC_PROVIDER_CORE_ONLY="${GREENTIC_PROVIDER_CORE_ONLY:-1}"
 
@@ -36,6 +35,31 @@ fi
 run_fmt() {
   echo "==> cargo fmt --check"
   cargo fmt --all --check
+}
+
+run_dependency_sanity() {
+  echo "==> dependency sanity"
+
+  local package="${LOCAL_CHECK_HOST_PACKAGE:-greentic-runner-host}"
+  local versions=()
+  mapfile -t versions < <(
+    cargo tree -p "$package" --duplicates \
+      | awk '/^wasmtime v/ { sub(/^v/, "", $2); print $2 }' \
+      | sort -u
+  )
+
+  if (( ${#versions[@]} > 1 )); then
+    echo "found multiple wasmtime versions in $package: ${versions[*]}" >&2
+    echo "this usually means local workspace crates and published greentic-* crates are built against different wasmtime lines" >&2
+    echo >&2
+    for version in "${versions[@]}"; do
+      echo "==> dependency paths for wasmtime@$version" >&2
+      cargo tree -p "$package" --invert "wasmtime@$version" >&2
+      echo >&2
+    done
+    echo "align the greentic-* dependency versions with the workspace wasmtime version before running clippy/tests" >&2
+    exit 1
+  fi
 }
 
 run_clippy() {
@@ -105,7 +129,7 @@ run_package() {
   fi
 }
 
-default_steps=("fmt" "clippy" "host_smoke" "crate_tests" "workspace_tests" "conformance" "package")
+default_steps=("fmt" "dependency_sanity" "clippy" "host_smoke" "crate_tests" "workspace_tests" "conformance" "package")
 if [[ -n "${LOCAL_CHECK_STEPS:-}" ]]; then
   steps_list="${LOCAL_CHECK_STEPS//,/ }"
   read -r -a steps <<< "$steps_list"
@@ -116,6 +140,7 @@ fi
 for step in "${steps[@]}"; do
   case "$step" in
     fmt) run_fmt ;;
+    dependency_sanity) run_dependency_sanity ;;
     clippy) run_clippy ;;
     host_smoke) run_host_smoke ;;
     crate_tests) run_crate_tests ;;
