@@ -579,9 +579,11 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        assert!(Pin::new(&mut sink)
-            .poll_write(&mut cx, b"[INFO][svc] partial")
-            .is_ready());
+        assert!(
+            Pin::new(&mut sink)
+                .poll_write(&mut cx, b"[INFO][svc] partial")
+                .is_ready()
+        );
         assert!(Pin::new(&mut sink).poll_shutdown(&mut cx).is_ready());
     }
 
@@ -596,9 +598,11 @@ mod tests {
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        assert!(Pin::new(&mut sink)
-            .poll_write(&mut cx, &[0xff, b'\n'])
-            .is_ready());
+        assert!(
+            Pin::new(&mut sink)
+                .poll_write(&mut cx, &[0xff, b'\n'])
+                .is_ready()
+        );
         assert!(Pin::new(&mut sink).poll_flush(&mut cx).is_ready());
     }
 }
