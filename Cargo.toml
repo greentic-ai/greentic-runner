@@ -100,10 +100,11 @@ features = [
     "pkcs8",
 ]
 
-# Floor pinned to the C5.2 publish: the runner stamps `attr_keys::PACK_ID` onto
-# the per-invocation TenantCtx (C5.4), which earlier dev publishes lack.
+# Floor pinned to the M1.1a publish (PR #133): adds `provider_id` field on
+# `ProviderDecl` + `validate_basic` cross-namespace collision check. Earlier dev
+# publishes lack the field and resolve provider_id by provider_type fallback.
 [workspace.dependencies.greentic-types]
-version = ">=1.1.0-dev.26451269983, <1.2.0-0"
+version = ">=1.1.0-dev.26561934923, <1.2.0-0"
 default-features = false
 features = [
     "std",

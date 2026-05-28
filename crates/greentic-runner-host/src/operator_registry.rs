@@ -97,11 +97,16 @@ impl OperatorRegistry {
         provider_type: Option<&str>,
         op_id: &str,
     ) -> Result<&OperatorBinding, OperatorResolveError> {
-        if let Some(id) = provider_id {
-            if let Some(ops) = self.per_provider_id.get(id) {
-                return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
-            }
-            return Err(OperatorResolveError::ProviderNotFound);
+        // M1.1b: post-cutover, `per_provider_id` only contains decls that
+        // explicitly declared a `provider_id`. State-store-backed instances
+        // (resolved via ProviderRegistry::load_instance) carry an id that
+        // OperatorRegistry has never seen at build time. When the caller
+        // supplies both `provider_id` and `provider_type`, fall through to
+        // the type index on id miss so ops are still resolvable.
+        if let Some(id) = provider_id
+            && let Some(ops) = self.per_provider_id.get(id)
+        {
+            return ops.get(op_id).ok_or(OperatorResolveError::OpNotFound);
         }
         if let Some(ty) = provider_type {
             if let Some(ops) = self.per_provider_type.get(ty) {

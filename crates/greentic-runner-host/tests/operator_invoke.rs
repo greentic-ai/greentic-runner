@@ -485,10 +485,15 @@ async fn invoke_operator_api_preserves_provider_instance_config_for_component_ru
     )?;
 
     let payload = serde_cbor::to_vec(&json!({"message": "ping"}))?;
+    // M1.1b: instance-bound dispatch needs both id+type. The inline pack
+    // decl no longer synthesizes `provider_id = Some(provider_type)`, so
+    // OperatorRegistry won't be keyed under the id alone. The caller supplies
+    // `provider_type` so the operator resolves; `provider_id` then drives
+    // ProviderRegistry::resolve to load the state-store instance config.
     let request = OperatorRequest {
         tenant_id: Some("demo".into()),
         provider_id: Some(PROVIDER_TYPE.to_string()),
-        provider_type: None,
+        provider_type: Some(PROVIDER_TYPE.to_string()),
         pack_id: None,
         op_id: "process".to_string(),
         trace_id: None,
@@ -607,6 +612,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
+            provider_id: None,
             capabilities: Vec::new(),
             ops: vec!["process".to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),
@@ -732,6 +738,7 @@ fn build_provider_pack_with_schemas(
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
+            provider_id: None,
             capabilities: Vec::new(),
             ops: vec![PROVIDER_OP.to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),
