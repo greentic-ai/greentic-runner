@@ -3369,6 +3369,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3458,6 +3459,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let ctx = FlowContext {
             tenant: "demo",

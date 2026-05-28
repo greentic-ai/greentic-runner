@@ -139,17 +139,32 @@ impl ProviderRegistry {
         }
 
         if let Some(id) = provider_id {
-            if let Some(binding) = self.load_instance(id)? {
-                return Ok(binding);
-            }
-            if let Some(ext) = self
+            let binding = if let Some(binding) = self.load_instance(id)? {
+                binding
+            } else if let Some(ext) = self
                 .inline
                 .iter()
                 .find(|decl| decl.provider_id.as_deref() == Some(id))
             {
-                return Ok(binding_from_decl(ext, self.pack_ref.clone(), None));
+                binding_from_decl(ext, self.pack_ref.clone(), None)
+            } else {
+                bail!("provider_id `{id}` not found");
+            };
+
+            // Defense-in-depth: when caller supplies both, the resolved
+            // binding's provider_type must match the requested provider_type.
+            // Catches drift between an instance file's provider_type and the
+            // caller's expectation (e.g. an instance retyped from Teams→Slack
+            // while flows still target it by id).
+            if let Some(ty) = provider_type
+                && binding.provider_type != ty
+            {
+                bail!(
+                    "provider_id `{id}` resolved to provider_type `{}`, but caller requested `{ty}`",
+                    binding.provider_type
+                );
             }
-            bail!("provider_id `{id}` not found");
+            return Ok(binding);
         }
 
         let provider_type = provider_type.unwrap();
@@ -196,11 +211,26 @@ fn extract_inline_providers(manifest: &PackManifest) -> Result<Vec<ProviderExtDe
         return Ok(Vec::new());
     };
 
+    // Trust boundary: validate the wire payload before building any runtime
+    // registry from it. validate_basic enforces non-empty/unique provider_type,
+    // unique non-empty provider_id, no cross-namespace collisions, and
+    // populated runtime fields. Without this gate, OperatorRegistry::build
+    // (last-wins HashMap) and ProviderRegistry::resolve (first-wins Vec scan)
+    // can diverge on a pack with duplicate provider_ids, routing op metadata
+    // to one decl and the actual runtime invocation to another.
+    inline
+        .validate_basic()
+        .context("provider extension inline failed validation")?;
+
     let providers = inline
         .providers
         .iter()
         .map(|provider| ProviderExtDecl {
-            provider_id: Some(provider.provider_type.clone()),
+            // M1.1b hard-cutover: preserve the wire `provider_id` verbatim
+            // (Option<String>). Previously synthesized as `Some(provider_type)`,
+            // which conflated identity with type and made cross-namespace
+            // collisions ambiguous.
+            provider_id: provider.provider_id.clone(),
             provider_type: provider.provider_type.clone(),
             capabilities: provider.capabilities.clone(),
             ops: provider.ops.clone(),

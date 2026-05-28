@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Level, span};
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
-use crate::operator_registry::OperatorResolveError;
+use crate::operator_registry::{OperatorBinding, OperatorResolveError};
+use crate::provider::ProviderBinding;
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::contract_cache::ContractSnapshot;
 use crate::runner::contract_introspection::introspect_component_contract;
@@ -492,66 +493,111 @@ pub async fn invoke_operator(
         .fetch_add(1, Ordering::Relaxed);
     let resolve_span = span!(Level::DEBUG, "resolve_op");
     let _resolve_guard = resolve_span.enter();
-    let binding = match runtime
+
+    let emit_resolve_error = |err: OperatorResolveError| {
+        let (code, message) = match err {
+            OperatorResolveError::ProviderNotFound => {
+                let label = provider_id.or(provider_type).unwrap_or("unknown");
+                (
+                    OperatorErrorCode::ProviderNotFound,
+                    format!("provider `{label}` not registered"),
+                )
+            }
+            OperatorResolveError::OpNotFound => {
+                let label = provider_id.or(provider_type).unwrap_or("unknown provider");
+                (
+                    OperatorErrorCode::OpNotFound,
+                    format!("op `{}` not found for provider `{label}`", &op_id),
+                )
+            }
+        };
+        runtime
+            .operator_metrics()
+            .resolve_errors
+            .fetch_add(1, Ordering::Relaxed);
+        let response = OperatorResponse::error(code, message);
+        let diagnostic = diagnostic_error(
+            match code {
+                OperatorErrorCode::ProviderNotFound => "provider_not_found",
+                OperatorErrorCode::OpNotFound => "op_not_found",
+                _ => "resolve_error",
+            },
+            "/op_id",
+            match code {
+                OperatorErrorCode::ProviderNotFound => "runner.operator.provider_not_found",
+                OperatorErrorCode::OpNotFound => "runner.operator.op_not_found",
+                _ => "runner.operator.resolve_error",
+            },
+            response
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "operator resolve failed".to_string()),
+            Some(op_id.as_str()),
+            binding_component_ref_hint(provider_id, provider_type),
+            runtime.digest(),
+            &locale,
+        );
+        OperatorResponse::error_with_diagnostics(
+            code,
+            response
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "operator resolve failed".to_string()),
+            vec![diagnostic],
+        )
+    };
+
+    // M1.1b: state-store-backed provider instances are not in
+    // OperatorRegistry's per_provider_id index (the registry is built from
+    // inline pack decls at load time, instances live in the tenant state
+    // store at providers/instances/{id}.json). For id-only dispatch, probe
+    // the state store via main_pack to derive the provider_type, then re-key
+    // the operator lookup by type. The probe's ProviderBinding is carried
+    // forward so the second-stage pack.resolve_provider can be skipped — one
+    // state-store read covers both the type-derivation and the runtime
+    // binding. This also makes the snapshot atomic (no probe-vs-dispatch
+    // TOCTOU on the instance file).
+    let initial = runtime
         .operator_registry()
-        .resolve(provider_id, provider_type, &op_id)
-    {
-        Ok(binding) => binding,
-        Err(err) => {
-            let (code, message) = match err {
-                OperatorResolveError::ProviderNotFound => {
-                    let label = provider_id.or(provider_type).unwrap_or("unknown");
-                    (
-                        OperatorErrorCode::ProviderNotFound,
-                        format!("provider `{label}` not registered"),
-                    )
+        .resolve(provider_id, provider_type, &op_id);
+    let (binding, probe_binding): (OperatorBinding, Option<ProviderBinding>) = match initial {
+        Ok(b) => (b.clone(), None),
+        Err(OperatorResolveError::ProviderNotFound)
+            if let Some(id) = provider_id
+                && provider_type.is_none() =>
+        {
+            match runtime.main_pack().resolve_provider(Some(id), None) {
+                Ok(pb) => {
+                    let derived = pb.provider_type.clone();
+                    // Retry by type only: the probe proved this id maps to
+                    // that type. The strict OperatorRegistry contract would
+                    // reject (Some(id), _) again because the id is not in
+                    // per_provider_id.
+                    match runtime
+                        .operator_registry()
+                        .resolve(None, Some(derived.as_str()), &op_id)
+                    {
+                        Ok(b) => (b.clone(), Some(pb)),
+                        Err(err) => return emit_resolve_error(err),
+                    }
                 }
-                OperatorResolveError::OpNotFound => {
-                    let label = provider_id.or(provider_type).unwrap_or("unknown provider");
-                    (
-                        OperatorErrorCode::OpNotFound,
-                        format!("op `{}` not found for provider `{label}`", &op_id),
-                    )
+                Err(probe_err) => {
+                    // Don't swallow — disabled instance, malformed JSON, or
+                    // state-store I/O errors are all actionable diagnostics
+                    // that get rolled up as a generic ProviderNotFound to
+                    // the caller but surface in logs for operators.
+                    tracing::warn!(
+                        provider_id = %id,
+                        error = %probe_err,
+                        "state-store probe failed for id-only operator dispatch"
+                    );
+                    return emit_resolve_error(OperatorResolveError::ProviderNotFound);
                 }
-            };
-            runtime
-                .operator_metrics()
-                .resolve_errors
-                .fetch_add(1, Ordering::Relaxed);
-            let response = OperatorResponse::error(code, message);
-            let diagnostic = diagnostic_error(
-                match code {
-                    OperatorErrorCode::ProviderNotFound => "provider_not_found",
-                    OperatorErrorCode::OpNotFound => "op_not_found",
-                    _ => "resolve_error",
-                },
-                "/op_id",
-                match code {
-                    OperatorErrorCode::ProviderNotFound => "runner.operator.provider_not_found",
-                    OperatorErrorCode::OpNotFound => "runner.operator.op_not_found",
-                    _ => "runner.operator.resolve_error",
-                },
-                response
-                    .error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "operator resolve failed".to_string()),
-                Some(op_id.as_str()),
-                binding_component_ref_hint(provider_id, provider_type),
-                runtime.digest(),
-                &locale,
-            );
-            let response = OperatorResponse::error_with_diagnostics(
-                code,
-                response
-                    .error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_else(|| "operator resolve failed".to_string()),
-                vec![diagnostic],
-            );
-            return response;
+            }
         }
+        Err(err) => return emit_resolve_error(err),
     };
     drop(_resolve_guard);
 
@@ -636,14 +682,24 @@ pub async fn invoke_operator(
         }
     };
     let pack = resolved.pack;
-    let provider_binding = match pack.resolve_provider(provider_id, provider_type) {
-        Ok(binding) => binding,
-        Err(err) => {
-            return OperatorResponse::error(
-                OperatorErrorCode::HostFailure,
-                format!("failed to resolve provider runtime: {err}"),
-            );
-        }
+    // When the probe above produced a ProviderBinding (id-only dispatch
+    // against a state-store instance), reuse it — it's already a coherent
+    // snapshot from the same load_instance call that derived the type, so
+    // there's nothing to drift against and no second state-store read is
+    // needed. For all other paths the second-stage resolve runs as before
+    // and ProviderRegistry's defense-in-depth check (binding.provider_type
+    // == requested) fires on the (Some(id), Some(type)) shape.
+    let provider_binding = match probe_binding {
+        Some(pb) => pb,
+        None => match pack.resolve_provider(provider_id, provider_type) {
+            Ok(binding) => binding,
+            Err(err) => {
+                return OperatorResponse::error(
+                    OperatorErrorCode::HostFailure,
+                    format!("failed to resolve provider runtime: {err}"),
+                );
+            }
+        },
     };
 
     let component_ref = &provider_binding.component_ref;
