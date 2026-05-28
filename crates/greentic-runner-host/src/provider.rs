@@ -211,6 +211,17 @@ fn extract_inline_providers(manifest: &PackManifest) -> Result<Vec<ProviderExtDe
         return Ok(Vec::new());
     };
 
+    // Trust boundary: validate the wire payload before building any runtime
+    // registry from it. validate_basic enforces non-empty/unique provider_type,
+    // unique non-empty provider_id, no cross-namespace collisions, and
+    // populated runtime fields. Without this gate, OperatorRegistry::build
+    // (last-wins HashMap) and ProviderRegistry::resolve (first-wins Vec scan)
+    // can diverge on a pack with duplicate provider_ids, routing op metadata
+    // to one decl and the actual runtime invocation to another.
+    inline
+        .validate_basic()
+        .map_err(|err| anyhow!("provider extension inline failed validation: {err}"))?;
+
     let providers = inline
         .providers
         .iter()

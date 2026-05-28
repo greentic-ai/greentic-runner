@@ -136,3 +136,38 @@ fn resolve_with_matching_id_and_type_succeeds() {
     assert_eq!(binding.provider_id.as_deref(), Some("vendor.cache.primary"));
     assert_eq!(binding.provider_type, "vendor.cache");
 }
+
+#[test]
+fn registry_rejects_pack_with_duplicate_provider_id() {
+    // validate_basic must fire at the trust boundary. Two decls both
+    // declaring provider_id="dup" would otherwise lead OperatorRegistry's
+    // last-wins HashMap insert to disagree with ProviderRegistry::resolve's
+    // first-match Vec scan — policy routing and runtime invocation could
+    // resolve to different decls.
+    let err = registry_for(vec![
+        decl("vendor.a", Some("dup")),
+        decl("vendor.b", Some("dup")),
+    ])
+    .err()
+    .expect("duplicate provider_id rejected at registry construction");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation") && msg.contains("duplicate provider_id"),
+        "expected validation failure naming duplicate provider_id, got: {msg}"
+    );
+}
+
+#[test]
+fn registry_rejects_pack_with_cross_namespace_collision() {
+    // A Slack decl whose provider_id matches a Teams decl's provider_type
+    // would let id-lookup keyed "teams" silently bind to the Slack runtime.
+    // The runner must reject the manifest at construction time.
+    let err = registry_for(vec![decl("teams", None), decl("slack", Some("teams"))])
+        .err()
+        .expect("cross-namespace collision rejected at registry construction");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("validation") && msg.contains("provider_id 'teams'"),
+        "expected collision validation failure, got: {msg}"
+    );
+}

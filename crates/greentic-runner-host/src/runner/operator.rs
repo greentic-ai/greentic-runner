@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{Level, span};
 
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
-use crate::operator_registry::OperatorResolveError;
+use crate::operator_registry::{OperatorBinding, OperatorResolveError};
 use crate::routing::TenantRuntimeHandle;
 use crate::runner::contract_cache::ContractSnapshot;
 use crate::runner::contract_introspection::introspect_component_contract;
@@ -492,10 +492,37 @@ pub async fn invoke_operator(
         .fetch_add(1, Ordering::Relaxed);
     let resolve_span = span!(Level::DEBUG, "resolve_op");
     let _resolve_guard = resolve_span.enter();
-    let binding = match runtime
+    // M1.1b: state-store-backed provider instances are not in
+    // OperatorRegistry's per_provider_id index (the registry is built from
+    // inline pack decls at load time, instances live in the tenant state
+    // store at providers/instances/{id}.json). For id-only dispatch, probe
+    // the state store via main_pack to derive the provider_type, then look
+    // up ops by type. The probe is bounded — one extra state-store read in
+    // exchange for keeping id-only the documented happy path.
+    let mut derived_provider_type: Option<String> = None;
+    let initial = runtime
         .operator_registry()
-        .resolve(provider_id, provider_type, &op_id)
-    {
+        .resolve(provider_id, provider_type, &op_id);
+    let owned_binding: Result<OperatorBinding, OperatorResolveError> = match initial {
+        Ok(binding) => Ok(binding.clone()),
+        Err(OperatorResolveError::ProviderNotFound)
+            if provider_id.is_some() && provider_type.is_none() =>
+        {
+            let id = provider_id.expect("provider_id is Some");
+            match runtime.main_pack().resolve_provider(Some(id), None) {
+                Ok(pb) => {
+                    derived_provider_type = Some(pb.provider_type.clone());
+                    runtime
+                        .operator_registry()
+                        .resolve(Some(id), Some(pb.provider_type.as_str()), &op_id)
+                        .cloned()
+                }
+                Err(_) => Err(OperatorResolveError::ProviderNotFound),
+            }
+        }
+        Err(err) => Err(err),
+    };
+    let binding = match owned_binding {
         Ok(binding) => binding,
         Err(err) => {
             let (code, message) = match err {
@@ -636,7 +663,12 @@ pub async fn invoke_operator(
         }
     };
     let pack = resolved.pack;
-    let provider_binding = match pack.resolve_provider(provider_id, provider_type) {
+    // When we derived provider_type via the state-store probe above, pass it
+    // back into the second-stage resolve so ProviderRegistry's defense-in-depth
+    // check (binding.provider_type == requested) fires. Catches the case where
+    // an instance file was retyped between the probe and dispatch.
+    let effective_provider_type = derived_provider_type.as_deref().or(provider_type);
+    let provider_binding = match pack.resolve_provider(provider_id, effective_provider_type) {
         Ok(binding) => binding,
         Err(err) => {
             return OperatorResponse::error(

@@ -485,15 +485,15 @@ async fn invoke_operator_api_preserves_provider_instance_config_for_component_ru
     )?;
 
     let payload = serde_cbor::to_vec(&json!({"message": "ping"}))?;
-    // M1.1b: instance-bound dispatch needs both id+type. The inline pack
-    // decl no longer synthesizes `provider_id = Some(provider_type)`, so
-    // OperatorRegistry won't be keyed under the id alone. The caller supplies
-    // `provider_type` so the operator resolves; `provider_id` then drives
-    // ProviderRegistry::resolve to load the state-store instance config.
+    // M1.1b: id-only dispatch for state-store-backed instances. The inline
+    // pack decl no longer synthesizes `provider_id = Some(provider_type)`,
+    // so per_provider_id has no entry. invoke_operator probes the state
+    // store via main_pack.resolve_provider to derive provider_type and
+    // retries the operator lookup.
     let request = OperatorRequest {
         tenant_id: Some("demo".into()),
         provider_id: Some(PROVIDER_TYPE.to_string()),
-        provider_type: Some(PROVIDER_TYPE.to_string()),
+        provider_type: None,
         pack_id: None,
         op_id: "process".to_string(),
         trace_id: None,
