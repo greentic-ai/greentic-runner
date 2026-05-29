@@ -2,8 +2,9 @@
 //!
 //! `ExtensionRuntime::invoke_tool` is a synchronous `fn` performing
 //! Wasmtime WASM dispatch (CPU-bound, may block seconds). Every call
-//! site MUST wrap it in `tokio::task::spawn_blocking` (spec §5.3) — this
-//! module is the ONLY place that calls `invoke_tool`.
+//! site MUST wrap it in `tokio::task::spawn_blocking` (spec §5.3). This
+//! module calls it for agent tool dispatch; `llm_extension::RuntimeInvoker`
+//! also calls it (likewise wrapped) when the LLM runs through an extension.
 //!
 //! Each tool call is recorded in Redis by `tool_call_id` BEFORE the
 //! result is committed so a state-save failure cannot cause a
