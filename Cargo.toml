@@ -100,11 +100,13 @@ features = [
     "pkcs8",
 ]
 
-# Floor pinned to the M1.1a publish (PR #133): adds `provider_id` field on
-# `ProviderDecl` + `validate_basic` cross-namespace collision check. Earlier dev
-# publishes lack the field and resolve provider_id by provider_type fallback.
+# Floor pinned to the M1.4b-ii publish (PR #134): adds
+# `attr_keys::MESSAGING_ENDPOINT_ID` and the `tenant_ctx_to_telemetry` bridge
+# mapping it onto `TelemetryCtx::messaging_endpoint_id`. Earlier dev publishes
+# (incl. M1.1a) lack the const, so `tenant_ctx()` in
+# `engine::runtime::IngressEnvelope` would fail to compile.
 [workspace.dependencies.greentic-types]
-version = ">=1.1.0-dev.26561934923, <1.2.0-0"
+version = ">=1.1.0-dev.26640931069, <1.2.0-0"
 default-features = false
 features = [
     "std",

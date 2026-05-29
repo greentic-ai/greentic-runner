@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use greentic_session::{SessionData, SessionKey as StoreSessionKey};
 use greentic_types::{
     EnvId, FlowId, GreenticError, PackId, ReplyScope, SessionCursor as TypesSessionCursor,
-    TenantCtx, TenantId, UserId,
+    TenantCtx, TenantId, UserId, telemetry::attr_keys,
 };
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
@@ -219,6 +219,7 @@ mod tests {
             action: Some("messaging".into()),
             session_hint: Some("demo:provider:chan:conv:user".into()),
             provider: Some("provider".into()),
+            messaging_endpoint_id: None,
             channel: Some("chan".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),
@@ -324,6 +325,7 @@ mod tests {
             action: None,
             session_hint: None,
             provider: None,
+            messaging_endpoint_id: None,
             channel: None,
             conversation: None,
             user: None,
@@ -340,6 +342,121 @@ mod tests {
         assert_eq!(envelope.conversation.as_deref(), Some("flow.main"));
         assert_eq!(envelope.user.as_deref(), Some("activity-1"));
         assert!(envelope.session_hint.is_some());
+    }
+
+    #[test]
+    fn canonical_session_hint_is_pure_structured_form() {
+        // canonical_session_hint() does NOT embed messaging_endpoint_id —
+        // namespacing happens at the canonicalize() layer so explicit
+        // producer-supplied hints get the same treatment.
+        let mut envelope = sample_envelope();
+        envelope.session_hint = None;
+        assert_eq!(
+            envelope.canonical_session_hint(),
+            "demo:provider:chan:conv:user"
+        );
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        assert_eq!(
+            envelope.canonical_session_hint(),
+            "demo:provider:chan:conv:user"
+        );
+    }
+
+    #[test]
+    fn canonicalize_unchanged_when_endpoint_id_none() {
+        // Backward compat: pre-M1.4 envelopes (endpoint_id = None) must
+        // produce the same session_hint bytes, or existing Redis sessions
+        // orphan. Both derived and explicit hints stay untouched.
+        let mut derived = sample_envelope();
+        derived.session_hint = None;
+        let derived = derived.canonicalize();
+        assert_eq!(
+            derived.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+
+        let explicit = sample_envelope().canonicalize();
+        assert_eq!(
+            explicit.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+    }
+
+    #[test]
+    fn canonicalize_namespaces_derived_hint_when_endpoint_id_set() {
+        let mut envelope = sample_envelope();
+        envelope.session_hint = None;
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let envelope = envelope.canonicalize();
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("ep=teams-legal::demo:provider:chan:conv:user")
+        );
+    }
+
+    #[test]
+    fn canonicalize_partitions_explicit_hints_across_endpoints() {
+        // Codex M1.4b-iii regression: producer-supplied hints must still
+        // partition by endpoint id, not collapse to the same session key.
+        // Two endpoints with IDENTICAL producer-supplied session_hints must
+        // resolve to distinct effective session keys.
+        let raw = "shared-session-key";
+
+        let mut a = sample_envelope();
+        a.session_hint = Some(raw.into());
+        a.messaging_endpoint_id = Some("teams-legal".into());
+        let a = a.canonicalize();
+
+        let mut b = sample_envelope();
+        b.session_hint = Some(raw.into());
+        b.messaging_endpoint_id = Some("teams-accounting".into());
+        let b = b.canonicalize();
+
+        assert_ne!(a.session_hint, b.session_hint);
+        assert_eq!(
+            a.session_hint.as_deref(),
+            Some("ep=teams-legal::shared-session-key")
+        );
+        assert_eq!(
+            b.session_hint.as_deref(),
+            Some("ep=teams-accounting::shared-session-key")
+        );
+    }
+
+    #[test]
+    fn canonicalize_is_idempotent_for_endpoint_prefix() {
+        // Re-canonicalizing must not double-prefix the namespace marker.
+        let mut envelope = sample_envelope();
+        envelope.session_hint = Some("raw-key".into());
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let once = envelope.canonicalize();
+        let twice = once.clone().canonicalize();
+        assert_eq!(once.session_hint, twice.session_hint);
+        assert_eq!(
+            twice.session_hint.as_deref(),
+            Some("ep=teams-legal::raw-key")
+        );
+    }
+
+    #[test]
+    fn tenant_ctx_stamps_messaging_endpoint_id() {
+        let mut envelope = sample_envelope();
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let ctx = envelope.tenant_ctx();
+        assert_eq!(
+            ctx.attributes.get(attr_keys::MESSAGING_ENDPOINT_ID),
+            Some(&"teams-legal".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_ctx_omits_messaging_endpoint_id_when_unset() {
+        let envelope = sample_envelope();
+        let ctx = envelope.tenant_ctx();
+        assert!(
+            !ctx.attributes
+                .contains_key(attr_keys::MESSAGING_ENDPOINT_ID)
+        );
     }
 }
 
@@ -719,6 +836,12 @@ pub struct IngressEnvelope {
     pub session_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Multi-instance messaging endpoint discriminator (M1.4).
+    /// Distinguishes provider instances of the same `provider_type` —
+    /// e.g. `teams-legal` vs `teams-accounting` — so sessions and traces
+    /// don't collide across endpoints that share provider/channel/user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -757,9 +880,24 @@ impl IngressEnvelope {
                 self.user = Some("user".into());
             }
         }
-        if self.session_hint.is_none() {
-            self.session_hint = Some(self.canonical_session_hint());
-        }
+        // Endpoint isolation: prefix the hint (explicit OR derived) with
+        // `ep=<eid>::` so two endpoints reusing the same producer-supplied
+        // session key never collide. Idempotent — re-canonicalize is a no-op.
+        let base = self
+            .session_hint
+            .clone()
+            .unwrap_or_else(|| self.canonical_session_hint());
+        self.session_hint = Some(match &self.messaging_endpoint_id {
+            Some(eid) => {
+                let prefix = format!("ep={eid}::");
+                if base.starts_with(&prefix) {
+                    base
+                } else {
+                    format!("{prefix}{base}")
+                }
+            }
+            None => base,
+        });
         if self.reply_scope.is_none()
             && let Some(conversation) = self.conversation.clone()
         {
@@ -774,6 +912,10 @@ impl IngressEnvelope {
     }
 
     pub fn canonical_session_hint(&self) -> String {
+        // Pre-M1.4 structured form. Endpoint isolation is applied uniformly
+        // at the `canonicalize()` layer so explicit producer-supplied hints
+        // get the same namespacing as derived ones — keeping this function
+        // pure and bytes-identical to pre-M1.4 for `endpoint_id = None`.
         format!(
             "{}:{}:{}:{}:{}",
             self.tenant,
@@ -797,6 +939,13 @@ impl IngressEnvelope {
         }
         if let Some(session) = &self.session_hint {
             ctx = ctx.with_session(session.clone());
+        }
+        // M1.4: ride the attributes map so the greentic-types
+        // `tenant_ctx_to_telemetry` bridge projects it onto
+        // `TelemetryCtx::messaging_endpoint_id` for OTel export.
+        if let Some(eid) = &self.messaging_endpoint_id {
+            ctx.attributes
+                .insert(attr_keys::MESSAGING_ENDPOINT_ID.to_string(), eid.clone());
         }
         ctx
     }

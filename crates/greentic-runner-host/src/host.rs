@@ -222,6 +222,9 @@ impl RunnerHost {
         let action = activity.action().map(|value| value.to_string());
         let session = activity.session_id().map(|value| value.to_string());
         let provider = activity.provider_id().map(|value| value.to_string());
+        let messaging_endpoint_id = activity
+            .messaging_endpoint_id()
+            .map(|value| value.to_string());
         let channel = activity.channel().map(|value| value.to_string());
         let conversation = activity.conversation().map(|value| value.to_string());
         let user = activity.user().map(|value| value.to_string());
@@ -245,6 +248,7 @@ impl RunnerHost {
             action,
             session_hint: session,
             provider,
+            messaging_endpoint_id,
             channel,
             conversation,
             user,
