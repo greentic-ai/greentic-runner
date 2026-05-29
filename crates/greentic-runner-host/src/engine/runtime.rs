@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use greentic_session::{SessionData, SessionKey as StoreSessionKey};
 use greentic_types::{
     EnvId, FlowId, GreenticError, PackId, ReplyScope, SessionCursor as TypesSessionCursor,
-    TenantCtx, TenantId, UserId,
+    TenantCtx, TenantId, UserId, telemetry::attr_keys,
 };
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
@@ -219,6 +219,7 @@ mod tests {
             action: Some("messaging".into()),
             session_hint: Some("demo:provider:chan:conv:user".into()),
             provider: Some("provider".into()),
+            messaging_endpoint_id: None,
             channel: Some("chan".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),
@@ -324,6 +325,7 @@ mod tests {
             action: None,
             session_hint: None,
             provider: None,
+            messaging_endpoint_id: None,
             channel: None,
             conversation: None,
             user: None,
@@ -340,6 +342,52 @@ mod tests {
         assert_eq!(envelope.conversation.as_deref(), Some("flow.main"));
         assert_eq!(envelope.user.as_deref(), Some("activity-1"));
         assert!(envelope.session_hint.is_some());
+    }
+
+    #[test]
+    fn canonical_session_hint_unchanged_when_endpoint_id_none() {
+        // Backward compat: pre-M1.4 envelopes (endpoint_id = None) must
+        // produce the same hint bytes, or existing Redis sessions orphan.
+        let envelope = sample_envelope();
+        assert_eq!(
+            envelope.canonical_session_hint(),
+            "demo:provider:chan:conv:user"
+        );
+    }
+
+    #[test]
+    fn canonical_session_hint_partitions_by_endpoint_id() {
+        let mut a = sample_envelope();
+        a.messaging_endpoint_id = Some("teams-legal".into());
+        let mut b = sample_envelope();
+        b.messaging_endpoint_id = Some("teams-accounting".into());
+
+        let hint_a = a.canonical_session_hint();
+        let hint_b = b.canonical_session_hint();
+        assert_eq!(hint_a, "demo:provider#teams-legal:chan:conv:user");
+        assert_eq!(hint_b, "demo:provider#teams-accounting:chan:conv:user");
+        assert_ne!(hint_a, hint_b);
+    }
+
+    #[test]
+    fn tenant_ctx_stamps_messaging_endpoint_id() {
+        let mut envelope = sample_envelope();
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let ctx = envelope.tenant_ctx();
+        assert_eq!(
+            ctx.attributes.get(attr_keys::MESSAGING_ENDPOINT_ID),
+            Some(&"teams-legal".to_string())
+        );
+    }
+
+    #[test]
+    fn tenant_ctx_omits_messaging_endpoint_id_when_unset() {
+        let envelope = sample_envelope();
+        let ctx = envelope.tenant_ctx();
+        assert!(
+            !ctx.attributes
+                .contains_key(attr_keys::MESSAGING_ENDPOINT_ID)
+        );
     }
 }
 
@@ -719,6 +767,12 @@ pub struct IngressEnvelope {
     pub session_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Multi-instance messaging endpoint discriminator (M1.4).
+    /// Distinguishes provider instances of the same `provider_type` —
+    /// e.g. `teams-legal` vs `teams-accounting` — so sessions and traces
+    /// don't collide across endpoints that share provider/channel/user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messaging_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -774,14 +828,25 @@ impl IngressEnvelope {
     }
 
     pub fn canonical_session_hint(&self) -> String {
-        format!(
-            "{}:{}:{}:{}:{}",
-            self.tenant,
-            self.provider.as_deref().unwrap_or("provider"),
-            self.channel.as_deref().unwrap_or("channel"),
-            self.conversation.as_deref().unwrap_or("conversation"),
-            self.user.as_deref().unwrap_or("user")
-        )
+        // When `messaging_endpoint_id` is None the hint is bytes-identical to
+        // pre-M1.4 — existing sessions in Redis don't get orphaned. When set,
+        // we fold it into the provider segment so two endpoints on the same
+        // (provider, channel, conversation, user) partition into distinct
+        // sessions. `#` is reserved here as the in-segment separator.
+        let provider = self.provider.as_deref().unwrap_or("provider");
+        let channel = self.channel.as_deref().unwrap_or("channel");
+        let conversation = self.conversation.as_deref().unwrap_or("conversation");
+        let user = self.user.as_deref().unwrap_or("user");
+        match self.messaging_endpoint_id.as_deref() {
+            Some(eid) => format!(
+                "{}:{}#{}:{}:{}:{}",
+                self.tenant, provider, eid, channel, conversation, user
+            ),
+            None => format!(
+                "{}:{}:{}:{}:{}",
+                self.tenant, provider, channel, conversation, user
+            ),
+        }
     }
 
     pub fn tenant_ctx(&self) -> TenantCtx {
@@ -797,6 +862,13 @@ impl IngressEnvelope {
         }
         if let Some(session) = &self.session_hint {
             ctx = ctx.with_session(session.clone());
+        }
+        // M1.4: ride the attributes map so the greentic-types
+        // `tenant_ctx_to_telemetry` bridge projects it onto
+        // `TelemetryCtx::messaging_endpoint_id` for OTel export.
+        if let Some(eid) = &self.messaging_endpoint_id {
+            ctx.attributes
+                .insert(attr_keys::MESSAGING_ENDPOINT_ID.to_string(), eid.clone());
         }
         ctx
     }

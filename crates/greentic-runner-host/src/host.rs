@@ -245,6 +245,10 @@ impl RunnerHost {
             action,
             session_hint: session,
             provider,
+            // M1.4: producer wires from the receiving provider instance.
+            // Greentic-start's ingress dispatcher (M1.4c) populates this;
+            // the runner-side seam carries None until that lands.
+            messaging_endpoint_id: None,
             channel,
             conversation,
             user,
