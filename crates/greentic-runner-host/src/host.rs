@@ -5,11 +5,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
-use crate::activity::Activity;
+use crate::activity::{Activity, WelcomeFlowHint};
 use crate::boot;
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
-use crate::engine::runtime::IngressEnvelope;
+use crate::engine::runtime::{FlowResumeStore, IngressEnvelope};
 use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
 use crate::runner::adapt_timer;
@@ -228,23 +228,25 @@ impl RunnerHost {
         let channel = activity.channel().map(|value| value.to_string());
         let conversation = activity.conversation().map(|value| value.to_string());
         let user = activity.user().map(|value| value.to_string());
-        let flow_type = activity
-            .flow_type()
-            .map(|value| value.to_string())
-            .or_else(|| {
-                runtime
-                    .engine()
-                    .flow_by_key(&pack_id, &flow_id)
-                    .map(|desc| desc.flow_type.clone())
-            });
+        let welcome_flow_hint = activity.welcome_flow_hint().cloned();
+        let resolved_flow_type =
+            activity
+                .flow_type()
+                .map(|value| value.to_string())
+                .or_else(|| {
+                    runtime
+                        .engine()
+                        .flow_by_key(&pack_id, &flow_id)
+                        .map(|desc| desc.flow_type.clone())
+                });
         let payload = activity.into_payload();
 
-        let envelope = IngressEnvelope {
+        let mut envelope = IngressEnvelope {
             tenant: tenant.to_string(),
             env: std::env::var("GREENTIC_ENV").ok(),
             pack_id: Some(pack_id.clone()),
             flow_id: flow_id.clone(),
-            flow_type,
+            flow_type: resolved_flow_type,
             action,
             session_hint: session,
             provider,
@@ -259,6 +261,19 @@ impl RunnerHost {
             reply_scope: None,
         }
         .canonicalize();
+
+        let hint_flow_type = welcome_flow_hint.as_ref().and_then(|hint| {
+            runtime
+                .engine()
+                .flow_by_key(&hint.pack_id, &hint.flow_id)
+                .map(|desc| desc.flow_type.clone())
+        });
+        apply_welcome_flow_override(
+            runtime.session_store(),
+            &mut envelope,
+            welcome_flow_hint.as_ref(),
+            hint_flow_type,
+        )?;
 
         let result = runtime.state_machine().handle(envelope).await?;
         Ok(normalize_replies(result, tenant))
@@ -365,6 +380,49 @@ impl TenantHandle {
     }
 }
 
+/// M1.5 welcome-flow override: if a producer attached a [`WelcomeFlowHint`]
+/// AND the envelope carries a `messaging_endpoint_id` AND the envelope's
+/// canonical session lookup finds no prior resume snapshot, swap the
+/// envelope's `(pack_id, flow_id, flow_type)` over to the hint's flow before
+/// the state machine sees it. Any missing precondition is a silent no-op
+/// (back-compat with pre-M1.5 producers and post-first-contact turns).
+///
+/// First-contact detection uses `FlowResumeStore::fetch`, which keys on the
+/// envelope's endpoint-prefixed session hint AND the current pack_id (see
+/// `build_store_ctx`). A user who talked to a *different* pack on the same
+/// endpoint would still be flagged first-contact for *this* pack. That is
+/// the intended scope for the scaffold — true endpoint-level first contact
+/// across packs needs the session-key shape to drop pack_id, which is a
+/// Phase D follow-up.
+///
+/// Takes the session store + pre-resolved `hint_flow_type` as primitives so
+/// the logic is unit-testable without a `TenantRuntime`. The caller is
+/// responsible for the engine lookup that produces `hint_flow_type`.
+fn apply_welcome_flow_override(
+    session_store: &DynSessionStore,
+    envelope: &mut IngressEnvelope,
+    hint: Option<&WelcomeFlowHint>,
+    hint_flow_type: Option<String>,
+) -> Result<()> {
+    let Some(hint) = hint else {
+        return Ok(());
+    };
+    if envelope.messaging_endpoint_id.is_none() {
+        return Ok(());
+    }
+    let resume = FlowResumeStore::new(Arc::clone(session_store));
+    let snapshot = resume
+        .fetch(envelope)
+        .map_err(|err| anyhow!("welcome-flow first-contact probe failed: {err}"))?;
+    if snapshot.is_some() {
+        return Ok(());
+    }
+    envelope.pack_id = Some(hint.pack_id.clone());
+    envelope.flow_id = hint.flow_id.clone();
+    envelope.flow_type = hint_flow_type;
+    Ok(())
+}
+
 fn resolve_flow_id(runtime: &TenantRuntime, activity: &Activity) -> Result<(String, String)> {
     let engine = runtime.engine();
     if let Some(flow_id) = activity.flow_id() {
@@ -422,4 +480,161 @@ fn is_pack_archive(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("gtpack"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod welcome_flow_tests {
+    use super::*;
+    use crate::engine::runtime::IngressEnvelope;
+    use crate::runner::engine::{ExecutionState, FlowSnapshot, FlowWait};
+    use crate::storage::new_session_store;
+    use greentic_types::ReplyScope;
+    use serde_json::json;
+
+    fn sample_envelope(endpoint_id: Option<&str>) -> IngressEnvelope {
+        IngressEnvelope {
+            tenant: "demo".into(),
+            env: Some("local".into()),
+            pack_id: Some("pack.default".into()),
+            flow_id: "flow.default".into(),
+            flow_type: Some("messaging".into()),
+            action: Some("messaging".into()),
+            session_hint: None,
+            provider: Some("teams".into()),
+            messaging_endpoint_id: endpoint_id.map(String::from),
+            channel: Some("chan".into()),
+            conversation: Some("conv".into()),
+            user: Some("user-1".into()),
+            activity_id: None,
+            timestamp: None,
+            payload: json!({}),
+            metadata: None,
+            reply_scope: Some(ReplyScope {
+                conversation: "conv".into(),
+                thread: None,
+                reply_to: None,
+                correlation: None,
+            }),
+        }
+        .canonicalize()
+    }
+
+    fn hint() -> WelcomeFlowHint {
+        WelcomeFlowHint {
+            pack_id: "pack.welcome".into(),
+            flow_id: "flow.welcome".into(),
+        }
+    }
+
+    fn seed_resume(store: &DynSessionStore, envelope: &IngressEnvelope) {
+        // Plant a snapshot in the exact bucket `fetch` would query so the
+        // next call resolves to a resume — proves the override skips when a
+        // session already exists.
+        let resume = FlowResumeStore::new(Arc::clone(store));
+        let state: ExecutionState = serde_json::from_value(json!({
+            "input": { "text": "hi" },
+            "nodes": {},
+            "egress": []
+        }))
+        .expect("state");
+        let wait = FlowWait {
+            reason: Some("await-user".into()),
+            snapshot: FlowSnapshot {
+                pack_id: envelope.pack_id.clone().expect("pack_id"),
+                flow_id: envelope.flow_id.clone(),
+                next_flow: None,
+                next_node: "node-2".into(),
+                state,
+            },
+        };
+        resume.save(envelope, &wait).expect("seed save");
+    }
+
+    #[test]
+    fn override_is_no_op_when_hint_absent() {
+        // Pre-M1.5 producers don't attach a hint — flow resolution must
+        // stay exactly the same.
+        let store = new_session_store();
+        let mut envelope = sample_envelope(Some("teams-legal"));
+        let before = envelope.clone();
+        apply_welcome_flow_override(&store, &mut envelope, None, None).expect("ok");
+        assert_eq!(envelope.pack_id, before.pack_id);
+        assert_eq!(envelope.flow_id, before.flow_id);
+        assert_eq!(envelope.flow_type, before.flow_type);
+    }
+
+    #[test]
+    fn override_is_no_op_when_endpoint_id_absent() {
+        // Non-messaging traffic carries no endpoint id and must never hit
+        // the welcome-flow path even if the hint is somehow set.
+        let store = new_session_store();
+        let mut envelope = sample_envelope(None);
+        let before = envelope.clone();
+        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .expect("ok");
+        assert_eq!(envelope.pack_id, before.pack_id);
+        assert_eq!(envelope.flow_id, before.flow_id);
+    }
+
+    #[test]
+    fn override_swaps_pack_flow_and_type_on_first_contact() {
+        let store = new_session_store();
+        let mut envelope = sample_envelope(Some("teams-legal"));
+        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .expect("ok");
+        assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
+        assert_eq!(envelope.flow_id, "flow.welcome");
+        assert_eq!(envelope.flow_type.as_deref(), Some("welcome"));
+    }
+
+    #[test]
+    fn override_clears_flow_type_when_hint_lookup_unresolved() {
+        // If the producer's resolver can't find the welcome flow's type
+        // (unknown flow in engine), the hint's flow_type ends up None —
+        // downstream resolution defaults take over.
+        let store = new_session_store();
+        let mut envelope = sample_envelope(Some("teams-legal"));
+        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), None).expect("ok");
+        assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
+        assert!(envelope.flow_type.is_none());
+    }
+
+    #[test]
+    fn override_is_no_op_on_repeat_turn_with_existing_session() {
+        // Resume path: an already-active session in the same bucket means
+        // this isn't first contact. The user must continue on the resumed
+        // flow, NOT be redirected to the welcome flow.
+        let store = new_session_store();
+        let envelope_template = sample_envelope(Some("teams-legal"));
+        seed_resume(&store, &envelope_template);
+
+        let mut envelope = envelope_template.clone();
+        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
+            .expect("ok");
+        assert_eq!(envelope.pack_id, envelope_template.pack_id);
+        assert_eq!(envelope.flow_id, envelope_template.flow_id);
+        assert_eq!(envelope.flow_type, envelope_template.flow_type);
+    }
+
+    #[test]
+    fn override_partitions_first_contact_per_endpoint() {
+        // A user who has talked to `teams-legal` is first contact on
+        // `teams-accounting` (endpoint partitions the session bucket via
+        // `ep=<eid>::` prefix at canonicalize). Welcome flow must fire on
+        // the second endpoint even though the user is known on the first.
+        let store = new_session_store();
+        let legal = sample_envelope(Some("teams-legal"));
+        seed_resume(&store, &legal);
+
+        let mut accounting = sample_envelope(Some("teams-accounting"));
+        apply_welcome_flow_override(
+            &store,
+            &mut accounting,
+            Some(&hint()),
+            Some("welcome".into()),
+        )
+        .expect("ok");
+        assert_eq!(accounting.pack_id.as_deref(), Some("pack.welcome"));
+        assert_eq!(accounting.flow_id, "flow.welcome");
+    }
 }

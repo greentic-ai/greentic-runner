@@ -30,8 +30,28 @@ pub struct Activity {
     channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
+    /// M1.5 first-contact override hint. Producer-supplied — the runner only
+    /// honours it when the (env, tenant, user, endpoint_id) tuple has no
+    /// resume snapshot in this pack's session bucket AND a messaging
+    /// endpoint is asserted. Lets the env's per-endpoint welcome flow run
+    /// instead of the pack's default entry flow, without changing flow
+    /// resolution for repeat turns. See [`WelcomeFlowHint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    welcome_flow_hint: Option<WelcomeFlowHint>,
     #[serde(default)]
     payload: Value,
+}
+
+/// M1.5 welcome-flow override hint: the `(pack_id, flow_id)` a producer wants
+/// the runner to dispatch when this activity is the user's first contact on
+/// the asserted messaging endpoint. Encodes both axes because welcome flows
+/// can live in a different pack from the resolved one (e.g. greentic-start
+/// reads the endpoint's `welcome_flow` from `Environment.messaging_endpoints`
+/// and attaches it here).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WelcomeFlowHint {
+    pub pack_id: String,
+    pub flow_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -63,6 +83,7 @@ impl Activity {
             user_id: None,
             channel_id: None,
             conversation_id: None,
+            welcome_flow_hint: None,
             payload: json!({ "text": text.into() }),
         }
     }
@@ -84,8 +105,23 @@ impl Activity {
             user_id: None,
             channel_id: None,
             conversation_id: None,
+            welcome_flow_hint: None,
             payload,
         }
+    }
+
+    /// Attach the M1.5 welcome-flow override hint. See [`WelcomeFlowHint`] for
+    /// the contract — the runner only acts on it when the activity is first
+    /// contact on the asserted messaging endpoint, so calling this on every
+    /// turn is safe.
+    pub fn with_welcome_flow_hint(mut self, hint: WelcomeFlowHint) -> Self {
+        self.welcome_flow_hint = Some(hint);
+        self
+    }
+
+    /// Return the welcome-flow override hint, if any.
+    pub fn welcome_flow_hint(&self) -> Option<&WelcomeFlowHint> {
+        self.welcome_flow_hint.as_ref()
     }
 
     /// Attach a tenant identifier to the activity.
