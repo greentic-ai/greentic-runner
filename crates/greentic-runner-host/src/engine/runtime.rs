@@ -958,9 +958,26 @@ impl IngressEnvelope {
         }
         // Defensive: drop an invalid eid BEFORE it reaches the prefix step
         // or telemetry stamping. See `endpoint_id_is_valid` for why.
+        //
+        // The drop is silent at the http boundary (greentic-start validates
+        // and drops there too — see Codex review note: that path is fronted
+        // by request validation, so an invalid eid means the operator never
+        // asserted one). Embedded callers and the future WIT-derived
+        // `identify_instance` path have no such validator, so a downgrade
+        // here usually signals a producer bug. Emit at WARN so operators can
+        // spot it, then continue with the same drop-to-None semantics the
+        // http layer uses — staying consistent across boundaries.
         if let Some(eid) = self.messaging_endpoint_id.as_deref()
             && !endpoint_id_is_valid(eid)
         {
+            tracing::warn!(
+                tenant = %self.tenant,
+                flow_id = %self.flow_id,
+                messaging_endpoint_id = %eid,
+                "M1.4: invalid messaging_endpoint_id dropped at runner-host canonicalize \
+                 — request will run unscoped (legacy session bucket). \
+                 Producer bug or non-HTTP caller bypassing the boundary validator."
+            );
             self.messaging_endpoint_id = None;
         }
         // Endpoint isolation: prefix the hint (explicit OR derived) with

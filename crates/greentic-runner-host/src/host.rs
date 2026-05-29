@@ -380,20 +380,31 @@ impl TenantHandle {
     }
 }
 
-/// M1.5 welcome-flow override: if a producer attached a [`WelcomeFlowHint`]
-/// AND the envelope carries a `messaging_endpoint_id` AND the envelope's
-/// canonical session lookup finds no prior resume snapshot, swap the
-/// envelope's `(pack_id, flow_id, flow_type)` over to the hint's flow before
-/// the state machine sees it. Any missing precondition is a silent no-op
-/// (back-compat with pre-M1.5 producers and post-first-contact turns).
+/// M1.5 welcome-flow override: swap the envelope's `(pack_id, flow_id,
+/// flow_type)` over to the producer-supplied [`WelcomeFlowHint`] before the
+/// state machine sees it, when **all** three preconditions hold:
 ///
-/// First-contact detection uses `FlowResumeStore::fetch`, which keys on the
-/// envelope's endpoint-prefixed session hint AND the current pack_id (see
-/// `build_store_ctx`). A user who talked to a *different* pack on the same
-/// endpoint would still be flagged first-contact for *this* pack. That is
-/// the intended scope for the scaffold — true endpoint-level first contact
-/// across packs needs the session-key shape to drop pack_id, which is a
-/// Phase D follow-up.
+/// 1. The producer attached a hint
+/// 2. The envelope carries a `messaging_endpoint_id`
+/// 3. `FlowResumeStore::fetch` finds no active wait snapshot for this
+///    envelope in this pack's session bucket
+///
+/// Any missing precondition is a silent no-op.
+///
+/// # Important: this is a safety net, NOT first-contact detection
+///
+/// `FlowResumeStore::fetch` only looks up **active wait snapshots**. A flow
+/// that completed (or completed without ever calling `session.wait`) leaves
+/// NO marker — so the wait-lookup returning `None` does NOT prove this is
+/// the user's first turn on the endpoint. A post-completion turn would pass
+/// this check and re-fire welcome.
+///
+/// Preventing that welcome-loop is the **producer's** responsibility — see
+/// [`WelcomeFlowHint`]. The producer (greentic-start) is expected to
+/// consult a durable welcome-seen marker before attaching the hint and only
+/// attach it on actual first contact. The wait-check here just adds a
+/// belt-and-braces safety net against accidentally re-routing a
+/// mid-conversation turn (where a wait IS active).
 ///
 /// Takes the session store + pre-resolved `hint_flow_type` as primitives so
 /// the logic is unit-testable without a `TenantRuntime`. The caller is
@@ -614,6 +625,33 @@ mod welcome_flow_tests {
         assert_eq!(envelope.pack_id, envelope_template.pack_id);
         assert_eq!(envelope.flow_id, envelope_template.flow_id);
         assert_eq!(envelope.flow_type, envelope_template.flow_type);
+    }
+
+    #[test]
+    fn override_documented_limit_post_completion_re_fires_welcome() {
+        // CONTRACT: the runner-host's wait-lookup is NOT a first-contact
+        // probe — it only finds active wait snapshots. A completed flow
+        // leaves no marker, so a turn after completion will pass this
+        // check and re-fire welcome. This test documents the limit so the
+        // producer side (greentic-start) knows to consult its own
+        // welcome-seen marker before attaching the hint.
+        let store = new_session_store();
+        let envelope = sample_envelope(Some("teams-legal"));
+        seed_resume(&store, &envelope);
+        // Producer-style cleanup: the flow finished and its wait was
+        // cleared by the resume mechanism (mirror what `FlowResumeStore::
+        // clear` does after a successful resume).
+        let resume = FlowResumeStore::new(Arc::clone(&store));
+        resume.clear(&envelope).expect("clear post-completion wait");
+
+        // Now a subsequent turn arrives. The hint is still attached
+        // (producer didn't check welcome-seen). Override fires — this is
+        // the buggy welcome-loop the producer must prevent.
+        let mut next = sample_envelope(Some("teams-legal"));
+        apply_welcome_flow_override(&store, &mut next, Some(&hint()), Some("welcome".into()))
+            .expect("ok");
+        assert_eq!(next.pack_id.as_deref(), Some("pack.welcome"));
+        assert_eq!(next.flow_id, "flow.welcome");
     }
 
     #[test]
