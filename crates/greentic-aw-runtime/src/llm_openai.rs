@@ -54,6 +54,10 @@ enum OaMessage {
     },
     Assistant {
         content: Option<String>,
+        // OpenAI rejects `tool_calls: []` (400, code `empty_array`) on a
+        // multi-turn request — omit the field entirely for a text-only
+        // assistant turn (it's only valid with >=1 call).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<OaToolCallEmit>,
     },
     Tool {
@@ -261,6 +265,7 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -273,6 +278,34 @@ mod tests {
         assert_eq!(
             split_tool_name("toolname-no-ext"),
             (String::new(), "toolname-no-ext".into())
+        );
+    }
+
+    #[test]
+    fn assistant_with_empty_tool_calls_omits_field() {
+        // Regression: a text-only assistant turn must NOT serialise
+        // `tool_calls: []` (OpenAI 400, code `empty_array`).
+        use crate::config::LlmProviderRef;
+        use crate::state::ChatMessage;
+        let req = LlmRequest {
+            system_prompt: "sys".into(),
+            history: vec![ChatMessage::Assistant {
+                content: "hi".into(),
+                tool_calls: vec![],
+            }],
+            tools: vec![],
+            provider: LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+            },
+        };
+        let value = serde_json::to_value(build_messages(&req)).unwrap();
+        // [0] = system prompt, [1] = the assistant turn.
+        assert_eq!(value[1]["role"], "assistant");
+        assert!(
+            value[1].get("tool_calls").is_none(),
+            "empty tool_calls must be omitted, got: {}",
+            value[1]
         );
     }
 }
