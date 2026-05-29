@@ -381,34 +381,19 @@ impl TenantHandle {
 }
 
 /// M1.5 welcome-flow override: swap the envelope's `(pack_id, flow_id,
-/// flow_type)` over to the producer-supplied [`WelcomeFlowHint`] before the
-/// state machine sees it, when **all** three preconditions hold:
+/// flow_type)` to the producer-supplied [`WelcomeFlowHint`] when all three
+/// preconditions hold: the hint is present, the envelope carries a
+/// `messaging_endpoint_id`, and `FlowResumeStore::fetch` finds no active
+/// wait snapshot for this envelope. Any missing precondition is a silent
+/// no-op.
 ///
-/// 1. The producer attached a hint
-/// 2. The envelope carries a `messaging_endpoint_id`
-/// 3. `FlowResumeStore::fetch` finds no active wait snapshot for this
-///    envelope in this pack's session bucket
+/// **First-contact ownership is on the producer** — see [`WelcomeFlowHint`]
+/// for the full contract. The wait-lookup here is a safety net against
+/// mid-conversation override, not a first-contact probe.
 ///
-/// Any missing precondition is a silent no-op.
-///
-/// # Important: this is a safety net, NOT first-contact detection
-///
-/// `FlowResumeStore::fetch` only looks up **active wait snapshots**. A flow
-/// that completed (or completed without ever calling `session.wait`) leaves
-/// NO marker — so the wait-lookup returning `None` does NOT prove this is
-/// the user's first turn on the endpoint. A post-completion turn would pass
-/// this check and re-fire welcome.
-///
-/// Preventing that welcome-loop is the **producer's** responsibility — see
-/// [`WelcomeFlowHint`]. The producer (greentic-start) is expected to
-/// consult a durable welcome-seen marker before attaching the hint and only
-/// attach it on actual first contact. The wait-check here just adds a
-/// belt-and-braces safety net against accidentally re-routing a
-/// mid-conversation turn (where a wait IS active).
-///
-/// Takes the session store + pre-resolved `hint_flow_type` as primitives so
-/// the logic is unit-testable without a `TenantRuntime`. The caller is
-/// responsible for the engine lookup that produces `hint_flow_type`.
+/// `session_store` + `hint_flow_type` are passed as primitives so the logic
+/// is unit-testable without a `TenantRuntime`; the caller does the engine
+/// lookup that produces `hint_flow_type`.
 fn apply_welcome_flow_override(
     session_store: &DynSessionStore,
     envelope: &mut IngressEnvelope,
@@ -588,26 +573,25 @@ mod welcome_flow_tests {
     }
 
     #[test]
-    fn override_swaps_pack_flow_and_type_on_first_contact() {
-        let store = new_session_store();
-        let mut envelope = sample_envelope(Some("teams-legal"));
-        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), Some("welcome".into()))
-            .expect("ok");
-        assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
-        assert_eq!(envelope.flow_id, "flow.welcome");
-        assert_eq!(envelope.flow_type.as_deref(), Some("welcome"));
-    }
-
-    #[test]
-    fn override_clears_flow_type_when_hint_lookup_unresolved() {
-        // If the producer's resolver can't find the welcome flow's type
-        // (unknown flow in engine), the hint's flow_type ends up None —
+    fn override_swaps_pack_flow_and_threads_flow_type_through() {
+        // Both axes covered: when the caller pre-resolved the welcome
+        // flow's type, it lands on the envelope; when the resolver
+        // returned None (unknown flow in engine), it lands as None and
         // downstream resolution defaults take over.
-        let store = new_session_store();
-        let mut envelope = sample_envelope(Some("teams-legal"));
-        apply_welcome_flow_override(&store, &mut envelope, Some(&hint()), None).expect("ok");
-        assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
-        assert!(envelope.flow_type.is_none());
+        for hint_flow_type in [Some("welcome".to_string()), None] {
+            let store = new_session_store();
+            let mut envelope = sample_envelope(Some("teams-legal"));
+            apply_welcome_flow_override(
+                &store,
+                &mut envelope,
+                Some(&hint()),
+                hint_flow_type.clone(),
+            )
+            .expect("ok");
+            assert_eq!(envelope.pack_id.as_deref(), Some("pack.welcome"));
+            assert_eq!(envelope.flow_id, "flow.welcome");
+            assert_eq!(envelope.flow_type, hint_flow_type);
+        }
     }
 
     #[test]

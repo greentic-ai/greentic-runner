@@ -972,7 +972,6 @@ impl IngressEnvelope {
         {
             tracing::warn!(
                 tenant = %self.tenant,
-                flow_id = %self.flow_id,
                 messaging_endpoint_id = %eid,
                 "M1.4: invalid messaging_endpoint_id dropped at runner-host canonicalize \
                  — request will run unscoped (legacy session bucket). \
