@@ -222,6 +222,9 @@ impl RunnerHost {
         let action = activity.action().map(|value| value.to_string());
         let session = activity.session_id().map(|value| value.to_string());
         let provider = activity.provider_id().map(|value| value.to_string());
+        let messaging_endpoint_id = activity
+            .messaging_endpoint_id()
+            .map(|value| value.to_string());
         let channel = activity.channel().map(|value| value.to_string());
         let conversation = activity.conversation().map(|value| value.to_string());
         let user = activity.user().map(|value| value.to_string());
@@ -245,10 +248,7 @@ impl RunnerHost {
             action,
             session_hint: session,
             provider,
-            // M1.4: producer wires from the receiving provider instance.
-            // Greentic-start's ingress dispatcher (M1.4c) populates this;
-            // the runner-side seam carries None until that lands.
-            messaging_endpoint_id: None,
+            messaging_endpoint_id,
             channel,
             conversation,
             user,

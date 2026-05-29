@@ -18,6 +18,12 @@ pub struct Activity {
     session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     provider_id: Option<String>,
+    /// Multi-instance messaging endpoint id (M1.4). Disambiguates provider
+    /// instances of the same `provider_type` so sessions/traces partition
+    /// per-endpoint. Producer-set; the runner threads it into
+    /// `IngressEnvelope.messaging_endpoint_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messaging_endpoint_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +59,7 @@ impl Activity {
             flow_type: Some("messaging".into()),
             session_id: None,
             provider_id: None,
+            messaging_endpoint_id: None,
             user_id: None,
             channel_id: None,
             conversation_id: None,
@@ -73,6 +80,7 @@ impl Activity {
             flow_type: None,
             session_id: None,
             provider_id: None,
+            messaging_endpoint_id: None,
             user_id: None,
             channel_id: None,
             conversation_id: None,
@@ -120,6 +128,15 @@ impl Activity {
     /// Attach a provider identifier for telemetry scoping.
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider_id = Some(provider.into());
+        self
+    }
+
+    /// Attach the receiving messaging endpoint id (M1.4). Distinguishes
+    /// provider instances of the same `provider_type` (e.g. `teams-legal`
+    /// vs `teams-accounting`); the runner threads it into the envelope so
+    /// session keys and telemetry partition per-endpoint.
+    pub fn with_messaging_endpoint(mut self, endpoint_id: impl Into<String>) -> Self {
+        self.messaging_endpoint_id = Some(endpoint_id.into());
         self
     }
 
@@ -171,6 +188,11 @@ impl Activity {
     /// Return the originating provider identifier, if supplied.
     pub fn provider_id(&self) -> Option<&str> {
         self.provider_id.as_deref()
+    }
+
+    /// Return the receiving messaging endpoint id (M1.4), if supplied.
+    pub fn messaging_endpoint_id(&self) -> Option<&str> {
+        self.messaging_endpoint_id.as_deref()
     }
 
     /// Return the originating user identifier, if supplied.
@@ -226,5 +248,48 @@ impl ActivityKind {
             ActivityKind::Message => Some("messaging"),
             ActivityKind::Custom { action, .. } => Some(action.as_str()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_messaging_endpoint_sets_field() {
+        let activity = Activity::text("hi").with_messaging_endpoint("teams-legal");
+        assert_eq!(activity.messaging_endpoint_id(), Some("teams-legal"));
+    }
+
+    #[test]
+    fn messaging_endpoint_id_defaults_to_none() {
+        let activity = Activity::text("hi");
+        assert!(activity.messaging_endpoint_id().is_none());
+    }
+
+    #[test]
+    fn messaging_endpoint_id_round_trips_through_serde() {
+        let original = Activity::text("hi").with_messaging_endpoint("teams-legal");
+        let encoded = serde_json::to_string(&original).expect("serialize");
+        assert!(encoded.contains("\"messaging_endpoint_id\":\"teams-legal\""));
+        let decoded: Activity = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.messaging_endpoint_id(), Some("teams-legal"));
+    }
+
+    #[test]
+    fn messaging_endpoint_id_serde_skips_when_unset() {
+        let activity = Activity::text("hi");
+        let encoded = serde_json::to_string(&activity).expect("serialize");
+        assert!(!encoded.contains("messaging_endpoint_id"));
+    }
+
+    #[test]
+    fn legacy_activity_without_endpoint_deserializes() {
+        // Backward-compat proof: a wire payload that omits the new
+        // `messaging_endpoint_id` field round-trips with the field unset.
+        let encoded = serde_json::to_string(&Activity::text("hi")).expect("serialize");
+        assert!(!encoded.contains("messaging_endpoint_id"));
+        let decoded: Activity = serde_json::from_str(&encoded).expect("legacy decode");
+        assert!(decoded.messaging_endpoint_id().is_none());
     }
 }

@@ -196,6 +196,13 @@ fn map_store_error(err: GreenticError) -> RunnerError {
     }
 }
 
+/// Session-key namespace prefix for a messaging endpoint id (M1.4).
+/// Format chosen so the prefix is recognizable for idempotence checks and
+/// distinct from any segment used in canonical hints.
+fn endpoint_session_prefix(eid: &str) -> String {
+    format!("ep={eid}::")
+}
+
 fn generate_correlation_id() -> String {
     let mut bytes = [0u8; 16];
     rng().fill(&mut bytes);
@@ -345,10 +352,17 @@ mod tests {
     }
 
     #[test]
-    fn canonical_session_hint_unchanged_when_endpoint_id_none() {
-        // Backward compat: pre-M1.4 envelopes (endpoint_id = None) must
-        // produce the same hint bytes, or existing Redis sessions orphan.
-        let envelope = sample_envelope();
+    fn canonical_session_hint_is_pure_structured_form() {
+        // canonical_session_hint() does NOT embed messaging_endpoint_id —
+        // namespacing happens at the canonicalize() layer so explicit
+        // producer-supplied hints get the same treatment.
+        let mut envelope = sample_envelope();
+        envelope.session_hint = None;
+        assert_eq!(
+            envelope.canonical_session_hint(),
+            "demo:provider:chan:conv:user"
+        );
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
         assert_eq!(
             envelope.canonical_session_hint(),
             "demo:provider:chan:conv:user"
@@ -356,17 +370,92 @@ mod tests {
     }
 
     #[test]
-    fn canonical_session_hint_partitions_by_endpoint_id() {
-        let mut a = sample_envelope();
-        a.messaging_endpoint_id = Some("teams-legal".into());
-        let mut b = sample_envelope();
-        b.messaging_endpoint_id = Some("teams-accounting".into());
+    fn canonicalize_unchanged_when_endpoint_id_none() {
+        // Backward compat: pre-M1.4 envelopes (endpoint_id = None) must
+        // produce the same session_hint bytes, or existing Redis sessions
+        // orphan. Both derived and explicit hints stay untouched.
+        let mut derived = sample_envelope();
+        derived.session_hint = None;
+        let derived = derived.canonicalize();
+        assert_eq!(
+            derived.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
 
-        let hint_a = a.canonical_session_hint();
-        let hint_b = b.canonical_session_hint();
-        assert_eq!(hint_a, "demo:provider#teams-legal:chan:conv:user");
-        assert_eq!(hint_b, "demo:provider#teams-accounting:chan:conv:user");
-        assert_ne!(hint_a, hint_b);
+        let explicit = sample_envelope().canonicalize();
+        assert_eq!(
+            explicit.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+    }
+
+    #[test]
+    fn canonicalize_namespaces_derived_hint_when_endpoint_id_set() {
+        let mut envelope = sample_envelope();
+        envelope.session_hint = None;
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let envelope = envelope.canonicalize();
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("ep=teams-legal::demo:provider:chan:conv:user")
+        );
+    }
+
+    #[test]
+    fn canonicalize_namespaces_explicit_session_hint() {
+        // Regression for the Codex M1.4b-iii finding: when a producer
+        // supplies BOTH a session_hint AND a messaging_endpoint_id, the
+        // endpoint discriminator must still partition the session key.
+        let mut envelope = sample_envelope();
+        envelope.session_hint = Some("provider-supplied-key".into());
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let envelope = envelope.canonicalize();
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("ep=teams-legal::provider-supplied-key")
+        );
+    }
+
+    #[test]
+    fn canonicalize_partitions_explicit_hints_across_endpoints() {
+        // Two endpoints with IDENTICAL producer-supplied session_hints must
+        // resolve to distinct effective session keys.
+        let raw = "shared-session-key";
+
+        let mut a = sample_envelope();
+        a.session_hint = Some(raw.into());
+        a.messaging_endpoint_id = Some("teams-legal".into());
+        let a = a.canonicalize();
+
+        let mut b = sample_envelope();
+        b.session_hint = Some(raw.into());
+        b.messaging_endpoint_id = Some("teams-accounting".into());
+        let b = b.canonicalize();
+
+        assert_ne!(a.session_hint, b.session_hint);
+        assert_eq!(
+            a.session_hint.as_deref(),
+            Some("ep=teams-legal::shared-session-key")
+        );
+        assert_eq!(
+            b.session_hint.as_deref(),
+            Some("ep=teams-accounting::shared-session-key")
+        );
+    }
+
+    #[test]
+    fn canonicalize_is_idempotent_for_endpoint_prefix() {
+        // Re-canonicalizing must not double-prefix the namespace marker.
+        let mut envelope = sample_envelope();
+        envelope.session_hint = Some("raw-key".into());
+        envelope.messaging_endpoint_id = Some("teams-legal".into());
+        let once = envelope.canonicalize();
+        let twice = once.clone().canonicalize();
+        assert_eq!(once.session_hint, twice.session_hint);
+        assert_eq!(
+            twice.session_hint.as_deref(),
+            Some("ep=teams-legal::raw-key")
+        );
     }
 
     #[test]
@@ -811,9 +900,27 @@ impl IngressEnvelope {
                 self.user = Some("user".into());
             }
         }
-        if self.session_hint.is_none() {
-            self.session_hint = Some(self.canonical_session_hint());
-        }
+        // Resolve the session hint base, then apply endpoint namespacing.
+        // The base is the producer-supplied hint when present; otherwise the
+        // structured canonical hint. We then prefix with `ep=<eid>::` when
+        // `messaging_endpoint_id` is set so explicit hints get the SAME
+        // isolation as derived ones — two endpoints reusing the same
+        // producer-supplied session key must not share resume state.
+        let base = self
+            .session_hint
+            .clone()
+            .unwrap_or_else(|| self.canonical_session_hint());
+        self.session_hint = Some(match &self.messaging_endpoint_id {
+            Some(eid) => {
+                let prefix = endpoint_session_prefix(eid);
+                if base.starts_with(&prefix) {
+                    base
+                } else {
+                    format!("{prefix}{base}")
+                }
+            }
+            None => base,
+        });
         if self.reply_scope.is_none()
             && let Some(conversation) = self.conversation.clone()
         {
@@ -828,25 +935,18 @@ impl IngressEnvelope {
     }
 
     pub fn canonical_session_hint(&self) -> String {
-        // When `messaging_endpoint_id` is None the hint is bytes-identical to
-        // pre-M1.4 — existing sessions in Redis don't get orphaned. When set,
-        // we fold it into the provider segment so two endpoints on the same
-        // (provider, channel, conversation, user) partition into distinct
-        // sessions. `#` is reserved here as the in-segment separator.
-        let provider = self.provider.as_deref().unwrap_or("provider");
-        let channel = self.channel.as_deref().unwrap_or("channel");
-        let conversation = self.conversation.as_deref().unwrap_or("conversation");
-        let user = self.user.as_deref().unwrap_or("user");
-        match self.messaging_endpoint_id.as_deref() {
-            Some(eid) => format!(
-                "{}:{}#{}:{}:{}:{}",
-                self.tenant, provider, eid, channel, conversation, user
-            ),
-            None => format!(
-                "{}:{}:{}:{}:{}",
-                self.tenant, provider, channel, conversation, user
-            ),
-        }
+        // Pre-M1.4 structured form. Endpoint isolation is applied uniformly
+        // at the `canonicalize()` layer so explicit producer-supplied hints
+        // get the same namespacing as derived ones — keeping this function
+        // pure and bytes-identical to pre-M1.4 for `endpoint_id = None`.
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.tenant,
+            self.provider.as_deref().unwrap_or("provider"),
+            self.channel.as_deref().unwrap_or("channel"),
+            self.conversation.as_deref().unwrap_or("conversation"),
+            self.user.as_deref().unwrap_or("user")
+        )
     }
 
     pub fn tenant_ctx(&self) -> TenantCtx {
