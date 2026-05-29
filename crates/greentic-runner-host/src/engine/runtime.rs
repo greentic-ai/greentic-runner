@@ -196,13 +196,6 @@ fn map_store_error(err: GreenticError) -> RunnerError {
     }
 }
 
-/// Session-key namespace prefix for a messaging endpoint id (M1.4).
-/// Format chosen so the prefix is recognizable for idempotence checks and
-/// distinct from any segment used in canonical hints.
-fn endpoint_session_prefix(eid: &str) -> String {
-    format!("ep={eid}::")
-}
-
 fn generate_correlation_id() -> String {
     let mut bytes = [0u8; 16];
     rng().fill(&mut bytes);
@@ -402,22 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn canonicalize_namespaces_explicit_session_hint() {
-        // Regression for the Codex M1.4b-iii finding: when a producer
-        // supplies BOTH a session_hint AND a messaging_endpoint_id, the
-        // endpoint discriminator must still partition the session key.
-        let mut envelope = sample_envelope();
-        envelope.session_hint = Some("provider-supplied-key".into());
-        envelope.messaging_endpoint_id = Some("teams-legal".into());
-        let envelope = envelope.canonicalize();
-        assert_eq!(
-            envelope.session_hint.as_deref(),
-            Some("ep=teams-legal::provider-supplied-key")
-        );
-    }
-
-    #[test]
     fn canonicalize_partitions_explicit_hints_across_endpoints() {
+        // Codex M1.4b-iii regression: producer-supplied hints must still
+        // partition by endpoint id, not collapse to the same session key.
         // Two endpoints with IDENTICAL producer-supplied session_hints must
         // resolve to distinct effective session keys.
         let raw = "shared-session-key";
@@ -900,19 +880,16 @@ impl IngressEnvelope {
                 self.user = Some("user".into());
             }
         }
-        // Resolve the session hint base, then apply endpoint namespacing.
-        // The base is the producer-supplied hint when present; otherwise the
-        // structured canonical hint. We then prefix with `ep=<eid>::` when
-        // `messaging_endpoint_id` is set so explicit hints get the SAME
-        // isolation as derived ones — two endpoints reusing the same
-        // producer-supplied session key must not share resume state.
+        // Endpoint isolation: prefix the hint (explicit OR derived) with
+        // `ep=<eid>::` so two endpoints reusing the same producer-supplied
+        // session key never collide. Idempotent — re-canonicalize is a no-op.
         let base = self
             .session_hint
             .clone()
             .unwrap_or_else(|| self.canonical_session_hint());
         self.session_hint = Some(match &self.messaging_endpoint_id {
             Some(eid) => {
-                let prefix = endpoint_session_prefix(eid);
+                let prefix = format!("ep={eid}::");
                 if base.starts_with(&prefix) {
                     base
                 } else {

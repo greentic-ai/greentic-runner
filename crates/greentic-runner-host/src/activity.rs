@@ -278,18 +278,12 @@ mod tests {
 
     #[test]
     fn messaging_endpoint_id_serde_skips_when_unset() {
-        let activity = Activity::text("hi");
-        let encoded = serde_json::to_string(&activity).expect("serialize");
-        assert!(!encoded.contains("messaging_endpoint_id"));
-    }
-
-    #[test]
-    fn legacy_activity_without_endpoint_deserializes() {
-        // Backward-compat proof: a wire payload that omits the new
-        // `messaging_endpoint_id` field round-trips with the field unset.
+        // Combined wire-compat + skip-if-none proof: an Activity without
+        // the field omits it on the wire AND decodes back with the field
+        // unset, so pre-M1.4 producers/consumers interop cleanly.
         let encoded = serde_json::to_string(&Activity::text("hi")).expect("serialize");
         assert!(!encoded.contains("messaging_endpoint_id"));
-        let decoded: Activity = serde_json::from_str(&encoded).expect("legacy decode");
+        let decoded: Activity = serde_json::from_str(&encoded).expect("deserialize");
         assert!(decoded.messaging_endpoint_id().is_none());
     }
 }
