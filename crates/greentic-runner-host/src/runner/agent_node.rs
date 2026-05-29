@@ -162,6 +162,30 @@ fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
     }
 }
 
+/// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
+/// API key is present. Defaults: provider "openai", model "gpt-4o". Pure (no
+/// env) so it is unit-testable without global state.
+fn bridge_credential(
+    provider: Option<String>,
+    model: Option<String>,
+    api_key: String,
+    base_url: Option<String>,
+) -> Option<greentic_aw_runtime::BridgeCredential> {
+    if api_key.trim().is_empty() {
+        return None;
+    }
+    Some(greentic_aw_runtime::BridgeCredential {
+        provider: provider
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "openai".into()),
+        model: model
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "gpt-4o".into()),
+        api_key,
+        base_url: base_url.filter(|s| !s.trim().is_empty()),
+    })
+}
+
 /// Build the production `DwAgent` handler if the environment is configured.
 ///
 /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
@@ -181,7 +205,8 @@ pub async fn build_agent_node_handler(config: &HostConfig) -> Option<Arc<dyn Age
     use greentic_aw_runtime::cost::RedisTokenMeter;
     use greentic_aw_runtime::tools::RedisToolLedger;
     use greentic_aw_runtime::{
-        OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore, RetryingLlmBackend,
+        ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore,
+        RetryingLlmBackend,
     };
 
     if config.agents.is_empty() {
@@ -212,12 +237,55 @@ pub async fn build_agent_node_handler(config: &HostConfig) -> Option<Arc<dyn Age
 
     let ext_runtime = build_ext_runtime()?;
 
-    let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-    let llm = Arc::new(RetryingLlmBackend::new(
-        OpenAiLlmBackend::new(openai_key),
-        3,
-        Duration::from_millis(250),
-    ));
+    // Prefer the LLM bridge extension when configured (LLM-as-extension);
+    // fall back to the env-keyed in-process OpenAI client otherwise.
+    let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(ext_id) => {
+            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default();
+            match bridge_credential(
+                std::env::var("GREENTIC_LLM_PROVIDER").ok(),
+                std::env::var("GREENTIC_LLM_MODEL").ok(),
+                api_key,
+                std::env::var("GREENTIC_LLM_BASE_URL").ok(),
+            ) {
+                Some(cred) => {
+                    tracing::info!(
+                        extension = %ext_id, provider = %cred.provider, model = %cred.model,
+                        "AW LLM via bridge extension"
+                    );
+                    Arc::new(RetryingLlmBackend::new(
+                        ExtensionLlmBackend::new(ext_runtime.clone(), ext_id, cred),
+                        3,
+                        Duration::from_millis(250),
+                    ))
+                }
+                None => {
+                    tracing::warn!(
+                        "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
+                         falling back to in-process OpenAI client"
+                    );
+                    Arc::new(RetryingLlmBackend::new(
+                        OpenAiLlmBackend::new(String::new()),
+                        3,
+                        Duration::from_millis(250),
+                    ))
+                }
+            }
+        }
+        None => {
+            let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+            Arc::new(RetryingLlmBackend::new(
+                OpenAiLlmBackend::new(openai_key),
+                3,
+                Duration::from_millis(250),
+            ))
+        }
+    };
 
     let config_provider = Arc::new(CachingConfigProvider::new(HostConfigProvider::new(
         config.agents.clone(),
@@ -326,6 +394,34 @@ mod tests {
             .expect("known agent resolves");
 
         assert_eq!(resolved.agent_id, "greeter");
+    }
+
+    #[test]
+    fn bridge_credential_defaults_provider_and_model() {
+        let c = super::bridge_credential(None, None, "sk-x".into(), None).unwrap();
+        assert_eq!(c.provider, "openai");
+        assert_eq!(c.model, "gpt-4o");
+        assert_eq!(c.api_key, "sk-x");
+        assert!(c.base_url.is_none());
+    }
+
+    #[test]
+    fn bridge_credential_honors_explicit_parts() {
+        let c = super::bridge_credential(
+            Some("anthropic".into()),
+            Some("claude-x".into()),
+            "sk-ant".into(),
+            Some("https://proxy".into()),
+        )
+        .unwrap();
+        assert_eq!(c.provider, "anthropic");
+        assert_eq!(c.model, "claude-x");
+        assert_eq!(c.base_url.as_deref(), Some("https://proxy"));
+    }
+
+    #[test]
+    fn bridge_credential_none_without_key() {
+        assert!(super::bridge_credential(Some("openai".into()), None, "  ".into(), None).is_none());
     }
 
     #[tokio::test]
