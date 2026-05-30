@@ -123,6 +123,17 @@ impl FlowResumeStore {
         }
         Ok(())
     }
+
+    /// Returns the `(tenant_ctx, user_id)` pair this store derives from
+    /// `envelope` for wait bucketing.
+    ///
+    /// Exposed so siblings — currently the M1.5 welcome-seen marker — can
+    /// partition by the SAME identity instead of re-deriving the digest and
+    /// risking drift.
+    pub(crate) fn contact_identity(envelope: &IngressEnvelope) -> GResult<(TenantCtx, UserId)> {
+        let (ctx, user, _, _) = build_store_ctx(envelope)?;
+        Ok((ctx, user))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
