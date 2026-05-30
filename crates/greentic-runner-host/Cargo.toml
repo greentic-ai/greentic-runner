@@ -27,7 +27,7 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.10-research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.11-research" }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
