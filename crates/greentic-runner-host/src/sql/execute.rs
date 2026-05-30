@@ -87,16 +87,13 @@ pub async fn run(
             Ok(map_rows_pg(rows, cap))
         }
         (Engine::Mysql, ConnectionPool::Mysql(p)) => {
-            let mut tx = p.begin().await.map_err(map_err)?;
-            sqlx::query("SET TRANSACTION READ ONLY")
-                .execute(&mut *tx)
+            let mut conn = p.acquire().await.map_err(map_err)?;
+            sqlx::query("START TRANSACTION READ ONLY")
+                .execute(&mut *conn)
                 .await
                 .map_err(map_err)?;
-            let rows = sqlx::query(sql)
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(map_err)?;
-            tx.rollback().await.ok();
+            let rows = sqlx::query(sql).fetch_all(&mut *conn).await.map_err(map_err)?;
+            sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
             Ok(map_rows_mysql(rows, cap))
         }
         _ => Err("engine/pool mismatch".to_string()),

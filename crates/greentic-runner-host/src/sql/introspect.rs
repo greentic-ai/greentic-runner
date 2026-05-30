@@ -76,7 +76,8 @@ pub async fn introspect(engine: Engine, pool: &ConnectionPool) -> Result<Schema,
             let mut tables = Vec::new();
             for row in names {
                 let table: String = row.get("name");
-                let cols = sqlx::query(&format!("PRAGMA table_info({table})"))
+                let escaped = table.replace('"', "\"\"");
+                let cols = sqlx::query(&format!("PRAGMA table_info(\"{escaped}\")"))
                     .fetch_all(p)
                     .await
                     .map_err(|e| format!("sqlite columns: {e}"))?;
@@ -146,5 +147,18 @@ mod tests {
         let users = schema.tables.iter().find(|t| t.name == "users").unwrap();
         assert_eq!(users.columns.len(), 2);
         assert!(users.columns.iter().any(|c| c.name == "email"));
+    }
+
+    #[tokio::test]
+    async fn introspects_sqlite_quoted_table_name() {
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(r#"CREATE TABLE "weird name" (id INTEGER)"#)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cp = crate::sql::pool::ConnectionPool::Sqlite(pool);
+        let schema = introspect(Engine::Sqlite, &cp).await.unwrap();
+        let t = schema.tables.iter().find(|t| t.name == "weird name").unwrap();
+        assert_eq!(t.columns.len(), 1);
     }
 }
