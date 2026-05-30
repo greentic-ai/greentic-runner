@@ -96,6 +96,8 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+tower.workspace = true
+http-body-util = "0.1"
 greentic-aw-runtime = { path = "../greentic-aw-runtime", features = ["test-mock"] }
 
 [[bench]]
