@@ -6,9 +6,11 @@
 //! cached per connection name so repeated `/schema` calls hit memory only.
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
+use axum::routing::{get, post};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -168,16 +170,41 @@ pub async fn query_handler(
     }
 }
 
+// ── Router builder ────────────────────────────────────────────────────────────
+
+/// Build a self-contained axum [`Router`] serving the SQL gateway endpoints.
+///
+/// Mounts:
+/// - `GET  /sql/{conn}/schema` → [`schema_handler`]
+/// - `POST /sql/{conn}/query`  → [`query_handler`]
+///
+/// Returns a `Router<()>` (i.e. `Router` with no outstanding state parameter)
+/// ready to pass directly to `axum::serve` for a dedicated SQL gateway port,
+/// or to merge into another `Router<()>` via `Router::merge`.
+///
+/// # Example
+/// ```no_run
+/// # use greentic_runner_host::sql::SqlGateway;
+/// # use std::collections::HashMap;
+/// let gw = SqlGateway::new(HashMap::new(), "secret".to_string());
+/// let app = greentic_runner_host::sql::routes::router(gw);
+/// // axum::serve(listener, app).await.unwrap();
+/// ```
+pub fn router(gateway: crate::sql::SqlGateway) -> Router {
+    Router::new()
+        .route("/sql/{conn}/schema", get(schema_handler))
+        .route("/sql/{conn}/query", post(query_handler))
+        .with_state(gateway)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use axum::Router;
     use axum::body::Body;
     use axum::http::Request;
-    use axum::routing::{get, post};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
 
@@ -186,9 +213,11 @@ mod tests {
     use crate::sql::pool::ConnectionPool;
     use crate::sql::{SqlConnection, SqlGateway};
 
-    /// Build a test `Router` backed by an in-memory SQLite gateway.
+    /// Build a test [`Router`] backed by an in-memory SQLite gateway.
     ///
-    /// The caller is responsible for seeding the pool before passing it.
+    /// Delegates to the public [`router`] helper so the helper is exercised by
+    /// every existing test as well as the dedicated `router_helper_serves_routes`
+    /// test below.
     async fn build_test_app(pool: sqlx::sqlite::SqlitePool, token: &str) -> Router {
         let mut connections = HashMap::new();
         connections.insert(
@@ -199,11 +228,7 @@ mod tests {
             },
         );
         let gateway = SqlGateway::new(connections, token.to_string());
-
-        Router::new()
-            .route("/sql/{conn}/schema", get(schema_handler))
-            .route("/sql/{conn}/query", post(query_handler))
-            .with_state(gateway)
+        router(gateway)
     }
 
     /// Collect the response body bytes and deserialize as JSON.
@@ -421,6 +446,58 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── router() helper ───────────────────────────────────────────────────────
+
+    /// Verifies that the public `router()` builder wires the routes correctly:
+    /// a valid Bearer token → 200, and a missing token → 401.
+    #[tokio::test]
+    async fn router_helper_serves_routes() {
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut connections = HashMap::new();
+        connections.insert(
+            "db".to_string(),
+            SqlConnection {
+                engine: Engine::Sqlite,
+                pool: ConnectionPool::Sqlite(pool),
+            },
+        );
+        let gateway = SqlGateway::new(connections, "tok".to_string());
+        let app = router(gateway);
+
+        // 200 with valid token
+        let ok_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sql/db/schema")
+                    .header("authorization", "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok_response.status(), StatusCode::OK);
+
+        // 401 without token
+        let unauth_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sql/db/schema")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauth_response.status(), StatusCode::UNAUTHORIZED);
     }
 
     // ── Full end-to-end composite ─────────────────────────────────────────────
