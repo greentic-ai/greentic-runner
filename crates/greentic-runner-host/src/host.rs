@@ -416,8 +416,7 @@ fn apply_welcome_flow_override(
         return Ok(());
     }
 
-    let marker = WelcomeContactStore::new(Arc::clone(session_store));
-    if !marker.try_mark_first_contact(envelope)? {
+    if !try_mark_welcome_first_contact(session_store, envelope)? {
         return Ok(());
     }
 
@@ -435,102 +434,76 @@ fn apply_welcome_flow_override(
     Ok(())
 }
 
-/// Persistent per-(tenant, env, eid, user) welcome-seen marker, layered on
-/// the existing `SessionStore` trait so both in-memory and Redis backends
-/// inherit it without a trait surface change.
+/// Persists a per-`(tenant, env, eid, user)` welcome-seen marker on first
+/// contact and returns `true` only when this turn observed no marker AND
+/// wrote one. Subsequent turns short-circuit to `false`.
 ///
-/// The marker is registered as a TTL-less wait under a synthetic
-/// [`ReplyScope`] keyed on the endpoint id. That scope is deliberately
-/// disjoint from any flow's own conversation scope so the engine's
-/// `clear_wait` (called on flow completion + on TTL expiry) cannot drop the
-/// marker. The marker outlives the flow's wait by design.
-struct WelcomeContactStore {
-    store: DynSessionStore,
-}
+/// Returns `false` (without writing) if the envelope lacks a
+/// `messaging_endpoint_id` — no marker bucket is derivable.
+///
+/// Race window: check + mark is two store calls, not one atomic CAS. Two
+/// concurrent first-ever turns can both observe "no marker" and both fire
+/// welcome once — bounded harm, mitigated by the wait-snapshot safety net
+/// in [`apply_welcome_flow_override`]. A real atomic primitive
+/// (`register_wait_if_absent`) is Phase D.
+fn try_mark_welcome_first_contact(
+    store: &DynSessionStore,
+    envelope: &IngressEnvelope,
+) -> Result<bool> {
+    let Some(scope) = welcome_marker_scope(envelope) else {
+        return Ok(false);
+    };
+    let (ctx, user) = FlowResumeStore::contact_identity(envelope)
+        .map_err(|e| anyhow!("welcome marker identity probe failed: {e}"))?;
 
-impl WelcomeContactStore {
-    fn new(store: DynSessionStore) -> Self {
-        Self { store }
+    if store
+        .find_wait_by_scope(&ctx, &user, &scope)
+        .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
+        .is_some()
+    {
+        return Ok(false);
     }
 
-    /// Returns `true` iff this turn is true first contact: no marker
-    /// existed and one has now been persisted. Returns `false` if the
-    /// marker is already present (subsequent turn — override MUST NOT
-    /// fire), if the envelope lacks a `messaging_endpoint_id` (no marker
-    /// key derivable), or if any precondition on the store fails.
-    ///
-    /// Race window: check + mark is two store calls, not one atomic CAS.
-    /// Two concurrent first-ever turns can both observe "no marker" and
-    /// both fire welcome once — bounded harm, mitigated downstream by the
-    /// wait-snapshot safety net in [`apply_welcome_flow_override`]. A real
-    /// atomic primitive (`register_wait_if_absent`) is Phase D.
-    fn try_mark_first_contact(&self, envelope: &IngressEnvelope) -> Result<bool> {
-        let Some(scope) = welcome_marker_scope(envelope) else {
-            return Ok(false);
-        };
-        let (ctx, user) = FlowResumeStore::contact_identity(envelope)
-            .map_err(|e| anyhow!("welcome marker identity probe failed: {e}"))?;
-
-        if self
-            .store
-            .find_wait_by_scope(&ctx, &user, &scope)
-            .map_err(|e| anyhow!("welcome marker probe failed: {e}"))?
-            .is_some()
-        {
-            return Ok(false);
-        }
-
-        let data = marker_session_data(&ctx, &user)?;
-        let session_key = marker_session_key(&ctx, &user, &scope);
-        self.store
-            .register_wait(&ctx, &user, &scope, &session_key, data, None)
-            .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
-        Ok(true)
-    }
+    let data = marker_session_data(&ctx, &user);
+    let session_key = marker_session_key(&ctx, &user, &scope);
+    store
+        .register_wait(&ctx, &user, &scope, &session_key, data, None)
+        .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
+    Ok(true)
 }
 
 /// Stable, identity-scoped session key for the welcome marker.
 ///
 /// **The session key is the store's per-entry identity.** Both backends
 /// (in-memory + Redis) overwrite or reject an existing entry on a
-/// register_wait collision, so a `SessionKey` that only encoded the scope
-/// (e.g. `welcome-marker::<eid>`) collapsed every `(tenant, env, user)` on
-/// the same endpoint onto the same row:
-/// - in-memory: `ensure_ctx_preserved` rejects User B's first turn with a
-///   hard error once User A is stored;
-/// - Redis: User B's `SET` silently overwrites User A's entry, leaving
-///   User A's scope index dangling to User B's data — User A's next probe
-///   sees a user mismatch, drops the index, and re-fires welcome.
+/// `register_wait` collision, so a scope-only `SessionKey` would collapse
+/// every `(tenant, env, user)` on the same endpoint onto one row:
+/// in-memory's `ensure_ctx_preserved` would reject User B's first turn
+/// outright; Redis's unconditional `SET` would overwrite User A's entry
+/// and dangle User A's scope index to User B's data.
 ///
-/// Codex adversarial review of greentic-runner#382 — high-severity.
-///
-/// Fix: derive the key from a stable SHA-256 over `(env, tenant, team,
-/// user, conversation)`. The `v1` prefix lets us bump the derivation
-/// without colliding on old markers.
+/// Fix: SHA-256 over `(env, tenant, team, user, conversation)`. The `v1`
+/// prefix lets us bump the derivation without colliding on old markers.
 fn marker_session_key(
     ctx: &greentic_types::TenantCtx,
     user: &greentic_types::UserId,
     scope: &greentic_types::ReplyScope,
 ) -> greentic_session::SessionKey {
     use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(b"welcome-marker:v1\x00");
-    hasher.update(ctx.env.as_str().as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(ctx.tenant_id.as_str().as_bytes());
-    hasher.update(b"\x00");
-    match ctx.team_id.as_ref().or(ctx.team.as_ref()) {
-        Some(team) => {
-            hasher.update(b"team=");
-            hasher.update(team.as_str().as_bytes());
-        }
-        None => hasher.update(b"team=<none>"),
-    }
-    hasher.update(b"\x00");
-    hasher.update(user.as_str().as_bytes());
-    hasher.update(b"\x00");
-    hasher.update(scope.conversation.as_bytes());
-    let digest = hasher.finalize();
+    let team = match ctx.team_id.as_ref().or(ctx.team.as_ref()) {
+        Some(t) => t.as_str(),
+        None => "<none>",
+    };
+    let digest = Sha256::digest(
+        format!(
+            "welcome-marker:v1\0{}\0{}\0team={team}\0{}\0{}",
+            ctx.env.as_str(),
+            ctx.tenant_id.as_str(),
+            user.as_str(),
+            scope.conversation,
+        )
+        .as_bytes(),
+    );
     greentic_session::SessionKey::new(format!("welcome-marker::{}", hex::encode(digest)))
 }
 
@@ -555,21 +528,22 @@ fn welcome_marker_scope(envelope: &IngressEnvelope) -> Option<greentic_types::Re
 fn marker_session_data(
     ctx: &greentic_types::TenantCtx,
     user: &greentic_types::UserId,
-) -> Result<greentic_session::SessionData> {
+) -> greentic_session::SessionData {
     use std::str::FromStr;
-    let flow_id = greentic_types::FlowId::from_str("welcome-marker")
-        .map_err(|e| anyhow!("welcome marker flow id: {e}"))?;
-    let pack_id = greentic_types::PackId::from_str("welcome-marker")
-        .map_err(|e| anyhow!("welcome marker pack id: {e}"))?;
+    use std::sync::LazyLock;
+    static FLOW_ID: LazyLock<greentic_types::FlowId> =
+        LazyLock::new(|| greentic_types::FlowId::from_str("welcome-marker").expect("valid id"));
+    static PACK_ID: LazyLock<greentic_types::PackId> =
+        LazyLock::new(|| greentic_types::PackId::from_str("welcome-marker").expect("valid id"));
     let cursor = greentic_types::SessionCursor::new("marker".to_string());
     let ctx = ctx.clone().with_user(Some(user.clone()));
-    Ok(greentic_session::SessionData {
+    greentic_session::SessionData {
         tenant_ctx: ctx,
-        flow_id,
-        pack_id: Some(pack_id),
+        flow_id: FLOW_ID.clone(),
+        pack_id: Some(PACK_ID.clone()),
         cursor,
         context_json: "{}".to_string(),
-    })
+    }
 }
 
 fn resolve_flow_id(runtime: &TenantRuntime, activity: &Activity) -> Result<(String, String)> {
