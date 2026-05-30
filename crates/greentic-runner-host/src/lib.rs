@@ -58,7 +58,7 @@ mod activity;
 mod host;
 pub mod oauth;
 
-pub use activity::{Activity, ActivityKind};
+pub use activity::{Activity, ActivityKind, WelcomeFlowHint};
 pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;

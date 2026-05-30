@@ -290,6 +290,13 @@ pub struct TenantRuntime {
     digests: Vec<Option<String>>,
     engine: Arc<FlowEngine>,
     state_machine: Arc<StateMachineRuntime>,
+    /// The session store this runtime was loaded with. Shared with the inner
+    /// state machine — re-exposed here so callers outside the flow run loop
+    /// (M1.5 welcome-flow first-contact probe) can query the SAME bucket the
+    /// state machine will read/write. For revision mode each revision passes
+    /// its own store into `load_revision`; querying the RunnerHost-level
+    /// store would key the wrong bucket.
+    session_store: DynSessionStore,
     http_client: Client,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -585,7 +592,7 @@ impl TenantRuntime {
                 Arc::clone(&engine),
                 pack_trace,
                 session_host,
-                session_store,
+                Arc::clone(&session_store),
                 state_host,
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
@@ -600,6 +607,7 @@ impl TenantRuntime {
             digests,
             engine,
             state_machine,
+            session_store,
             http_client,
             mocks,
             timer_handles: Mutex::new(Vec::new()),
@@ -661,6 +669,14 @@ impl TenantRuntime {
 
     pub fn state_machine(&self) -> &Arc<StateMachineRuntime> {
         &self.state_machine
+    }
+
+    /// Shared session store. M1.5: lets `apply_welcome_flow_override`
+    /// build a `FlowResumeStore` against the SAME bucket the state machine
+    /// will read/write — important under revision mode where each revision
+    /// is given its own store via `load_revision`.
+    pub fn session_store(&self) -> &DynSessionStore {
+        &self.session_store
     }
 
     pub fn http_client(&self) -> &Client {

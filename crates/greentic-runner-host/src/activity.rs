@@ -30,8 +30,50 @@ pub struct Activity {
     channel_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_id: Option<String>,
+    /// M1.5 welcome-flow override hint. Producer-supplied — the runner uses
+    /// it as a one-way override of the resolved `(pack_id, flow_id,
+    /// flow_type)` when **all** of: a messaging endpoint is asserted AND
+    /// this hint is present AND no active wait snapshot exists in this
+    /// pack's session bucket. See [`WelcomeFlowHint`] for the contract —
+    /// the **producer** decides when this is actually first contact; the
+    /// runner-host only refuses to override on top of an active wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    welcome_flow_hint: Option<WelcomeFlowHint>,
     #[serde(default)]
     payload: Value,
+}
+
+/// M1.5 welcome-flow override hint: the `(pack_id, flow_id)` a producer wants
+/// the runner to dispatch when this activity is the user's first contact on
+/// the asserted messaging endpoint. Encodes both axes because welcome flows
+/// can live in a different pack from the resolved one (e.g. greentic-start
+/// reads the endpoint's `welcome_flow` from `Environment.messaging_endpoints`
+/// and attaches it here).
+///
+/// # First-contact ownership is on the producer
+///
+/// The runner-host's first-contact probe checks `FlowResumeStore::fetch`,
+/// which only finds **active wait snapshots**. A flow that completed (or
+/// completed without ever calling `session.wait`) leaves NO marker, so a
+/// post-completion turn would also see "no wait" and re-fire welcome. To
+/// avoid welcome-loop behaviour the producer is responsible for **only
+/// attaching this hint when the activity is actually first contact** — for
+/// greentic-start that means consulting a durable welcome-seen marker
+/// (planned follow-up) before attaching.
+///
+/// The runner-host's role is narrowly:
+/// 1. Honour the producer's hint when no active wait exists (override
+///    `(pack_id, flow_id, flow_type)` before the state machine runs).
+/// 2. Refuse to override when an active wait exists, even if the hint is
+///    present — that's the safety net against accidentally re-routing a
+///    mid-conversation turn.
+///
+/// Attaching the hint on every turn is **NOT** safe under this contract —
+/// it would route every no-wait turn through welcome.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WelcomeFlowHint {
+    pub pack_id: String,
+    pub flow_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -63,6 +105,7 @@ impl Activity {
             user_id: None,
             channel_id: None,
             conversation_id: None,
+            welcome_flow_hint: None,
             payload: json!({ "text": text.into() }),
         }
     }
@@ -84,8 +127,24 @@ impl Activity {
             user_id: None,
             channel_id: None,
             conversation_id: None,
+            welcome_flow_hint: None,
             payload,
         }
+    }
+
+    /// Attach the M1.5 welcome-flow override hint. See [`WelcomeFlowHint`]
+    /// for the contract — the **producer** is responsible for only calling
+    /// this when the activity is actually first contact on the asserted
+    /// messaging endpoint. Attaching on every turn would route every
+    /// no-active-wait turn through the welcome flow.
+    pub fn with_welcome_flow_hint(mut self, hint: WelcomeFlowHint) -> Self {
+        self.welcome_flow_hint = Some(hint);
+        self
+    }
+
+    /// Return the welcome-flow override hint, if any.
+    pub fn welcome_flow_hint(&self) -> Option<&WelcomeFlowHint> {
+        self.welcome_flow_hint.as_ref()
     }
 
     /// Attach a tenant identifier to the activity.

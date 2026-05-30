@@ -439,6 +439,59 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_drops_invalid_endpoint_id_to_none() {
+        // Defensive depth: an eid that bypassed the http-layer validator
+        // (embedded caller, future WIT-derived `identify_instance`) must
+        // not corrupt the `ep=<eid>::<base>` namespace prefix or the
+        // telemetry attribute. Drop to None ⇒ run unscoped.
+        let cases = [
+            ("empty", ""),
+            ("colon embedded", "teams:legal"), // collides prefix delimiter
+            ("space", "teams legal"),
+            ("control char", "teams\nlegal"),
+            ("oversized", &"a".repeat(129)),
+        ];
+        for (label, bad) in cases {
+            let mut envelope = sample_envelope();
+            envelope.session_hint = Some("raw-key".into());
+            envelope.messaging_endpoint_id = Some(bad.into());
+            let canon = envelope.canonicalize();
+            assert!(
+                canon.messaging_endpoint_id.is_none(),
+                "{label}: invalid eid {bad:?} must drop to None"
+            );
+            // Session hint must be the un-prefixed form when eid was dropped.
+            assert_eq!(
+                canon.session_hint.as_deref(),
+                Some("raw-key"),
+                "{label}: dropped eid must leave hint un-namespaced"
+            );
+        }
+    }
+
+    #[test]
+    fn canonicalize_preserves_valid_endpoint_id_forms() {
+        // The validator must accept both the M1.2 ULID form and a
+        // hand-typeable slug, and the dot variant used in display ids.
+        for valid in ["teams-legal", "01HA1ABCDE", "teams_legal.v2"] {
+            let mut envelope = sample_envelope();
+            envelope.session_hint = Some("raw-key".into());
+            envelope.messaging_endpoint_id = Some(valid.into());
+            let canon = envelope.canonicalize();
+            assert_eq!(
+                canon.messaging_endpoint_id.as_deref(),
+                Some(valid),
+                "valid eid {valid:?} must be preserved"
+            );
+            assert_eq!(
+                canon.session_hint.as_deref(),
+                Some(format!("ep={valid}::raw-key").as_str()),
+                "valid eid {valid:?} must still prefix the hint"
+            );
+        }
+    }
+
+    #[test]
     fn tenant_ctx_stamps_messaging_endpoint_id() {
         let mut envelope = sample_envelope();
         envelope.messaging_endpoint_id = Some("teams-legal".into());
@@ -860,6 +913,29 @@ pub struct IngressEnvelope {
     pub reply_scope: Option<ReplyScope>,
 }
 
+/// Validate a producer-asserted messaging endpoint id at the runner-host
+/// boundary. Mirrors the http-layer validator in
+/// `greentic-start::revision_serve::validate_endpoint_id` so the
+/// canonicalize-layer `ep=<eid>::<base>` session prefix is safe regardless
+/// of how the eid reached the envelope — http header (already validated),
+/// embedded callers (`start_embedded_host`), or the upcoming WIT-derived
+/// `identify_instance` path. Invalid → drop to None (run unscoped instead
+/// of corrupting the namespace prefix).
+///
+/// The threat the grammar defends against: a value containing `:` collides
+/// the prefix delimiter (`eid="a"+base="b::c"` and `eid="a::b"+base="c"`
+/// both produce `ep=a::b::c`); empty/whitespace-only values collapse all
+/// malformed traffic into one namespace; control characters or unbounded
+/// length corrupt downstream session-store keys and telemetry attribute
+/// values.
+fn endpoint_id_is_valid(raw: &str) -> bool {
+    if raw.is_empty() || raw.len() > 128 {
+        return false;
+    }
+    raw.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 impl IngressEnvelope {
     pub fn canonicalize(mut self) -> Self {
         if self.provider.is_none() {
@@ -879,6 +955,29 @@ impl IngressEnvelope {
             } else {
                 self.user = Some("user".into());
             }
+        }
+        // Defensive: drop an invalid eid BEFORE it reaches the prefix step
+        // or telemetry stamping. See `endpoint_id_is_valid` for why.
+        //
+        // The drop is silent at the http boundary (greentic-start validates
+        // and drops there too — see Codex review note: that path is fronted
+        // by request validation, so an invalid eid means the operator never
+        // asserted one). Embedded callers and the future WIT-derived
+        // `identify_instance` path have no such validator, so a downgrade
+        // here usually signals a producer bug. Emit at WARN so operators can
+        // spot it, then continue with the same drop-to-None semantics the
+        // http layer uses — staying consistent across boundaries.
+        if let Some(eid) = self.messaging_endpoint_id.as_deref()
+            && !endpoint_id_is_valid(eid)
+        {
+            tracing::warn!(
+                tenant = %self.tenant,
+                messaging_endpoint_id = %eid,
+                "M1.4: invalid messaging_endpoint_id dropped at runner-host canonicalize \
+                 — request will run unscoped (legacy session bucket). \
+                 Producer bug or non-HTTP caller bypassing the boundary validator."
+            );
+            self.messaging_endpoint_id = None;
         }
         // Endpoint isolation: prefix the hint (explicit OR derived) with
         // `ep=<eid>::` so two endpoints reusing the same producer-supplied
