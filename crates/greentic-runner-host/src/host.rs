@@ -481,13 +481,57 @@ impl WelcomeContactStore {
         }
 
         let data = marker_session_data(&ctx, &user)?;
-        let session_key =
-            greentic_session::SessionKey::new(format!("welcome-marker::{}", scope.conversation));
+        let session_key = marker_session_key(&ctx, &user, &scope);
         self.store
             .register_wait(&ctx, &user, &scope, &session_key, data, None)
             .map_err(|e| anyhow!("welcome marker register failed: {e}"))?;
         Ok(true)
     }
+}
+
+/// Stable, identity-scoped session key for the welcome marker.
+///
+/// **The session key is the store's per-entry identity.** Both backends
+/// (in-memory + Redis) overwrite or reject an existing entry on a
+/// register_wait collision, so a `SessionKey` that only encoded the scope
+/// (e.g. `welcome-marker::<eid>`) collapsed every `(tenant, env, user)` on
+/// the same endpoint onto the same row:
+/// - in-memory: `ensure_ctx_preserved` rejects User B's first turn with a
+///   hard error once User A is stored;
+/// - Redis: User B's `SET` silently overwrites User A's entry, leaving
+///   User A's scope index dangling to User B's data — User A's next probe
+///   sees a user mismatch, drops the index, and re-fires welcome.
+///
+/// Codex adversarial review of greentic-runner#382 — high-severity.
+///
+/// Fix: derive the key from a stable SHA-256 over `(env, tenant, team,
+/// user, conversation)`. The `v1` prefix lets us bump the derivation
+/// without colliding on old markers.
+fn marker_session_key(
+    ctx: &greentic_types::TenantCtx,
+    user: &greentic_types::UserId,
+    scope: &greentic_types::ReplyScope,
+) -> greentic_session::SessionKey {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"welcome-marker:v1\x00");
+    hasher.update(ctx.env.as_str().as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(ctx.tenant_id.as_str().as_bytes());
+    hasher.update(b"\x00");
+    match ctx.team_id.as_ref().or(ctx.team.as_ref()) {
+        Some(team) => {
+            hasher.update(b"team=");
+            hasher.update(team.as_str().as_bytes());
+        }
+        None => hasher.update(b"team=<none>"),
+    }
+    hasher.update(b"\x00");
+    hasher.update(user.as_str().as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(scope.conversation.as_bytes());
+    let digest = hasher.finalize();
+    greentic_session::SessionKey::new(format!("welcome-marker::{}", hex::encode(digest)))
 }
 
 /// Synthetic [`ReplyScope`] keyed on `messaging_endpoint_id` so the marker
@@ -597,6 +641,10 @@ mod welcome_flow_tests {
     use serde_json::json;
 
     fn sample_envelope(endpoint_id: Option<&str>) -> IngressEnvelope {
+        sample_envelope_for_user(endpoint_id, "user-1")
+    }
+
+    fn sample_envelope_for_user(endpoint_id: Option<&str>, user: &str) -> IngressEnvelope {
         IngressEnvelope {
             tenant: "demo".into(),
             env: Some("local".into()),
@@ -608,14 +656,14 @@ mod welcome_flow_tests {
             provider: Some("teams".into()),
             messaging_endpoint_id: endpoint_id.map(String::from),
             channel: Some("chan".into()),
-            conversation: Some("conv".into()),
-            user: Some("user-1".into()),
+            conversation: Some(format!("conv-{user}")),
+            user: Some(user.to_string()),
             activity_id: None,
             timestamp: None,
             payload: json!({}),
             metadata: None,
             reply_scope: Some(ReplyScope {
-                conversation: "conv".into(),
+                conversation: format!("conv-{user}"),
                 thread: None,
                 reply_to: None,
                 correlation: None,
@@ -804,6 +852,52 @@ mod welcome_flow_tests {
             Some("pack.welcome"),
             "different endpoint = independent first contact"
         );
+    }
+
+    #[test]
+    fn override_partitions_marker_per_user_on_same_endpoint() {
+        // Codex adversarial review of #382 (high): a session-key derived
+        // only from the eid collapses every user on that endpoint onto one
+        // store row — in-memory rejects User B's first turn with a hard
+        // error, Redis silently overwrites and lets User A re-welcome on
+        // their next turn.
+        //
+        // Regression guard: two users on the same eid each get welcome on
+        // their own first turn; the second user's first contact does NOT
+        // fail; both subsequent turns are no-ops.
+        let store = new_session_store();
+
+        // User A's first turn
+        let mut a1 = sample_envelope_for_user(Some("teams-legal"), "user-a");
+        apply_welcome_flow_override(&store, &mut a1, Some(&hint()), Some("welcome".into()))
+            .expect("user-a first ok");
+        assert_eq!(a1.pack_id.as_deref(), Some("pack.welcome"));
+
+        // User B's first turn — must independently fire welcome, NOT error.
+        let mut b1 = sample_envelope_for_user(Some("teams-legal"), "user-b");
+        apply_welcome_flow_override(&store, &mut b1, Some(&hint()), Some("welcome".into()))
+            .expect("user-b first must not collide with user-a marker");
+        assert_eq!(
+            b1.pack_id.as_deref(),
+            Some("pack.welcome"),
+            "user-b is independent first contact"
+        );
+
+        // User A's second turn — marker still intact, no re-fire.
+        let mut a2 = sample_envelope_for_user(Some("teams-legal"), "user-a");
+        apply_welcome_flow_override(&store, &mut a2, Some(&hint()), Some("welcome".into()))
+            .expect("user-a second ok");
+        assert_eq!(
+            a2.pack_id.as_deref(),
+            Some("pack.default"),
+            "user-a must not be re-welcomed after user-b joined"
+        );
+
+        // User B's second turn — same.
+        let mut b2 = sample_envelope_for_user(Some("teams-legal"), "user-b");
+        apply_welcome_flow_override(&store, &mut b2, Some(&hint()), Some("welcome".into()))
+            .expect("user-b second ok");
+        assert_eq!(b2.pack_id.as_deref(), Some("pack.default"));
     }
 
     #[test]
