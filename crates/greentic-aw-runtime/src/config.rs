@@ -29,10 +29,12 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub tools: Vec<ToolRef>,
     pub llm: LlmProviderRef,
+    #[serde(default)]
     pub limits: AgentLimits,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentLimits {
     /// Maximum Plan-Act-Observe iterations per step. Default: 8.
     pub max_iter: u32,
@@ -99,6 +101,50 @@ mod duration_ms {
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
         Ok(Duration::from_millis(u64::deserialize(d)?))
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod limits_serde_tests {
+    use super::*;
+
+    #[test]
+    fn agent_limits_fills_all_missing_fields_from_default() {
+        let limits: AgentLimits = serde_json::from_str("{}").unwrap();
+        assert_eq!(limits.max_iter, 8);
+        assert_eq!(limits.timeout, std::time::Duration::from_secs(60));
+        assert_eq!(limits.max_history_turns, 20);
+        assert_eq!(limits.llm_retry_attempts, 3);
+        assert_eq!(
+            limits.llm_retry_backoff,
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(limits.provider_failure_message, None);
+        assert_eq!(limits.daily_token_cap_per_tenant, None);
+    }
+
+    #[test]
+    fn agent_limits_partial_keeps_given_overrides_defaults_rest() {
+        let limits: AgentLimits =
+            serde_json::from_str(r#"{ "max_iter": 99, "timeout": 5 }"#).unwrap();
+        assert_eq!(limits.max_iter, 99);
+        assert_eq!(limits.timeout, std::time::Duration::from_secs(5));
+        assert_eq!(limits.max_history_turns, 20);
+        assert_eq!(limits.llm_retry_attempts, 3);
+    }
+
+    #[test]
+    fn agent_config_allows_omitted_limits_block() {
+        let json = r#"{
+            "agent_id": "greeter",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.limits.max_iter, 8);
+        assert_eq!(cfg.limits.timeout, std::time::Duration::from_secs(60));
     }
 }
 
