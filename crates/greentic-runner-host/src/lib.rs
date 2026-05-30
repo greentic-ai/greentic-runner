@@ -53,6 +53,7 @@ pub mod trace;
 pub mod validate;
 pub mod verify;
 pub mod wasi;
+pub mod sql;
 pub mod watcher;
 
 mod activity;

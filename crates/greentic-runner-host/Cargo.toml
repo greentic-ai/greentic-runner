@@ -72,6 +72,15 @@ handlebars.workspace = true
 dashmap.workspace = true
 wasmtime-environ.workspace = true
 jsonschema.workspace = true
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "chrono",
+    "json",
+] }
+subtle = "2"
 
 # External stack components
 wasmtime = { workspace = true }
