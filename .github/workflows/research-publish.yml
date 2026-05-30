@@ -9,7 +9,7 @@
 # exists"). Bump the version in Cargo.toml before re-running (e.g.
 # 1.2.0-research → 1.2.1-research).
 #
-# Trigger: manual only (Actions → Research Publish → Run workflow on research).
+# Trigger: push to `research` (or manual Actions → Research Publish → Run workflow).
 # Maintainer prerequisites:
 #   1. Add CARGO_REGISTRY_TOKEN as a repository (or organisation) secret.
 #   2. Ensure the version in Cargo.toml is X.Y.Z-research before running.
@@ -18,8 +18,13 @@
 name: Research Publish
 
 on:
-  # Manual trigger only — no push trigger to avoid accidental publishes.
-  # crates.io is permanent; re-publishing the same version fails.
+  # Push to `research` triggers a publish (push triggers, unlike
+  # workflow_dispatch, do NOT require the workflow to live on the default
+  # branch — keeping this research-only). The version-verify step + crates.io's
+  # duplicate-version rejection (warn-continue per crate) make re-pushes safe
+  # no-ops; bump the X.Y.Z-research version in Cargo.toml to publish a new one.
+  push:
+    branches: [research]
   workflow_dispatch:
 
 permissions:
