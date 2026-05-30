@@ -18,13 +18,13 @@
 name: Research Publish
 
 on:
-  # Push to `research` triggers a publish (push triggers, unlike
-  # workflow_dispatch, do NOT require the workflow to live on the default
-  # branch — keeping this research-only). The version-verify step + crates.io's
-  # duplicate-version rejection (warn-continue per crate) make re-pushes safe
-  # no-ops; bump the X.Y.Z-research version in Cargo.toml to publish a new one.
-  push:
-    branches: [research]
+  # DISABLED auto-trigger: a plain `cargo publish` loop CANNOT correctly publish
+  # this interdependent workspace — the org `dev-prepare` machinery does
+  # pre-publish manifest rewriting (version reqs on path-deps) that this workflow
+  # lacks. A push-triggered run partially published (runner-core only) then
+  # failed on the dependent crates. Left as workflow_dispatch-only until the
+  # proper publish path is decided (org-level dev-prepare -research channel, or
+  # faithful manifest-rewrite replication). Do not rely on this as-is.
   workflow_dispatch:
 
 permissions:
