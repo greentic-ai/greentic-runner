@@ -196,9 +196,11 @@ impl TenantRuntime {
                 },
             );
         }
+        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
         let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
             .context("failed to prime flow engine")?;
+        #[cfg(feature = "agentic-worker")]
         if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(&config).await {
             engine.set_agent_node_handler(handler);
             tracing::info!("DwAgent runtime wired into FlowEngine");

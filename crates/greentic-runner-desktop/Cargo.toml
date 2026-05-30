@@ -7,6 +7,12 @@ license = "MIT"
 homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"
 
+[features]
+default = ["agentic-worker"]
+# Propagates the agentic-worker feature to the host shim.
+# Keep out of published defaults when greentic-aw-runtime is not on crates.io.
+agentic-worker = ["greentic-runner-host/agentic-worker"]
+
 [dependencies]
 anyhow.workspace = true
 greentic-runner-host = { workspace = true, features = ["telemetry"] }

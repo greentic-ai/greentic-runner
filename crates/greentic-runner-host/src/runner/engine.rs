@@ -53,6 +53,7 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    #[cfg(feature = "agentic-worker")]
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
 }
 
@@ -279,6 +280,7 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
         })
     }
@@ -291,6 +293,7 @@ impl FlowEngine {
 
     /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
     /// runtime. Constructed by the runner binary (Task 4.3).
+    #[cfg(feature = "agentic-worker")]
     pub fn set_agent_node_handler(
         &mut self,
         handler: Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
@@ -724,6 +727,7 @@ impl FlowEngine {
         }
     }
 
+    #[cfg(feature = "agentic-worker")]
     async fn execute_dw_agent(
         &self,
         ctx: &FlowContext<'_>,
@@ -745,6 +749,19 @@ impl FlowEngine {
             )
             .await?;
         Ok(NodeOutput::new(result))
+    }
+
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_dw_agent(
+        &self,
+        _ctx: &FlowContext<'_>,
+        agent_id: &str,
+        _payload: Value,
+    ) -> Result<NodeOutput> {
+        anyhow::bail!(
+            "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
+             `agentic-worker` feature. Rebuild with --features agentic-worker."
+        )
     }
 
     async fn execute_state_get(&self, ctx: &FlowContext<'_>, payload: Value) -> Result<NodeOutput> {
@@ -2517,6 +2534,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
         }
     }
@@ -2938,6 +2956,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
         };
         let observer = CountingObserver::new();
@@ -2970,6 +2989,7 @@ mod tests {
         assert_eq!(ends[0], json!({ "message": "logged" }));
     }
 
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn dw_agent_node_routes_to_handler_and_returns_reply() {
         use crate::runner::agent_node::{AgentNodeHandler, RuntimeAgentNodeHandler};
@@ -3077,6 +3097,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: Some(handler),
         };
         let ctx = FlowContext {
@@ -3171,6 +3192,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
         }
     }

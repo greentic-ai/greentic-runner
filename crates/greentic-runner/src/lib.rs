@@ -69,6 +69,8 @@ mod tests {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
         }
     }
 

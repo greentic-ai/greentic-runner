@@ -75,13 +75,20 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Passthrough feature flags so the `info` report can accurately partition host
 # capabilities into enabled/disabled. These stay disabled by default — enable
 # them on the host crate and mirror them here if you need them surfaced.
-default = ["verify"]
+default = ["verify", "agentic-worker"]
 verify = ["greentic-runner-host/verify"]
 telemetry = ["greentic-runner-host/telemetry"]
 session-redis = ["greentic-runner-host/session-redis"]
 component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
+# Gates DwAgent (agentic-worker) nodes and their unpublishable runtime deps.
+# Enabled by default for local workspace builds; excluded from published
+# defaults because greentic-aw-runtime is not on crates.io.
+agentic-worker = [
+    "greentic-runner-host/agentic-worker",
+    "greentic-runner-desktop/agentic-worker",
+]
 
 [dev-dependencies]
 greentic-flow.workspace = true

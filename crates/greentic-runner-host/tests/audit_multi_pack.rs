@@ -38,6 +38,7 @@ fn host_config(tenant: &str) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
     }
 }

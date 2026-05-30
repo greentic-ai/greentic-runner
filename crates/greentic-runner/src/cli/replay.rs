@@ -161,6 +161,8 @@ fn replay_host_config() -> HostConfig {
         trace: greentic_runner_host::trace::TraceConfig::from_env(),
         validation: greentic_runner_host::validate::ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
     }
 }
 

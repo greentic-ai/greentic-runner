@@ -37,6 +37,8 @@ pub struct HostConfig {
     /// Operator-declared Digital Worker agent configs, keyed by `agent_id`.
     /// Sourced from the `agents:` section of the bindings YAML and consumed
     /// by the production `ConfigProvider` (Task 4.3).
+    /// Only populated when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
     pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
 }
 
@@ -62,6 +64,8 @@ pub struct BindingsFile {
     /// Digital Worker agent configs keyed by `agent_id`. The whole section is
     /// optional; each value must be a complete `AgentConfig` (all `limits`
     /// fields are required — `AgentLimits` has no serde defaults).
+    /// Only present when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
     #[serde(default)]
     pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
 }
@@ -199,6 +203,7 @@ impl HostConfig {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::from_config(bindings.operator.clone()),
+            #[cfg(feature = "agentic-worker")]
             agents: bindings.agents.clone(),
         })
     }
@@ -229,6 +234,7 @@ impl HostConfig {
             // TODO(phase-4): TenantBindings (gtbind) has no agents section yet.
             // When embedded gtbind hosts need Digital Worker agents, extend
             // TenantBindings to carry them and populate this map here.
+            #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
         }
     }
@@ -521,10 +527,12 @@ mod tests {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
         }
     }
 
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn load_from_path_parses_agents_section() {
         // All seven `limits` fields are required: AgentLimits has no serde
@@ -564,6 +572,7 @@ agents:
         );
     }
 
+    #[cfg(feature = "agentic-worker")]
     #[test]
     fn load_from_path_omitted_agents_section_yields_empty_map() {
         let yaml = "tenant: acme\n";

@@ -93,6 +93,8 @@ fn host_config(tenant: &str, retry: FlowRetryConfig) -> HostConfig {
         trace: TraceConfig::from_env().with_overrides(TraceMode::Off, None),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        #[cfg(feature = "agentic-worker")]
+        agents: HashMap::new(),
     }
 }
 

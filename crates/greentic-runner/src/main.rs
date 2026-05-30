@@ -727,6 +727,8 @@ async fn load_pack_runtime_for_contract(path: &Path) -> Result<PackRuntime> {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
     });
     PackRuntime::load(
         path,
