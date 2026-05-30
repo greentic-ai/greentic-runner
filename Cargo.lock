@@ -1986,7 +1986,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-aw-runtime"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2326,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -21,7 +21,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.1.0-dev.0"
+version = "1.2.0-research"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -143,15 +143,15 @@ version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = ">=1.1.0-dev, <1.2.0-0"
+version = "=1.2.0-research"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = ">=1.1.0-dev, <1.2.0-0"
+version = "=1.2.0-research"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = ">=1.1.0-dev, <1.2.0-0"
+version = "=1.2.0-research"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
