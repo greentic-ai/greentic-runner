@@ -40,9 +40,29 @@ Prerequisites:
   (`GREENTIC_EXTENSIONS_DIR`, else `~/.greentic/extensions`).
 - `GREENTIC_AW_REDIS_URL` is set (the agent loop persists session state in Redis).
 
-## Method 2 — auto-overlay tools from a Digital Worker manifest
+## Method 2 — manifest overlay
 
-See `docs/agentic-worker-tools.md#manifest-overlay` (added in Task 6) once the
-manifest overlay ships. In short: drop the DW's `<agent_id>.json` manifest into
-the manifests dir and its `agentic_worker`-capable tools replace the YAML
-`tools:` list automatically; the YAML still supplies `system_prompt` + `llm`.
+Instead of hand-listing `tools:` in YAML, drop the Digital Worker's manifest
+JSON into the manifests dir and the runner overlays its `agentic_worker`-capable
+tools onto the agent's `tools` list automatically.
+
+- **Where:** `GREENTIC_AGENT_MANIFESTS_DIR` (else `~/.greentic/agents/`), file
+  named `<agent_id>.json`.
+- **What it is:** the `DigitalWorkerManifest` JSON the DW compose wizard emits
+  (`greentic-dw` wizard stdout — capture it to a file).
+- **What it overrides:** only `AgentConfig.tools`. The operator YAML `agents:`
+  entry still supplies `system_prompt`, `llm`, and `limits` — those are NOT in
+  the manifest.
+- **Fail-soft:** a missing, malformed, invalid, or id-mismatched manifest is
+  logged and ignored; the agent falls back to the YAML `tools:` list. A valid
+  manifest that declares *no* agentic-worker tools is treated as "no tool
+  opinion" and likewise leaves the YAML list intact (it never silently wipes it).
+  A broken manifest never takes the agent offline.
+
+Example: with `~/.greentic/agents/research-bot.json` present, the YAML
+`agents.research-bot` needs only `system_prompt` + `llm` (+ optional `limits`);
+its `tools:` may be empty and will be replaced by the manifest's tool set at
+load time.
+
+> Note: v1 expects a loose `<agent_id>.json`. Auto-extracting the manifest from
+> the composed `.gtpack` is a planned follow-up.
