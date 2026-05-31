@@ -83,15 +83,24 @@ pub async fn introspect(engine: Engine, pool: &ConnectionPool) -> Result<Schema,
                     .map_err(|e| format!("sqlite columns: {e}"))?;
                 let columns = cols
                     .iter()
-                    .map(|c| Column { name: c.get("name"), type_: c.get("type") })
+                    .map(|c| Column {
+                        name: c.get("name"),
+                        type_: c.get("type"),
+                    })
                     .collect();
-                tables.push(Table { name: table, columns });
+                tables.push(Table {
+                    name: table,
+                    columns,
+                });
             }
             tables
         }
         _ => return Err("engine/pool mismatch".to_string()),
     };
-    Ok(Schema { engine: engine_str(engine).to_string(), tables })
+    Ok(Schema {
+        engine: engine_str(engine).to_string(),
+        tables,
+    })
 }
 
 fn engine_str(engine: Engine) -> &'static str {
@@ -106,9 +115,15 @@ fn group_columns(rows: impl Iterator<Item = (String, String, String)>) -> Vec<Ta
     let mut tables: Vec<Table> = Vec::new();
     for (table, column, type_) in rows {
         if tables.last().map(|t| &t.name) != Some(&table) {
-            tables.push(Table { name: table.clone(), columns: Vec::new() });
+            tables.push(Table {
+                name: table.clone(),
+                columns: Vec::new(),
+            });
         }
-        tables.last_mut().unwrap().columns.push(Column { name: column, type_ });
+        tables.last_mut().unwrap().columns.push(Column {
+            name: column,
+            type_,
+        });
     }
     tables
 }
@@ -132,7 +147,9 @@ mod tests {
 
     #[tokio::test]
     async fn introspects_sqlite() {
-        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query("CREATE TABLE users (id INTEGER, email TEXT)")
             .execute(&pool)
             .await
@@ -151,14 +168,20 @@ mod tests {
 
     #[tokio::test]
     async fn introspects_sqlite_quoted_table_name() {
-        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
         sqlx::query(r#"CREATE TABLE "weird name" (id INTEGER)"#)
             .execute(&pool)
             .await
             .unwrap();
         let cp = crate::sql::pool::ConnectionPool::Sqlite(pool);
         let schema = introspect(Engine::Sqlite, &cp).await.unwrap();
-        let t = schema.tables.iter().find(|t| t.name == "weird name").unwrap();
+        let t = schema
+            .tables
+            .iter()
+            .find(|t| t.name == "weird name")
+            .unwrap();
         assert_eq!(t.columns.len(), 1);
     }
 }

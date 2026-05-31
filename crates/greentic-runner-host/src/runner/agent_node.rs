@@ -40,8 +40,8 @@ mod aw {
     use greentic_aw_runtime::{AgentInput, AgentRuntime, AgentStep, TenantContext};
     use serde_json::{Value, json};
 
-    use crate::config::HostConfig;
     use super::AgentNodeHandler;
+    use crate::config::HostConfig;
 
     /// Fixed, user-safe reply returned when an agentic step fails. The detailed
     /// [`greentic_aw_runtime::AgentError`] is logged but never surfaced to the
@@ -208,7 +208,9 @@ mod aw {
     /// Redis is sourced from the environment because the runner uses an
     /// in-memory flow-state store by default and carries no Redis URL in
     /// [`HostConfig`]; this mirrors the existing env-config convention.
-    pub async fn build_agent_node_handler(config: &HostConfig) -> Option<Arc<dyn AgentNodeHandler>> {
+    pub async fn build_agent_node_handler(
+        config: &HostConfig,
+    ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
@@ -457,8 +459,4 @@ mod aw {
 }
 
 #[cfg(feature = "agentic-worker")]
-pub use aw::{
-    RuntimeAgentNodeHandler,
-    HostConfigProvider,
-    build_agent_node_handler,
-};
+pub use aw::{HostConfigProvider, RuntimeAgentNodeHandler, build_agent_node_handler};
