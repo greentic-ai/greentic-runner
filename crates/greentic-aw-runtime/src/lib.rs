@@ -34,7 +34,9 @@ pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
-pub use llm_extension::{BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker};
+pub use llm_extension::{
+    BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
+};
 pub use llm_openai::OpenAiLlmBackend;
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;

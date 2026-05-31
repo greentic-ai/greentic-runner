@@ -76,10 +76,7 @@ impl HostServer {
                 "/sql/{conn}/schema",
                 get(crate::sql::routes::schema_handler),
             )
-            .route(
-                "/sql/{conn}/query",
-                post(crate::sql::routes::query_handler),
-            )
+            .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
             .with_state(state.clone());
         Ok(Self {
             addr,

@@ -149,14 +149,19 @@ mod tests {
     fn req() -> LlmRequest {
         LlmRequest {
             system_prompt: "be helpful".into(),
-            history: vec![ChatMessage::User { content: "hi".into() }],
+            history: vec![ChatMessage::User {
+                content: "hi".into(),
+            }],
             tools: vec![LlmToolSchema {
                 extension_id: "http".into(),
                 tool_name: "fetch".into(),
                 description: "fetch".into(),
                 parameters: serde_json::json!({ "type": "object" }),
             }],
-            provider: LlmProviderRef { provider: "openai".into(), model: "gpt-4o".into() },
+            provider: LlmProviderRef {
+                provider: "openai".into(),
+                model: "gpt-4o".into(),
+            },
         }
     }
 
@@ -183,7 +188,10 @@ mod tests {
             "tokens_in": 3, "tokens_out": 5
         })
         .to_string();
-        let inv = Arc::new(ScriptInvoker { seen: Mutex::new(None), reply: Ok(reply) });
+        let inv = Arc::new(ScriptInvoker {
+            seen: Mutex::new(None),
+            reply: Ok(reply),
+        });
         let backend = ExtensionLlmBackend::with_invoker(inv.clone(), "llm-openai-bridge", cred());
 
         let resp = backend.complete(req()).await.unwrap();

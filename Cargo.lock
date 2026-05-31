@@ -1421,7 +1421,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1556,7 +1556,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2084,7 +2084,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#d0329f4077703fd48b14863c459d32ed96dbb938"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -2099,7 +2099,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#d0329f4077703fd48b14863c459d32ed96dbb938"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -2110,7 +2110,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#43055c6da11294c17e1fb228f5400d303046a23b"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#d0329f4077703fd48b14863c459d32ed96dbb938"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -2121,8 +2121,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.8"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.11-research#c566970a318ede37aad32613396ad3052ff3025b"
+version = "1.2.12"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.14-research#3ebd48b02dcab82ef9bcd735cf0bb35c06721a0b"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2145,9 +2145,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.2.3-research"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02faefc200f17874d4b541e277831571a0f26fb48846d484e9cd630e6bcbe8bb"
+version = "1.2.4-research"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.4-research#289ba7684383da8dc89f864593b652a0dadb819f"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3751,7 +3750,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4487,7 +4486,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5028,7 +5027,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5110,7 +5109,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5965,7 +5964,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7409,7 +7408,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
