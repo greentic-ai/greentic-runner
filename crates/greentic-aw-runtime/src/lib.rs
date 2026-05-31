@@ -17,6 +17,7 @@ pub mod llm;
 pub mod llm_extension;
 pub mod llm_openai;
 pub mod r#loop;
+pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod state;
 pub mod state_redis;
