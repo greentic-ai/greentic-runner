@@ -18,13 +18,14 @@
 name: Research Publish
 
 on:
-  # DISABLED auto-trigger: a plain `cargo publish` loop CANNOT correctly publish
-  # this interdependent workspace — the org `dev-prepare` machinery does
-  # pre-publish manifest rewriting (version reqs on path-deps) that this workflow
-  # lacks. A push-triggered run partially published (runner-core only) then
-  # failed on the dependent crates. Left as workflow_dispatch-only until the
-  # proper publish path is decided (org-level dev-prepare -research channel, or
-  # faithful manifest-rewrite replication). Do not rely on this as-is.
+  # Publishes on push to `research`. The "Strip unpublishable internal deps"
+  # step below removes greentic-aw-runtime / greentic-ext-runtime + the
+  # agentic-worker feature before `cargo publish`, replicating what the org
+  # `dev-prepare` does — validated via `cargo publish --dry-run` (host packages
+  # cleanly as X.Y.Z-research). Per-crate warn-continue makes re-pushes safe;
+  # bump the -research version in Cargo.toml to publish a new one.
+  push:
+    branches: [research]
   workflow_dispatch:
 
 permissions:
