@@ -153,6 +153,24 @@ mod aw {
         std::env::temp_dir().join("greentic").join("extensions")
     }
 
+    /// Resolve the directory scanned for `<agent_id>.json` Digital Worker manifests.
+    ///
+    /// Honours `GREENTIC_AGENT_MANIFESTS_DIR`; otherwise `~/.greentic/agents`, and
+    /// finally a temp-dir path when no home is resolvable (keeps the fn total). A
+    /// missing dir is harmless — the overlay provider simply finds no manifest and
+    /// returns the YAML base unchanged.
+    fn manifests_discovery_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("GREENTIC_AGENT_MANIFESTS_DIR")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".greentic").join("agents");
+        }
+        std::env::temp_dir().join("greentic").join("agents")
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -213,6 +231,7 @@ mod aw {
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
+        use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::cost::RedisTokenMeter;
         use greentic_aw_runtime::tools::RedisToolLedger;
@@ -299,9 +318,11 @@ mod aw {
             }
         };
 
-        let config_provider = Arc::new(CachingConfigProvider::new(HostConfigProvider::new(
-            config.agents.clone(),
-        )));
+        let overlay = ManifestToolOverlayProvider::new(
+            HostConfigProvider::new(config.agents.clone()),
+            manifests_discovery_dir(),
+        );
+        let config_provider = Arc::new(CachingConfigProvider::new(overlay));
         let telemetry = Arc::new(OtelTelemetry);
 
         let runtime = Arc::new(AgentRuntime::new(
@@ -412,6 +433,43 @@ mod aw {
                 .expect("known agent resolves");
 
             assert_eq!(resolved.agent_id, "greeter");
+        }
+
+        #[tokio::test]
+        async fn overlay_provider_replaces_tools_from_manifest() {
+            use greentic_aw_runtime::ManifestToolOverlayProvider;
+            use greentic_aw_runtime::config::ToolRef;
+            use greentic_aw_runtime::config_provider::ConfigProvider;
+
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("greeter.json"),
+                r#"{"id":"greeter","display_name":"G",
+                "tenancy":{"tenant":"t","team_policy":"disabled"},
+                "locale":{"worker_default_locale":"en-US","policy":"worker_default",
+                          "propagation":"current_task_only","output":"worker_default"},
+                "extension_tools":[{"extension_id":"greentic.tavily","extension_version":"1.0.0",
+                  "tool_name":"web_search","description":"d","input_schema_json":"{\"type\":\"object\"}",
+                  "capabilities":["agentic_worker"],"agentic_worker_metadata":{}}]}"#,
+            )
+            .unwrap();
+
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            let provider = ManifestToolOverlayProvider::new(
+                HostConfigProvider::new(agents),
+                tmp.path().to_path_buf(),
+            );
+
+            let tenant = TenantContext::new("acme", "prod");
+            let cfg = provider.agent_config(&tenant, "greeter").await.unwrap();
+            assert_eq!(
+                cfg.tools,
+                vec![ToolRef {
+                    extension_id: "greentic.tavily".into(),
+                    tool_name: "web_search".into()
+                }]
+            );
         }
 
         #[test]
