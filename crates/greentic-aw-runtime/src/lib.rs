@@ -30,6 +30,7 @@ pub mod mock;
 
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
+pub use manifest_provider::ManifestToolOverlayProvider;
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
