@@ -4,7 +4,9 @@
 //!
 //! Fail-soft: a missing, malformed, or mismatched manifest logs a warning and
 //! returns the base config unchanged, so a broken manifest never takes an agent
-//! offline (it degrades to the operator's YAML tool list).
+//! offline (it degrades to the operator's YAML tool list). A valid manifest that
+//! declares *no* agentic-worker tools is likewise treated as "no tool opinion"
+//! and leaves the base tool list intact, rather than silently wiping it.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -27,7 +29,8 @@ pub struct ManifestToolOverlayProvider<P: ConfigProvider> {
 }
 
 impl<P: ConfigProvider> ManifestToolOverlayProvider<P> {
-    /// `manifests_dir` is scanned for `<agent_id>.json` per request.
+    /// `manifests_dir` is scanned for `<agent_id>.json` on each resolution
+    /// (i.e. per cache-miss when wrapped by `CachingConfigProvider`).
     pub fn new(inner: P, manifests_dir: PathBuf) -> Self {
         Self {
             inner,
@@ -38,6 +41,9 @@ impl<P: ConfigProvider> ManifestToolOverlayProvider<P> {
     /// Load + validate `<agent_id>.json`. Returns `None` (fail-soft) for absent,
     /// unreadable, malformed, invalid, or id-mismatched manifests, logging a
     /// warning for every problem except a plain absent file (the common case).
+    ///
+    /// Reads the file synchronously; acceptable because this resolves at most
+    /// once per 60s `CachingConfigProvider` window, reading one small local file.
     fn load_manifest(&self, agent_id: &str) -> Option<DigitalWorkerManifest> {
         let path = self.manifests_dir.join(format!("{agent_id}.json"));
         let bytes = match std::fs::read(&path) {
@@ -79,7 +85,11 @@ impl<P: ConfigProvider> ConfigProvider for ManifestToolOverlayProvider<P> {
         Box::pin(async move {
             let mut base = self.inner.agent_config(tenant, agent_id).await?;
             if let Some(manifest) = self.load_manifest(agent_id) {
-                base.tools = manifest_to_tool_refs(&manifest);
+                let refs = manifest_to_tool_refs(&manifest);
+                // An empty tool set is "no opinion" — don't clobber the YAML base.
+                if !refs.is_empty() {
+                    base.tools = refs;
+                }
             }
             Ok(base)
         })
@@ -139,6 +149,24 @@ mod tests {
                   "agentic_worker_metadata": {{}}
                 }}
               ]
+            }}"#
+        )
+    }
+
+    /// Valid v0.3 manifest JSON declaring NO extension tools.
+    fn empty_tools_manifest_json(agent_id: &str) -> String {
+        format!(
+            r#"{{
+              "id": "{agent_id}",
+              "display_name": "Test Worker",
+              "tenancy": {{ "tenant": "t", "team_policy": "disabled" }},
+              "locale": {{
+                "worker_default_locale": "en-US",
+                "policy": "worker_default",
+                "propagation": "current_task_only",
+                "output": "worker_default"
+              }},
+              "extension_tools": []
             }}"#
         )
     }
@@ -220,6 +248,26 @@ mod tests {
         );
         let cfg = provider.agent_config(&tenant, "bot").await.unwrap();
         assert_eq!(cfg.tools[0].extension_id, "yaml.ext");
+    }
+
+    #[tokio::test]
+    async fn empty_manifest_tools_do_not_clobber_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tenant = TenantContext::new("t", "e");
+        // A valid manifest that declares no tools must NOT wipe the YAML tools.
+        write_manifest(tmp.path(), "bot", &empty_tools_manifest_json("bot"));
+        let provider = ManifestToolOverlayProvider::new(
+            base_provider("bot", &tenant),
+            tmp.path().to_path_buf(),
+        );
+        let cfg = provider.agent_config(&tenant, "bot").await.unwrap();
+        assert_eq!(
+            cfg.tools,
+            vec![ToolRef {
+                extension_id: "yaml.ext".into(),
+                tool_name: "yaml_tool".into(),
+            }]
+        );
     }
 
     #[tokio::test]
