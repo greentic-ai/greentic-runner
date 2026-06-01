@@ -16,6 +16,10 @@ verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
+# Declared but off by default. C5.4 introduced #[cfg(feature = "telemetry")]
+# gates around greentic_telemetry::annotate_span calls; turning the gate on
+# activates explicit span annotation (greentic-telemetry is always linked).
+telemetry = []
 
 [dependencies]
 async-trait.workspace = true
@@ -32,6 +36,7 @@ greentic-interfaces.workspace = true
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
 greentic-distributor-client.workspace = true
+greentic-deploy-spec.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
 greentic-secrets-lib.workspace = true
@@ -85,6 +90,12 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+# C5.4 export regression: a real OTLP exporter to prove gt.* attribution reaches
+# exported spans. Versions match greentic-telemetry's OTel stack.
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [[bench]]
 name = "perf"

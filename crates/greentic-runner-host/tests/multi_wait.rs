@@ -15,6 +15,7 @@ fn envelope_for(conversation: &str) -> IngressEnvelope {
         action: Some("messaging".into()),
         session_hint: Some("demo:provider:chan:conv:user".into()),
         provider: Some("provider".into()),
+        messaging_endpoint_id: None,
         channel: Some(conversation.into()),
         conversation: Some(conversation.into()),
         user: Some("user".into()),
