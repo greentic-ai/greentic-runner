@@ -34,14 +34,17 @@ impl<P: ConfigProvider, F: ConfigProvider> ConfigProvider for LayeredConfigProvi
                 Err(ConfigError::AgentNotFound(_)) | Err(ConfigError::Internal(_)) => {
                     self.fallback.agent_config(tenant, agent_id).await
                 }
-                Err(other) => Err(other), // Misconfigured: surface, don't mask
+                // Misconfigured + any future ConfigError variant: surface, never
+                // mask. New variants fall through here and propagate by default;
+                // revisit only if a new variant should fall back.
+                Err(other) => Err(other),
             }
         })
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
@@ -71,6 +74,31 @@ mod tests {
             let e = (self.0)();
             Box::pin(async move { Err(e) })
         }
+    }
+
+    /// Fallback that panics if consulted — proves the primary short-circuits.
+    struct PanicProvider;
+    impl ConfigProvider for PanicProvider {
+        fn agent_config<'a>(
+            &'a self,
+            _t: &'a TenantContext,
+            _a: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<AgentConfig, ConfigError>> + Send + 'a>> {
+            Box::pin(
+                async move { panic!("fallback must not be consulted when primary returns Ok") },
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn primary_ok_short_circuits_fallback() {
+        let mut primary = InMemoryConfigProvider::new();
+        let tenant = TenantContext::new("t", "e");
+        primary.insert(&tenant, "bot", cfg("bot"));
+        let layered = LayeredConfigProvider::new(primary, PanicProvider);
+        // If the fallback were awaited, PanicProvider would panic and fail this.
+        let got = layered.agent_config(&tenant, "bot").await.unwrap();
+        assert_eq!(got.agent_id, "bot");
     }
 
     #[tokio::test]
