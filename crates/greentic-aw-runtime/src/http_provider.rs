@@ -22,10 +22,18 @@ impl HttpConfigProvider {
     /// `base_url` is the admin origin (no trailing slash needed); `token` is a
     /// tenant `gtc_live_*` key.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        // A per-request timeout matches the crate idiom (see llm_openai.rs) and
+        // bounds a hung registry: without it the calling step() would block with
+        // no upper bound, and the LayeredConfigProvider fallback cannot fire
+        // until this future resolves.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 }
@@ -54,6 +62,14 @@ impl ConfigProvider for HttpConfigProvider {
                     .await
                     .map_err(|e| ConfigError::Misconfigured(format!("agent config decode: {e}"))),
                 404 => Err(ConfigError::AgentNotFound(agent_id.to_string())),
+                // Auth failures are operator-actionable misconfig, not a
+                // transient fault — surface them (Misconfigured is NOT swallowed
+                // by the LayeredConfigProvider fallback) rather than masking a
+                // bad token behind a local fallback.
+                401 | 403 => Err(ConfigError::Misconfigured(format!(
+                    "agent registry auth rejected (status {})",
+                    resp.status().as_u16()
+                ))),
                 other => Err(ConfigError::Internal(format!(
                     "agent registry returned status {other}"
                 ))),
@@ -121,5 +137,31 @@ mod tests {
         let tenant = TenantContext::new("t", "e");
         let result = provider.agent_config(&tenant, "bot").await;
         assert!(matches!(result, Err(ConfigError::Internal(_))));
+    }
+
+    #[tokio::test]
+    async fn maps_malformed_body_to_misconfigured() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{not json"))
+            .mount(&server)
+            .await;
+        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_x");
+        let tenant = TenantContext::new("t", "e");
+        let result = provider.agent_config(&tenant, "bot").await;
+        assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
+    }
+
+    #[tokio::test]
+    async fn maps_auth_rejection_to_misconfigured() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let provider = HttpConfigProvider::new(server.uri(), "gtc_live_bad");
+        let tenant = TenantContext::new("t", "e");
+        let result = provider.agent_config(&tenant, "bot").await;
+        assert!(matches!(result, Err(ConfigError::Misconfigured(_))));
     }
 }
