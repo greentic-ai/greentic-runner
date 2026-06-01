@@ -64,5 +64,7 @@ Example: with `~/.greentic/agents/research-bot.json` present, the YAML
 its `tools:` may be empty and will be replaced by the manifest's tool set at
 load time.
 
-> Note: v1 expects a loose `<agent_id>.json`. Auto-extracting the manifest from
-> the composed `.gtpack` is a planned follow-up.
+> The DW wizard writes this file for you: `gtc wizard … --emit-manifest <DIR>`
+> emits `<DIR>/<manifest_id>.json` — the exact loose file this overlay reads.
+> (The manifest is not stored inside the composed `.gtpack`, so this loose file
+> is the supported delivery path.)
