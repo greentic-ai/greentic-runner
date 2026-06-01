@@ -466,6 +466,7 @@ fn provider_extension() -> BTreeMap<String, greentic_types::ExtensionRef> {
     let inline = greentic_types::ProviderExtensionInline {
         providers: vec![greentic_types::ProviderDecl {
             provider_type: "example.dummy".into(),
+            provider_id: None,
             capabilities: Vec::new(),
             ops: vec!["echo".into()],
             config_schema_ref: "schemas/config.schema.json".into(),

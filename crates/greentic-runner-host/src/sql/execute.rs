@@ -27,7 +27,7 @@
 //! can use `sqlx::describe` (compile-time or runtime) to get column metadata
 //! without fetching rows.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
 use sqlx::{Column, Row};
 
@@ -67,10 +67,7 @@ pub async fn run(
     let cap = u64::from(max_rows);
     match (engine, pool) {
         (Engine::Sqlite, ConnectionPool::Sqlite(p)) => {
-            let rows = sqlx::query(sql)
-                .fetch_all(p)
-                .await
-                .map_err(map_err)?;
+            let rows = sqlx::query(sql).fetch_all(p).await.map_err(map_err)?;
             Ok(map_rows_sqlite(rows, cap))
         }
         (Engine::Postgres, ConnectionPool::Postgres(p)) => {
@@ -92,7 +89,10 @@ pub async fn run(
                 .execute(&mut *conn)
                 .await
                 .map_err(map_err)?;
-            let rows = sqlx::query(sql).fetch_all(&mut *conn).await.map_err(map_err)?;
+            let rows = sqlx::query(sql)
+                .fetch_all(&mut *conn)
+                .await
+                .map_err(map_err)?;
             sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
             Ok(map_rows_mysql(rows, cap))
         }
@@ -366,14 +366,9 @@ mod tests {
             .unwrap();
 
         let cp = ConnectionPool::Sqlite(pool);
-        let result = run(
-            Engine::Sqlite,
-            &cp,
-            "SELECT id, name FROM t ORDER BY id",
-            2,
-        )
-        .await
-        .unwrap();
+        let result = run(Engine::Sqlite, &cp, "SELECT id, name FROM t ORDER BY id", 2)
+            .await
+            .unwrap();
 
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows.len(), 2);

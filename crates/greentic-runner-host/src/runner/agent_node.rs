@@ -202,6 +202,39 @@ mod aw {
         std::env::temp_dir().join("greentic").join("extensions")
     }
 
+    /// Resolve the directory scanned for `<agent_id>.json` Digital Worker manifests.
+    ///
+    /// Honours `GREENTIC_AGENT_MANIFESTS_DIR`; otherwise `~/.greentic/agents`, and
+    /// finally a temp-dir path when no home is resolvable (keeps the fn total). A
+    /// missing dir is harmless — the overlay provider simply finds no manifest and
+    /// returns the YAML base unchanged.
+    fn manifests_discovery_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("GREENTIC_AGENT_MANIFESTS_DIR")
+            && !dir.is_empty()
+        {
+            return PathBuf::from(dir);
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".greentic").join("agents");
+        }
+        std::env::temp_dir().join("greentic").join("agents")
+    }
+
+    /// Build an [`HttpConfigProvider`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
+    /// `GREENTIC_AW_ADMIN_TOKEN`. Returns `None` when either is unset/empty, so
+    /// the runtime keeps using the local overlay alone.
+    fn registry_from_env() -> Option<greentic_aw_runtime::HttpConfigProvider> {
+        let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(greentic_aw_runtime::HttpConfigProvider::new(
+            endpoint, token,
+        ))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -267,6 +300,8 @@ mod aw {
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
+        use greentic_aw_runtime::LayeredConfigProvider;
+        use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::cost::RedisTokenMeter;
         use greentic_aw_runtime::tools::RedisToolLedger;
@@ -354,9 +389,20 @@ mod aw {
         };
 
         let agent_count = merged_agents.len();
-        let config_provider = Arc::new(CachingConfigProvider::new(HostConfigProvider::new(
-            merged_agents,
-        )));
+        // Base config source = the merged agents (pack-embedded ⊕ operator,
+        // operator wins). Wrap in the manifest-tool overlay, then layer the
+        // admin agent registry on top when configured (registry first, overlay
+        // fallback); cache the result either way.
+        let overlay = ManifestToolOverlayProvider::new(
+            HostConfigProvider::new(merged_agents),
+            manifests_discovery_dir(),
+        );
+        let config_provider: Arc<dyn ConfigProvider> = match registry_from_env() {
+            Some(http) => Arc::new(CachingConfigProvider::new(LayeredConfigProvider::new(
+                http, overlay,
+            ))),
+            None => Arc::new(CachingConfigProvider::new(overlay)),
+        };
         let telemetry = Arc::new(OtelTelemetry);
 
         let runtime = Arc::new(AgentRuntime::new(
@@ -467,6 +513,43 @@ mod aw {
                 .expect("known agent resolves");
 
             assert_eq!(resolved.agent_id, "greeter");
+        }
+
+        #[tokio::test]
+        async fn overlay_provider_replaces_tools_from_manifest() {
+            use greentic_aw_runtime::ManifestToolOverlayProvider;
+            use greentic_aw_runtime::config::ToolRef;
+            use greentic_aw_runtime::config_provider::ConfigProvider;
+
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("greeter.json"),
+                r#"{"id":"greeter","display_name":"G",
+                "tenancy":{"tenant":"t","team_policy":"disabled"},
+                "locale":{"worker_default_locale":"en-US","policy":"worker_default",
+                          "propagation":"current_task_only","output":"worker_default"},
+                "extension_tools":[{"extension_id":"greentic.tavily","extension_version":"1.0.0",
+                  "tool_name":"web_search","description":"d","input_schema_json":"{\"type\":\"object\"}",
+                  "capabilities":["agentic_worker"],"agentic_worker_metadata":{}}]}"#,
+            )
+            .unwrap();
+
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            let provider = ManifestToolOverlayProvider::new(
+                HostConfigProvider::new(agents),
+                tmp.path().to_path_buf(),
+            );
+
+            let tenant = TenantContext::new("acme", "prod");
+            let cfg = provider.agent_config(&tenant, "greeter").await.unwrap();
+            assert_eq!(
+                cfg.tools,
+                vec![ToolRef {
+                    extension_id: "greentic.tavily".into(),
+                    tool_name: "web_search".into()
+                }]
+            );
         }
 
         #[test]
@@ -629,6 +712,37 @@ mod aw {
             assert_eq!(configs.len(), 1, "malformed blob must be skipped");
             assert!(configs.contains_key("good-agent"));
             assert!(!configs.contains_key("bad-agent"));
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn registry_from_env_requires_both_vars() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+            assert!(super::registry_from_env().is_none());
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+            }
+            assert!(
+                super::registry_from_env().is_none(),
+                "endpoint alone is not enough"
+            );
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(super::registry_from_env().is_some());
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
         }
     }
 }

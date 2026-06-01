@@ -13,10 +13,13 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod error;
+pub mod http_provider;
+pub mod layered_provider;
 pub mod llm;
 pub mod llm_extension;
 pub mod llm_openai;
 pub mod r#loop;
+pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod state;
 pub mod state_redis;
@@ -33,9 +36,14 @@ pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigP
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use http_provider::HttpConfigProvider;
+pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
-pub use llm_extension::{BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker};
+pub use llm_extension::{
+    BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
+};
 pub use llm_openai::OpenAiLlmBackend;
+pub use manifest_provider::ManifestToolOverlayProvider;
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};

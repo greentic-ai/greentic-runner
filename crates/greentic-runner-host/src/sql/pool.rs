@@ -77,7 +77,9 @@ mod tests {
     async fn builds_sqlite_pool_in_memory() {
         // Secondary smoke test: in-memory SQLite opened without read-only flag
         // (read_only=false because ":memory:" file doesn't exist as a real path).
-        let pool = build(Engine::Sqlite, "sqlite::memory:", false).await.unwrap();
+        let pool = build(Engine::Sqlite, "sqlite::memory:", false)
+            .await
+            .unwrap();
         assert!(matches!(pool, ConnectionPool::Sqlite(_)));
     }
 }
