@@ -40,8 +40,57 @@ mod aw {
     use greentic_aw_runtime::{AgentInput, AgentRuntime, AgentStep, TenantContext};
     use serde_json::{Value, json};
 
-    use crate::config::HostConfig;
     use super::AgentNodeHandler;
+
+    // -----------------------------------------------------------------------
+    // Pack-manifest agent helpers
+    // -----------------------------------------------------------------------
+
+    /// Deserialize raw agent blobs from a pack manifest into typed
+    /// [`AgentConfig`] structs.
+    ///
+    /// Malformed blobs are skipped with a [`tracing::warn!`] so a single
+    /// bad entry never prevents other agents (or pack-level operators) from
+    /// loading. The `pack_id` argument is used only in log messages.
+    pub fn agent_configs_from_manifest(
+        pack_id: &str,
+        blobs: &std::collections::BTreeMap<String, Value>,
+    ) -> HashMap<String, AgentConfig> {
+        blobs
+            .iter()
+            .filter_map(|(agent_id, blob)| {
+                match serde_json::from_value::<AgentConfig>(blob.clone()) {
+                    Ok(config) => Some((agent_id.clone(), config)),
+                    Err(deserialize_error) => {
+                        tracing::warn!(
+                            pack_id,
+                            agent_id,
+                            error = %deserialize_error,
+                            "skipping malformed agent blob in pack manifest"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// Merge pack-provided agent configs with operator-declared ones.
+    ///
+    /// Pack agents form the base layer; operator entries take precedence on
+    /// `agent_id` collision (operator always wins). This ensures operators can
+    /// override or refine any pack-embedded agent without touching the pack
+    /// itself.
+    pub fn merge_agent_sources(
+        pack_agents: HashMap<String, AgentConfig>,
+        operator_agents: HashMap<String, AgentConfig>,
+    ) -> HashMap<String, AgentConfig> {
+        let mut merged = pack_agents;
+        for (agent_id, operator_config) in operator_agents {
+            merged.insert(agent_id, operator_config);
+        }
+        merged
+    }
 
     /// Fixed, user-safe reply returned when an agentic step fails. The detailed
     /// [`greentic_aw_runtime::AgentError`] is logged but never surfaced to the
@@ -200,15 +249,22 @@ mod aw {
     ///
     /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
     /// these graceful-degradation conditions:
-    /// - no agents are declared in [`HostConfig::agents`];
+    /// - `merged_agents` is empty (no agents from packs or operator config);
     /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
     /// - the AW Redis connection fails;
     /// - the extension runtime fails to initialise.
     ///
+    /// `merged_agents` is the result of merging pack-embedded agents (base)
+    /// with operator-declared [`HostConfig::agents`] (operator wins on
+    /// collision). This merged map replaces the former direct read of
+    /// `config.agents` so pack-provided agents are included in the runtime.
+    ///
     /// Redis is sourced from the environment because the runner uses an
     /// in-memory flow-state store by default and carries no Redis URL in
     /// [`HostConfig`]; this mirrors the existing env-config convention.
-    pub async fn build_agent_node_handler(config: &HostConfig) -> Option<Arc<dyn AgentNodeHandler>> {
+    pub async fn build_agent_node_handler(
+        merged_agents: HashMap<String, AgentConfig>,
+    ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
@@ -219,7 +275,7 @@ mod aw {
             RetryingLlmBackend,
         };
 
-        if config.agents.is_empty() {
+        if merged_agents.is_empty() {
             return None; // nothing to serve
         }
 
@@ -297,8 +353,9 @@ mod aw {
             }
         };
 
+        let agent_count = merged_agents.len();
         let config_provider = Arc::new(CachingConfigProvider::new(HostConfigProvider::new(
-            config.agents.clone(),
+            merged_agents,
         )));
         let telemetry = Arc::new(OtelTelemetry);
 
@@ -312,7 +369,7 @@ mod aw {
             ledger,
         ));
 
-        tracing::info!(agent_count = config.agents.len(), "AW runtime constructed");
+        tracing::info!(agent_count, "AW runtime constructed");
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
     }
 
@@ -453,12 +510,131 @@ mod aw {
 
             assert!(matches!(result, Err(ConfigError::AgentNotFound(_))));
         }
+
+        // -----------------------------------------------------------------------
+        // merge_agent_sources tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn merge_pack_only_agent_resolves() {
+            let mut pack_agents = HashMap::new();
+            pack_agents.insert("pack-bot".to_string(), sample_agent_config("pack-bot"));
+
+            let merged = super::merge_agent_sources(pack_agents, HashMap::new());
+
+            assert!(merged.contains_key("pack-bot"));
+            assert_eq!(merged["pack-bot"].agent_id, "pack-bot");
+        }
+
+        #[test]
+        fn merge_operator_only_agent_resolves() {
+            let mut operator_agents = HashMap::new();
+            operator_agents.insert("op-bot".to_string(), sample_agent_config("op-bot"));
+
+            let merged = super::merge_agent_sources(HashMap::new(), operator_agents);
+
+            assert!(merged.contains_key("op-bot"));
+            assert_eq!(merged["op-bot"].agent_id, "op-bot");
+        }
+
+        #[test]
+        fn merge_operator_wins_on_collision() {
+            let mut pack_agents = HashMap::new();
+            let mut pack_config = sample_agent_config("shared-bot");
+            pack_config.system_prompt = "pack prompt".to_string();
+            pack_agents.insert("shared-bot".to_string(), pack_config);
+
+            let mut operator_agents = HashMap::new();
+            let mut operator_config = sample_agent_config("shared-bot");
+            operator_config.system_prompt = "operator prompt".to_string();
+            operator_agents.insert("shared-bot".to_string(), operator_config);
+
+            let merged = super::merge_agent_sources(pack_agents, operator_agents);
+
+            assert_eq!(merged.len(), 1);
+            assert_eq!(
+                merged["shared-bot"].system_prompt, "operator prompt",
+                "operator config must override pack config on agent_id collision"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // agent_configs_from_manifest tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn deserialize_agent_blob_produces_correct_config() {
+            let blob = serde_json::json!({
+                "agent_id": "demo-agent",
+                "system_prompt": "You are helpful.",
+                "tools": [],
+                "llm": {
+                    "provider": "openai",
+                    "model": "gpt-4o-mini"
+                },
+                "limits": {
+                    "max_iter": 5,
+                    "timeout": 30,
+                    "max_history_turns": 10,
+                    "llm_retry_attempts": 2,
+                    "llm_retry_backoff": 500,
+                    "provider_failure_message": null,
+                    "daily_token_cap_per_tenant": null
+                }
+            });
+
+            let config: AgentConfig =
+                serde_json::from_value(blob).expect("valid blob must deserialize");
+
+            assert_eq!(config.agent_id, "demo-agent");
+            assert_eq!(config.system_prompt, "You are helpful.");
+            assert_eq!(config.limits.max_iter, 5);
+            assert_eq!(config.limits.timeout, std::time::Duration::from_secs(30));
+        }
+
+        #[test]
+        fn agent_configs_from_manifest_skips_malformed_blobs() {
+            use std::collections::BTreeMap;
+
+            let mut blobs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+            // Valid agent blob
+            blobs.insert(
+                "good-agent".to_string(),
+                serde_json::json!({
+                    "agent_id": "good-agent",
+                    "system_prompt": "Valid.",
+                    "tools": [],
+                    "llm": { "provider": "openai", "model": "gpt-4o-mini" },
+                    "limits": {
+                        "max_iter": 8,
+                        "timeout": 60,
+                        "max_history_turns": 20,
+                        "llm_retry_attempts": 3,
+                        "llm_retry_backoff": 250,
+                        "provider_failure_message": null,
+                        "daily_token_cap_per_tenant": null
+                    }
+                }),
+            );
+
+            // Malformed blob (missing required fields)
+            blobs.insert(
+                "bad-agent".to_string(),
+                serde_json::json!({ "broken": true }),
+            );
+
+            let configs = super::agent_configs_from_manifest("test-pack", &blobs);
+
+            assert_eq!(configs.len(), 1, "malformed blob must be skipped");
+            assert!(configs.contains_key("good-agent"));
+            assert!(!configs.contains_key("bad-agent"));
+        }
     }
 }
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
-    RuntimeAgentNodeHandler,
-    HostConfigProvider,
-    build_agent_node_handler,
+    HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
+    build_agent_node_handler, merge_agent_sources,
 };

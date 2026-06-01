@@ -2156,6 +2156,20 @@ impl PackRuntime {
         self.component_manifests.get(component_ref)
     }
 
+    /// Returns the raw agent config blobs embedded in this pack's manifest.
+    ///
+    /// Only present on the New (`greentic_types::PackManifest`) path; Legacy
+    /// packs do not carry agent config and return an empty map. Callers
+    /// (e.g. `TenantRuntime::from_packs`) deserialize these blobs into
+    /// concrete `AgentConfig` structs via
+    /// `agent_node::agent_configs_from_manifest`.
+    pub fn manifest_agent_blobs(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.manifest
+            .as_ref()
+            .map(|m| m.agents.clone())
+            .unwrap_or_default()
+    }
+
     pub fn describe_component_contract_v0_6(&self, component_ref: &str) -> Result<Option<Value>> {
         let pack_component = self
             .components

@@ -131,6 +131,7 @@ fn build_pack_with_runtime_extension(runtime_extension: Value, pack_path: &Path)
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 
