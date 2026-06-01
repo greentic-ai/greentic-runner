@@ -29,6 +29,11 @@ use crate::validate::{
 };
 use greentic_types::{Flow, Node, NodeId, Routing};
 
+/// Component ID of the slot-extractor WASM component. Used to detect
+/// slot-extractor nodes and inject flow-level `slot_schema` as
+/// `slot_definitions` into the invocation payload (Phase D).
+const SLOT_EXTRACTOR_COMPONENT_ID: &str = "ai.greentic.component-slot-extractor";
+
 /// Callback trait for resolving cross-pack provider invocations.
 ///
 /// When a `provider.invoke` node references a provider that is not in the
@@ -101,6 +106,9 @@ struct HostFlow {
     id: String,
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
+    /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
+    /// Injected into slot-extractor component invocations at dispatch time (Phase D).
+    slot_schema: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -560,6 +568,7 @@ impl FlowEngine {
                     &mut state,
                     payload,
                     &event,
+                    flow_ir.slot_schema.as_ref(),
                 )
                 .await;
             let DispatchOutcome { output, control } = match dispatch {
@@ -711,6 +720,7 @@ impl FlowEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_node(
         &self,
         ctx: &FlowContext<'_>,
@@ -719,11 +729,22 @@ impl FlowEngine {
         state: &mut ExecutionState,
         mut payload: Value,
         event: &NodeEvent<'_>,
+        flow_slot_schema: Option<&Value>,
     ) -> Result<DispatchOutcome> {
         inject_card_locale(&mut payload, &state.entry);
         match &node.kind {
-            NodeKind::Exec { target_component } => self
-                .execute_component_exec(
+            NodeKind::Exec { target_component } => {
+                // Phase D: inject flow-level slot_schema into slot-extractor
+                // component invocations. Only fires when all of:
+                //   1. target is the slot-extractor component
+                //   2. flow carries a slot_schema
+                //   3. payload.input does NOT already contain slot_definitions
+                let slot_schema_for_exec = if target_component == SLOT_EXTRACTOR_COMPONENT_ID {
+                    flow_slot_schema
+                } else {
+                    None
+                };
+                self.execute_component_exec(
                     ctx,
                     node_id,
                     node,
@@ -733,9 +754,11 @@ impl FlowEngine {
                         component: Some(target_component.as_str()),
                         operation: node.operation_name.as_deref(),
                     },
+                    slot_schema_for_exec,
                 )
                 .await
-                .and_then(component_dispatch_outcome),
+                .and_then(component_dispatch_outcome)
+            }
             NodeKind::PackComponent { component_ref } => self
                 .execute_component_call(ctx, node_id, node, payload, component_ref.as_str(), event)
                 .await
@@ -951,6 +974,7 @@ impl FlowEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_component_exec(
         &self,
         ctx: &FlowContext<'_>,
@@ -959,6 +983,7 @@ impl FlowEngine {
         payload: Value,
         event: &NodeEvent<'_>,
         overrides: ComponentOverrides<'_>,
+        flow_slot_schema: Option<&Value>,
     ) -> Result<NodeOutput> {
         #[derive(Deserialize)]
         struct ComponentPayload {
@@ -986,10 +1011,19 @@ impl FlowEngine {
             overrides.operation,
             node.operation_in_mapping.as_deref(),
         )?;
+        let mut input = payload.input;
+
+        // Phase D: inject flow-level slot_schema as slot_definitions into the
+        // slot-extractor's input when the author omitted inline definitions.
+        // Explicit inline slot_definitions win (back-compat with M2.4 NDA demo).
+        if let Some(schema) = flow_slot_schema {
+            inject_slot_definitions(&mut input, schema, ctx.flow_id, node_id);
+        }
+
         let call = ComponentCall {
             component_ref,
             operation,
-            input: payload.input,
+            input,
             config: payload.config,
         };
 
@@ -1869,10 +1903,20 @@ impl From<Flow> for HostFlow {
             .and_then(Value::as_str)
             .and_then(|id| NodeId::from_str(id).ok())
             .or_else(|| nodes.keys().next().cloned());
+        // Extract flow-level slot_schema from metadata.extra (Phase D).
+        // The producer side (greentic-flow compile_flow) stores it under
+        // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
+        let slot_schema = value
+            .metadata
+            .extra
+            .get("greentic.slot_schema")
+            .filter(|v| !v.is_null())
+            .cloned();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
+            slot_schema,
         }
     }
 }
@@ -2202,6 +2246,41 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
         .and_then(Value::as_str);
     if let Some(locale) = locale {
         map.insert("locale".into(), Value::String(locale.to_string()));
+    }
+}
+
+/// Inject flow-level `slot_schema` as `slot_definitions` into the
+/// slot-extractor component's input value. Skips injection when the input
+/// already contains an explicit `slot_definitions` key (back-compat with
+/// M2.4 NDA demo inline definitions). When the input is `Null`, wraps the
+/// schema in a new object.
+fn inject_slot_definitions(input: &mut Value, slot_schema: &Value, flow_id: &str, node_id: &str) {
+    let already_has = input
+        .as_object()
+        .is_some_and(|m| m.contains_key("slot_definitions"));
+    if already_has {
+        return;
+    }
+    let slot_count = slot_schema.as_array().map_or(0, Vec::len);
+    tracing::debug!(
+        flow_id,
+        slot_count,
+        "injecting flow-level slot_schema as slot_definitions into slot-extractor input"
+    );
+    match input {
+        Value::Object(map) => {
+            map.insert("slot_definitions".to_string(), slot_schema.clone());
+        }
+        Value::Null => {
+            *input = json!({"slot_definitions": slot_schema});
+        }
+        _ => {
+            tracing::warn!(
+                flow_id,
+                node_id,
+                "slot-extractor input is not an object; cannot inject slot_definitions"
+            );
+        }
     }
 }
 
@@ -2862,6 +2941,7 @@ mod tests {
                     component: None,
                     operation: None,
                 },
+                None,
             ))
             .unwrap_err();
         let message = err.to_string();
@@ -2927,6 +3007,7 @@ mod tests {
                     component: None,
                     operation: None,
                 },
+                None,
             ))
             .unwrap_err();
         let message = err.to_string();
@@ -3258,6 +3339,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            slot_schema: None,
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -3480,6 +3562,108 @@ mod tests {
         };
         let result = engine.execute(ctx, Value::Null).await;
         assert!(result.is_err(), "non-user-facing flow must propagate Err");
+    }
+
+    // ---- Phase D: slot_schema injection tests ----
+
+    #[test]
+    fn host_flow_extracts_slot_schema_from_metadata_extra() {
+        use greentic_types::FlowMetadata;
+        use std::collections::BTreeSet;
+
+        let schema = json!([
+            {"name": "counterparty", "slot_type": "string", "required": true},
+            {"name": "due_date", "slot_type": "date", "required": true}
+        ]);
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: BTreeSet::new(),
+                extra: json!({"greentic.slot_schema": schema}),
+            },
+        };
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&schema),
+            "HostFlow must extract slot_schema from metadata.extra"
+        );
+    }
+
+    #[test]
+    fn host_flow_slot_schema_is_none_when_absent() {
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: Default::default(),
+        };
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when metadata.extra has no greentic.slot_schema"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_adds_to_object_input() {
+        let schema = json!([
+            {"name": "city", "slot_type": "string"}
+        ]);
+        let mut input = json!({"utterance": "hello"});
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"utterance": "hello", "slot_definitions": schema}),
+            "slot_definitions must be injected into existing object"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_wraps_null_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = Value::Null;
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"slot_definitions": schema}),
+            "null input must become an object with slot_definitions"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_preserves_explicit_inline() {
+        let flow_schema = json!([{"name": "city", "slot_type": "string"}]);
+        let inline_defs = json!([{"name": "country", "slot_type": "string"}]);
+        let mut input = json!({
+            "utterance": "hello",
+            "slot_definitions": inline_defs
+        });
+        inject_slot_definitions(&mut input, &flow_schema, "f", "n");
+        assert_eq!(
+            input["slot_definitions"], inline_defs,
+            "explicit inline slot_definitions must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_skips_non_object_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = json!("a string");
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!("a string"),
+            "non-object input must be left unchanged"
+        );
     }
 }
 
