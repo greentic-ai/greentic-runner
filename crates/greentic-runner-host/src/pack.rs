@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::{ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProfile};
@@ -77,8 +77,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
-use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
+use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -101,14 +100,6 @@ use wasmtime_wasi::p2::add_to_linker_sync as add_wasi_to_linker;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use greentic_flow::model::FlowDoc;
-
-static RUSTLS_CRYPTO_PROVIDER: Once = Once::new();
-
-fn ensure_rustls_crypto_provider() {
-    RUSTLS_CRYPTO_PROVIDER.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
 
 #[allow(dead_code)]
 pub struct PackRuntime {
@@ -1209,8 +1200,6 @@ pub struct ComponentState {
 
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
-        ensure_rustls_crypto_provider();
-
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1291,7 +1280,9 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    add_wasi_tls_to_linker(linker, &opts)?;
+    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
+        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
+    })?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1442,15 +1433,6 @@ impl WasiView for ComponentState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
-            table: &mut self.resource_table,
-        }
-    }
-}
-
-impl WasiTlsView for ComponentState {
-    fn tls(&mut self) -> WasiTlsCtxView<'_> {
-        WasiTlsCtxView {
-            ctx: &mut self.wasi_tls_ctx,
             table: &mut self.resource_table,
         }
     }
