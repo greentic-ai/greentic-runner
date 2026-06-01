@@ -424,6 +424,9 @@ impl AsyncWrite for TelemetryLineSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::task::noop_waker;
+    use std::pin::Pin;
+    use std::task::Context;
 
     #[test]
     fn parses_full_line_with_all_segments() {
@@ -514,5 +517,92 @@ mod tests {
         assert_eq!(p.file_line, "crates/foo/src/lib.rs:42");
         assert_eq!(p.message, "oops");
         assert_eq!(p.fields, vec![("code", "500")]);
+    }
+
+    #[test]
+    fn rejects_unknown_level_and_unclosed_tokens() {
+        assert!(parse_line("[NOTICE] hello").is_none());
+        assert!(parse_line("[INFO hello").is_none());
+        assert!(parse_line("[INFO][component hello").is_some());
+    }
+
+    #[test]
+    fn timestamp_requires_separator_after_z() {
+        let line = "2026-05-25T10:30:42.123Z[INFO] no separator";
+        let (timestamp, rest) = split_optional_timestamp(line);
+
+        assert_eq!(timestamp, "");
+        assert_eq!(rest, line);
+    }
+
+    #[test]
+    fn malformed_file_line_stays_in_message() {
+        let line = "[INFO] src/lib.rs:not-a-line still message";
+        let p = parse_line(line).expect("should parse");
+
+        assert_eq!(p.file_line, "");
+        assert_eq!(p.message, "src/lib.rs:not-a-line still message");
+    }
+
+    #[test]
+    fn fields_ignore_entries_without_equals() {
+        let line = "[INFO] event [good=value, missing, also=ok]";
+        let p = parse_line(line).expect("should parse");
+
+        assert_eq!(p.fields, vec![("good", "value"), ("also", "ok")]);
+    }
+
+    #[test]
+    fn fields_json_escapes_special_characters() {
+        let json = fields_to_json(&[
+            ("quote", "a\"b"),
+            ("slash", "a\\b"),
+            ("line", "a\nb"),
+            ("tab", "a\tb"),
+            ("ctrl", "\u{1f}"),
+        ]);
+
+        assert_eq!(
+            json,
+            "{\"quote\":\"a\\\"b\",\"slash\":\"a\\\\b\",\"line\":\"a\\nb\",\"tab\":\"a\\tb\",\"ctrl\":\"\\u001f\"}"
+        );
+    }
+
+    #[test]
+    fn telemetry_stream_buffers_partial_lines_until_shutdown() {
+        let stream = TelemetryStream::stdout().drop_unmatched();
+        let mut sink = TelemetryLineSink {
+            kind: stream.kind,
+            forward_unmatched: stream.forward_unmatched,
+            buffer: Default::default(),
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut sink)
+                .poll_write(&mut cx, b"[INFO][svc] partial")
+                .is_ready()
+        );
+        assert!(Pin::new(&mut sink).poll_shutdown(&mut cx).is_ready());
+    }
+
+    #[test]
+    fn telemetry_stream_handles_invalid_utf8_without_forwarding() {
+        let stream = TelemetryStream::stderr().drop_unmatched();
+        let mut sink = TelemetryLineSink {
+            kind: stream.kind,
+            forward_unmatched: stream.forward_unmatched,
+            buffer: Default::default(),
+        };
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(
+            Pin::new(&mut sink)
+                .poll_write(&mut cx, &[0xff, b'\n'])
+                .is_ready()
+        );
+        assert!(Pin::new(&mut sink).poll_flush(&mut cx).is_ready());
     }
 }

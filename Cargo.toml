@@ -169,6 +169,11 @@ features = [
     "blocking",
 ]
 
+[workspace.dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws_lc_rs"]
+
 [workspace.dependencies.serde]
 version = "1.0"
 features = [
