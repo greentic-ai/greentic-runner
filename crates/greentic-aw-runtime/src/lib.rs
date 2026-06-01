@@ -13,6 +13,7 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod error;
+pub mod http_provider;
 pub mod llm;
 pub mod llm_extension;
 pub mod llm_openai;
@@ -30,16 +31,17 @@ pub mod mock;
 
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
-pub use manifest_provider::ManifestToolOverlayProvider;
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use http_provider::HttpConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
     BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
 };
 pub use llm_openai::OpenAiLlmBackend;
+pub use manifest_provider::ManifestToolOverlayProvider;
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
