@@ -171,6 +171,21 @@ mod aw {
         std::env::temp_dir().join("greentic").join("agents")
     }
 
+    /// Build an [`HttpConfigProvider`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
+    /// `GREENTIC_AW_ADMIN_TOKEN`. Returns `None` when either is unset/empty, so
+    /// the runtime keeps using the local overlay alone.
+    fn registry_from_env() -> Option<greentic_aw_runtime::HttpConfigProvider> {
+        let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(greentic_aw_runtime::HttpConfigProvider::new(
+            endpoint, token,
+        ))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -231,6 +246,7 @@ mod aw {
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
+        use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::cost::RedisTokenMeter;
@@ -322,7 +338,15 @@ mod aw {
             HostConfigProvider::new(config.agents.clone()),
             manifests_discovery_dir(),
         );
-        let config_provider = Arc::new(CachingConfigProvider::new(overlay));
+        // When the admin agent registry is configured, pull from it first and
+        // fall back to the local overlay on miss/outage; otherwise use the
+        // local overlay alone. The result is cached either way.
+        let config_provider: Arc<dyn ConfigProvider> = match registry_from_env() {
+            Some(http) => Arc::new(CachingConfigProvider::new(LayeredConfigProvider::new(
+                http, overlay,
+            ))),
+            None => Arc::new(CachingConfigProvider::new(overlay)),
+        };
         let telemetry = Arc::new(OtelTelemetry);
 
         let runtime = Arc::new(AgentRuntime::new(
@@ -512,6 +536,35 @@ mod aw {
             let result = provider.agent_config(&tenant, "missing").await;
 
             assert!(matches!(result, Err(ConfigError::AgentNotFound(_))));
+        }
+
+        #[test]
+        #[allow(unsafe_code)]
+        fn registry_from_env_requires_both_vars() {
+            // SAFETY: single-threaded test; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+            assert!(super::registry_from_env().is_none());
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+            }
+            assert!(
+                super::registry_from_env().is_none(),
+                "endpoint alone is not enough"
+            );
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(super::registry_from_env().is_some());
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
         }
     }
 }
