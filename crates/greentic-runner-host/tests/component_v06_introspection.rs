@@ -109,6 +109,7 @@ fn build_component_pack_v06(component_path: &Path, pack_path: &Path) -> Result<(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 

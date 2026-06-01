@@ -658,6 +658,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 
@@ -784,6 +785,7 @@ fn build_provider_pack_with_schemas(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 

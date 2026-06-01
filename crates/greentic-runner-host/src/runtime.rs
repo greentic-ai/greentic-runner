@@ -201,9 +201,44 @@ impl TenantRuntime {
             .await
             .context("failed to prime flow engine")?;
         #[cfg(feature = "agentic-worker")]
-        if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(&config).await {
-            engine.set_agent_node_handler(handler);
-            tracing::info!("DwAgent runtime wired into FlowEngine");
+        {
+            use crate::runner::agent_node::{agent_configs_from_manifest, merge_agent_sources};
+            use std::collections::HashMap;
+
+            // Collect agent configs from all New-manifest packs. When the same
+            // agent_id appears in multiple packs the last pack wins (packs are
+            // ordered: first = primary, rest = overlays). Collisions are logged
+            // so operators can audit cross-pack conflicts.
+            let mut pack_agents: HashMap<String, greentic_aw_runtime::AgentConfig> = HashMap::new();
+            for pack in &pack_runtimes {
+                let blobs = pack.manifest_agent_blobs();
+                if blobs.is_empty() {
+                    continue;
+                }
+                let pack_id = pack.metadata().pack_id.clone();
+                let configs = agent_configs_from_manifest(&pack_id, &blobs);
+                for (agent_id, agent_config) in configs {
+                    if let Some(existing) = pack_agents.get(&agent_id) {
+                        tracing::warn!(
+                            agent_id,
+                            prior_pack = existing.agent_id.as_str(),
+                            new_pack = pack_id.as_str(),
+                            "agent_id collision across packs; last pack wins"
+                        );
+                    }
+                    pack_agents.insert(agent_id, agent_config);
+                }
+            }
+
+            // Operator config overrides pack-provided agents on collision.
+            let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
+
+            if let Some(handler) =
+                crate::runner::agent_node::build_agent_node_handler(merged_agents).await
+            {
+                engine.set_agent_node_handler(handler);
+                tracing::info!("DwAgent runtime wired into FlowEngine");
+            }
         }
         let engine = Arc::new(engine);
         let state_machine = Arc::new(

@@ -115,6 +115,7 @@ fn build_pack(pack_path: &Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -193,6 +194,7 @@ fn build_pack_with_component_sources(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
     manifest.set_component_sources_v1(sources_payload)?;
@@ -248,6 +250,7 @@ fn build_pack_with_component_sources_only(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
     manifest.set_component_sources_v1(sources_payload)?;
@@ -452,6 +455,7 @@ fn build_state_store_pack(pack_path: &Path, include_state_capability: bool) -> R
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -886,6 +890,7 @@ fn gtpack_cbor_only_pack_loads() -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -976,6 +981,7 @@ fn gtpack_legacy_artifacts_are_ignored() -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 

@@ -238,6 +238,7 @@ fn build_pack(flow_yaml: &str, pack_path: &Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -324,6 +325,7 @@ fn build_pack_with_flow_id(pack_id: &str, flow: Flow, pack_path: &Path) -> Resul
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -401,6 +403,7 @@ fn build_pack_with_runtime_extension(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 
