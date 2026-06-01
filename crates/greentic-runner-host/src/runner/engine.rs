@@ -3665,6 +3665,131 @@ mod tests {
             "non-object input must be left unchanged"
         );
     }
+
+    /// Integration test: exercises the real `greentic_flow::compile_flow`
+    /// producer path with a `FlowDoc` carrying `slot_schema`, then converts
+    /// through `HostFlow::from` and verifies the runtime-side `slot_schema`
+    /// field is populated — closing the gap Codex flagged where the existing
+    /// unit tests constructed `FlowMetadata` directly.
+    #[test]
+    fn compile_flow_round_trips_slot_schema_into_host_flow() {
+        use greentic_flow::compile_flow;
+        use greentic_flow::model::{FlowDoc, NodeDoc};
+
+        let slot_defs = json!([
+            {
+                "name": "counterparty",
+                "slot_type": "string",
+                "required": true
+            },
+            {
+                "name": "due_date",
+                "slot_type": "date",
+                "required": true,
+                "pattern": "\\d{4}-\\d{2}-\\d{2}"
+            }
+        ]);
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "extractor".to_string(),
+            NodeDoc {
+                raw: {
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "component.exec".to_string(),
+                        json!({"component": "slot-extractor"}),
+                    );
+                    m
+                },
+                routing: json!([{"out": true}]),
+                ..Default::default()
+            },
+        );
+
+        let doc = FlowDoc {
+            id: "slot-test".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("extractor".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema: Some(slot_defs.clone()),
+            nodes,
+        };
+
+        // Phase 1: compile_flow must forward slot_schema into metadata.extra
+        let flow = compile_flow(doc).expect("compile_flow must succeed");
+        let extra_schema = flow.metadata.extra.get("greentic.slot_schema").expect(
+            "compile_flow must store slot_schema in metadata.extra[\"greentic.slot_schema\"]",
+        );
+        assert_eq!(
+            extra_schema, &slot_defs,
+            "metadata.extra slot_schema must match the FlowDoc input"
+        );
+
+        // Phase 2: HostFlow::from must extract it back out
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&slot_defs),
+            "HostFlow.slot_schema must survive the compile_flow -> HostFlow round-trip"
+        );
+    }
+
+    /// Verify that `compile_flow` without `slot_schema` produces a `Flow`
+    /// whose `metadata.extra` has no `greentic.slot_schema` key, and that
+    /// `HostFlow.slot_schema` stays `None` through the real compile path.
+    #[test]
+    fn compile_flow_without_slot_schema_leaves_host_flow_none() {
+        use greentic_flow::compile_flow;
+        use greentic_flow::model::{FlowDoc, NodeDoc};
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "echo".to_string(),
+            NodeDoc {
+                raw: {
+                    let mut m = IndexMap::new();
+                    m.insert("component.exec".to_string(), json!({"component": "echo"}));
+                    m
+                },
+                routing: json!([{"out": true}]),
+                ..Default::default()
+            },
+        );
+
+        let doc = FlowDoc {
+            id: "no-slots".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("echo".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema: None,
+            nodes,
+        };
+
+        let flow = compile_flow(doc).expect("compile_flow must succeed");
+        assert!(
+            flow.metadata.extra.get("greentic.slot_schema").is_none(),
+            "metadata.extra must not contain greentic.slot_schema when FlowDoc.slot_schema is None"
+        );
+
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when FlowDoc has no slot_schema"
+        );
+    }
 }
 
 use tracing::Instrument;
