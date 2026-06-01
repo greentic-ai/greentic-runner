@@ -4110,6 +4110,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4170,6 +4171,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
