@@ -539,9 +539,11 @@ mod aw {
         }
 
         #[test]
+        #[serial_test::serial]
         #[allow(unsafe_code)]
         fn registry_from_env_requires_both_vars() {
-            // SAFETY: single-threaded test; vars cleaned up at the end.
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
             unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
