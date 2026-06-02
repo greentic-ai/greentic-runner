@@ -11,7 +11,7 @@ use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::{FlowResumeStore, IngressEnvelope};
 use crate::http::health::HealthState;
-use crate::pack::PackRuntime;
+use crate::pack::{IdentifyOutcome, PackRuntime};
 use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
@@ -218,14 +218,17 @@ impl RunnerHost {
     /// admit table; that's how a header-less webhook gets auto-routed to the
     /// right endpoint.
     ///
-    /// Returns a `HashMap` keyed by the input `provider_type` strings:
+    /// Returns a `HashMap` keyed by the input `provider_type` strings,
+    /// carrying the three-state [`IdentifyOutcome`] per the WIT contract:
     ///
-    /// - `Some(provider_id)` ⇒ a pack's component identified the payload
-    ///   (the first hit across `main_pack` + `overlays` wins; identical
-    ///   payloads should yield identical ids across packs by construction);
-    /// - `None` ⇒ no pack recognised the payload for this type (either the
-    ///   pack ships no binding for the type, the binding has no
-    ///   `identify-instance` export, or every export returned `NoMatch`).
+    /// - [`IdentifyOutcome::Identified`] — first pack to return an id wins;
+    ///   that type drops out of remaining probing.
+    /// - [`IdentifyOutcome::NoMatch`] — at least one pack exported the world
+    ///   and explicitly declined. Beats `Unsupported` (cannot be downgraded
+    ///   back). Probing continues (a later pack may still `Identified`).
+    /// - [`IdentifyOutcome::Unsupported`] — the floor state; persists only
+    ///   when every probed pack returned `Unsupported` (no binding or no
+    ///   export). Caller may fall back to the static `provider_id`.
     ///
     /// Component traps and other infrastructure errors propagate as `Err`;
     /// the caller distinguishes them from a clean miss via the `?`.
@@ -237,7 +240,7 @@ impl RunnerHost {
         revision_id: RevisionId,
         provider_types: &[&str],
         payload: &[u8],
-    ) -> Result<HashMap<String, Option<String>>> {
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
         if provider_types.is_empty() {
             return Ok(HashMap::new());
         }
@@ -250,26 +253,45 @@ impl RunnerHost {
                      (deployment {deployment_id}, revision {revision_id})"
                 )
             })?;
-        let mut merged: HashMap<String, Option<String>> = provider_types
+        // Seed every type at Unsupported — the floor of the merge lattice.
+        let mut merged: HashMap<String, IdentifyOutcome> = provider_types
             .iter()
-            .map(|ty| ((*ty).to_string(), None))
+            .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
             .collect();
-        let mut remaining: Vec<&str> = provider_types.to_vec();
+        // Types already resolved to Identified — no further probing needed.
+        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| !resolved.contains(*ty))
+                .collect();
             if remaining.is_empty() {
                 break;
             }
             let probe = pack
                 .identify_endpoints_by_provider_type(&remaining, payload)
                 .await?;
-            remaining.retain(|ty| {
-                if let Some(Some(id)) = probe.get(*ty) {
-                    merged.insert((*ty).to_string(), Some(id.clone()));
-                    false
-                } else {
-                    true
+            for (ty, outcome) in probe {
+                match outcome {
+                    IdentifyOutcome::Identified(_) => {
+                        merged.insert(ty.clone(), outcome);
+                        resolved.insert(ty);
+                    }
+                    IdentifyOutcome::NoMatch => {
+                        // NoMatch beats Unsupported, but cannot override Identified
+                        // (already removed from remaining) or downgrade to Unsupported.
+                        merged.entry(ty).and_modify(|existing| {
+                            if matches!(existing, IdentifyOutcome::Unsupported) {
+                                *existing = IdentifyOutcome::NoMatch;
+                            }
+                        });
+                    }
+                    IdentifyOutcome::Unsupported => {
+                        // Floor — never overrides anything.
+                    }
                 }
-            });
+            }
         }
         Ok(merged)
     }
