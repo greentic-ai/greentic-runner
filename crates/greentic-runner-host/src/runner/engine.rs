@@ -1230,14 +1230,17 @@ impl FlowEngine {
             .as_deref()
             .or(payload.provider_type.as_deref())
             .unwrap_or("unknown");
+        let invoke_started = std::time::Instant::now();
         let invoke_result = pack
             .invoke_provider(&binding, exec_ctx, &op, input_json)
             .await;
+        let invoke_duration_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
         crate::metrics::record_provider_invocation(
             ctx.tenant,
             provider_metric_id,
             &op,
             if invoke_result.is_ok() { "ok" } else { "err" },
+            invoke_duration_ms,
         );
         let result = invoke_result?;
         #[cfg(feature = "fault-injection")]
