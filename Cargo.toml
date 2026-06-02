@@ -28,8 +28,8 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-# Floor pinned to greentic-flow PR #222: exports `SLOT_SCHEMA_METADATA_KEY`
-# const consumed by the runner's `HostFlow::from(Flow)` conversion.
+# Floor pinned to the version that introduced `greentic_flow::SLOT_SCHEMA_METADATA_KEY`,
+# consumed by the runner's `HostFlow::from(Flow)` conversion.
 greentic-flow = ">=1.1.0-dev.26799910683, <1.2.0-0"
 greentic-session = ">=1.1.0-dev, <1.2.0-0"
 greentic-state = ">=1.1.0-dev, <1.2.0-0"
