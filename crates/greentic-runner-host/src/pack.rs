@@ -40,6 +40,7 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     },
 };
 use greentic_interfaces_wasmtime::http_client_client_v1_1::greentic::http::http_client as http_client_client_alias;
+use greentic_interfaces_wasmtime::instance_identity_v0_1::InstanceIdentityPre;
 use greentic_interfaces_wasmtime::{
     http_client_client_v1_0::greentic::interfaces_types::types as http_types_v1_0,
     http_client_client_v1_1::greentic::interfaces_types::types as http_types_v1_1,
@@ -2079,6 +2080,71 @@ impl PackRuntime {
         })
     }
 
+    /// Call the provider component's `identify-instance` export
+    /// (`greentic:provider-instance-identity@0.1.0`) with the inbound
+    /// payload bytes. Returns the `provider_id` the component asserts the
+    /// payload belongs to, or `None` if the payload does not match any
+    /// known instance.
+    ///
+    /// Returns `Ok(None)` when the component does not export the
+    /// instance-identity world — opt-in is by component, single-instance
+    /// providers do not have to implement it.
+    pub async fn invoke_identify_instance(
+        &self,
+        binding: &ProviderBinding,
+        payload: Vec<u8>,
+    ) -> Result<Option<String>> {
+        let component_ref_owned = binding.component_ref.clone();
+        let pack_component = self.components.get(&component_ref_owned).with_context(|| {
+            format!("provider component '{component_ref_owned}' not found in pack")
+        })?;
+        let component = pack_component.component.clone();
+
+        let engine = self.engine.clone();
+        let config = Arc::clone(&self.config);
+        let http_client = Arc::clone(&self.http_client);
+        let mocks = self.mocks.clone();
+        let session_store = self.session_store.clone();
+        let state_store = self.state_store.clone();
+        let secrets = Arc::clone(&self.secrets);
+        let oauth_config = self.oauth_config.clone();
+        let wasi_policy = Arc::clone(&self.wasi_policy);
+        let pack_id = self.metadata().pack_id.clone();
+        let allow_state_store = self.allows_state_store(&component_ref_owned);
+
+        run_on_wasi_thread("provider.identify_instance", move || {
+            let mut linker = Linker::new(&engine);
+            register_all(&mut linker, allow_state_store)?;
+            add_component_control_to_linker(&mut linker)?;
+            let host_state = HostState::new(
+                pack_id.clone(),
+                config,
+                http_client,
+                mocks,
+                session_store,
+                state_store,
+                secrets,
+                oauth_config,
+                None,
+                Some(component_ref_owned.clone()),
+                true,
+            )?;
+            let store_state = ComponentState::new(host_state, wasi_policy)?;
+            let mut store = wasmtime::Store::new(&engine, store_state);
+
+            let pre_instance = linker.instantiate_pre(component.as_ref())?;
+            let pre = match InstanceIdentityPre::<ComponentState>::new(pre_instance) {
+                Ok(pre) => pre,
+                Err(err) if is_missing_export_error(&format!("{err:#}")) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+            let api = bindings.greentic_provider_instance_identity_instance_identity_api();
+            let result = api.call_identify_instance(&mut store, &payload)?;
+            Ok(result)
+        })
+    }
+
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
         if let Some(registry) = self.provider_registry.read().clone() {
             return Ok(registry);
@@ -2494,6 +2560,16 @@ fn deserialize_json_bytes(bytes: Vec<u8>) -> Result<Value> {
             .map(Value::String)
             .map_err(|err| anyhow!(err))
     })
+}
+
+/// `wasmtime::component::bindgen!` returns this error shape when a
+/// `*Pre::new(...)` call resolves a world whose required export is
+/// absent on the component. We treat that as "component does not opt
+/// in" and let the caller fall back to the operator's statically
+/// declared instance. Mirrors the same pattern in `invoke_provider`
+/// for the legacy/path schema-core fallback.
+fn is_missing_export_error(message: &str) -> bool {
+    message.contains("no exported instance named") || message.contains("no exported function named")
 }
 
 impl PackFlows {
@@ -4207,6 +4283,20 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    #[test]
+    fn missing_export_error_detection_recognises_bindgen_shapes() {
+        assert!(is_missing_export_error(
+            "instantiation: no exported instance named \
+             `greentic:provider-instance-identity/instance-identity-api@0.1.0`"
+        ));
+        assert!(is_missing_export_error(
+            "instantiation: no exported function named `identify-instance`"
+        ));
+        assert!(!is_missing_export_error(
+            "Wasm trap: out of bounds memory access"
+        ));
     }
 }
 
