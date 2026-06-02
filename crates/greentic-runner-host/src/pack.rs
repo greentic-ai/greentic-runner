@@ -2173,6 +2173,72 @@ impl PackRuntime {
         })
     }
 
+    /// Fan out [`invoke_identify_instance`] over each requested
+    /// `provider_type`. For each type the registry resolves a single
+    /// [`ProviderBinding`] (the existing M1.1 invariant) and the probe is
+    /// invoked. The result map is keyed by the input `provider_type`:
+    ///
+    /// - `Some(provider_id)` ⇒ the component recognised the payload and
+    ///   returned an instance identifier;
+    /// - `None` ⇒ the component returned `NoMatch` (the export ran and
+    ///   declined the payload) **or** [`IdentifyOutcome::Unsupported`] (no
+    ///   `identify-instance` export in this pack) **or** there is no binding
+    ///   in this pack for that type (the pack ships a different set of
+    ///   provider classes).
+    ///
+    /// Per-type errors are NOT swallowed — wasmtime traps, instantiation
+    /// failures, and other infrastructure errors surface so the caller can
+    /// distinguish "the component said no" from "the component crashed".
+    /// `provider_id`-collision errors raised by [`ProviderRegistry::resolve`]
+    /// against a `provider_type` query (M1.1 invariant violation) are also
+    /// propagated — they indicate a malformed pack, not a clean miss.
+    ///
+    /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    pub async fn identify_endpoints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, Option<String>>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            // No manifest ⇒ no provider registry ⇒ every type is a clean miss.
+            // Single-pack legacy tests rely on this.
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), None);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                // Resolver returns Err for both "no binding for this type" and
+                // "multiple bindings". The first is a clean miss; the second
+                // is an M1.1 invariant violation we MUST surface.
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), None);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let outcome = self
+                .invoke_identify_instance(&binding, payload.to_vec())
+                .await?;
+            let resolved = match outcome {
+                IdentifyOutcome::Identified(id) => Some(id),
+                IdentifyOutcome::NoMatch | IdentifyOutcome::Unsupported => None,
+            };
+            out.insert((*ty).to_string(), resolved);
+        }
+        Ok(out)
+    }
+
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
         if let Some(registry) = self.provider_registry.read().clone() {
             return Ok(registry);

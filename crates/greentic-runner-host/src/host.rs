@@ -208,6 +208,72 @@ impl RunnerHost {
         self.dispatch_activity(&runtime, tenant, activity).await
     }
 
+    /// Per-revision per-`provider_type` `identify-instance` probe (M1 IID.4).
+    ///
+    /// Given the candidate `provider_types` an env declares messaging
+    /// endpoints for, ask each pack loaded under this revision (main +
+    /// overlays) which `provider_id` the inbound `payload` claims to address.
+    /// The greentic-start resolver pairs the returned `provider_id` with the
+    /// `provider_type` and looks the `MessagingEndpointId` up in the env's
+    /// admit table; that's how a header-less webhook gets auto-routed to the
+    /// right endpoint.
+    ///
+    /// Returns a `HashMap` keyed by the input `provider_type` strings:
+    ///
+    /// - `Some(provider_id)` ⇒ a pack's component identified the payload
+    ///   (the first hit across `main_pack` + `overlays` wins; identical
+    ///   payloads should yield identical ids across packs by construction);
+    /// - `None` ⇒ no pack recognised the payload for this type (either the
+    ///   pack ships no binding for the type, the binding has no
+    ///   `identify-instance` export, or every export returned `NoMatch`).
+    ///
+    /// Component traps and other infrastructure errors propagate as `Err`;
+    /// the caller distinguishes them from a clean miss via the `?`.
+    pub async fn identify_messaging_endpoints_for_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, Option<String>>> {
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self
+            .active
+            .load_revision(tenant, deployment_id, bundle_id, revision_id)
+            .with_context(|| {
+                format!(
+                    "revision runtime not loaded for tenant {tenant} \
+                     (deployment {deployment_id}, revision {revision_id})"
+                )
+            })?;
+        let mut merged: HashMap<String, Option<String>> = provider_types
+            .iter()
+            .map(|ty| ((*ty).to_string(), None))
+            .collect();
+        let mut remaining: Vec<&str> = provider_types.to_vec();
+        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .identify_endpoints_by_provider_type(&remaining, payload)
+                .await?;
+            remaining.retain(|ty| {
+                if let Some(Some(id)) = probe.get(*ty) {
+                    merged.insert((*ty).to_string(), Some(id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        Ok(merged)
+    }
+
     /// Shared activity-execution body: resolve the flow, build the canonical
     /// ingress envelope, run the state machine, and normalize replies. Both the
     /// legacy and revision entry points funnel through here so flow resolution
@@ -895,6 +961,82 @@ mod welcome_flow_tests {
             next.pack_id.as_deref(),
             Some("pack.welcome"),
             "no marker leaked from hint-absent path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_endpoints_tests {
+    use super::*;
+
+    fn dummy_runner_host() -> RunnerHost {
+        let session_store = new_session_store();
+        let state_store = new_state_store();
+        RunnerHost {
+            configs: HashMap::new(),
+            active: Arc::new(ActivePacks::new()),
+            health: Arc::new(HealthState::new()),
+            session_host: session_host_from(session_store.clone()),
+            state_host: state_host_from(state_store.clone()),
+            session_store,
+            state_store,
+            wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            secrets_manager: default_manager().expect("default secrets manager"),
+            telemetry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_types_returns_empty_map_without_loading_revision() {
+        // No revision is loaded; this proves the fast-path short-circuits
+        // before `load_revision` so the caller can ask "any types?" cheaply
+        // when an env declares zero messaging endpoints.
+        let host = dummy_runner_host();
+        let map = host
+            .identify_messaging_endpoints_for_revision(
+                "demo",
+                DeploymentId::new(),
+                BundleId::new("anything"),
+                RevisionId::new(),
+                &[],
+                b"{}",
+            )
+            .await
+            .expect("empty types is the cheap fast path");
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_revision_surfaces_clear_error() {
+        // Non-empty types but the revision was never loaded — the error
+        // chain must name the revision so operators can correlate it with
+        // their dispatch log.
+        let host = dummy_runner_host();
+        let deployment = DeploymentId::new();
+        let revision = RevisionId::new();
+        let err = host
+            .identify_messaging_endpoints_for_revision(
+                "demo",
+                deployment,
+                BundleId::new("missing"),
+                revision,
+                &["teams"],
+                b"{}",
+            )
+            .await
+            .expect_err("missing revision must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("revision runtime not loaded"),
+            "error chain should name the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains(&deployment.to_string()),
+            "error chain should name the deployment id, got: {msg}"
+        );
+        assert!(
+            msg.contains(&revision.to_string()),
+            "error chain should name the revision id, got: {msg}"
         );
     }
 }
