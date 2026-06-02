@@ -403,12 +403,7 @@ impl FlowEngine {
         .await;
         let status = if result.is_ok() { "ok" } else { "err" };
         let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-        crate::metrics::record_flow_execution(
-            &metric_tenant,
-            &metric_flow_id,
-            status,
-            duration_ms,
-        );
+        crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
         result
     }
 
