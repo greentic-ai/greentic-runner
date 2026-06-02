@@ -153,6 +153,24 @@ pub enum IdentifyOutcome {
     Identified(String),
 }
 
+impl IdentifyOutcome {
+    /// Merge `other` into `self` per the lattice
+    /// `Identified > NoMatch > Unsupported`. Used by callers fanning the probe
+    /// out over multiple packs (overlays) where the strongest signal across
+    /// packs wins.
+    pub fn merge_in(&mut self, other: IdentifyOutcome) {
+        match (&*self, &other) {
+            // Identified is the top — never gets overwritten.
+            (IdentifyOutcome::Identified(_), _) => {}
+            // Promote to Identified from anything else.
+            (_, IdentifyOutcome::Identified(_)) => *self = other,
+            // NoMatch promotes Unsupported but cannot downgrade itself.
+            (IdentifyOutcome::Unsupported, IdentifyOutcome::NoMatch) => *self = other,
+            _ => {}
+        }
+    }
+}
+
 fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -2171,6 +2189,71 @@ impl PackRuntime {
                 None => IdentifyOutcome::NoMatch,
             })
         })
+    }
+
+    /// Fan out [`invoke_identify_instance`] over each requested
+    /// `provider_type`. For each type the registry resolves a single
+    /// [`ProviderBinding`] (the existing M1.1 invariant) and the probe is
+    /// invoked. The result map is keyed by the input `provider_type` with
+    /// the three-state [`IdentifyOutcome`] preserved verbatim:
+    ///
+    /// - [`IdentifyOutcome::Identified`] — the component recognised the
+    ///   payload and returned a `provider_id`;
+    /// - [`IdentifyOutcome::NoMatch`] — the component exported the world
+    ///   and explicitly declined the payload. Caller MUST fail closed.
+    /// - [`IdentifyOutcome::Unsupported`] — no binding for this
+    ///   `provider_type` in this pack, OR the binding's component does not
+    ///   export the `identify-instance` world. Both are caller-fallback-safe
+    ///   (fall back to the statically-declared `provider_id`).
+    ///
+    /// Per-type errors are NOT swallowed — wasmtime traps, instantiation
+    /// failures, and other infrastructure errors surface so the caller can
+    /// distinguish "the component said no" from "the component crashed".
+    /// `provider_id`-collision errors raised by [`ProviderRegistry::resolve`]
+    /// against a `provider_type` query (M1.1 invariant violation) are also
+    /// propagated — they indicate a malformed pack, not a clean miss.
+    ///
+    /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    pub async fn identify_endpoints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            // No manifest ⇒ no provider registry ⇒ every type is Unsupported.
+            // Single-pack legacy tests rely on this fast path.
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                // Resolver returns Err for both "no binding for this type" and
+                // "multiple bindings". The first collapses into Unsupported
+                // (caller-fallback-safe, same as no-export); the second is an
+                // M1.1 invariant violation we MUST surface.
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let outcome = self
+                .invoke_identify_instance(&binding, payload.to_vec())
+                .await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
     }
 
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
@@ -4350,6 +4433,128 @@ mod tests {
         assert!(!is_missing_export_error(
             "instantiation: no exported function named `invoke`"
         ));
+    }
+
+    #[test]
+    fn identify_outcome_merge_in_follows_lattice() {
+        let unsupported = || IdentifyOutcome::Unsupported;
+        let no_match = || IdentifyOutcome::NoMatch;
+        let id_a = || IdentifyOutcome::Identified("a".to_string());
+        let id_b = || IdentifyOutcome::Identified("b".to_string());
+
+        // Unsupported is the floor — every other variant promotes it.
+        let mut x = unsupported();
+        x.merge_in(unsupported());
+        assert_eq!(x, unsupported());
+        let mut x = unsupported();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = unsupported();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a());
+
+        // NoMatch beats Unsupported but is overridable by Identified.
+        let mut x = no_match();
+        x.merge_in(unsupported());
+        assert_eq!(x, no_match(), "NoMatch must not downgrade to Unsupported");
+        let mut x = no_match();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = no_match();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a(), "Identified must override NoMatch");
+
+        // Identified is the top — nothing overwrites it (first id wins).
+        let mut x = id_a();
+        x.merge_in(unsupported());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(no_match());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(id_b());
+        assert_eq!(
+            x,
+            id_a(),
+            "first Identified wins; later id does not replace"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_endpoints_pack_tests {
+    use super::*;
+    use crate::config::{
+        FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
+        WebhookPolicy,
+    };
+    use crate::trace::TraceConfig;
+    use crate::validate::ValidationConfig;
+
+    fn test_host_config() -> HostConfig {
+        HostConfig {
+            tenant: "test".to_string(),
+            bindings_path: PathBuf::from("/tmp/bindings.yaml"),
+            flow_type_bindings: HashMap::new(),
+            rate_limits: RateLimits::default(),
+            retry: FlowRetryConfig::default(),
+            http_enabled: false,
+            secrets_policy: SecretsPolicy::allow_all(),
+            state_store_policy: StateStorePolicy::default(),
+            webhook_policy: WebhookPolicy::default(),
+            timers: Vec::new(),
+            oauth: None,
+            mocks: None,
+            pack_bindings: Vec::new(),
+            env_passthrough: Vec::new(),
+            trace: TraceConfig::from_env(),
+            validation: ValidationConfig::from_env(),
+            operator_policy: OperatorPolicy::allow_all(),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_manifest_returns_unsupported_for_all_types() {
+        // A PackRuntime with manifest: None (e.g. legacy single-component
+        // packs or the for_component_test constructor) has no provider
+        // registry. Every requested type must map to Unsupported — NOT
+        // NoMatch — so the caller knows it can fall back to the static
+        // provider_id rather than failing closed.
+        let pack = PackRuntime::for_component_test(
+            Vec::new(),
+            HashMap::new(),
+            "test-pack",
+            Arc::new(test_host_config()),
+        )
+        .expect("empty pack construction");
+        let result = pack
+            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], b"{}")
+            .await
+            .expect("no-manifest path must succeed");
+        assert_eq!(result.len(), 3);
+        for ty in &["teams", "slack", "telegram"] {
+            assert_eq!(
+                result.get(*ty),
+                Some(&IdentifyOutcome::Unsupported),
+                "type '{ty}' must be Unsupported when pack has no manifest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_types_returns_empty_map() {
+        let pack = PackRuntime::for_component_test(
+            Vec::new(),
+            HashMap::new(),
+            "test-pack",
+            Arc::new(test_host_config()),
+        )
+        .expect("empty pack construction");
+        let result = pack
+            .identify_endpoints_by_provider_type(&[], b"{}")
+            .await
+            .expect("empty types fast path");
+        assert!(result.is_empty());
     }
 }
 

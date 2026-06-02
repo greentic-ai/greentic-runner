@@ -11,7 +11,7 @@ use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::{FlowResumeStore, IngressEnvelope};
 use crate::http::health::HealthState;
-use crate::pack::PackRuntime;
+use crate::pack::{IdentifyOutcome, PackRuntime};
 use crate::runner::adapt_timer;
 use crate::runner::engine::FlowEngine;
 use crate::runtime::{ActivePacks, TenantRuntime};
@@ -206,6 +206,79 @@ impl RunnerHost {
                 )
             })?;
         self.dispatch_activity(&runtime, tenant, activity).await
+    }
+
+    /// Per-revision per-`provider_type` `identify-instance` probe (M1 IID.4).
+    ///
+    /// Given the candidate `provider_types` an env declares messaging
+    /// endpoints for, ask each pack loaded under this revision (main +
+    /// overlays) which `provider_id` the inbound `payload` claims to address.
+    /// The greentic-start resolver pairs the returned `provider_id` with the
+    /// `provider_type` and looks the `MessagingEndpointId` up in the env's
+    /// admit table; that's how a header-less webhook gets auto-routed to the
+    /// right endpoint.
+    ///
+    /// Returns a `HashMap` keyed by the input `provider_type` strings,
+    /// carrying the three-state [`IdentifyOutcome`] per the WIT contract:
+    ///
+    /// - [`IdentifyOutcome::Identified`] — first pack to return an id wins;
+    ///   that type drops out of remaining probing.
+    /// - [`IdentifyOutcome::NoMatch`] — at least one pack exported the world
+    ///   and explicitly declined. Beats `Unsupported` (cannot be downgraded
+    ///   back). Probing continues (a later pack may still `Identified`).
+    /// - [`IdentifyOutcome::Unsupported`] — the floor state; persists only
+    ///   when every probed pack returned `Unsupported` (no binding or no
+    ///   export). Caller may fall back to the static `provider_id`.
+    ///
+    /// Component traps and other infrastructure errors propagate as `Err`;
+    /// the caller distinguishes them from a clean miss via the `?`.
+    pub async fn identify_messaging_endpoints_for_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self
+            .active
+            .load_revision(tenant, deployment_id, bundle_id, revision_id)
+            .with_context(|| {
+                format!(
+                    "revision runtime not loaded for tenant {tenant} \
+                     (deployment {deployment_id}, revision {revision_id})"
+                )
+            })?;
+        // Seed every type at Unsupported — the floor of the merge lattice
+        // (see `IdentifyOutcome::merge_in`).
+        let mut merged: HashMap<String, IdentifyOutcome> = provider_types
+            .iter()
+            .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
+            .collect();
+        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+            // Skip types already at the lattice top — no probe could improve them.
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| !matches!(merged.get(*ty), Some(IdentifyOutcome::Identified(_))))
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .identify_endpoints_by_provider_type(&remaining, payload)
+                .await?;
+            for (ty, outcome) in probe {
+                if let Some(existing) = merged.get_mut(&ty) {
+                    existing.merge_in(outcome);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Shared activity-execution body: resolve the flow, build the canonical
@@ -895,6 +968,82 @@ mod welcome_flow_tests {
             next.pack_id.as_deref(),
             Some("pack.welcome"),
             "no marker leaked from hint-absent path"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_endpoints_tests {
+    use super::*;
+
+    fn dummy_runner_host() -> RunnerHost {
+        let session_store = new_session_store();
+        let state_store = new_state_store();
+        RunnerHost {
+            configs: HashMap::new(),
+            active: Arc::new(ActivePacks::new()),
+            health: Arc::new(HealthState::new()),
+            session_host: session_host_from(session_store.clone()),
+            state_host: state_host_from(state_store.clone()),
+            session_store,
+            state_store,
+            wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            secrets_manager: default_manager().expect("default secrets manager"),
+            telemetry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_types_returns_empty_map_without_loading_revision() {
+        // No revision is loaded; this proves the fast-path short-circuits
+        // before `load_revision` so the caller can ask "any types?" cheaply
+        // when an env declares zero messaging endpoints.
+        let host = dummy_runner_host();
+        let map = host
+            .identify_messaging_endpoints_for_revision(
+                "demo",
+                DeploymentId::new(),
+                BundleId::new("anything"),
+                RevisionId::new(),
+                &[],
+                b"{}",
+            )
+            .await
+            .expect("empty types is the cheap fast path");
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_revision_surfaces_clear_error() {
+        // Non-empty types but the revision was never loaded — the error
+        // chain must name the revision so operators can correlate it with
+        // their dispatch log.
+        let host = dummy_runner_host();
+        let deployment = DeploymentId::new();
+        let revision = RevisionId::new();
+        let err = host
+            .identify_messaging_endpoints_for_revision(
+                "demo",
+                deployment,
+                BundleId::new("missing"),
+                revision,
+                &["teams"],
+                b"{}",
+            )
+            .await
+            .expect_err("missing revision must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("revision runtime not loaded"),
+            "error chain should name the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains(&deployment.to_string()),
+            "error chain should name the deployment id, got: {msg}"
+        );
+        assert!(
+            msg.contains(&revision.to_string()),
+            "error chain should name the revision id, got: {msg}"
         );
     }
 }
