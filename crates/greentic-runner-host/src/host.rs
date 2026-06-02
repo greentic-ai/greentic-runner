@@ -218,6 +218,19 @@ impl RunnerHost {
     /// admit table; that's how a header-less webhook gets auto-routed to the
     /// right endpoint.
     ///
+    /// # Payload shape (M1 IID.4d wrapper)
+    ///
+    /// `payload` is forwarded opaque to every probed component. The shape
+    /// is the caller's contract; the M1 IID.4d convention from
+    /// `greentic-start` is `{headers: [{name,value}], body: <parsed-or-null>}`,
+    /// which lets providers whose discriminator lives in HTTP headers
+    /// (Telegram via `x-telegram-bot-api-secret-token`) identify the
+    /// instance from the same payload shape that body-based providers
+    /// (Teams `recipient.id`, Slack `team_id`, etc.) use. See the WIT
+    /// docstring on
+    /// `greentic:provider-instance-identity@0.1.0/identify-instance` for the
+    /// full contract.
+    ///
     /// Returns a `HashMap` keyed by the input `provider_type` strings,
     /// carrying the three-state [`IdentifyOutcome`] per the WIT contract:
     ///
