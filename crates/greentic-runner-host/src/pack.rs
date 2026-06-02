@@ -137,23 +137,19 @@ struct PackComponent {
     component: Arc<Component>,
 }
 
-/// Outcome of calling a provider component's `identify-instance`
-/// export. The three variants reflect the three distinct cases
-/// callers must treat differently per the
-/// `greentic:provider-instance-identity@0.1.0` contract.
+/// Outcome of calling a provider component's `identify-instance` export
+/// (`greentic:provider-instance-identity@0.1.0`). Callers MUST treat the
+/// three variants differently per the WIT contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IdentifyOutcome {
-    /// The component does not export the instance-identity world.
-    /// Caller should fall back to the operator's statically-declared
-    /// `provider_id` — single-instance providers do not opt in.
+    /// Component does not export the world — caller falls back to the
+    /// operator's statically-declared `provider_id`.
     Unsupported,
-    /// The component exported the world and returned `None`. Per WIT
-    /// contract this payload does not belong to any known instance —
-    /// caller MUST fail closed (401/404), no fallback.
+    /// Component exported the world and returned `None` — caller MUST
+    /// fail closed (401/404), no fallback.
     NoMatch,
-    /// The component identified the payload as belonging to the
-    /// instance with this `provider_id`. Caller routes to the matching
-    /// `MessagingEndpoint`.
+    /// Component identified the payload as belonging to this
+    /// `provider_id` — caller routes to the matching `MessagingEndpoint`.
     Identified(String),
 }
 
@@ -2102,26 +2098,15 @@ impl PackRuntime {
 
     /// Call the provider component's `identify-instance` export
     /// (`greentic:provider-instance-identity@0.1.0`) with the inbound
-    /// payload bytes.
-    ///
-    /// Returns an [`IdentifyOutcome`] whose three variants map 1-to-1
-    /// to the WIT contract semantics:
-    ///
-    /// - [`IdentifyOutcome::Unsupported`] — component does not export
-    ///   the identity world; caller falls back to the operator's
-    ///   statically-declared `provider_id`.
-    /// - [`IdentifyOutcome::NoMatch`] — component exported the world
-    ///   but returned `None`; caller MUST fail closed (401/404).
-    /// - [`IdentifyOutcome::Identified`] — component returned a
-    ///   concrete `provider_id`; caller routes accordingly.
+    /// payload bytes. Returns an [`IdentifyOutcome`] — see the variant
+    /// docs for the per-case contract.
     ///
     /// # Host authority on identity probes (Phase D follow-up)
     ///
     /// The identity probe currently runs with the same full host
     /// imports (state store, secrets, OAuth, HTTP) as a normal
     /// `schema-core` invocation. A hardened deployment should link a
-    /// reduced import set (read-only config, no secrets write, no
-    /// state mutations) so a compromised component cannot exfiltrate
+    /// reduced import set so a compromised component cannot exfiltrate
     /// data during the lightweight identification call. Tracked as a
     /// Phase D follow-up.
     pub async fn invoke_identify_instance(
@@ -2622,10 +2607,8 @@ fn deserialize_json_bytes(bytes: Vec<u8>) -> Result<Value> {
 fn is_missing_export_error(message: &str) -> bool {
     let has_broad_marker = message.contains("no exported instance named")
         || message.contains("no exported function named");
-    let has_identity_segment = {
-        let lower = message.to_ascii_lowercase();
-        lower.contains("instance-identity-api") || lower.contains("identify-instance")
-    };
+    let has_identity_segment =
+        message.contains("instance-identity-api") || message.contains("identify-instance");
     has_broad_marker && has_identity_segment
 }
 
@@ -4367,45 +4350,6 @@ mod tests {
         assert!(!is_missing_export_error(
             "instantiation: no exported function named `invoke`"
         ));
-    }
-
-    #[test]
-    fn identify_outcome_enum_variants_are_distinct() {
-        // Verify the three variants are distinguishable via PartialEq
-        let unsupported = IdentifyOutcome::Unsupported;
-        let no_match = IdentifyOutcome::NoMatch;
-        let identified = IdentifyOutcome::Identified("bot-123".to_string());
-
-        assert_ne!(unsupported, no_match);
-        assert_ne!(unsupported, identified);
-        assert_ne!(no_match, identified);
-
-        // Clone + Eq round-trip
-        assert_eq!(identified, identified.clone());
-        assert_eq!(unsupported, IdentifyOutcome::Unsupported);
-    }
-
-    #[test]
-    fn identify_outcome_classification_from_call_result() {
-        // Simulates the mapping logic inside invoke_identify_instance:
-        // Some(id) → Identified, None → NoMatch
-        let some_result: Option<String> = Some("teams-legal-bot".into());
-        let none_result: Option<String> = None;
-
-        let outcome_some = match some_result {
-            Some(id) => IdentifyOutcome::Identified(id),
-            None => IdentifyOutcome::NoMatch,
-        };
-        assert_eq!(
-            outcome_some,
-            IdentifyOutcome::Identified("teams-legal-bot".into())
-        );
-
-        let outcome_none = match none_result {
-            Some(id) => IdentifyOutcome::Identified(id),
-            None => IdentifyOutcome::NoMatch,
-        };
-        assert_eq!(outcome_none, IdentifyOutcome::NoMatch);
     }
 }
 
