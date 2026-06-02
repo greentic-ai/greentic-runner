@@ -253,18 +253,18 @@ impl RunnerHost {
                      (deployment {deployment_id}, revision {revision_id})"
                 )
             })?;
-        // Seed every type at Unsupported — the floor of the merge lattice.
+        // Seed every type at Unsupported — the floor of the merge lattice
+        // (see `IdentifyOutcome::merge_in`).
         let mut merged: HashMap<String, IdentifyOutcome> = provider_types
             .iter()
             .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
             .collect();
-        // Types already resolved to Identified — no further probing needed.
-        let mut resolved: std::collections::HashSet<String> = std::collections::HashSet::new();
         for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+            // Skip types already at the lattice top — no probe could improve them.
             let remaining: Vec<&str> = provider_types
                 .iter()
                 .copied()
-                .filter(|ty| !resolved.contains(*ty))
+                .filter(|ty| !matches!(merged.get(*ty), Some(IdentifyOutcome::Identified(_))))
                 .collect();
             if remaining.is_empty() {
                 break;
@@ -273,23 +273,8 @@ impl RunnerHost {
                 .identify_endpoints_by_provider_type(&remaining, payload)
                 .await?;
             for (ty, outcome) in probe {
-                match outcome {
-                    IdentifyOutcome::Identified(_) => {
-                        merged.insert(ty.clone(), outcome);
-                        resolved.insert(ty);
-                    }
-                    IdentifyOutcome::NoMatch => {
-                        // NoMatch beats Unsupported, but cannot override Identified
-                        // (already removed from remaining) or downgrade to Unsupported.
-                        merged.entry(ty).and_modify(|existing| {
-                            if matches!(existing, IdentifyOutcome::Unsupported) {
-                                *existing = IdentifyOutcome::NoMatch;
-                            }
-                        });
-                    }
-                    IdentifyOutcome::Unsupported => {
-                        // Floor — never overrides anything.
-                    }
+                if let Some(existing) = merged.get_mut(&ty) {
+                    existing.merge_in(outcome);
                 }
             }
         }

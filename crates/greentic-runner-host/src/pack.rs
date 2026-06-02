@@ -153,6 +153,24 @@ pub enum IdentifyOutcome {
     Identified(String),
 }
 
+impl IdentifyOutcome {
+    /// Merge `other` into `self` per the lattice
+    /// `Identified > NoMatch > Unsupported`. Used by callers fanning the probe
+    /// out over multiple packs (overlays) where the strongest signal across
+    /// packs wins.
+    pub fn merge_in(&mut self, other: IdentifyOutcome) {
+        match (&*self, &other) {
+            // Identified is the top — never gets overwritten.
+            (IdentifyOutcome::Identified(_), _) => {}
+            // Promote to Identified from anything else.
+            (_, IdentifyOutcome::Identified(_)) => *self = other,
+            // NoMatch promotes Unsupported but cannot downgrade itself.
+            (IdentifyOutcome::Unsupported, IdentifyOutcome::NoMatch) => *self = other,
+            _ => {}
+        }
+    }
+}
+
 fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -4415,6 +4433,51 @@ mod tests {
         assert!(!is_missing_export_error(
             "instantiation: no exported function named `invoke`"
         ));
+    }
+
+    #[test]
+    fn identify_outcome_merge_in_follows_lattice() {
+        let unsupported = || IdentifyOutcome::Unsupported;
+        let no_match = || IdentifyOutcome::NoMatch;
+        let id_a = || IdentifyOutcome::Identified("a".to_string());
+        let id_b = || IdentifyOutcome::Identified("b".to_string());
+
+        // Unsupported is the floor — every other variant promotes it.
+        let mut x = unsupported();
+        x.merge_in(unsupported());
+        assert_eq!(x, unsupported());
+        let mut x = unsupported();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = unsupported();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a());
+
+        // NoMatch beats Unsupported but is overridable by Identified.
+        let mut x = no_match();
+        x.merge_in(unsupported());
+        assert_eq!(x, no_match(), "NoMatch must not downgrade to Unsupported");
+        let mut x = no_match();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = no_match();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a(), "Identified must override NoMatch");
+
+        // Identified is the top — nothing overwrites it (first id wins).
+        let mut x = id_a();
+        x.merge_in(unsupported());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(no_match());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(id_b());
+        assert_eq!(
+            x,
+            id_a(),
+            "first Identified wins; later id does not replace"
+        );
     }
 }
 
