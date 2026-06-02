@@ -27,6 +27,7 @@ use crate::validate::{
     ValidationConfig, ValidationIssue, ValidationMode, validate_component_envelope,
     validate_tool_envelope,
 };
+use greentic_flow::SLOT_SCHEMA_METADATA_KEY;
 use greentic_types::{Flow, Node, NodeId, Routing};
 
 /// Component ID of the slot-extractor WASM component. Used to detect
@@ -1898,7 +1899,7 @@ impl From<Flow> for HostFlow {
         let slot_schema = value
             .metadata
             .extra
-            .get("greentic.slot_schema")
+            .get(SLOT_SCHEMA_METADATA_KEY)
             .filter(|v| !v.is_null())
             .cloned();
         Self {
@@ -3566,7 +3567,7 @@ mod tests {
                 title: None,
                 description: None,
                 tags: BTreeSet::new(),
-                extra: json!({"greentic.slot_schema": schema}),
+                extra: json!({(SLOT_SCHEMA_METADATA_KEY): schema}),
             },
         };
         let host = HostFlow::from(flow);
@@ -3696,7 +3697,8 @@ mod tests {
     #[test]
     fn compile_flow_round_trips_slot_schema_into_host_flow() {
         let slot_defs = json!([
-            { "name": "counterparty", "slot_type": "string", "required": true },
+            { "name": "counterparty", "slot_type": "string", "required": true,
+              "pattern": ".+" },
             { "name": "due_date", "slot_type": "date", "required": true,
               "pattern": "\\d{4}-\\d{2}-\\d{2}" }
         ]);
@@ -3709,7 +3711,7 @@ mod tests {
 
         let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
         assert_eq!(
-            flow.metadata.extra.get("greentic.slot_schema"),
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY),
             Some(&slot_defs),
             "compile_flow must forward slot_schema into metadata.extra"
         );
@@ -3731,7 +3733,7 @@ mod tests {
 
         let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
         assert!(
-            flow.metadata.extra.get("greentic.slot_schema").is_none(),
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY).is_none(),
             "metadata.extra must not contain greentic.slot_schema when FlowDoc.slot_schema is None"
         );
 
