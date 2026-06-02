@@ -2119,6 +2119,19 @@ impl PackRuntime {
     /// payload bytes. Returns an [`IdentifyOutcome`] — see the variant
     /// docs for the per-case contract.
     ///
+    /// # Payload shape (M1 IID.4d wrapper)
+    ///
+    /// `payload` is forwarded opaque to the component. The shape is set by
+    /// the caller; the M1 IID.4d wrapper convention from `greentic-start`
+    /// is `{headers: [{name,value}], body: <parsed-or-null>}` so providers
+    /// whose discriminator lives in HTTP headers (Telegram via
+    /// `x-telegram-bot-api-secret-token`) can identify the instance the
+    /// same call shape that body-based providers (Teams, Slack, Webex,
+    /// etc.) use. See the docstring on
+    /// `greentic:provider-instance-identity/instance-identity-api.identify-instance`
+    /// for the full contract; this host method does not parse or
+    /// validate the bytes.
+    ///
     /// # Host authority on identity probes (Phase D follow-up)
     ///
     /// The identity probe currently runs with the same full host
