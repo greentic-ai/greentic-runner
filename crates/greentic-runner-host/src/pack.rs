@@ -2367,27 +2367,28 @@ impl PackRuntime {
     /// against a `provider_type` query are propagated (M1.1 invariant
     /// violation, malformed pack).
     ///
-    /// Fan out an async probe `f` over each requested `provider_type`. The
-    /// registry resolves one [`ProviderBinding`] per type (M1.1 invariant);
-    /// types with no binding receive `default()` and skip the probe. The
-    /// "no provider runtime found for type" miss is the only error variant
-    /// the resolver classifies as a clean miss; everything else (notably
-    /// the M1.1 multi-binding collision) is propagated as `Err`.
-    async fn for_each_provider_binding<T, F>(
+    /// Fan out [`resolve_identify_hint`] across requested types. `None` value
+    /// means the pack has no binding for that type OR the binding's component
+    /// does not export the describe world.
+    ///
+    /// The per-binding loop is inlined (rather than factored into a shared
+    /// `AsyncFnMut`-based helper) deliberately: routing through an
+    /// `AsyncFnMut` closure destabilises HRTB `Send` inference for the
+    /// returned future, which propagates up to host-level fan-out APIs and
+    /// from there to downstream spawned-service consumers. See the
+    /// regression test `identify_futures_are_send` on the host.
+    ///
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn describe_identify_hints_by_provider_type(
         &self,
         provider_types: &[&str],
-        default: impl Fn() -> T,
-        mut f: F,
-    ) -> Result<HashMap<String, T>>
-    where
-        F: AsyncFnMut(&ProviderBinding) -> Result<T>,
-    {
+    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
         let mut out = HashMap::with_capacity(provider_types.len());
         let registry = match self.provider_registry_optional()? {
             Some(registry) => registry,
             None => {
                 for ty in provider_types {
-                    out.insert((*ty).to_string(), default());
+                    out.insert((*ty).to_string(), None);
                 }
                 return Ok(out);
             }
@@ -2400,32 +2401,15 @@ impl PackRuntime {
                         .to_string()
                         .starts_with("no provider runtime found for type") =>
                 {
-                    out.insert((*ty).to_string(), default());
+                    out.insert((*ty).to_string(), None);
                     continue;
                 }
                 Err(err) => return Err(err),
             };
-            let value = f(&binding).await?;
-            out.insert((*ty).to_string(), value);
+            let hint = self.resolve_identify_hint(&binding).await;
+            out.insert((*ty).to_string(), hint);
         }
         Ok(out)
-    }
-
-    /// Fan out [`resolve_identify_hint`] across requested types. `None` value
-    /// means the pack has no binding for that type OR the binding's component
-    /// does not export the describe world.
-    ///
-    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
-    pub async fn describe_identify_hints_by_provider_type(
-        &self,
-        provider_types: &[&str],
-    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
-        self.for_each_provider_binding(
-            provider_types,
-            || None,
-            async |binding| Ok(self.resolve_identify_hint(binding).await),
-        )
-        .await
     }
 
     /// Unscoped legacy API: fan out [`invoke_identify_instance`] with the
@@ -2434,21 +2418,46 @@ impl PackRuntime {
     /// scoping. New callers should use the `_scoped` sibling for
     /// per-provider header allowlist scoping (Phase D).
     ///
+    /// See [`describe_identify_hints_by_provider_type`] for the rationale
+    /// behind inlining the per-binding loop.
+    ///
     /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    /// [`describe_identify_hints_by_provider_type`]:
+    ///     PackRuntime::describe_identify_hints_by_provider_type
     pub async fn identify_endpoints_by_provider_type(
         &self,
         provider_types: &[&str],
         payload: &[u8],
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        self.for_each_provider_binding(
-            provider_types,
-            || IdentifyOutcome::Unsupported,
-            async |binding| {
-                self.invoke_identify_instance(binding, payload.to_vec())
-                    .await
-            },
-        )
-        .await
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let outcome = self
+                .invoke_identify_instance(&binding, payload.to_vec())
+                .await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
     }
 
     /// Per-provider scoped variant of [`identify_endpoints_by_provider_type`].
@@ -2459,25 +2468,49 @@ impl PackRuntime {
     /// their hint declares; unhinted providers see every header passed in.
     /// Result-map semantics match the unscoped variant.
     ///
+    /// See [`describe_identify_hints_by_provider_type`] for the rationale
+    /// behind inlining the per-binding loop.
+    ///
     /// [`identify_endpoints_by_provider_type`]:
     ///     PackRuntime::identify_endpoints_by_provider_type
     /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    /// [`describe_identify_hints_by_provider_type`]:
+    ///     PackRuntime::describe_identify_hints_by_provider_type
     pub async fn identify_endpoints_by_provider_type_scoped(
         &self,
         provider_types: &[&str],
         headers: &[(String, String)],
         body: &Value,
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        self.for_each_provider_binding(
-            provider_types,
-            || IdentifyOutcome::Unsupported,
-            async |binding| {
-                let hint = self.resolve_identify_hint(binding).await;
-                let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
-                self.invoke_identify_instance(binding, payload).await
-            },
-        )
-        .await
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let hint = self.resolve_identify_hint(&binding).await;
+            let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
+            let outcome = self.invoke_identify_instance(&binding, payload).await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
     }
 
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
