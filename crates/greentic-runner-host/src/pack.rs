@@ -2319,16 +2319,34 @@ impl PackRuntime {
     /// first ask and reuse thereafter. `ArcSwap`-driven revision swaps
     /// allocate a fresh [`PackRuntime`], naturally invalidating the cache.
     ///
+    /// Returns `None` when the component does not export the describe
+    /// world, when the probe returns no hint, or when the probe fails
+    /// (trap, timeout, instantiation error). Failures are warn-logged
+    /// and cached — the same trap is logged once per revision per
+    /// component, not per request.
+    ///
     /// [`invoke_describe_identify_instance`]:
     ///     PackRuntime::invoke_describe_identify_instance
     pub async fn resolve_identify_hint(
         &self,
         binding: &ProviderBinding,
-    ) -> Result<Option<IdentifyInstanceHint>> {
+    ) -> Option<IdentifyInstanceHint> {
         if let Some(cached) = self.identify_hint_cache.read().get(&binding.component_ref) {
-            return Ok(cached.clone());
+            return cached.clone();
         }
-        let hint = self.invoke_describe_identify_instance(binding).await?;
+        let hint = match self.invoke_describe_identify_instance(binding).await {
+            Ok(hint) => hint,
+            Err(err) => {
+                warn!(
+                    event = "provider.describe_identify_instance.failed",
+                    component_ref = %binding.component_ref,
+                    error = %err,
+                    "describe-identify-instance probe failed; \
+                     falling back to unhinted wrapper for this component"
+                );
+                None
+            }
+        };
         // Tolerate a concurrent populate — `insert` is idempotent on the
         // same (component_ref, hint) shape and the probe is pure w.r.t.
         // the component, so re-probing on a write-race yields identical
@@ -2336,7 +2354,7 @@ impl PackRuntime {
         self.identify_hint_cache
             .write()
             .insert(binding.component_ref.clone(), hint.clone());
-        Ok(hint)
+        hint
     }
 
     /// Fan out [`resolve_identify_hint`] over each requested `provider_type`.
@@ -2377,14 +2395,62 @@ impl PackRuntime {
                 }
                 Err(err) => return Err(err),
             };
-            let hint = self.resolve_identify_hint(&binding).await?;
+            let hint = self.resolve_identify_hint(&binding).await;
             out.insert((*ty).to_string(), hint);
         }
         Ok(out)
     }
 
-    /// Fan out [`invoke_identify_instance`] over each requested
-    /// `provider_type`. For each type the registry resolves a single
+    /// Unscoped legacy API: fan out [`invoke_identify_instance`] over each
+    /// requested `provider_type` with the caller-supplied opaque `payload`
+    /// bytes forwarded verbatim. No describe-identify-instance hint lookup,
+    /// no per-provider header scoping.
+    ///
+    /// New callers should use [`identify_endpoints_by_provider_type_scoped`]
+    /// for per-provider header allowlist scoping (Phase D).
+    ///
+    /// [`identify_endpoints_by_provider_type_scoped`]:
+    ///     PackRuntime::identify_endpoints_by_provider_type_scoped
+    /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    pub async fn identify_endpoints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let outcome = self
+                .invoke_identify_instance(&binding, payload.to_vec())
+                .await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
+    }
+
+    /// Per-provider scoped variant of [`identify_endpoints_by_provider_type`].
+    ///
+    /// For each `provider_type` the registry resolves a single
     /// [`ProviderBinding`] (the existing M1.1 invariant) and the probe is
     /// invoked with a wrapper payload built per-provider from
     /// `(headers, body)` and the component's cached identify-instance
@@ -2412,9 +2478,11 @@ impl PackRuntime {
     /// against a `provider_type` query (M1.1 invariant violation) are also
     /// propagated — they indicate a malformed pack, not a clean miss.
     ///
+    /// [`identify_endpoints_by_provider_type`]:
+    ///     PackRuntime::identify_endpoints_by_provider_type
     /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
     /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
-    pub async fn identify_endpoints_by_provider_type(
+    pub async fn identify_endpoints_by_provider_type_scoped(
         &self,
         provider_types: &[&str],
         headers: &[(String, String)],
@@ -2423,8 +2491,6 @@ impl PackRuntime {
         let mut out = HashMap::with_capacity(provider_types.len());
         let registry = match self.provider_registry_optional()? {
             Some(registry) => registry,
-            // No manifest ⇒ no provider registry ⇒ every type is Unsupported.
-            // Single-pack legacy tests rely on this fast path.
             None => {
                 for ty in provider_types {
                     out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
@@ -2435,10 +2501,6 @@ impl PackRuntime {
         for ty in provider_types {
             let binding = match registry.resolve(None, Some(ty)) {
                 Ok(binding) => binding,
-                // Resolver returns Err for both "no binding for this type" and
-                // "multiple bindings". The first collapses into Unsupported
-                // (caller-fallback-safe, same as no-export); the second is an
-                // M1.1 invariant violation we MUST surface.
                 Err(err)
                     if err
                         .to_string()
@@ -2449,7 +2511,7 @@ impl PackRuntime {
                 }
                 Err(err) => return Err(err),
             };
-            let hint = self.resolve_identify_hint(&binding).await?;
+            let hint = self.resolve_identify_hint(&binding).await;
             let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
             let outcome = self.invoke_identify_instance(&binding, payload).await?;
             out.insert((*ty).to_string(), outcome);
@@ -4900,7 +4962,7 @@ mod identify_endpoints_pack_tests {
         )
         .expect("empty pack construction");
         let result = pack
-            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], &[], &Value::Null)
+            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], b"{}")
             .await
             .expect("no-manifest path must succeed");
         assert_eq!(result.len(), 3);
@@ -4923,7 +4985,7 @@ mod identify_endpoints_pack_tests {
         )
         .expect("empty pack construction");
         let result = pack
-            .identify_endpoints_by_provider_type(&[], &[], &Value::Null)
+            .identify_endpoints_by_provider_type(&[], b"{}")
             .await
             .expect("empty types fast path");
         assert!(result.is_empty());
