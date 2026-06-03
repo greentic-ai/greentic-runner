@@ -463,11 +463,7 @@ impl RunnerHost {
         // would let main pack silently shadow an overlay that binds the
         // same provider_type — the identify-side merge lattice can return
         // outcomes from any pack, so the invoke side must refuse to guess.
-        let mut matched: Option<(
-            Arc<PackRuntime>,
-            crate::provider::ProviderBinding,
-            Vec<String>,
-        )> = None;
+        let mut matched = None;
         for pack in runtime.all_packs() {
             let Some(registry) = pack.provider_registry_optional()? else {
                 continue;
@@ -493,7 +489,7 @@ impl RunnerHost {
                  (deployment {deployment_id}, revision {revision_id})"
             );
         };
-        if !declared_ops.iter().any(|declared| declared == op) {
+        if !declared_ops.iter().any(|d| d == op) {
             bail!(
                 "op `{op}` is not declared for provider_type `{provider_type}` \
                  in revision (deployment {deployment_id}, revision {revision_id}); \

@@ -350,7 +350,7 @@ mod tests {
             provider_id: None,
             provider_type: provider_type.to_string(),
             capabilities: Vec::new(),
-            ops: ops.iter().map(|s| (*s).to_string()).collect(),
+            ops: ops.iter().map(|s| s.to_string()).collect(),
             config_schema_ref: None,
             state_schema_ref: None,
             runtime: ProviderExtRuntime {
