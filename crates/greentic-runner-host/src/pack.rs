@@ -2394,17 +2394,9 @@ impl PackRuntime {
             }
         };
         for ty in provider_types {
-            let binding = match registry.resolve(None, Some(ty)) {
-                Ok(binding) => binding,
-                Err(err)
-                    if err
-                        .to_string()
-                        .starts_with("no provider runtime found for type") =>
-                {
-                    out.insert((*ty).to_string(), None);
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), None);
+                continue;
             };
             let hint = self.resolve_identify_hint(&binding).await;
             out.insert((*ty).to_string(), hint);
@@ -2418,8 +2410,8 @@ impl PackRuntime {
     /// scoping. New callers should use the `_scoped` sibling for
     /// per-provider header allowlist scoping (Phase D).
     ///
-    /// See [`describe_identify_hints_by_provider_type`] for the rationale
-    /// behind inlining the per-binding loop.
+    /// Loop inlined for the same reason as
+    /// [`describe_identify_hints_by_provider_type`].
     ///
     /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
     /// [`describe_identify_hints_by_provider_type`]:
@@ -2440,17 +2432,9 @@ impl PackRuntime {
             }
         };
         for ty in provider_types {
-            let binding = match registry.resolve(None, Some(ty)) {
-                Ok(binding) => binding,
-                Err(err)
-                    if err
-                        .to_string()
-                        .starts_with("no provider runtime found for type") =>
-                {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                continue;
             };
             let outcome = self
                 .invoke_identify_instance(&binding, payload.to_vec())
@@ -2468,8 +2452,8 @@ impl PackRuntime {
     /// their hint declares; unhinted providers see every header passed in.
     /// Result-map semantics match the unscoped variant.
     ///
-    /// See [`describe_identify_hints_by_provider_type`] for the rationale
-    /// behind inlining the per-binding loop.
+    /// Loop inlined for the same reason as
+    /// [`describe_identify_hints_by_provider_type`].
     ///
     /// [`identify_endpoints_by_provider_type`]:
     ///     PackRuntime::identify_endpoints_by_provider_type
@@ -2493,17 +2477,9 @@ impl PackRuntime {
             }
         };
         for ty in provider_types {
-            let binding = match registry.resolve(None, Some(ty)) {
-                Ok(binding) => binding,
-                Err(err)
-                    if err
-                        .to_string()
-                        .starts_with("no provider runtime found for type") =>
-                {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                    continue;
-                }
-                Err(err) => return Err(err),
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                continue;
             };
             let hint = self.resolve_identify_hint(&binding).await;
             let payload = build_scoped_identify_payload(headers, body, hint.as_ref());

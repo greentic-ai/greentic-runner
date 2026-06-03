@@ -129,6 +129,33 @@ impl ProviderRegistry {
             .collect()
     }
 
+    /// Resolve `(provider_id, provider_type)` to a binding, returning
+    /// `Ok(None)` when no provider runtime is registered for the type
+    /// (the "missing binding is OK" case for fan-out probes) and `Err`
+    /// only on hard failures (multi-binding collision, id/type mismatch,
+    /// instance-file load errors).
+    ///
+    /// Encapsulates the brittle "no provider runtime found for type"
+    /// string discrimination that fan-out callers (identify-instance,
+    /// describe-identify-instance) need to skip-vs-fail-closed.
+    pub fn try_resolve(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+    ) -> Result<Option<ProviderBinding>> {
+        match self.resolve(provider_id, provider_type) {
+            Ok(binding) => Ok(Some(binding)),
+            Err(err)
+                if err
+                    .to_string()
+                    .starts_with("no provider runtime found for type") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn resolve(
         &self,
         provider_id: Option<&str>,

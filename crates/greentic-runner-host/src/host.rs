@@ -208,6 +208,27 @@ impl RunnerHost {
         self.dispatch_activity(&runtime, tenant, activity).await
     }
 
+    /// Resolve the per-revision tenant runtime, attaching a uniform "not
+    /// loaded" context to the error. The three per-revision identify
+    /// fan-out APIs all need this exact lookup; sharing it keeps the
+    /// error chain identical across them.
+    fn load_revision_runtime(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Result<Arc<crate::runtime::TenantRuntime>> {
+        self.active
+            .load_revision(tenant, deployment_id, bundle_id, revision_id)
+            .with_context(|| {
+                format!(
+                    "revision runtime not loaded for tenant {tenant} \
+                     (deployment {deployment_id}, revision {revision_id})"
+                )
+            })
+    }
+
     /// Per-revision per-`provider_type` `identify-instance` probe (M1 IID.4).
     ///
     /// Given the candidate `provider_types` an env declares messaging
@@ -251,22 +272,14 @@ impl RunnerHost {
         if provider_types.is_empty() {
             return Ok(HashMap::new());
         }
-        let runtime = self
-            .active
-            .load_revision(tenant, deployment_id, bundle_id, revision_id)
-            .with_context(|| {
-                format!(
-                    "revision runtime not loaded for tenant {tenant} \
-                     (deployment {deployment_id}, revision {revision_id})"
-                )
-            })?;
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
         // Seed every type at Unsupported — the floor of the merge lattice
         // (see `IdentifyOutcome::merge_in`).
         let mut merged: HashMap<String, IdentifyOutcome> = provider_types
             .iter()
             .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
             .collect();
-        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+        for pack in runtime.all_packs() {
             // Skip types already at the lattice top — no probe could improve them.
             let remaining: Vec<&str> = provider_types
                 .iter()
@@ -297,9 +310,8 @@ impl RunnerHost {
     /// ONLY the headers their hint declares; unhinted components receive
     /// every header the caller passed in (back-compat).
     ///
-    /// See [`identify_messaging_endpoints_for_revision`] for the rationale
-    /// behind inlining the per-pack loop instead of factoring it into a
-    /// shared helper.
+    /// Loop inlined for the same reason as
+    /// [`identify_messaging_endpoints_for_revision`].
     ///
     /// [`identify_messaging_endpoints_for_revision`]:
     ///     RunnerHost::identify_messaging_endpoints_for_revision
@@ -317,20 +329,12 @@ impl RunnerHost {
         if provider_types.is_empty() {
             return Ok(HashMap::new());
         }
-        let runtime = self
-            .active
-            .load_revision(tenant, deployment_id, bundle_id, revision_id)
-            .with_context(|| {
-                format!(
-                    "revision runtime not loaded for tenant {tenant} \
-                     (deployment {deployment_id}, revision {revision_id})"
-                )
-            })?;
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
         let mut merged: HashMap<String, IdentifyOutcome> = provider_types
             .iter()
             .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
             .collect();
-        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+        for pack in runtime.all_packs() {
             let remaining: Vec<&str> = provider_types
                 .iter()
                 .copied()
@@ -372,27 +376,20 @@ impl RunnerHost {
         if provider_types.is_empty() {
             return Ok(HashMap::new());
         }
-        let runtime = self
-            .active
-            .load_revision(tenant, deployment_id, bundle_id, revision_id)
-            .with_context(|| {
-                format!(
-                    "revision runtime not loaded for tenant {tenant} \
-                     (deployment {deployment_id}, revision {revision_id})"
-                )
-            })?;
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
         let mut merged: HashMap<String, Option<crate::identify_hint::IdentifyInstanceHint>> =
             provider_types
                 .iter()
                 .map(|ty| ((*ty).to_string(), None))
                 .collect();
-        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+        for pack in runtime.all_packs() {
             // First non-`None` hint per type wins — anything already populated
-            // is at the lattice top.
+            // is at the lattice top. Mirror the `matches!` shape the sibling
+            // identify fns use so the predicate is consistent across files.
             let remaining: Vec<&str> = provider_types
                 .iter()
                 .copied()
-                .filter(|ty| merged.get(*ty).is_none_or(Option::is_none))
+                .filter(|ty| !matches!(merged.get(*ty), Some(Some(_))))
                 .collect();
             if remaining.is_empty() {
                 break;
