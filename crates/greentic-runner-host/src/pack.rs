@@ -2367,17 +2367,27 @@ impl PackRuntime {
     /// against a `provider_type` query are propagated (M1.1 invariant
     /// violation, malformed pack).
     ///
-    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
-    pub async fn describe_identify_hints_by_provider_type(
+    /// Fan out an async probe `f` over each requested `provider_type`. The
+    /// registry resolves one [`ProviderBinding`] per type (M1.1 invariant);
+    /// types with no binding receive `default()` and skip the probe. The
+    /// "no provider runtime found for type" miss is the only error variant
+    /// the resolver classifies as a clean miss; everything else (notably
+    /// the M1.1 multi-binding collision) is propagated as `Err`.
+    async fn for_each_provider_binding<T, F>(
         &self,
         provider_types: &[&str],
-    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
+        default: impl Fn() -> T,
+        mut f: F,
+    ) -> Result<HashMap<String, T>>
+    where
+        F: AsyncFnMut(&ProviderBinding) -> Result<T>,
+    {
         let mut out = HashMap::with_capacity(provider_types.len());
         let registry = match self.provider_registry_optional()? {
             Some(registry) => registry,
             None => {
                 for ty in provider_types {
-                    out.insert((*ty).to_string(), None);
+                    out.insert((*ty).to_string(), default());
                 }
                 return Ok(out);
             }
@@ -2390,97 +2400,67 @@ impl PackRuntime {
                         .to_string()
                         .starts_with("no provider runtime found for type") =>
                 {
-                    out.insert((*ty).to_string(), None);
+                    out.insert((*ty).to_string(), default());
                     continue;
                 }
                 Err(err) => return Err(err),
             };
-            let hint = self.resolve_identify_hint(&binding).await;
-            out.insert((*ty).to_string(), hint);
+            let value = f(&binding).await?;
+            out.insert((*ty).to_string(), value);
         }
         Ok(out)
     }
 
-    /// Unscoped legacy API: fan out [`invoke_identify_instance`] over each
-    /// requested `provider_type` with the caller-supplied opaque `payload`
-    /// bytes forwarded verbatim. No describe-identify-instance hint lookup,
-    /// no per-provider header scoping.
+    /// Fan out [`resolve_identify_hint`] across requested types. `None` value
+    /// means the pack has no binding for that type OR the binding's component
+    /// does not export the describe world.
     ///
-    /// New callers should use [`identify_endpoints_by_provider_type_scoped`]
-    /// for per-provider header allowlist scoping (Phase D).
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn describe_identify_hints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
+        self.for_each_provider_binding(
+            provider_types,
+            || None,
+            async |binding| Ok(self.resolve_identify_hint(binding).await),
+        )
+        .await
+    }
+
+    /// Unscoped legacy API: fan out [`invoke_identify_instance`] with the
+    /// caller-supplied opaque `payload` bytes forwarded verbatim. No
+    /// describe-identify-instance hint lookup, no per-provider header
+    /// scoping. New callers should use the `_scoped` sibling for
+    /// per-provider header allowlist scoping (Phase D).
     ///
-    /// [`identify_endpoints_by_provider_type_scoped`]:
-    ///     PackRuntime::identify_endpoints_by_provider_type_scoped
     /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
     pub async fn identify_endpoints_by_provider_type(
         &self,
         provider_types: &[&str],
         payload: &[u8],
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        let mut out = HashMap::with_capacity(provider_types.len());
-        let registry = match self.provider_registry_optional()? {
-            Some(registry) => registry,
-            None => {
-                for ty in provider_types {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                }
-                return Ok(out);
-            }
-        };
-        for ty in provider_types {
-            let binding = match registry.resolve(None, Some(ty)) {
-                Ok(binding) => binding,
-                Err(err)
-                    if err
-                        .to_string()
-                        .starts_with("no provider runtime found for type") =>
-                {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let outcome = self
-                .invoke_identify_instance(&binding, payload.to_vec())
-                .await?;
-            out.insert((*ty).to_string(), outcome);
-        }
-        Ok(out)
+        self.for_each_provider_binding(
+            provider_types,
+            || IdentifyOutcome::Unsupported,
+            async |binding| {
+                self.invoke_identify_instance(binding, payload.to_vec())
+                    .await
+            },
+        )
+        .await
     }
 
     /// Per-provider scoped variant of [`identify_endpoints_by_provider_type`].
     ///
-    /// For each `provider_type` the registry resolves a single
-    /// [`ProviderBinding`] (the existing M1.1 invariant) and the probe is
-    /// invoked with a wrapper payload built per-provider from
-    /// `(headers, body)` and the component's cached identify-instance
-    /// hint (see [`resolve_identify_hint`]). Hinted providers see ONLY
-    /// the headers their hint declares; unhinted providers see every
-    /// header the caller passed in (back-compat with components that
-    /// have not yet exported `describe-identify-instance`).
-    ///
-    /// The result map is keyed by the input `provider_type` with the
-    /// three-state [`IdentifyOutcome`] preserved verbatim:
-    ///
-    /// - [`IdentifyOutcome::Identified`] — the component recognised the
-    ///   payload and returned a `provider_id`;
-    /// - [`IdentifyOutcome::NoMatch`] — the component exported the world
-    ///   and explicitly declined the payload. Caller MUST fail closed.
-    /// - [`IdentifyOutcome::Unsupported`] — no binding for this
-    ///   `provider_type` in this pack, OR the binding's component does not
-    ///   export the `identify-instance` world. Both are caller-fallback-safe
-    ///   (fall back to the statically-declared `provider_id`).
-    ///
-    /// Per-type errors are NOT swallowed — wasmtime traps, instantiation
-    /// failures, and other infrastructure errors surface so the caller can
-    /// distinguish "the component said no" from "the component crashed".
-    /// `provider_id`-collision errors raised by [`ProviderRegistry::resolve`]
-    /// against a `provider_type` query (M1.1 invariant violation) are also
-    /// propagated — they indicate a malformed pack, not a clean miss.
+    /// The wrapper payload is built per-binding from `(headers, body)` and
+    /// the component's cached identify-instance hint (see
+    /// [`resolve_identify_hint`]): hinted providers see only the headers
+    /// their hint declares; unhinted providers see every header passed in.
+    /// Result-map semantics match the unscoped variant.
     ///
     /// [`identify_endpoints_by_provider_type`]:
     ///     PackRuntime::identify_endpoints_by_provider_type
-    /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
     /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
     pub async fn identify_endpoints_by_provider_type_scoped(
         &self,
@@ -2488,35 +2468,16 @@ impl PackRuntime {
         headers: &[(String, String)],
         body: &Value,
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        let mut out = HashMap::with_capacity(provider_types.len());
-        let registry = match self.provider_registry_optional()? {
-            Some(registry) => registry,
-            None => {
-                for ty in provider_types {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                }
-                return Ok(out);
-            }
-        };
-        for ty in provider_types {
-            let binding = match registry.resolve(None, Some(ty)) {
-                Ok(binding) => binding,
-                Err(err)
-                    if err
-                        .to_string()
-                        .starts_with("no provider runtime found for type") =>
-                {
-                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let hint = self.resolve_identify_hint(&binding).await;
-            let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
-            let outcome = self.invoke_identify_instance(&binding, payload).await?;
-            out.insert((*ty).to_string(), outcome);
-        }
-        Ok(out)
+        self.for_each_provider_binding(
+            provider_types,
+            || IdentifyOutcome::Unsupported,
+            async |binding| {
+                let hint = self.resolve_identify_hint(binding).await;
+                let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
+                self.invoke_identify_instance(binding, payload).await
+            },
+        )
+        .await
     }
 
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
@@ -2985,12 +2946,13 @@ fn build_scoped_identify_payload(
     hint: Option<&IdentifyInstanceHint>,
 ) -> Vec<u8> {
     let scoped_headers: Vec<&(String, String)> = match hint {
+        // Hints carry 1-3 source headers in practice; a linear scan beats
+        // a HashSet for that size (no hash + no allocation).
         Some(hint) => {
-            let allowed: std::collections::HashSet<&str> =
-                hint.header_names().into_iter().collect();
+            let allowed = hint.header_names();
             headers
                 .iter()
-                .filter(|(name, _)| allowed.contains(name.as_str()))
+                .filter(|(name, _)| allowed.contains(&name.as_str()))
                 .collect()
         }
         None => headers.iter().collect(),
@@ -3067,39 +3029,27 @@ mod build_scoped_identify_payload_tests {
     }
 
     #[test]
-    fn body_path_only_hint_yields_empty_headers() {
-        // Teams-shape hint: only a body_path source. No headers needed.
-        // The component must see `"headers": []` — passing Telegram's
-        // secret token here is the exact blast-radius bug PR-B2 closes.
-        let h = hint(vec![HintSource::BodyPath {
-            json_pointer: "/recipient/id".into(),
-        }]);
-        let headers = vec![(
-            "x-telegram-bot-api-secret-token".into(),
-            "should-not-leak".into(),
-        )];
-        let body = json!({ "recipient": { "id": "28:bot" } });
-        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
-        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed["headers"], json!([]));
-        assert_eq!(parsed["body"], body);
-    }
-
-    #[test]
-    fn empty_sources_hint_drops_all_headers() {
-        // Degenerate hint with no sources. The component is opting out
-        // of every input — pass nothing through. Body is still forwarded
-        // (we don't body-path-filter; that's the future short-circuit).
-        let h = hint(vec![]);
+    fn hints_without_header_sources_drop_all_headers() {
+        // Body-path-only (Teams-shape) and degenerate-empty hints both yield
+        // an empty `Header` source set; the wrapper MUST carry no headers
+        // either way. Passing Telegram's secret token through to either is
+        // the exact blast-radius bug PR-B2 closes.
         let headers = vec![(
             "x-telegram-bot-api-secret-token".into(),
             "should-not-leak".into(),
         )];
         let body = json!({ "anything": true });
-        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
-        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(parsed["headers"], json!([]));
-        assert_eq!(parsed["body"], body);
+        for h in [
+            hint(vec![HintSource::BodyPath {
+                json_pointer: "/recipient/id".into(),
+            }]),
+            hint(vec![]),
+        ] {
+            let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["headers"], json!([]), "hint={:?}", h.sources);
+            assert_eq!(parsed["body"], body);
+        }
     }
 
     #[test]

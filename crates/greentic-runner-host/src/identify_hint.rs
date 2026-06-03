@@ -81,14 +81,14 @@ impl IdentifyInstanceHint {
             .sources
             .into_iter()
             .map(|src| match src {
-                WireSource::Header(inner) => Ok(HintSource::Header {
+                WireSource::Header(inner) => HintSource::Header {
                     name: inner.name.to_ascii_lowercase(),
-                }),
-                WireSource::BodyPath(inner) => Ok(HintSource::BodyPath {
+                },
+                WireSource::BodyPath(inner) => HintSource::BodyPath {
                     json_pointer: inner.json_pointer,
-                }),
+                },
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect();
         Ok(Self { sources })
     }
 
