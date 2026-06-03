@@ -10,6 +10,7 @@ use crate::cache::{ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProf
 use crate::component_api::{
     self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError,
 };
+use crate::identify_hint::IdentifyInstanceHint;
 use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
 use crate::provider::{ProviderBinding, ProviderRegistry};
 use crate::provider_core::{
@@ -40,6 +41,7 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     },
 };
 use greentic_interfaces_wasmtime::http_client_client_v1_1::greentic::http::http_client as http_client_client_alias;
+use greentic_interfaces_wasmtime::instance_identity_instance_identity_describe_v0_1::InstanceIdentityDescribePre;
 use greentic_interfaces_wasmtime::instance_identity_v0_1::InstanceIdentityPre;
 use greentic_interfaces_wasmtime::{
     http_client_client_v1_0::greentic::interfaces_types::types as http_types_v1_0,
@@ -124,6 +126,14 @@ pub struct PackRuntime {
     wasi_policy: Arc<RunnerWasiPolicy>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
+    /// Per-revision lazy cache of `describe-identify-instance` results,
+    /// keyed by `component_ref`. `None` value means the component does not
+    /// export the describe world (or the hint was malformed) — the
+    /// caller falls back to passing input headers through unchanged. The
+    /// outer `Option` distinguishes "not probed yet" from "probed and
+    /// has no hint". `ArcSwap`-driven revision swaps allocate a fresh
+    /// `PackRuntime` so this cache is naturally invalidated.
+    identify_hint_cache: RwLock<HashMap<String, Option<IdentifyInstanceHint>>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
     cache: CacheManager,
@@ -1830,6 +1840,7 @@ impl PackRuntime {
             wasi_policy,
             assets_tempdir,
             provider_registry: RwLock::new(None),
+            identify_hint_cache: RwLock::new(HashMap::new()),
             secrets,
             oauth_config,
             cache,
@@ -2204,11 +2215,186 @@ impl PackRuntime {
         })
     }
 
+    /// Call the provider component's `describe-identify-instance` export
+    /// (`greentic:provider-instance-identity/instance-identity-describe@0.1.0`)
+    /// and parse the returned JSON into an [`IdentifyInstanceHint`].
+    ///
+    /// Returns `Ok(None)` for every "no hint available" case: the
+    /// component does not export the describe world, the export returned
+    /// `none`, the returned bytes are not valid JSON, or the `version`
+    /// gate failed. The two malformed cases are warn-logged so a typo'd
+    /// hint surfaces in operator logs without blocking ingest. Component
+    /// traps and other infrastructure errors propagate as `Err`.
+    ///
+    /// This is the uncached probe — see [`resolve_identify_hint`] for the
+    /// cached wrapper that callers SHOULD use on the inbound hot path.
+    ///
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn invoke_describe_identify_instance(
+        &self,
+        binding: &ProviderBinding,
+    ) -> Result<Option<IdentifyInstanceHint>> {
+        let component_ref_owned = binding.component_ref.clone();
+        let pack_component = self.components.get(&component_ref_owned).with_context(|| {
+            format!("provider component '{component_ref_owned}' not found in pack")
+        })?;
+        let component = pack_component.component.clone();
+
+        let engine = self.engine.clone();
+        let config = Arc::clone(&self.config);
+        let http_client = Arc::clone(&self.http_client);
+        let mocks = self.mocks.clone();
+        let session_store = self.session_store.clone();
+        let state_store = self.state_store.clone();
+        let secrets = Arc::clone(&self.secrets);
+        let oauth_config = self.oauth_config.clone();
+        let wasi_policy = Arc::clone(&self.wasi_policy);
+        let pack_id = self.metadata().pack_id.clone();
+        let allow_state_store = self.allows_state_store(&component_ref_owned);
+
+        // Same reduced-import-set Phase D follow-up as `invoke_identify_instance`
+        // applies here — describe-identify-instance is a metadata probe with
+        // no inputs, so it has even less reason to need the full host surface.
+        run_on_wasi_thread("provider.describe_identify_instance", move || {
+            let mut linker = Linker::new(&engine);
+            register_all(&mut linker, allow_state_store)?;
+            add_component_control_to_linker(&mut linker)?;
+            let host_state = HostState::new(
+                pack_id.clone(),
+                config,
+                http_client,
+                mocks,
+                session_store,
+                state_store,
+                secrets,
+                oauth_config,
+                None,
+                Some(component_ref_owned.clone()),
+                true,
+            )?;
+            let store_state = ComponentState::new(host_state, wasi_policy)?;
+            let mut store = wasmtime::Store::new(&engine, store_state);
+
+            let pre_instance = linker.instantiate_pre(component.as_ref())?;
+            let pre = match InstanceIdentityDescribePre::<ComponentState>::new(pre_instance) {
+                Ok(pre) => pre,
+                Err(err) if is_missing_export_error(&format!("{err:#}")) => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+            let api = bindings.greentic_provider_instance_identity_instance_identity_describe_api();
+            let raw = api.call_describe_identify_instance(&mut store)?;
+            let Some(bytes) = raw else {
+                // Component exported the world but said "no hint right now".
+                // Per the WIT contract this is equivalent to a missing
+                // export — unhinted fallback at the caller.
+                return Ok(None);
+            };
+            match IdentifyInstanceHint::from_json(&bytes) {
+                Ok(hint) => Ok(Some(hint)),
+                Err(err) => {
+                    // Malformed hint or wrong version. Don't fail closed:
+                    // the contract demands the host fall back to unhinted
+                    // (invoke identify-instance with the global allowlist).
+                    // Warn so the provider author can fix the hint.
+                    warn!(
+                        event = "provider.describe_identify_instance.malformed",
+                        component_ref = %component_ref_owned,
+                        error = %err,
+                        "ignoring malformed describe-identify-instance hint; \
+                         falling back to unhinted wrapper"
+                    );
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    /// Cached wrapper around [`invoke_describe_identify_instance`]. The
+    /// hint for a given `binding.component_ref` is invariant across
+    /// inbound requests within a revision (it is a function of the
+    /// component itself, not of the payload), so we probe lazily on
+    /// first ask and reuse thereafter. `ArcSwap`-driven revision swaps
+    /// allocate a fresh [`PackRuntime`], naturally invalidating the cache.
+    ///
+    /// [`invoke_describe_identify_instance`]:
+    ///     PackRuntime::invoke_describe_identify_instance
+    pub async fn resolve_identify_hint(
+        &self,
+        binding: &ProviderBinding,
+    ) -> Result<Option<IdentifyInstanceHint>> {
+        if let Some(cached) = self.identify_hint_cache.read().get(&binding.component_ref) {
+            return Ok(cached.clone());
+        }
+        let hint = self.invoke_describe_identify_instance(binding).await?;
+        // Tolerate a concurrent populate — `insert` is idempotent on the
+        // same (component_ref, hint) shape and the probe is pure w.r.t.
+        // the component, so re-probing on a write-race yields identical
+        // bytes.
+        self.identify_hint_cache
+            .write()
+            .insert(binding.component_ref.clone(), hint.clone());
+        Ok(hint)
+    }
+
+    /// Fan out [`resolve_identify_hint`] over each requested `provider_type`.
+    /// Result map is keyed by `provider_type`; `None` value means the
+    /// pack has no binding for that type OR the binding's component does
+    /// not export the describe world (unhinted — caller forwards input
+    /// headers unfiltered for back-compat).
+    ///
+    /// `provider_id`-collision errors from [`ProviderRegistry::resolve`]
+    /// against a `provider_type` query are propagated (M1.1 invariant
+    /// violation, malformed pack).
+    ///
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn describe_identify_hints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), None);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let binding = match registry.resolve(None, Some(ty)) {
+                Ok(binding) => binding,
+                Err(err)
+                    if err
+                        .to_string()
+                        .starts_with("no provider runtime found for type") =>
+                {
+                    out.insert((*ty).to_string(), None);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+            let hint = self.resolve_identify_hint(&binding).await?;
+            out.insert((*ty).to_string(), hint);
+        }
+        Ok(out)
+    }
+
     /// Fan out [`invoke_identify_instance`] over each requested
     /// `provider_type`. For each type the registry resolves a single
     /// [`ProviderBinding`] (the existing M1.1 invariant) and the probe is
-    /// invoked. The result map is keyed by the input `provider_type` with
-    /// the three-state [`IdentifyOutcome`] preserved verbatim:
+    /// invoked with a wrapper payload built per-provider from
+    /// `(headers, body)` and the component's cached identify-instance
+    /// hint (see [`resolve_identify_hint`]). Hinted providers see ONLY
+    /// the headers their hint declares; unhinted providers see every
+    /// header the caller passed in (back-compat with components that
+    /// have not yet exported `describe-identify-instance`).
+    ///
+    /// The result map is keyed by the input `provider_type` with the
+    /// three-state [`IdentifyOutcome`] preserved verbatim:
     ///
     /// - [`IdentifyOutcome::Identified`] — the component recognised the
     ///   payload and returned a `provider_id`;
@@ -2227,10 +2413,12 @@ impl PackRuntime {
     /// propagated — they indicate a malformed pack, not a clean miss.
     ///
     /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
     pub async fn identify_endpoints_by_provider_type(
         &self,
         provider_types: &[&str],
-        payload: &[u8],
+        headers: &[(String, String)],
+        body: &Value,
     ) -> Result<HashMap<String, IdentifyOutcome>> {
         let mut out = HashMap::with_capacity(provider_types.len());
         let registry = match self.provider_registry_optional()? {
@@ -2261,9 +2449,9 @@ impl PackRuntime {
                 }
                 Err(err) => return Err(err),
             };
-            let outcome = self
-                .invoke_identify_instance(&binding, payload.to_vec())
-                .await?;
+            let hint = self.resolve_identify_hint(&binding).await?;
+            let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
+            let outcome = self.invoke_identify_instance(&binding, payload).await?;
             out.insert((*ty).to_string(), outcome);
         }
         Ok(out)
@@ -2579,6 +2767,7 @@ impl PackRuntime {
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
+            identify_hint_cache: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager()?,
             oauth_config: None,
             cache,
@@ -2696,16 +2885,186 @@ fn deserialize_json_bytes(bytes: Vec<u8>) -> Result<Value> {
 /// The match is intentionally narrow: the error must mention BOTH a
 /// broad wasmtime marker (`"no exported instance named"` or
 /// `"no exported function named"`) AND the identity-world-specific
-/// name segment (`"instance-identity-api"` or `"identify-instance"`).
+/// name segment (`"instance-identity-api"`, `"identify-instance"`,
+/// `"instance-identity-describe-api"`, or `"describe-identify-instance"`).
 /// A component that exports the identity world with a malformed
 /// signature or a typo'd function name will NOT be silently treated
 /// as unsupported — it will surface as a hard error.
 fn is_missing_export_error(message: &str) -> bool {
     let has_broad_marker = message.contains("no exported instance named")
         || message.contains("no exported function named");
-    let has_identity_segment =
-        message.contains("instance-identity-api") || message.contains("identify-instance");
+    let has_identity_segment = message.contains("instance-identity-api")
+        || message.contains("identify-instance")
+        || message.contains("instance-identity-describe-api")
+        || message.contains("describe-identify-instance");
     has_broad_marker && has_identity_segment
+}
+
+/// Build the M1 IID.4d wrapper payload (`{ headers, body }`) scoped per
+/// the provider's [`IdentifyInstanceHint`].
+///
+/// - `Some(hint)` ⇒ headers are filtered to ONLY those whose lowercase
+///   name appears in [`hint.header_names()`](IdentifyInstanceHint::header_names).
+///   A hint with no `Header` sources yields `"headers": []` — the
+///   component is declaring that it identifies from the body alone.
+/// - `None` ⇒ headers pass through unfiltered. The caller is responsible
+///   for prefiltering (greentic-start applies a global allowlist at the
+///   ingress boundary), so back-compat with not-yet-hinted providers
+///   matches the pre-PR-B2 behavior exactly: every probed component
+///   receives every allowlisted header.
+///
+/// `body` is forwarded verbatim regardless of hint shape. Body-path
+/// short-circuit (using the hint's `BodyPath { json_pointer }` to skip
+/// invoking `identify-instance` entirely) is a deliberately-deferred
+/// Phase D follow-up — the current pass scopes the header allowlist only.
+fn build_scoped_identify_payload(
+    headers: &[(String, String)],
+    body: &Value,
+    hint: Option<&IdentifyInstanceHint>,
+) -> Vec<u8> {
+    let scoped_headers: Vec<&(String, String)> = match hint {
+        Some(hint) => {
+            let allowed: std::collections::HashSet<&str> =
+                hint.header_names().into_iter().collect();
+            headers
+                .iter()
+                .filter(|(name, _)| allowed.contains(name.as_str()))
+                .collect()
+        }
+        None => headers.iter().collect(),
+    };
+    let wrapper = serde_json::json!({
+        "headers": scoped_headers
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>(),
+        "body": body,
+    });
+    serde_json::to_vec(&wrapper).expect("wrapper payload always serializes")
+}
+
+#[cfg(test)]
+mod build_scoped_identify_payload_tests {
+    use super::*;
+    use crate::identify_hint::HintSource;
+    use serde_json::json;
+
+    fn hint(sources: Vec<HintSource>) -> IdentifyInstanceHint {
+        IdentifyInstanceHint { sources }
+    }
+
+    #[test]
+    fn unhinted_passes_all_input_headers_through() {
+        // Back-compat: components without describe-identify-instance must
+        // continue to see every header the caller (greentic-start)
+        // allowlisted. Pre-PR-B2 behavior verbatim.
+        let headers = vec![
+            (
+                "x-telegram-bot-api-secret-token".into(),
+                "telegram-tok".into(),
+            ),
+            ("x-future-routing-tag".into(), "abc".into()),
+        ];
+        let body = json!({ "update_id": 1 });
+        let bytes = build_scoped_identify_payload(&headers, &body, None);
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-telegram-bot-api-secret-token", "value": "telegram-tok" },
+                { "name": "x-future-routing-tag", "value": "abc" }
+            ])
+        );
+        assert_eq!(parsed["body"], body);
+    }
+
+    #[test]
+    fn header_hint_filters_to_declared_names_only() {
+        // Telegram-shape hint: declares one header, sees only that one.
+        // Other allowlisted headers (e.g. a future Slack signature) MUST
+        // NOT leak into the Telegram probe.
+        let h = hint(vec![HintSource::Header {
+            name: "x-telegram-bot-api-secret-token".into(),
+        }]);
+        let headers = vec![
+            (
+                "x-telegram-bot-api-secret-token".into(),
+                "telegram-tok".into(),
+            ),
+            ("x-slack-signature".into(), "v0=sig".into()),
+        ];
+        let body = json!({});
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-telegram-bot-api-secret-token", "value": "telegram-tok" }
+            ])
+        );
+    }
+
+    #[test]
+    fn body_path_only_hint_yields_empty_headers() {
+        // Teams-shape hint: only a body_path source. No headers needed.
+        // The component must see `"headers": []` — passing Telegram's
+        // secret token here is the exact blast-radius bug PR-B2 closes.
+        let h = hint(vec![HintSource::BodyPath {
+            json_pointer: "/recipient/id".into(),
+        }]);
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".into(),
+            "should-not-leak".into(),
+        )];
+        let body = json!({ "recipient": { "id": "28:bot" } });
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["headers"], json!([]));
+        assert_eq!(parsed["body"], body);
+    }
+
+    #[test]
+    fn empty_sources_hint_drops_all_headers() {
+        // Degenerate hint with no sources. The component is opting out
+        // of every input — pass nothing through. Body is still forwarded
+        // (we don't body-path-filter; that's the future short-circuit).
+        let h = hint(vec![]);
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".into(),
+            "should-not-leak".into(),
+        )];
+        let body = json!({ "anything": true });
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["headers"], json!([]));
+        assert_eq!(parsed["body"], body);
+    }
+
+    #[test]
+    fn header_filter_preserves_input_order_and_dups() {
+        // Multi-value headers and ordering matter to debuggability
+        // (operators reading the wrapper from a probe should see the
+        // headers in the same order they arrived). Filter is a
+        // retain-only operation; no sort, no dedup.
+        let h = hint(vec![HintSource::Header {
+            name: "x-route".into(),
+        }]);
+        let headers = vec![
+            ("x-route".into(), "a".into()),
+            ("x-other".into(), "skip".into()),
+            ("x-route".into(), "b".into()),
+        ];
+        let body = json!({});
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-route", "value": "a" },
+                { "name": "x-route", "value": "b" }
+            ])
+        );
+    }
 }
 
 impl PackFlows {
@@ -4541,7 +4900,7 @@ mod identify_endpoints_pack_tests {
         )
         .expect("empty pack construction");
         let result = pack
-            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], b"{}")
+            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], &[], &Value::Null)
             .await
             .expect("no-manifest path must succeed");
         assert_eq!(result.len(), 3);
@@ -4564,7 +4923,7 @@ mod identify_endpoints_pack_tests {
         )
         .expect("empty pack construction");
         let result = pack
-            .identify_endpoints_by_provider_type(&[], b"{}")
+            .identify_endpoints_by_provider_type(&[], &[], &Value::Null)
             .await
             .expect("empty types fast path");
         assert!(result.is_empty());

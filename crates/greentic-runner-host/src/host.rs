@@ -212,24 +212,35 @@ impl RunnerHost {
     ///
     /// Given the candidate `provider_types` an env declares messaging
     /// endpoints for, ask each pack loaded under this revision (main +
-    /// overlays) which `provider_id` the inbound `payload` claims to address.
+    /// overlays) which `provider_id` the inbound request claims to address.
     /// The greentic-start resolver pairs the returned `provider_id` with the
     /// `provider_type` and looks the `MessagingEndpointId` up in the env's
     /// admit table; that's how a header-less webhook gets auto-routed to the
     /// right endpoint.
     ///
-    /// # Payload shape (M1 IID.4d wrapper)
+    /// # Payload shape (M1 IID.4d wrapper, Phase D scoped)
     ///
-    /// `payload` is forwarded opaque to every probed component. The shape
-    /// is the caller's contract; the M1 IID.4d convention from
-    /// `greentic-start` is `{headers: [{name,value}], body: <parsed-or-null>}`,
-    /// which lets providers whose discriminator lives in HTTP headers
-    /// (Telegram via `x-telegram-bot-api-secret-token`) identify the
-    /// instance from the same payload shape that body-based providers
-    /// (Teams `recipient.id`, Slack `team_id`, etc.) use. See the WIT
-    /// docstring on
-    /// `greentic:provider-instance-identity@0.1.0/identify-instance` for the
-    /// full contract.
+    /// `headers` and `body` are forwarded to every probed component as a
+    /// JSON wrapper `{ headers: [{name,value}], body: <parsed-or-null> }`.
+    /// As of Phase D the wrapper is built **per-provider** from the
+    /// component's cached `describe-identify-instance` hint
+    /// (see [`PackRuntime::resolve_identify_hint`]):
+    ///
+    /// - Components that export the hint world receive ONLY the headers
+    ///   their hint declares as `Header` sources. Teams (body-path only)
+    ///   sees `headers: []`; Telegram (header `x-telegram-bot-api-secret-token`)
+    ///   sees just that one header.
+    /// - Components that do NOT export the hint world receive every
+    ///   header the caller passed in — back-compat with not-yet-hinted
+    ///   providers. The caller (greentic-start) is responsible for
+    ///   prefiltering at ingress (it applies a global allowlist), so the
+    ///   set the host sees is already the allowlisted floor.
+    ///
+    /// See the WIT docstring on
+    /// `greentic:provider-instance-identity@0.1.0/identify-instance` for
+    /// the inbound contract, and
+    /// `greentic:provider-instance-identity/instance-identity-describe@0.1.0`
+    /// for the per-provider scoping contract.
     ///
     /// Returns a `HashMap` keyed by the input `provider_type` strings,
     /// carrying the three-state [`IdentifyOutcome`] per the WIT contract:
@@ -245,6 +256,7 @@ impl RunnerHost {
     ///
     /// Component traps and other infrastructure errors propagate as `Err`;
     /// the caller distinguishes them from a clean miss via the `?`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn identify_messaging_endpoints_for_revision(
         &self,
         tenant: &str,
@@ -252,7 +264,8 @@ impl RunnerHost {
         bundle_id: BundleId,
         revision_id: RevisionId,
         provider_types: &[&str],
-        payload: &[u8],
+        headers: &[(String, String)],
+        body: &Value,
     ) -> Result<HashMap<String, IdentifyOutcome>> {
         if provider_types.is_empty() {
             return Ok(HashMap::new());
@@ -283,11 +296,73 @@ impl RunnerHost {
                 break;
             }
             let probe = pack
-                .identify_endpoints_by_provider_type(&remaining, payload)
+                .identify_endpoints_by_provider_type(&remaining, headers, body)
                 .await?;
             for (ty, outcome) in probe {
                 if let Some(existing) = merged.get_mut(&ty) {
                     existing.merge_in(outcome);
+                }
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Per-revision describe-identify-instance hint discovery.
+    ///
+    /// Fans the cached describe probe out across the main pack + overlays;
+    /// first non-`None` hint per `provider_type` wins. Hosted as a sibling
+    /// of [`identify_messaging_endpoints_for_revision`] for callers
+    /// (greentic-start, future scoped-payload builders) that want to
+    /// inspect the per-provider header allowlist WITHOUT yet running the
+    /// expensive identify-instance probe — e.g. to log what would have
+    /// scoped, or to build the IID.4d wrapper outside the host.
+    ///
+    /// Returns `HashMap<provider_type, Option<IdentifyInstanceHint>>`:
+    /// `None` value means no pack in this revision exposes a usable hint
+    /// for that `provider_type` (either no binding, or the binding's
+    /// component does not export `describe-identify-instance`).
+    pub async fn describe_identify_instances_for_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        provider_types: &[&str],
+    ) -> Result<HashMap<String, Option<crate::identify_hint::IdentifyInstanceHint>>> {
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self
+            .active
+            .load_revision(tenant, deployment_id, bundle_id, revision_id)
+            .with_context(|| {
+                format!(
+                    "revision runtime not loaded for tenant {tenant} \
+                     (deployment {deployment_id}, revision {revision_id})"
+                )
+            })?;
+        let mut merged: HashMap<String, Option<crate::identify_hint::IdentifyInstanceHint>> =
+            provider_types
+                .iter()
+                .map(|ty| ((*ty).to_string(), None))
+                .collect();
+        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| matches!(merged.get(*ty), Some(None)))
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .describe_identify_hints_by_provider_type(&remaining)
+                .await?;
+            for (ty, hint) in probe {
+                if let Some(slot) = merged.get_mut(&ty)
+                    && slot.is_none()
+                {
+                    *slot = hint;
                 }
             }
         }
@@ -1019,7 +1094,8 @@ mod identify_endpoints_tests {
                 BundleId::new("anything"),
                 RevisionId::new(),
                 &[],
-                b"{}",
+                &[],
+                &Value::Null,
             )
             .await
             .expect("empty types is the cheap fast path");
@@ -1041,7 +1117,8 @@ mod identify_endpoints_tests {
                 BundleId::new("missing"),
                 revision,
                 &["teams"],
-                b"{}",
+                &[],
+                &Value::Null,
             )
             .await
             .expect_err("missing revision must fail closed");
