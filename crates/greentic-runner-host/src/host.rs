@@ -411,11 +411,10 @@ impl RunnerHost {
 
     /// Per-revision provider invocation (Phase D).
     ///
-    /// Locates a pack in `(deployment_id, bundle_id, revision_id)` whose
-    /// `greentic.provider-extension.v1` binds the requested `provider_type`,
-    /// then calls `op` on it with `input_json`. First pack to bind the type
-    /// wins — packs are iterated in `runtime.all_packs()` order (main pack
-    /// then overlays).
+    /// Locates the unique pack in `(deployment_id, bundle_id, revision_id)`
+    /// whose `greentic.provider-extension.v1` binds the requested
+    /// `provider_type`, verifies `op` is in that declaration's allowlist,
+    /// then calls `op` on it with `input_json`.
     ///
     /// Used by greentic-start's Phase D `ProviderRoute` admission arm to
     /// run provider webhooks (e.g. `ingest_http`) without round-tripping
@@ -430,9 +429,22 @@ impl RunnerHost {
     /// Fails closed when:
     /// - the revision isn't loaded (error chain names deployment + revision)
     /// - no pack in the revision binds `provider_type`
+    /// - **multiple packs in the revision bind `provider_type`** — the URL
+    ///   → provider routing the caller did at the route table is unable to
+    ///   disambiguate at invoke time. Mirrors the within-pack ambiguity
+    ///   check in [`ProviderRegistry::resolve`], lifted to the revision
+    ///   level so an overlay accidentally redeclaring a main-pack provider
+    ///   can't silently shadow the wrong runtime. A future revision of
+    ///   this API can accept an explicit `provider_id` to disambiguate
+    ///   when D.3 wires identification + invocation together.
+    /// - `op` is not in the resolved provider's declared `ops` allowlist
+    ///   (defense-in-depth: a caller bug or misconfigured `ProviderRoute`
+    ///   cannot smuggle an undeclared op past the schema-core boundary).
     ///
     /// Loop inlined for the same reason as
     /// [`identify_messaging_endpoints_for_revision`].
+    ///
+    /// [`ProviderRegistry::resolve`]: crate::provider::ProviderRegistry::resolve
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_provider_for_revision(
         &self,
@@ -447,37 +459,65 @@ impl RunnerHost {
         trace_id: Option<String>,
     ) -> Result<Value> {
         let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
+        // Walk ALL packs to detect cross-pack ambiguity. First-match-wins
+        // would let main pack silently shadow an overlay that binds the
+        // same provider_type — the identify-side merge lattice can return
+        // outcomes from any pack, so the invoke side must refuse to guess.
+        let mut matched: Option<(
+            Arc<PackRuntime>,
+            crate::provider::ProviderBinding,
+            Vec<String>,
+        )> = None;
         for pack in runtime.all_packs() {
             let Some(registry) = pack.provider_registry_optional()? else {
                 continue;
             };
-            let Some(binding) = registry.try_resolve(None, Some(provider_type))? else {
+            let Some((binding, declared_ops)) =
+                registry.try_resolve_with_ops(None, Some(provider_type))?
+            else {
                 continue;
             };
-            let exec_ctx = ComponentExecCtx {
-                tenant: ComponentTenantCtx {
-                    tenant: tenant.to_string(),
-                    team: None,
-                    user: None,
-                    trace_id,
-                    i18n_id: None,
-                    correlation_id: correlation_id.clone(),
-                    deadline_unix_ms: None,
-                    attempt: 1,
-                    idempotency_key: correlation_id,
-                },
-                i18n_id: None,
-                flow_id: format!("provider-webhook/{provider_type}"),
-                node_id: None,
-            };
-            return pack
-                .invoke_provider(&binding, exec_ctx, op, input_json)
-                .await;
+            if matched.is_some() {
+                bail!(
+                    "ambiguous provider_type `{provider_type}` in revision \
+                     (deployment {deployment_id}, revision {revision_id}): \
+                     multiple packs bind the same type; pack manifests must \
+                     declare each provider_type at most once across main + overlays"
+                );
+            }
+            matched = Some((Arc::clone(pack), binding, declared_ops));
         }
-        bail!(
-            "no pack in revision binds provider_type `{provider_type}` \
-             (deployment {deployment_id}, revision {revision_id})"
-        )
+        let Some((pack, binding, declared_ops)) = matched else {
+            bail!(
+                "no pack in revision binds provider_type `{provider_type}` \
+                 (deployment {deployment_id}, revision {revision_id})"
+            );
+        };
+        if !declared_ops.iter().any(|declared| declared == op) {
+            bail!(
+                "op `{op}` is not declared for provider_type `{provider_type}` \
+                 in revision (deployment {deployment_id}, revision {revision_id}); \
+                 declared ops: {declared_ops:?}"
+            );
+        }
+        let exec_ctx = ComponentExecCtx {
+            tenant: ComponentTenantCtx {
+                tenant: tenant.to_string(),
+                team: None,
+                user: None,
+                trace_id,
+                i18n_id: None,
+                correlation_id: correlation_id.clone(),
+                deadline_unix_ms: None,
+                attempt: 1,
+                idempotency_key: correlation_id,
+            },
+            i18n_id: None,
+            flow_id: format!("provider-webhook/{provider_type}"),
+            node_id: None,
+        };
+        pack.invoke_provider(&binding, exec_ctx, op, input_json)
+            .await
     }
 
     /// Shared activity-execution body: resolve the flow, build the canonical
