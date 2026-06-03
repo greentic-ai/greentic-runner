@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use crate::activity::{Activity, WelcomeFlowHint};
 use crate::boot;
+use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::{FlowResumeStore, IngressEnvelope};
@@ -406,6 +407,77 @@ impl RunnerHost {
             }
         }
         Ok(merged)
+    }
+
+    /// Per-revision provider invocation (Phase D).
+    ///
+    /// Locates a pack in `(deployment_id, bundle_id, revision_id)` whose
+    /// `greentic.provider-extension.v1` binds the requested `provider_type`,
+    /// then calls `op` on it with `input_json`. First pack to bind the type
+    /// wins — packs are iterated in `runtime.all_packs()` order (main pack
+    /// then overlays).
+    ///
+    /// Used by greentic-start's Phase D `ProviderRoute` admission arm to
+    /// run provider webhooks (e.g. `ingest_http`) without round-tripping
+    /// through the flow engine. The provider component returns the parsed
+    /// HTTP-out envelope verbatim; greentic-start dispatches the events
+    /// it carries back through the flow runtime separately.
+    ///
+    /// `correlation_id` is threaded into the `ComponentExecCtx` as both
+    /// `correlation_id` and `idempotency_key` (mirroring the operator-API
+    /// pattern in `build_exec_ctx`). `trace_id` rides through as-is.
+    ///
+    /// Fails closed when:
+    /// - the revision isn't loaded (error chain names deployment + revision)
+    /// - no pack in the revision binds `provider_type`
+    ///
+    /// Loop inlined for the same reason as
+    /// [`identify_messaging_endpoints_for_revision`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_provider_for_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        provider_type: &str,
+        op: &str,
+        input_json: Vec<u8>,
+        correlation_id: Option<String>,
+        trace_id: Option<String>,
+    ) -> Result<Value> {
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
+        for pack in runtime.all_packs() {
+            let Some(registry) = pack.provider_registry_optional()? else {
+                continue;
+            };
+            let Some(binding) = registry.try_resolve(None, Some(provider_type))? else {
+                continue;
+            };
+            let exec_ctx = ComponentExecCtx {
+                tenant: ComponentTenantCtx {
+                    tenant: tenant.to_string(),
+                    team: None,
+                    user: None,
+                    trace_id,
+                    i18n_id: None,
+                    correlation_id: correlation_id.clone(),
+                    deadline_unix_ms: None,
+                    attempt: 1,
+                    idempotency_key: correlation_id,
+                },
+                i18n_id: None,
+                flow_id: format!("provider-webhook/{provider_type}"),
+                node_id: None,
+            };
+            return pack
+                .invoke_provider(&binding, exec_ctx, op, input_json)
+                .await;
+        }
+        bail!(
+            "no pack in revision binds provider_type `{provider_type}` \
+             (deployment {deployment_id}, revision {revision_id})"
+        )
     }
 
     /// Shared activity-execution body: resolve the flow, build the canonical
@@ -1269,5 +1341,54 @@ mod identify_endpoints_tests {
             RevisionId::new(),
             &["teams"],
         ));
+        assert_send(host.invoke_provider_for_revision(
+            "demo",
+            DeploymentId::new(),
+            BundleId::new("anything"),
+            RevisionId::new(),
+            "messaging.telegram.bot",
+            "ingest_http",
+            b"{}".to_vec(),
+            None,
+            None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn invoke_provider_missing_revision_surfaces_clear_error() {
+        // Non-empty types but the revision was never loaded — the error
+        // chain must name the revision so operators can correlate it with
+        // their dispatch log. Mirrors the identify-side sibling so a future
+        // refactor can't quietly drop the lookup-context wrapper.
+        let host = dummy_runner_host();
+        let deployment = DeploymentId::new();
+        let revision = RevisionId::new();
+        let err = host
+            .invoke_provider_for_revision(
+                "demo",
+                deployment,
+                BundleId::new("missing"),
+                revision,
+                "messaging.telegram.bot",
+                "ingest_http",
+                b"{}".to_vec(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("missing revision must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("revision runtime not loaded"),
+            "error chain should name the failure mode, got: {msg}"
+        );
+        assert!(
+            msg.contains(&deployment.to_string()),
+            "error chain should name the deployment id, got: {msg}"
+        );
+        assert!(
+            msg.contains(&revision.to_string()),
+            "error chain should name the revision id, got: {msg}"
+        );
     }
 }
