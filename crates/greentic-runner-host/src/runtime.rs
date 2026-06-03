@@ -656,6 +656,17 @@ impl TenantRuntime {
         self.packs.iter().skip(1).cloned().collect()
     }
 
+    /// All packs in declaration order: main pack at index 0, overlays after.
+    /// Borrowed slice — no `Arc` clones, no allocation. Use this when you only
+    /// need to iterate the full pack list; prefer [`pack`]/[`overlays`] when
+    /// you need to hand out owned `Arc`s downstream.
+    ///
+    /// [`pack`]: TenantRuntime::pack
+    /// [`overlays`]: TenantRuntime::overlays
+    pub fn all_packs(&self) -> &[Arc<PackRuntime>] {
+        &self.packs
+    }
+
     /// Resolved content digest of each loaded pack, index-aligned with the pack
     /// list. `Some` for revision runtimes (verified at load) and the legacy
     /// index path; `None` only when a digest was unavailable.

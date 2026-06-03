@@ -208,63 +208,25 @@ impl RunnerHost {
         self.dispatch_activity(&runtime, tenant, activity).await
     }
 
-    /// Per-revision overlay-aware fan-out. Loads the revision once,
-    /// seeds the merge map with `default()`, then for each pack (main +
-    /// overlays in declaration order) invokes `probe` for the still-unsettled
-    /// types and folds each per-pack result via `merge`. `is_settled` skips
-    /// probing types that won't change again — the lattice top for the
-    /// caller's merge function.
-    #[allow(clippy::too_many_arguments)]
-    async fn fan_out_across_packs<T, F, IsSettled, Merge>(
+    /// Resolve the per-revision tenant runtime, attaching a uniform "not
+    /// loaded" context to the error. The three per-revision identify
+    /// fan-out APIs all need this exact lookup; sharing it keeps the
+    /// error chain identical across them.
+    fn load_revision_runtime(
         &self,
         tenant: &str,
         deployment_id: DeploymentId,
         bundle_id: BundleId,
         revision_id: RevisionId,
-        provider_types: &[&str],
-        default: impl Fn() -> T,
-        is_settled: IsSettled,
-        mut probe: F,
-        mut merge: Merge,
-    ) -> Result<HashMap<String, T>>
-    where
-        F: AsyncFnMut(&PackRuntime, &[&str]) -> Result<HashMap<String, T>>,
-        IsSettled: Fn(&T) -> bool,
-        Merge: FnMut(&mut T, T),
-    {
-        if provider_types.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let runtime = self
-            .active
+    ) -> Result<Arc<crate::runtime::TenantRuntime>> {
+        self.active
             .load_revision(tenant, deployment_id, bundle_id, revision_id)
             .with_context(|| {
                 format!(
                     "revision runtime not loaded for tenant {tenant} \
                      (deployment {deployment_id}, revision {revision_id})"
                 )
-            })?;
-        let mut merged: HashMap<String, T> = provider_types
-            .iter()
-            .map(|ty| ((*ty).to_string(), default()))
-            .collect();
-        for pack in std::iter::once(runtime.pack()).chain(runtime.overlays()) {
-            let remaining: Vec<&str> = provider_types
-                .iter()
-                .copied()
-                .filter(|ty| !merged.get(*ty).is_some_and(&is_settled))
-                .collect();
-            if remaining.is_empty() {
-                break;
-            }
-            let probe_result = probe(&pack, &remaining).await?;
-            for (ty, value) in probe_result {
-                if let Some(existing) = merged.get_mut(&ty) {
-                    merge(existing, value);
-                }
-            }
-        }
-        Ok(merged)
+            })
     }
 
     /// Per-revision per-`provider_type` `identify-instance` probe (M1 IID.4).
@@ -289,6 +251,13 @@ impl RunnerHost {
     /// `Identified > NoMatch > Unsupported` — first pack to `Identified`
     /// wins and that type drops out of remaining probing.
     ///
+    /// The per-pack loop is inlined (rather than factored into a shared
+    /// `AsyncFnMut`-based helper) deliberately: routing the loop through an
+    /// `AsyncFnMut` closure destabilises HRTB `Send` inference for
+    /// downstream consumers spawning the returned future (greentic-start's
+    /// hyper `service_fn`). The `Send`-bound test
+    /// [`identify_futures_are_send`] guards against silent regression.
+    ///
     /// [`identify_messaging_endpoints_for_revision_scoped`]:
     ///     RunnerHost::identify_messaging_endpoints_for_revision_scoped
     pub async fn identify_messaging_endpoints_for_revision(
@@ -300,21 +269,36 @@ impl RunnerHost {
         provider_types: &[&str],
         payload: &[u8],
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        self.fan_out_across_packs(
-            tenant,
-            deployment_id,
-            bundle_id,
-            revision_id,
-            provider_types,
-            || IdentifyOutcome::Unsupported,
-            |o| matches!(o, IdentifyOutcome::Identified(_)),
-            async |pack, types| {
-                pack.identify_endpoints_by_provider_type(types, payload)
-                    .await
-            },
-            |dst, src| dst.merge_in(src),
-        )
-        .await
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
+        // Seed every type at Unsupported — the floor of the merge lattice
+        // (see `IdentifyOutcome::merge_in`).
+        let mut merged: HashMap<String, IdentifyOutcome> = provider_types
+            .iter()
+            .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
+            .collect();
+        for pack in runtime.all_packs() {
+            // Skip types already at the lattice top — no probe could improve them.
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| !matches!(merged.get(*ty), Some(IdentifyOutcome::Identified(_))))
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .identify_endpoints_by_provider_type(&remaining, payload)
+                .await?;
+            for (ty, outcome) in probe {
+                if let Some(existing) = merged.get_mut(&ty) {
+                    existing.merge_in(outcome);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Per-provider scoped variant of
@@ -325,6 +309,9 @@ impl RunnerHost {
     /// [`PackRuntime::resolve_identify_hint`]): hinted components receive
     /// ONLY the headers their hint declares; unhinted components receive
     /// every header the caller passed in (back-compat).
+    ///
+    /// Loop inlined for the same reason as
+    /// [`identify_messaging_endpoints_for_revision`].
     ///
     /// [`identify_messaging_endpoints_for_revision`]:
     ///     RunnerHost::identify_messaging_endpoints_for_revision
@@ -339,21 +326,33 @@ impl RunnerHost {
         headers: &[(String, String)],
         body: &Value,
     ) -> Result<HashMap<String, IdentifyOutcome>> {
-        self.fan_out_across_packs(
-            tenant,
-            deployment_id,
-            bundle_id,
-            revision_id,
-            provider_types,
-            || IdentifyOutcome::Unsupported,
-            |o| matches!(o, IdentifyOutcome::Identified(_)),
-            async |pack, types| {
-                pack.identify_endpoints_by_provider_type_scoped(types, headers, body)
-                    .await
-            },
-            |dst, src| dst.merge_in(src),
-        )
-        .await
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
+        let mut merged: HashMap<String, IdentifyOutcome> = provider_types
+            .iter()
+            .map(|ty| ((*ty).to_string(), IdentifyOutcome::Unsupported))
+            .collect();
+        for pack in runtime.all_packs() {
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| !matches!(merged.get(*ty), Some(IdentifyOutcome::Identified(_))))
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .identify_endpoints_by_provider_type_scoped(&remaining, headers, body)
+                .await?;
+            for (ty, outcome) in probe {
+                if let Some(existing) = merged.get_mut(&ty) {
+                    existing.merge_in(outcome);
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// Per-revision describe-identify-instance hint discovery.
@@ -363,6 +362,9 @@ impl RunnerHost {
     /// the per-provider header allowlist without running the expensive
     /// identify-instance probe. `None` value means no pack in this revision
     /// exposes a usable hint for that `provider_type`.
+    ///
+    /// Loop inlined for the same reason as
+    /// [`identify_messaging_endpoints_for_revision`].
     pub async fn describe_identify_instances_for_revision(
         &self,
         tenant: &str,
@@ -371,22 +373,39 @@ impl RunnerHost {
         revision_id: RevisionId,
         provider_types: &[&str],
     ) -> Result<HashMap<String, Option<crate::identify_hint::IdentifyInstanceHint>>> {
-        self.fan_out_across_packs(
-            tenant,
-            deployment_id,
-            bundle_id,
-            revision_id,
-            provider_types,
-            || None,
-            |slot: &Option<_>| slot.is_some(),
-            async |pack, types| pack.describe_identify_hints_by_provider_type(types).await,
-            |dst, src| {
-                if dst.is_none() {
-                    *dst = src;
+        if provider_types.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let runtime = self.load_revision_runtime(tenant, deployment_id, bundle_id, revision_id)?;
+        let mut merged: HashMap<String, Option<crate::identify_hint::IdentifyInstanceHint>> =
+            provider_types
+                .iter()
+                .map(|ty| ((*ty).to_string(), None))
+                .collect();
+        for pack in runtime.all_packs() {
+            // First non-`None` hint per type wins — anything already populated
+            // is at the lattice top. Mirror the `matches!` shape the sibling
+            // identify fns use so the predicate is consistent across files.
+            let remaining: Vec<&str> = provider_types
+                .iter()
+                .copied()
+                .filter(|ty| !matches!(merged.get(*ty), Some(Some(_))))
+                .collect();
+            if remaining.is_empty() {
+                break;
+            }
+            let probe = pack
+                .describe_identify_hints_by_provider_type(&remaining)
+                .await?;
+            for (ty, hint) in probe {
+                if let Some(slot) = merged.get_mut(&ty)
+                    && slot.is_none()
+                {
+                    *slot = hint;
                 }
-            },
-        )
-        .await
+            }
+        }
+        Ok(merged)
     }
 
     /// Shared activity-execution body: resolve the flow, build the canonical
@@ -1203,5 +1222,52 @@ mod identify_endpoints_tests {
             msg.contains(&revision.to_string()),
             "error chain should name the revision id, got: {msg}"
         );
+    }
+
+    /// Regression guard: the futures returned by the per-revision identify
+    /// APIs MUST be `Send`. Downstream consumers (greentic-start's hyper
+    /// `service_fn`) spawn them through tokio; a non-`Send` future at this
+    /// boundary breaks every spawned-service consumer with a confusing
+    /// "implementation of Send is not general enough" diagnostic that
+    /// surfaces far from the offending change.
+    ///
+    /// Concrete history: PR #394 routed all three identify entry points
+    /// through a shared `fan_out_across_packs` helper bounded on
+    /// `AsyncFnMut`. The HRTB inference for the resulting future
+    /// destabilised `Send` proof for all three APIs, even the legacy
+    /// `identify_messaging_endpoints_for_revision` that itself hadn't
+    /// changed shape — greentic-start failed to compile on the next
+    /// dev-publish bump. This test would have caught it.
+    #[test]
+    fn identify_futures_are_send() {
+        fn assert_send<F: Send>(_: F) {}
+        let host = dummy_runner_host();
+        // Each call has to be wrapped in its own scope so the borrows
+        // don't outlive the host's reference per call — the point is to
+        // assert each returned future type is Send-clean in isolation.
+        assert_send(host.identify_messaging_endpoints_for_revision(
+            "demo",
+            DeploymentId::new(),
+            BundleId::new("anything"),
+            RevisionId::new(),
+            &["teams"],
+            b"{}",
+        ));
+        assert_send(host.identify_messaging_endpoints_for_revision_scoped(
+            "demo",
+            DeploymentId::new(),
+            BundleId::new("anything"),
+            RevisionId::new(),
+            &["teams"],
+            &[("x-telegram-bot-api-secret-token".into(), "tok".into())],
+            &Value::Null,
+        ));
+        assert_send(host.describe_identify_instances_for_revision(
+            "demo",
+            DeploymentId::new(),
+            BundleId::new("anything"),
+            RevisionId::new(),
+            &["teams"],
+        ));
     }
 }
