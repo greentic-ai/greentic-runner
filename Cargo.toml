@@ -144,6 +144,12 @@ version = ">=1.1.0-dev, <1.2.0-0"
 [workspace.dependencies.greentic-interfaces-wasmtime]
 version = ">=1.1.0-dev, <1.2.0-0"
 
+[workspace.dependencies.greentic-x-runtime]
+version = "0.4.15"
+
+[workspace.dependencies.greentic-x-types]
+version = "0.4.15"
+
 [workspace.dependencies.greentic-oauth-sdk]
 version = ">=1.1.0-dev, <1.2.0-0"
 

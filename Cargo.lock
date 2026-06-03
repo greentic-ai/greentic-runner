@@ -2160,6 +2160,8 @@ dependencies = [
  "greentic-state",
  "greentic-telemetry",
  "greentic-types",
+ "greentic-x-runtime",
+ "greentic-x-types",
  "handlebars",
  "hex",
  "hmac 0.13.0",
@@ -2403,6 +2405,65 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "greentic-x-contracts"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "814d7fe33a6f18287c2b7aea02e3abeb39b636a2348d1a72c2bac3d4d631c868"
+dependencies = [
+ "greentic-x-events",
+ "greentic-x-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "greentic-x-events"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90fed8964c644a83aee438d0630a699f1c1491b465d2768fed92d82f40dcad36"
+dependencies = [
+ "greentic-x-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "greentic-x-ops"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d77a7fa554a71289a46f573783fde81ab56ef6997b439485c2ca23412771490"
+dependencies = [
+ "greentic-x-types",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "greentic-x-runtime"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0838369559d54e6095e7483ca717cabf650f13c598f5ecc1d8a695656a9125dd"
+dependencies = [
+ "greentic-x-contracts",
+ "greentic-x-events",
+ "greentic-x-ops",
+ "greentic-x-types",
+ "jsonschema 0.46.5",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "greentic-x-types"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edaab69d756e0188f9895bbbfa0197163ecd22a0ac9c6d138252e1ca02c4737"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3911,7 +3972,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
