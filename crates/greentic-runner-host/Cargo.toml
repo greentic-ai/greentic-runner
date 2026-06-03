@@ -20,6 +20,7 @@ component-v0-6-introspection = []
 # gates around greentic_telemetry::annotate_span calls; turning the gate on
 # activates explicit span annotation (greentic-telemetry is always linked).
 telemetry = []
+greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
 [dependencies]
 async-trait.workspace = true
@@ -33,6 +34,8 @@ greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
 greentic-interfaces.workspace = true
+greentic-x-runtime = { workspace = true, optional = true }
+greentic-x-types = { workspace = true, optional = true }
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
 greentic-distributor-client.workspace = true
