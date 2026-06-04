@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as ComponentTenantCtx};
 use crate::pack::PackRuntime;
 use greentic_x_runtime::{
-    ComponentInvocationEnvelope, ComponentInvocationResultEnvelope, ComponentProvider, RuntimeError,
+    ComponentInvocationEnvelope, ComponentInvocationResultEnvelope, ComponentProvider,
+    Fast2FlowRouteRequest, Fast2FlowRouteResult, Fast2FlowRoutingProvider, RuntimeError,
 };
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
@@ -124,6 +125,120 @@ impl ComponentProvider for RunnerPackComponentProvider {
             component_id,
             output,
         ))
+    }
+}
+
+/// Fast2Flow routing provider backed by a materialized Greentic runner pack.
+///
+/// The routed component is expected to accept `Fast2FlowRouteRequest` JSON and
+/// return `Fast2FlowRouteResult` JSON. This keeps Greentic runner on the
+/// Greentic-X routing boundary while allowing the concrete Fast2Flow
+/// implementation to live in a pack/component.
+pub struct RunnerPackFast2FlowRoutingProvider {
+    pack: Arc<PackRuntime>,
+    runtime: Runtime,
+    component_ref: String,
+    operation: String,
+    tenant: String,
+    flow_id: String,
+}
+
+impl RunnerPackFast2FlowRoutingProvider {
+    pub fn new(pack: Arc<PackRuntime>) -> Result<Self, RuntimeError> {
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
+                scope: "runner-pack-routing-provider".to_owned(),
+                message: format!("failed to create routing invocation runtime: {err}"),
+            })?;
+        Ok(Self {
+            pack,
+            runtime,
+            component_ref: "fast2flow-routing".to_owned(),
+            operation: "route".to_owned(),
+            tenant: "default".to_owned(),
+            flow_id: "greentic-x.fast2flow-routing".to_owned(),
+        })
+    }
+
+    pub fn with_component_ref(mut self, component_ref: impl Into<String>) -> Self {
+        self.component_ref = component_ref.into();
+        self
+    }
+
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = operation.into();
+        self
+    }
+
+    pub fn with_tenant(mut self, tenant: impl Into<String>) -> Self {
+        self.tenant = tenant.into();
+        self
+    }
+
+    pub fn with_flow_id(mut self, flow_id: impl Into<String>) -> Self {
+        self.flow_id = flow_id.into();
+        self
+    }
+
+    fn exec_ctx(&self, request: &Fast2FlowRouteRequest) -> ComponentExecCtx {
+        ComponentExecCtx {
+            tenant: ComponentTenantCtx {
+                tenant: self.tenant.clone(),
+                team: None,
+                user: None,
+                trace_id: None,
+                i18n_id: Some(request.input_locale.clone()),
+                correlation_id: None,
+                deadline_unix_ms: None,
+                attempt: 1,
+                idempotency_key: Some(format!(
+                    "fast2flow:{}:{}:{}",
+                    request.scope,
+                    request.envelope.channel.as_deref().unwrap_or(""),
+                    request.now_unix_ms
+                )),
+            },
+            i18n_id: Some(request.input_locale.clone()),
+            flow_id: self.flow_id.clone(),
+            node_id: Some(self.component_ref.clone()),
+        }
+    }
+}
+
+impl Fast2FlowRoutingProvider for RunnerPackFast2FlowRoutingProvider {
+    fn route_intent(
+        &self,
+        request: Fast2FlowRouteRequest,
+    ) -> Result<Fast2FlowRouteResult, RuntimeError> {
+        let scope = request.scope.clone();
+        let ctx = self.exec_ctx(&request);
+        let input_json = serde_json::to_string(&request).map_err(|err| {
+            RuntimeError::Fast2FlowRoutingFailed {
+                scope: scope.clone(),
+                message: format!("failed to serialize Fast2Flow route request: {err}"),
+            }
+        })?;
+        let pack = Arc::clone(&self.pack);
+        let component_ref = self.component_ref.clone();
+        let operation = self.operation.clone();
+
+        let output = self
+            .runtime
+            .block_on(async move {
+                pack.invoke_component(&component_ref, ctx, &operation, None, input_json)
+                    .await
+            })
+            .map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
+                scope: scope.clone(),
+                message: err.to_string(),
+            })?;
+
+        serde_json::from_value(output).map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
+            scope,
+            message: format!("failed to decode Fast2Flow route result: {err}"),
+        })
     }
 }
 
