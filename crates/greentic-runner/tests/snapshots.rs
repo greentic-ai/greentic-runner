@@ -130,6 +130,7 @@ fn build_pack(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 

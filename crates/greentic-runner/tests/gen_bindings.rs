@@ -56,6 +56,7 @@ fn write_manifest_cbor(dir: &Path) -> PathBuf {
         secret_requirements: Vec::new(),
         signatures: PackSignatures::default(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
     let bytes = encode_pack_manifest(&manifest).expect("encode manifest");
