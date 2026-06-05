@@ -1348,23 +1348,13 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
 /// The reduced-authority boundary is enforced at the WASI policy layer
 /// instead: probe call sites construct a locked-down
 /// [`RunnerWasiPolicy`](crate::wasi::RunnerWasiPolicy) with no
-/// preopens, no env passthrough, and no stdio inheritance. See the
-/// `probe_wasi_policy` helper and the
-/// `register_identity_probe_uses_locked_down_wasi_policy` test.
+/// preopens, no env passthrough, and no stdio inheritance. See
+/// [`RunnerWasiPolicy::probe()`](crate::wasi::RunnerWasiPolicy::probe)
+/// and the `probe_wasi_policy_is_locked_down` test.
 pub fn register_identity_probe(linker: &mut Linker<ComponentState>) -> Result<()> {
     // Delegates to `register_all` with state-store disabled. See doc
     // comment above for the rationale (Wasmtime eager-import validation).
     register_all(linker, false)
-}
-
-/// Locked-down WASI policy for identity probes.
-///
-/// No preopens, no env passthrough, no stdio inheritance. This is the
-/// only reduced-authority boundary that the probe path can enforce today
-/// (the linker import surface must match the full component; see
-/// [`register_identity_probe`] doc comment).
-fn probe_wasi_policy() -> Arc<RunnerWasiPolicy> {
-    Arc::new(RunnerWasiPolicy::new().inherit_stdio(false))
 }
 
 #[cfg(test)]
@@ -1390,7 +1380,7 @@ mod register_identity_probe_tests {
     /// no stdio — the only reduced-authority boundary available today.
     #[test]
     fn probe_wasi_policy_is_locked_down() {
-        let policy = probe_wasi_policy();
+        let policy = RunnerWasiPolicy::probe();
         assert!(!policy.inherit_stdio, "probe WASI must not inherit stdio");
         assert!(
             policy.preopens.is_empty(),
@@ -2264,7 +2254,7 @@ impl PackRuntime {
         // The linker registers all imports (Wasmtime requires it for
         // instantiate_pre), but the WASI sandbox is the tightest we
         // can enforce today. See [`register_identity_probe`] docs.
-        let wasi_policy = probe_wasi_policy();
+        let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
         run_on_wasi_thread("provider.identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
@@ -2339,7 +2329,7 @@ impl PackRuntime {
 
         // Locked-down WASI policy — same rationale as
         // `invoke_identify_instance`. See [`register_identity_probe`] docs.
-        let wasi_policy = probe_wasi_policy();
+        let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
         run_on_wasi_thread("provider.describe_identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
