@@ -607,7 +607,6 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
-            provider_id: None,
             capabilities: Vec::new(),
             ops: vec!["process".to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),
@@ -734,7 +733,6 @@ fn build_provider_pack_with_schemas(
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
-            provider_id: None,
             capabilities: Vec::new(),
             ops: vec![PROVIDER_OP.to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),

@@ -328,6 +328,7 @@ fn build_pack(component_path: &Path, pack_path: &Path, flows: &[Flow]) -> Result
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: Some(extensions),
     };
 
@@ -394,6 +395,7 @@ fn build_component_pack(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 
@@ -466,7 +468,6 @@ fn provider_extension() -> BTreeMap<String, greentic_types::ExtensionRef> {
     let inline = greentic_types::ProviderExtensionInline {
         providers: vec![greentic_types::ProviderDecl {
             provider_type: "example.dummy".into(),
-            provider_id: None,
             capabilities: Vec::new(),
             ops: vec!["echo".into()],
             config_schema_ref: "schemas/config.schema.json".into(),

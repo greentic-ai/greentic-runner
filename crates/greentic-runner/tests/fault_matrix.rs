@@ -157,6 +157,7 @@ nodes:
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 

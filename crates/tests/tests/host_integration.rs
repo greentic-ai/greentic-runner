@@ -390,6 +390,7 @@ fn build_runner_components_pack(pack_path: &std::path::Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 
@@ -462,6 +463,7 @@ nodes:
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 
@@ -561,6 +563,7 @@ nodes:
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
+        agents: Default::default(),
         extensions: None,
     };
 
