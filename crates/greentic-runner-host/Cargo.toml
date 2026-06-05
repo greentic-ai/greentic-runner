@@ -52,6 +52,7 @@ lru.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 runner-core.workspace = true
 serde = { workspace = true }
 serde_cbor.workspace = true

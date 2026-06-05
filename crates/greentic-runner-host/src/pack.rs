@@ -80,7 +80,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
+use wasmtime_wasi_tls::p2::LinkOptions;
+use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -1243,8 +1244,28 @@ pub struct ComponentState {
     resource_table: ResourceTable,
 }
 
+/// Install the process-default rustls [`rustls::crypto::CryptoProvider`] exactly once.
+///
+/// `wasmtime-wasi-tls` 45's `RustlsProvider::default()` builds its
+/// `rustls::ClientConfig` via `ClientConfig::builder()`, which resolves the
+/// process-default provider. Our dependency graph enables BOTH the `ring` and
+/// `aws_lc_rs` rustls backends, so there is no unambiguous implicit default and
+/// the builder panics ("no process-level CryptoProvider available") the first
+/// time [`WasiTlsCtxBuilder::build`] constructs the default provider. Install
+/// the workspace-selected aws-lc-rs provider before that ever happens.
+/// Idempotent: a returned `Err` means a default was already installed.
+fn install_default_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        // Must run before `WasiTlsCtxBuilder::build()` below, which eagerly
+        // constructs wasi-tls's default rustls provider.
+        install_default_crypto_provider();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1403,9 +1424,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
-        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
-    })?;
+    wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1567,6 +1586,15 @@ impl WasiHttpView for ComponentState {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+impl WasiTlsView for ComponentState {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.wasi_tls_ctx,
+            table: &mut self.resource_table,
         }
     }
 }

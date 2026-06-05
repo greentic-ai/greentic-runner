@@ -69,8 +69,8 @@ toml = "1"
 # `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
 greentic-telemetry = ">=1.1.0-dev.26432434860, <1.2.0-0"
 walkdir = "2"
-wasmtime-wasi-http = "43"
-wasmtime-wasi-tls = "43"
+wasmtime-wasi-http = "45"
+wasmtime-wasi-tls = "45"
 jsonschema = "0.45"
 handlebars = "6"
 dashmap = "6"
@@ -230,7 +230,7 @@ features = [
 ]
 
 [workspace.dependencies.wasmtime]
-version = "43"
+version = "45"
 default-features = false
 features = [
     "component-model",
@@ -240,14 +240,14 @@ features = [
 ]
 
 [workspace.dependencies.wasmtime-wasi]
-version = "43"
+version = "45"
 default-features = false
 features = [
     "p2",
 ]
 
 [workspace.dependencies.wasmtime-environ]
-version = "43"
+version = "45"
 
 [workspace.dependencies.insta]
 version = "1"
