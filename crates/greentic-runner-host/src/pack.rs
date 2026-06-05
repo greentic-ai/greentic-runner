@@ -1319,6 +1319,102 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
     Ok(())
 }
 
+/// Reduced-authority linker for `identify-instance` and
+/// `describe-identify-instance` probes (M1 IID Phase D).
+///
+/// Identity probes match an inbound webhook payload against known
+/// per-endpoint discriminators (Telegram secret-token header, Slack
+/// signing-secret, Teams JWT issuer, …) and return an endpoint id
+/// or `none`. The WIT contract is a pure projection over `(headers,
+/// body)` — no outbound HTTP, no persistent state, no secrets.
+///
+/// Versus [`register_all`], this linker DELIBERATELY OMITS:
+///
+/// - `wasi-tls`, `wasi-http`, `greentic:http/client@{1.0,1.1}` — no
+///   outbound HTTP from a probe (an attacker-shaped header pattern
+///   must not be able to trigger a side-effecting request).
+/// - `greentic:secrets-store@{1.0,1.1}` — probes cannot read secrets
+///   (the discriminator they validate is already in the payload).
+/// - `greentic:state-store/state-store@1.0.0` — probes are read-only,
+///   no state mutations, no cross-request state leakage.
+/// - `greentic:runner-host/{http,kv}@1.0.0` — no host-side HTTP/KV.
+/// - `greentic:oauth/broker@1.0.0` — no token minting on a probe path.
+///
+/// What it KEEPS:
+///
+/// - `wasi` core — required to instantiate any wasm32-wasip2 component.
+/// - `greentic:component/control@{0.4,0.5}` — lifecycle hooks
+///   (`should-cancel`, `yield-now`), not security-sensitive.
+/// - `greentic:telemetry/logger@1.0.0` — probes may emit `warn!`-level
+///   diagnostics for malformed payloads, consistent with the host's
+///   own `provider.describe_identify_instance.malformed` warn line.
+///
+/// A regression test (`register_identity_probe_omits_secrets_and_state`)
+/// asserts the omitted set behaviorally: it registers the probe linker
+/// then re-registers the forbidden imports — Wasmtime's
+/// [`Linker::instance`] rejects double-registration, so a probe linker
+/// that accidentally pulled in `register_all` would fail that test.
+pub fn register_identity_probe(linker: &mut Linker<ComponentState>) -> Result<()> {
+    add_wasi_to_linker(linker)?;
+    add_component_control_to_linker(linker)?;
+    // HostFns can't be `..Default::default()`-ed here because the derive
+    // requires `T: Default` and `ComponentState` deliberately isn't `Default`
+    // (it owns non-default resources). List every slot explicitly so future
+    // additions to `HostFns` fail to compile here, forcing a probe-surface
+    // decision on each new host import rather than silently inheriting one.
+    add_all_v1_to_linker(
+        linker,
+        HostFns {
+            http_client_v1_1: None,
+            http_client: None,
+            oauth_broker: None,
+            runner_host_http: None,
+            runner_host_kv: None,
+            telemetry_logger: Some(|state: &mut ComponentState| state.host_mut()),
+            state_store: None,
+            secrets_store_v1_1: None,
+            secrets_store: None,
+        },
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod register_identity_probe_tests {
+    use super::*;
+    use greentic_interfaces_wasmtime::host_helpers::v1::{
+        secrets_store::{add_secrets_store_to_linker, add_secrets_store_v1_1_to_linker},
+        state_store::add_state_store_to_linker,
+    };
+
+    /// M1 IID Phase D: probes MUST run under [`register_identity_probe`],
+    /// which deliberately omits `secrets-store`, `state-store`, and the
+    /// outbound `http-client` worlds. Wasmtime has no `Linker::contains`
+    /// — prove omission BEHAVIORALLY by re-registering each forbidden
+    /// import on the probe linker. `Linker::instance(name)` rejects
+    /// duplicates with `Err`, so a probe linker that accidentally pulled
+    /// in `register_all` would make every `add_*_to_linker` below fail.
+    ///
+    /// A regression PR that swapped `register_identity_probe` back to
+    /// `register_all` would break this test at the linker layer rather
+    /// than silently widening the probe trust boundary.
+    #[test]
+    fn register_identity_probe_omits_secrets_and_state() {
+        let engine = wasmtime::Engine::default();
+        let mut linker = Linker::<ComponentState>::new(&engine);
+        register_identity_probe(&mut linker).expect("probe linker registers");
+
+        add_secrets_store_to_linker(&mut linker, |state: &mut ComponentState| state.host_mut())
+            .expect("probe linker leaves secrets-store@1.0.0 unregistered");
+        add_secrets_store_v1_1_to_linker(&mut linker, |state: &mut ComponentState| {
+            state.host_mut()
+        })
+        .expect("probe linker leaves secrets-store@1.1.0 unregistered");
+        add_state_store_to_linker(&mut linker, |state: &mut ComponentState| state.host_mut())
+            .expect("probe linker leaves state-store@1.0.0 unregistered");
+    }
+}
+
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
     add_wasi_to_linker(linker)?;
 
@@ -2174,13 +2270,13 @@ impl PackRuntime {
         let pack_id = self.metadata().pack_id.clone();
         let allow_state_store = self.allows_state_store(&component_ref_owned);
 
-        // Phase D follow-up: replace `register_all` + `add_component_control_to_linker`
-        // with a reduced import set for identity probes (read-only config, no secrets
-        // write, no state mutations). See doc-comment above.
+        // Reduced-authority linker for identity probes — no outbound HTTP,
+        // no secrets, no state. See [`register_identity_probe`] for the
+        // exact import surface and the threat model it closes.
+        let _ = allow_state_store; // probe linker never registers state-store.
         run_on_wasi_thread("provider.identify_instance", move || {
             let mut linker = Linker::new(&engine);
-            register_all(&mut linker, allow_state_store)?;
-            add_component_control_to_linker(&mut linker)?;
+            register_identity_probe(&mut linker)?;
             let host_state = HostState::new(
                 pack_id.clone(),
                 config,
@@ -2252,13 +2348,13 @@ impl PackRuntime {
         let pack_id = self.metadata().pack_id.clone();
         let allow_state_store = self.allows_state_store(&component_ref_owned);
 
-        // Same reduced-import-set Phase D follow-up as `invoke_identify_instance`
-        // applies here — describe-identify-instance is a metadata probe with
-        // no inputs, so it has even less reason to need the full host surface.
+        // Reduced-authority linker — same probe surface as
+        // `invoke_identify_instance`. Describe is a metadata probe with no
+        // inputs, so it has even less reason to need the full host surface.
+        let _ = allow_state_store; // probe linker never registers state-store.
         run_on_wasi_thread("provider.describe_identify_instance", move || {
             let mut linker = Linker::new(&engine);
-            register_all(&mut linker, allow_state_store)?;
-            add_component_control_to_linker(&mut linker)?;
+            register_identity_probe(&mut linker)?;
             let host_state = HostState::new(
                 pack_id.clone(),
                 config,
