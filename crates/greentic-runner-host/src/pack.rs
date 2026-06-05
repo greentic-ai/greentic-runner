@@ -1244,8 +1244,28 @@ pub struct ComponentState {
     resource_table: ResourceTable,
 }
 
+/// Install the process-default rustls [`rustls::crypto::CryptoProvider`] exactly once.
+///
+/// `wasmtime-wasi-tls` 45's `RustlsProvider::default()` builds its
+/// `rustls::ClientConfig` via `ClientConfig::builder()`, which resolves the
+/// process-default provider. Our dependency graph enables BOTH the `ring` and
+/// `aws_lc_rs` rustls backends, so there is no unambiguous implicit default and
+/// the builder panics ("no process-level CryptoProvider available") the first
+/// time [`WasiTlsCtxBuilder::build`] constructs the default provider. Install
+/// the workspace-selected aws-lc-rs provider before that ever happens.
+/// Idempotent: a returned `Err` means a default was already installed.
+fn install_default_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        // Must run before `WasiTlsCtxBuilder::build()` below, which eagerly
+        // constructs wasi-tls's default rustls provider.
+        install_default_crypto_provider();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
