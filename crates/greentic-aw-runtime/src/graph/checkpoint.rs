@@ -151,7 +151,7 @@ pub trait CheckpointStore: Send + Sync {
 /// Reject any key segment that contains `':'`.
 ///
 /// See module-level doc for the key-segment contract.
-fn check_segment(name: &str, value: &str) -> Result<(), CheckpointError> {
+pub(crate) fn check_segment(name: &str, value: &str) -> Result<(), CheckpointError> {
     if value.contains(':') {
         Err(CheckpointError::Backend(format!(
             "invalid key segment: {name} '{value}' must not contain ':'"

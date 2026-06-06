@@ -4,6 +4,7 @@
 pub mod checkpoint;
 pub mod executor;
 pub mod model;
+pub mod redis_checkpoint;
 pub mod router;
 pub mod state;
 
@@ -19,5 +20,6 @@ pub use executor::{
     GraphRunOutcome, ToolCallRequest, ToolFn,
 };
 pub use model::{Edge, Graph, GraphConfig, GraphError, Node, NodeKind};
+pub use redis_checkpoint::RedisCheckpointStore;
 pub use router::route;
 pub use state::{GraphMessage, GraphRole, GraphRunState};
