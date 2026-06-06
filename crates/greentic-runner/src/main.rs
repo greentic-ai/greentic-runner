@@ -729,6 +729,8 @@ async fn load_pack_runtime_for_contract(path: &Path) -> Result<PackRuntime> {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     });
     PackRuntime::load(
         path,

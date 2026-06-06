@@ -68,3 +68,11 @@ load time.
 > emits `<DIR>/<manifest_id>.json` — the exact loose file this overlay reads.
 > (The manifest is not stored inside the composed `.gtpack`, so this loose file
 > is the supported delivery path.)
+
+## Agent graphs
+
+Multi-agent orchestration is supported via the `dw.agent_graph` flow-node kind,
+backed by `greentic_aw_runtime::graph::GraphExecutor`. Graphs are defined in an
+`agent-graph.json` sidecar co-located with the pack. For the full design and
+sidecar schema see
+`docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md`.

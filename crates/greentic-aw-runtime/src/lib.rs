@@ -5,6 +5,10 @@
 //! point and the trait surface (`AgentStateStore`, `ConfigProvider`,
 //! `LlmBackend`, `Telemetry`) that the production runner-host and the
 //! designer playground both consume.
+//!
+//! The [`graph`] module provides durable multi-agent graph execution
+//! (`GraphExecutor`, `GraphConfig`, `CheckpointStore`); see
+//! `docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md`.
 
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
