@@ -13,6 +13,7 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod error;
+pub mod graph;
 pub mod http_provider;
 pub mod layered_provider;
 pub mod llm;
