@@ -77,7 +77,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
+use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -1280,9 +1281,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
-        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
-    })?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1444,6 +1443,15 @@ impl WasiHttpView for ComponentState {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+impl WasiTlsView for ComponentState {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.wasi_tls_ctx,
+            table: &mut self.resource_table,
         }
     }
 }
@@ -4207,6 +4215,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4267,6 +4276,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
