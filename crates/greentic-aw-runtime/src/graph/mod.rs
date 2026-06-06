@@ -3,6 +3,7 @@
 //! docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md.
 pub mod checkpoint;
 pub mod executor;
+pub mod http_provider;
 pub mod model;
 pub mod redis_checkpoint;
 pub mod router;
@@ -19,6 +20,7 @@ pub use executor::{
     AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, GraphExecError, GraphExecutor,
     GraphRunOutcome, ToolCallRequest, ToolFn,
 };
+pub use http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use model::{Edge, Graph, GraphConfig, GraphError, Node, NodeKind};
 pub use redis_checkpoint::RedisCheckpointStore;
 pub use router::route;

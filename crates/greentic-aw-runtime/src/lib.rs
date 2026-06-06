@@ -41,6 +41,7 @@ pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigP
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
 pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
