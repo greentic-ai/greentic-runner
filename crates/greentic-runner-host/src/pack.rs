@@ -1201,6 +1201,10 @@ pub struct ComponentState {
 
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        // `WasiTlsCtxBuilder::new()` below eagerly builds a rustls client
+        // config, which requires a process-level crypto provider; install it
+        // first (idempotent) so construction never panics.
+        ensure_rustls_provider_installed();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1275,7 +1279,28 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
     Ok(())
 }
 
+/// Install a process-level rustls [`CryptoProvider`] for `wasi-tls`.
+///
+/// `wasmtime-wasi-tls` 45 builds its TLS client config via
+/// `rustls::ClientConfig::builder()`, which relies on the process-default
+/// crypto provider. Because both `aws-lc-rs` (via reqwest/hyper-rustls) and
+/// `ring` (via wasmtime-wasi-tls) are linked, rustls 0.23 cannot auto-select
+/// one and panics on first use. Install `aws-lc-rs` explicitly to match the
+/// provider used by the rest of the runner's HTTP stack.
+///
+/// Idempotent: only installs when no default is set yet, so concurrent callers
+/// (and repeated `register_all` invocations) are safe.
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // `install_default` returns Err if another thread won the race; that is
+        // fine — a provider is installed either way.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
+    ensure_rustls_provider_installed();
+
     add_wasi_to_linker(linker)?;
 
     // Add wasi-tls types and turn on the feature in linker

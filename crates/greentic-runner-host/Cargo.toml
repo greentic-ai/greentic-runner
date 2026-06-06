@@ -91,6 +91,11 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 wasmtime-wasi-tls = { workspace = true }
+# Needed to install a process-level rustls CryptoProvider for wasi-tls.
+# rustls 0.23 (pulled by wasmtime-wasi-tls 45) refuses to auto-select a
+# provider when both `aws-lc-rs` (via reqwest/hyper-rustls) and `ring`
+# (via wasmtime-wasi-tls) are linked, so the runner must pick one explicitly.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 greentic-telemetry = { workspace = true, optional = true }
 
 [dev-dependencies]
