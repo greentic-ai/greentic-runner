@@ -7,9 +7,23 @@
 //! - [`InMemoryCheckpointStore`] — std::sync::Mutex-backed implementation for tests
 //!   and designer swap. The Redis implementation ships in Task 6.
 //!
-//! Key format rules (kept explicit so the Redis impl can reuse them verbatim):
-//! - Run key:  `"{tenant_id}:{env_id}:{run_id}"`
+//! # Key format and segment constraints
+//!
+//! Key segments (`tenant_id`, `env_id`, `run_id`, `node_id`) **MUST NOT contain `':'`**.
+//! Using `':'` as a delimiter makes keys unambiguous only when no segment itself contains
+//! the delimiter.  Run-id producers use `'__'` as their internal word separator to avoid
+//! conflicts.
+//!
+//! Key format for this in-memory implementation:
+//! - Run key:   `"{tenant_id}:{env_id}:{run_id}"`
 //! - Visit key: `"{tenant_id}:{env_id}:{run_id}:{node_id}:{attempt}"`
+//!
+//! The Redis implementation (Task 6) **must additionally** prepend the crate's `aw:` namespace
+//! prefix, consistent with [`crate::state_redis::RedisAgentStateStore`] which uses
+//! [`crate::tenant::TenantContext::key_prefix()`] (returning `"aw:{tenant_id}:{env_id}"`).
+//! This yields Redis keys of the form:
+//! - Run key:   `"aw:{tenant_id}:{env_id}:{run_id}"`
+//! - Visit key: `"aw:{tenant_id}:{env_id}:{run_id}:{node_id}:{attempt}"`
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -134,6 +148,19 @@ pub trait CheckpointStore: Send + Sync {
 // Key helpers
 // ---------------------------------------------------------------------------
 
+/// Reject any key segment that contains `':'`.
+///
+/// See module-level doc for the key-segment contract.
+fn check_segment(name: &str, value: &str) -> Result<(), CheckpointError> {
+    if value.contains(':') {
+        Err(CheckpointError::Backend(format!(
+            "invalid key segment: {name} '{value}' must not contain ':'"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn run_key(tenant: &TenantContext, run_id: &str) -> String {
     format!("{}:{}:{}", tenant.tenant_id, tenant.env_id, run_id)
 }
@@ -185,6 +212,7 @@ impl CheckpointStore for InMemoryCheckpointStore {
         rec: &'a GraphRunRecord,
     ) -> BoxFut<'a, Result<(), CheckpointError>> {
         Box::pin(async move {
+            check_segment("run_id", &rec.run_id)?;
             let key = run_key(tenant, &rec.run_id);
             let mut guard = self
                 .runs
@@ -204,6 +232,8 @@ impl CheckpointStore for InMemoryCheckpointStore {
         result: &'a serde_json::Value,
     ) -> BoxFut<'a, Result<NodeVisitOutcome, CheckpointError>> {
         Box::pin(async move {
+            check_segment("run_id", run_id)?;
+            check_segment("node_id", node_id)?;
             let key = visit_key(tenant, run_id, node_id, attempt);
             let mut guard = self
                 .visits
@@ -394,5 +424,31 @@ mod tests {
 
         let back: RunStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, RunStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn save_rejects_colon_in_run_id() {
+        let store = InMemoryCheckpointStore::default();
+        let t = TenantContext::new("t1", "dev");
+        let rec = make_record("a:b");
+        let err = store.save(&t, &rec).await.unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::Backend(ref msg) if msg.contains("run_id")),
+            "expected Backend error mentioning run_id, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_node_visit_rejects_colon_in_node_id() {
+        let store = InMemoryCheckpointStore::default();
+        let t = TenantContext::new("t1", "dev");
+        let err = store
+            .record_node_visit(&t, "r1", "x:y", 0, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CheckpointError::Backend(ref msg) if msg.contains("node_id")),
+            "expected Backend error mentioning node_id, got {err:?}"
+        );
     }
 }

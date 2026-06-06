@@ -92,14 +92,23 @@ impl Graph {
         self.edges.iter().filter(move |e| e.from == id)
     }
 
-    /// Validate the graph against the five structural rules:
+    /// Validate the graph against the six structural rules:
     ///
     /// 1. `entry` names an existing node.
     /// 2. Every edge endpoint names an existing node.
     /// 3. Agent and Tool nodes have exactly one outgoing edge.
     /// 4. Router nodes have both a `"loop"` and a `"resolved"` branch edge.
     /// 5. Respond nodes have zero outgoing edges.
+    /// 6. Node ids must be unique.
     pub fn validate(&self) -> Result<(), String> {
+        // Rule 6: node ids must be unique.
+        let mut seen = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if !seen.insert(&node.id) {
+                return Err(format!("duplicate node id '{}'", node.id));
+            }
+        }
+
         // Rule 1: entry exists.
         if self.node(&self.entry).is_none() {
             return Err(format!("entry node '{}' not found", self.entry));
@@ -278,5 +287,15 @@ mod tests {
         v["schemaVersion"] = 2.into();
         let err = GraphConfig::from_json(&v.to_string()).unwrap_err();
         assert!(matches!(err, GraphError::UnsupportedSchemaVersion(2)));
+    }
+
+    #[test]
+    fn rejects_duplicate_node_ids() {
+        let mut v = triage_value();
+        v["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"id": "agent", "kind": "respond"}));
+        assert!(GraphConfig::from_json(&v.to_string()).is_err());
     }
 }
