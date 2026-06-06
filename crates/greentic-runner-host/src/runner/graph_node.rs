@@ -932,9 +932,8 @@ mod aw {
             .await
             .map_err(|e| GraphExecError::Supervisor(format!("supervisor step failed: {e}")))?;
 
-        let raw_reply = strip_sentinel(&out.reply);
-
         // Parse [[ROUTE:<branch>]] from the reply (case-insensitive).
+        // Do this BEFORE stripping so we read from the unmodified reply.
         let branch = parse_route_branch(&out.reply, &req.routes).unwrap_or_else(|| {
             let fallback = req
                 .routes
@@ -949,6 +948,10 @@ mod aw {
             );
             fallback
         });
+
+        // Strip the [[ROUTE:<branch>]] sentinel from the stored assistant message
+        // so the message log does not expose routing instructions to downstream nodes.
+        let raw_reply = strip_route_sentinel(&out.reply);
 
         Ok(SupervisorResult { branch, raw_reply })
     }
@@ -973,6 +976,28 @@ mod aw {
         } else {
             None
         }
+    }
+
+    /// Strip the `[[ROUTE:<branch>]]` sentinel (case-insensitive, first occurrence)
+    /// from a supervisor reply, trimming surrounding whitespace.
+    ///
+    /// If no sentinel is present the reply is returned trimmed. Used to clean
+    /// up the text before it is pushed into the message log as an assistant
+    /// message.
+    fn strip_route_sentinel(reply: &str) -> String {
+        let lower = reply.to_ascii_lowercase();
+        let prefix_lower = ROUTE_SENTINEL_PREFIX.to_ascii_lowercase();
+        let suffix_lower = ROUTE_SENTINEL_SUFFIX.to_ascii_lowercase();
+        if let Some(start) = lower.find(&prefix_lower) {
+            let after_prefix = start + prefix_lower.len();
+            if let Some(end) = lower[after_prefix..].find(&suffix_lower) {
+                let sentinel_end = after_prefix + end + suffix_lower.len();
+                let mut out = reply.to_string();
+                out.replace_range(start..sentinel_end, "");
+                return out.trim().to_string();
+            }
+        }
+        reply.trim().to_string()
     }
 
     /// Build the [`ToolFn`] effect closure.
