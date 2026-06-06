@@ -1253,8 +1253,16 @@ mod aw {
             }
             assert!(super::graph_registry_from_env().is_some());
 
+            // Token-alone (no endpoint) must also be None.
             unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+            }
+            assert!(
+                super::graph_registry_from_env().is_none(),
+                "token alone is not enough"
+            );
+
+            unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
         }

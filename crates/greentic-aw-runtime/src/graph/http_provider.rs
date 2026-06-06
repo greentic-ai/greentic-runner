@@ -408,4 +408,53 @@ mod tests {
 
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
+
+    #[tokio::test]
+    async fn caching_provider_does_not_cache_errors() {
+        // Errors must always hit the inner provider; a cached error would
+        // permanently block a graph_id after a transient failure.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let provider = CachingGraphProvider::new(HttpGraphProvider::new(server.uri(), "tok"));
+        let tc = tenant();
+
+        let _ = provider.graph_config(&tc, "g1").await.unwrap_err();
+        let _ = provider.graph_config(&tc, "g1").await.unwrap_err();
+
+        // Both calls must have reached the server — errors are not stored.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "errors must not be cached; every error call hits the inner provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn caching_provider_isolates_tenants() {
+        // Two tenants with the same graph_id must receive independent cache
+        // entries — serving tenant-A's graph to tenant-B would be a data leak.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(valid_graph_json()))
+            .mount(&server)
+            .await;
+
+        let provider = CachingGraphProvider::new(HttpGraphProvider::new(server.uri(), "tok"));
+        let tc_a = TenantContext::new("tenant-a", "prod");
+        let tc_b = TenantContext::new("tenant-b", "prod");
+
+        let _ = provider.graph_config(&tc_a, "g1").await.unwrap();
+        let _ = provider.graph_config(&tc_b, "g1").await.unwrap();
+
+        // Each tenant's first request must hit the inner provider independently.
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "separate tenants must not share a cache entry for the same graph_id"
+        );
+    }
 }
