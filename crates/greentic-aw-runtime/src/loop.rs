@@ -1,5 +1,6 @@
 //! Plan-Act-Observe agent loop. Spec §5.3.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -10,7 +11,7 @@ use crate::state::{ChatMessage, ConversationState};
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
 use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
-use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep};
+use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver};
 
 pub async fn run_step(
     runtime: &AgentRuntime,
@@ -18,6 +19,7 @@ pub async fn run_step(
     session_id: &str,
     agent_id: &str,
     message: AgentInput,
+    observer: Arc<dyn StepObserver>,
 ) -> Result<AgentOutput, AgentError> {
     let started = Instant::now();
     let config = runtime
@@ -83,7 +85,13 @@ pub async fn run_step(
             provider: config.llm.clone(),
         };
 
-        let response = match runtime.llm.complete(request).await {
+        let obs = observer.clone();
+        let on_delta: crate::llm::OnDelta = Box::new(move |chunk: &str| obs.on_token_delta(chunk));
+        // On a mid-stream error the provider may have billed for partial
+        // tokens, but usage only arrives in the stream's final chunk; those
+        // partial tokens are NOT metered here. This matches the blocking
+        // path, which likewise meters nothing when complete() errors.
+        let response = match runtime.llm.complete_streaming(request, on_delta).await {
             Ok(r) => r,
             Err(LlmError::ServiceUnavailable) => {
                 let _ = runtime.state_store.save(&tenant, session_id, &state).await;
@@ -140,6 +148,7 @@ pub async fn run_step(
                 // the error as a Tool observation so the LLM can react, then
                 // continue. Failed calls are NOT recorded in the ledger
                 // (they should remain retryable on the next turn).
+                observer.on_tool_call(&call.tool_name, &call.call_id);
                 let result =
                     match dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await {
                         Ok(r) => r,
@@ -161,6 +170,8 @@ pub async fn run_step(
                             continue;
                         }
                     };
+
+                observer.on_tool_result(&call.tool_name, &call.call_id, &result);
 
                 // Record successful result in ledger (best-effort).
                 if let Err(e) = runtime
@@ -221,7 +232,7 @@ pub async fn run_step(
 }
 
 #[cfg(all(test, feature = "test-mock"))]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -279,5 +290,61 @@ mod tests {
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+    }
+
+    #[derive(Default)]
+    struct Collecting {
+        deltas: std::sync::Mutex<Vec<String>>,
+        tool_calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl crate::StepObserver for Collecting {
+        fn on_token_delta(&self, chunk: &str) {
+            self.deltas.lock().expect("lock").push(chunk.to_string());
+        }
+        fn on_tool_call(&self, name: &str, _call_id: &str) {
+            self.tool_calls.lock().expect("lock").push(name.to_string());
+        }
+    }
+
+    /// `step_with_observer` mirrors `happy_path_returns_llm_reply` but
+    /// drives a collecting observer; the default-impl single-delta path
+    /// (MockLlmBackend uses the trait default) must forward the full reply
+    /// to `on_token_delta`.
+    #[tokio::test]
+    async fn step_with_observer_streams_reply_deltas() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("hi from llm".into()),
+            tool_calls: vec![],
+            tokens_in: 10,
+            tokens_out: 20,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime =
+            AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
+
+        let obs = Arc::new(Collecting::default());
+        let out = runtime
+            .step_with_observer(
+                tc.clone(),
+                "sess-2",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                },
+                obs.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "hi from llm");
+        assert_eq!(*obs.deltas.lock().unwrap(), vec!["hi from llm".to_string()]);
     }
 }

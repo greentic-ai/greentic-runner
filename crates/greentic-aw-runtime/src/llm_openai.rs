@@ -1,15 +1,24 @@
 //! OpenAI Chat Completions API client (function-calling mode).
 //! Single backend MVP; multi-provider routing deferred (spec §10).
 
+use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::LlmError;
-use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema};
+use crate::llm::{LlmBackend, LlmRequest, LlmResponse, LlmToolSchema, OnDelta};
 use crate::state::{ChatMessage, ToolCallRecord};
+
+/// Maximum time to wait between consecutive bytes from the streaming
+/// response before treating the connection as dead. reqwest's client
+/// `.timeout()` bounds the *whole* request, not the gap between chunks,
+/// so a server that opens the stream and then stalls would otherwise hang
+/// indefinitely. Overridable only in tests for fast, deterministic checks.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct OpenAiLlmBackend {
     api_key: String,
@@ -41,6 +50,14 @@ struct OaRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OaTool<'a>>>,
     tool_choice: &'static str,
+    /// `Some(true)` on the streaming path; `None` (omitted) on the
+    /// blocking path so the request body is byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    /// `Some({"include_usage": true})` on the streaming path so the final
+    /// chunk carries token usage; `None` (omitted) on the blocking path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -146,6 +163,8 @@ impl LlmBackend for OpenAiLlmBackend {
                 messages,
                 tools,
                 tool_choice: "auto",
+                stream: None,
+                stream_options: None,
             };
             let url = format!("{}/v1/chat/completions", self.base_url);
             let resp = self
@@ -178,17 +197,7 @@ impl LlmBackend for OpenAiLlmBackend {
                 .tool_calls
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| {
-                    let args: serde_json::Value = serde_json::from_str(&c.function.arguments)
-                        .unwrap_or(serde_json::json!({}));
-                    let (extension_id, tool_name) = split_tool_name(&c.function.name);
-                    ToolCallRecord {
-                        call_id: c.id,
-                        extension_id,
-                        tool_name,
-                        args,
-                    }
-                })
+                .map(|c| build_tool_call_record(c.id, &c.function.name, &c.function.arguments))
                 .collect();
             Ok(LlmResponse {
                 content: choice.message.content,
@@ -197,6 +206,289 @@ impl LlmBackend for OpenAiLlmBackend {
                 tokens_out: oa.usage.completion_tokens,
             })
         })
+    }
+
+    /// Streaming completion over the OpenAI SSE protocol.
+    ///
+    /// The response body is split into lines at the byte level (so a
+    /// multi-byte UTF-8 scalar straddling a network-chunk boundary is never
+    /// corrupted to `U+FFFD`) and each complete line is fed to
+    /// [`StreamAccumulator::push_line`]. Each `stream.next()` await is bounded
+    /// by a 60s idle timeout ([`STREAM_IDLE_TIMEOUT`]): reqwest's client
+    /// `.timeout()` bounds the whole request, not the gap between chunks, so a
+    /// stalled-but-open stream would otherwise hang. On idle elapse this
+    /// returns [`LlmError::Transport`] `"stream idle timeout"`.
+    fn complete_streaming<'a>(
+        &'a self,
+        req: LlmRequest,
+        on_delta: OnDelta,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let messages = build_messages(&req);
+            let tools: Option<Vec<OaTool<'_>>> = if req.tools.is_empty() {
+                None
+            } else {
+                Some(req.tools.iter().map(build_tool).collect())
+            };
+            let body = OaRequest {
+                model: &req.provider.model,
+                messages,
+                tools,
+                tool_choice: "auto",
+                stream: Some(true),
+                stream_options: Some(serde_json::json!({ "include_usage": true })),
+            };
+            let url = format!("{}/v1/chat/completions", self.base_url);
+            let resp = self
+                .client
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| LlmError::Transport(e.to_string()))?;
+            let status = resp.status();
+            // A non-2xx response is an error body, not an SSE stream — read
+            // it whole and map exactly like the blocking path.
+            if status.is_server_error() {
+                return Err(LlmError::ServiceUnavailable);
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(LlmError::BadRequest(format!("{status}: {text}")));
+            }
+
+            let mut acc = StreamAccumulator::new();
+            let mut line_buf = SseLineBuffer::new();
+            let mut stream = resp.bytes_stream();
+            // Bound the gap between chunks: reqwest's request timeout does not
+            // cover an open-but-stalled stream.
+            while let Some(chunk) = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| LlmError::Transport("stream idle timeout".into()))?
+            {
+                let bytes = chunk.map_err(|e| LlmError::Transport(e.to_string()))?;
+                for line in line_buf.push_bytes(&bytes) {
+                    if let Some(text) = acc.push_line(&line)? {
+                        on_delta(&text);
+                    }
+                }
+            }
+            // Flush any trailing line without a terminating newline so a
+            // missing final newline does not drop the last event.
+            if let Some(line) = line_buf.take_remainder()
+                && let Some(text) = acc.push_line(&line)?
+            {
+                on_delta(&text);
+            }
+            Ok(acc.finish())
+        })
+    }
+}
+
+/// Byte-level line splitter for an SSE response body.
+///
+/// SSE chunks arrive as arbitrary byte slices: a single multi-byte UTF-8
+/// scalar (e.g. `é`, an emoji) can be split across two network chunks.
+/// Decoding each raw chunk independently with `from_utf8_lossy` would turn
+/// the split bytes into `U+FFFD`, corrupting the emitted delta. This buffer
+/// holds raw bytes and only decodes **complete** lines (terminated by `\n`),
+/// so a scalar straddling a chunk boundary is reassembled before decoding.
+struct SseLineBuffer {
+    buf: Vec<u8>,
+}
+
+impl SseLineBuffer {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Append `bytes` and return every newly-completed line, with trailing
+    /// `\r`/`\n` stripped. Bytes after the last `\n` are retained for the
+    /// next call. Decoding happens only on whole lines, so a multi-byte
+    /// scalar split across calls is never turned into `U+FFFD`.
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(bytes);
+        let mut lines = Vec::new();
+        while let Some(idx) = self.buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = self.buf.drain(..=idx).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+        }
+        lines
+    }
+
+    /// Decode any remaining bytes that were never newline-terminated as a
+    /// final line. Returns `None` when the buffer is empty. Call once after
+    /// the stream ends so a missing trailing newline does not drop the last
+    /// event.
+    fn take_remainder(&mut self) -> Option<String> {
+        if self.buf.is_empty() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&self.buf);
+        let line = line.trim_end_matches(['\r', '\n']).to_string();
+        self.buf.clear();
+        Some(line)
+    }
+}
+
+/// Pure accumulator for OpenAI streaming (SSE) chat-completion chunks.
+///
+/// Fed one `data: ...` line at a time via [`StreamAccumulator::push_line`],
+/// it concatenates content deltas, reassembles indexed tool-call fragments
+/// (`id`/`name` arrive once; `arguments` concatenate across chunks), and
+/// captures token usage from the final chunk. [`StreamAccumulator::finish`]
+/// projects the accumulated state into an [`LlmResponse`], reusing the same
+/// `split_tool_name` + `unwrap_or(json!({}))` argument parsing as the
+/// blocking path.
+struct StreamAccumulator {
+    content: String,
+    /// Tool-call fragments keyed by their stream `index` (stable ordering).
+    tool_calls: BTreeMap<u32, ToolCallFrag>,
+    tokens_in: u32,
+    tokens_out: u32,
+}
+
+#[derive(Default)]
+struct ToolCallFrag {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl StreamAccumulator {
+    fn new() -> Self {
+        Self {
+            content: String::new(),
+            tool_calls: BTreeMap::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+
+    /// Parse one streaming line. Returns `Ok(Some(text))` when the line
+    /// carried a content delta to emit, `Ok(None)` for non-content lines
+    /// (tool-call fragments, usage, keep-alives, `[DONE]`, blank lines).
+    fn push_line(&mut self, line: &str) -> Result<Option<String>, LlmError> {
+        let line = line.trim();
+        if line.is_empty() {
+            return Ok(None);
+        }
+        let payload = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => return Ok(None), // comments / keep-alives
+        };
+        if payload == "[DONE]" {
+            return Ok(None);
+        }
+        let chunk: OaStreamChunk =
+            serde_json::from_str(payload).map_err(|e| LlmError::Decode(e.to_string()))?;
+        if let Some(usage) = chunk.usage {
+            self.tokens_in = usage.prompt_tokens;
+            self.tokens_out = usage.completion_tokens;
+        }
+        let mut emit: Option<String> = None;
+        for choice in chunk.choices {
+            let delta = choice.delta;
+            if let Some(text) = delta.content
+                && !text.is_empty()
+            {
+                self.content.push_str(&text);
+                emit = Some(text);
+            }
+            for tc in delta.tool_calls.unwrap_or_default() {
+                let frag = self.tool_calls.entry(tc.index).or_default();
+                if let Some(id) = tc.id {
+                    frag.id = id;
+                }
+                if let Some(func) = tc.function {
+                    if let Some(name) = func.name {
+                        frag.name = name;
+                    }
+                    if let Some(args) = func.arguments {
+                        frag.arguments.push_str(&args);
+                    }
+                }
+            }
+        }
+        Ok(emit)
+    }
+
+    fn finish(self) -> LlmResponse {
+        let tool_calls = self
+            .tool_calls
+            .into_values()
+            .map(|frag| build_tool_call_record(frag.id, &frag.name, &frag.arguments))
+            .collect();
+        let content = if self.content.is_empty() {
+            None
+        } else {
+            Some(self.content)
+        };
+        LlmResponse {
+            content,
+            tool_calls,
+            tokens_in: self.tokens_in,
+            tokens_out: self.tokens_out,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OaStreamChunk {
+    #[serde(default)]
+    choices: Vec<OaStreamChoice>,
+    #[serde(default)]
+    usage: Option<OaUsage>,
+}
+
+#[derive(Deserialize)]
+struct OaStreamChoice {
+    delta: OaStreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct OaStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OaStreamToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OaStreamToolCall {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OaStreamToolFn>,
+}
+
+#[derive(Deserialize)]
+struct OaStreamToolFn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Build a [`ToolCallRecord`] from the raw pieces an OpenAI tool call
+/// carries: the call id, the dotted `extension.tool` name, and the
+/// JSON-encoded `arguments` string. Shared by the blocking ([`complete`])
+/// and streaming ([`StreamAccumulator::finish`]) paths so both decode
+/// arguments and split the name identically. Malformed argument JSON
+/// degrades to an empty object rather than failing the whole turn.
+///
+/// [`complete`]: OpenAiLlmBackend::complete
+fn build_tool_call_record(call_id: String, name: &str, raw_args: &str) -> ToolCallRecord {
+    let args: serde_json::Value = serde_json::from_str(raw_args).unwrap_or(serde_json::json!({}));
+    let (extension_id, tool_name) = split_tool_name(name);
+    ToolCallRecord {
+        call_id,
+        extension_id,
+        tool_name,
+        args,
     }
 }
 
@@ -265,7 +557,7 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -279,6 +571,129 @@ mod tests {
             split_tool_name("toolname-no-ext"),
             (String::new(), "toolname-no-ext".into())
         );
+    }
+
+    #[test]
+    fn line_buffer_reassembles_multibyte_char_split_across_chunks() {
+        // The two bytes of `é` (0xC3 0xA9) are split across two chunks.
+        // Decoding each chunk independently would yield U+FFFD; the buffer
+        // must reassemble them so the emitted line contains no replacement
+        // characters.
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"héllo\"}}]}\n";
+        let bytes = full.as_bytes();
+        // Find a split point inside the `é` (between its two UTF-8 bytes).
+        let e_pos = full.find('é').expect("contains é");
+        let split = e_pos + 1; // mid-scalar boundary
+        let (a, b) = bytes.split_at(split);
+
+        let mut lb = SseLineBuffer::new();
+        let mut lines = lb.push_bytes(a);
+        lines.extend(lb.push_bytes(b));
+        assert_eq!(lines.len(), 1, "one complete line expected");
+        assert!(
+            !lines[0].contains('\u{FFFD}'),
+            "line must not contain U+FFFD: {:?}",
+            lines[0]
+        );
+
+        // Feed the reassembled line through the accumulator and verify the
+        // delta is the intact string.
+        let mut acc = StreamAccumulator::new();
+        let delta = acc.push_line(&lines[0]).expect("parse");
+        assert_eq!(delta.as_deref(), Some("héllo"));
+    }
+
+    #[test]
+    fn line_buffer_reassembles_emoji_split_across_chunks() {
+        // A 4-byte emoji split across two chunks must not corrupt.
+        let full = "data: {\"choices\":[{\"delta\":{\"content\":\"hi 😀\"}}]}\n";
+        let bytes = full.as_bytes();
+        let emoji_pos = full.find('😀').expect("contains emoji");
+        let (a, b) = bytes.split_at(emoji_pos + 2); // mid-scalar
+        let mut lb = SseLineBuffer::new();
+        let mut lines = lb.push_bytes(a);
+        lines.extend(lb.push_bytes(b));
+        assert_eq!(lines.len(), 1);
+        let mut acc = StreamAccumulator::new();
+        let delta = acc.push_line(&lines[0]).expect("parse");
+        assert_eq!(delta.as_deref(), Some("hi 😀"));
+    }
+
+    #[test]
+    fn line_buffer_yields_remainder_without_trailing_newline() {
+        // A final event with no terminating newline must still be emitted
+        // via take_remainder.
+        let mut lb = SseLineBuffer::new();
+        let lines = lb.push_bytes(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}");
+        assert!(lines.is_empty(), "no newline yet: no complete line");
+        let rem = lb.take_remainder().expect("remainder present");
+        let mut acc = StreamAccumulator::new();
+        assert_eq!(acc.push_line(&rem).expect("parse").as_deref(), Some("x"));
+        assert!(lb.take_remainder().is_none(), "remainder consumed");
+    }
+
+    #[test]
+    fn line_buffer_splits_two_events_in_one_chunk() {
+        // Two `data:` events arriving in one byte chunk are both returned.
+        let mut lb = SseLineBuffer::new();
+        let chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"A\"}}]}\n\
+                     data: {\"choices\":[{\"delta\":{\"content\":\"B\"}}]}\n";
+        let lines = lb.push_bytes(chunk.as_bytes());
+        assert_eq!(lines.len(), 2);
+        let mut acc = StreamAccumulator::new();
+        let d0 = acc.push_line(&lines[0]).expect("parse");
+        let d1 = acc.push_line(&lines[1]).expect("parse");
+        assert_eq!(d0.as_deref(), Some("A"));
+        assert_eq!(d1.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn push_line_handles_crlf_line_ending() {
+        // A line carrying a trailing "\r" (CRLF wire format) parses cleanly.
+        let mut acc = StreamAccumulator::new();
+        // Simulate what SseLineBuffer produces after trimming: but feed a raw
+        // CRLF-tailed payload to confirm push_line's own trim() handles it.
+        let line = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r";
+        let delta = acc.push_line(line).expect("parse");
+        assert_eq!(delta.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn push_line_ignores_sse_comment_keepalive() {
+        // An SSE comment / keep-alive line (starts with ':') must yield no
+        // delta and no error.
+        let mut acc = StreamAccumulator::new();
+        assert_eq!(acc.push_line(": keep-alive").expect("no error"), None);
+        assert_eq!(acc.push_line(":").expect("no error"), None);
+        // A blank line is also a no-op.
+        assert_eq!(acc.push_line("").expect("no error"), None);
+    }
+
+    #[test]
+    fn accumulates_stream_lines_into_response() {
+        let lines = [
+            r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"kb.lookup","arguments":"{\"q\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#,
+            r#"data: {"usage":{"prompt_tokens":7,"completion_tokens":9},"choices":[]}"#,
+            "data: [DONE]",
+        ];
+        let mut acc = StreamAccumulator::new();
+        let mut deltas = Vec::new();
+        for l in lines {
+            if let Some(text) = acc.push_line(l).expect("parse") {
+                deltas.push(text);
+            }
+        }
+        let resp = acc.finish();
+        assert_eq!(deltas, vec!["Hel".to_string(), "lo".to_string()]);
+        assert_eq!(resp.content.as_deref(), Some("Hello"));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].tool_name, "lookup");
+        assert_eq!(resp.tool_calls[0].args, serde_json::json!({"q":"x"}));
+        assert_eq!(resp.tokens_in, 7);
+        assert_eq!(resp.tokens_out, 9);
     }
 
     #[test]
