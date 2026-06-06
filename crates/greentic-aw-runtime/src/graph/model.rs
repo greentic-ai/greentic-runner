@@ -218,29 +218,17 @@ impl GraphConfig {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::graph::test_fixtures;
 
-    fn triage_graph_json() -> serde_json::Value {
-        serde_json::json!({
-            "schemaVersion": 1,
-            "entry": "agent",
-            "nodes": [
-                {"id": "agent", "kind": "agent", "systemPrompt": "You triage.", "model": "gpt-4o-mini", "tools": []},
-                {"id": "lookup", "kind": "tool", "toolName": "kb.search"},
-                {"id": "router", "kind": "router", "maxIterations": 3},
-                {"id": "respond", "kind": "respond"}
-            ],
-            "edges": [
-                {"from": "agent", "to": "lookup"},
-                {"from": "lookup", "to": "router"},
-                {"from": "router", "to": "agent", "branch": "loop"},
-                {"from": "router", "to": "respond", "branch": "resolved"}
-            ]
-        })
+    /// Parse the shared fixture JSON back to a `serde_json::Value` so the
+    /// mutation-based tests can alter individual fields.
+    fn triage_value() -> serde_json::Value {
+        serde_json::from_str(&test_fixtures::triage_json()).expect("fixture is valid JSON")
     }
 
     #[test]
     fn parses_and_validates_triage_graph() {
-        let cfg = GraphConfig::from_json(&triage_graph_json().to_string()).expect("valid graph");
+        let cfg = GraphConfig::from_json(&test_fixtures::triage_json()).expect("valid graph");
         assert_eq!(cfg.schema_version, 1);
         assert_eq!(cfg.graph.entry, "agent");
         assert_eq!(cfg.graph.nodes.len(), 4);
@@ -248,7 +236,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_entry() {
-        let mut v = triage_graph_json();
+        let mut v = triage_value();
         v["entry"] = "missing".into();
         let err = GraphConfig::from_json(&v.to_string()).unwrap_err();
         assert!(matches!(err, GraphError::Invalid(_)), "got {err:?}");
@@ -256,7 +244,7 @@ mod tests {
 
     #[test]
     fn rejects_router_without_resolved_branch() {
-        let mut v = triage_graph_json();
+        let mut v = triage_value();
         v["edges"]
             .as_array_mut()
             .unwrap()
@@ -266,7 +254,7 @@ mod tests {
 
     #[test]
     fn rejects_agent_with_two_outgoing_edges() {
-        let mut v = triage_graph_json();
+        let mut v = triage_value();
         v["edges"]
             .as_array_mut()
             .unwrap()
@@ -276,7 +264,7 @@ mod tests {
 
     #[test]
     fn rejects_respond_with_outgoing_edge() {
-        let mut v = triage_graph_json();
+        let mut v = triage_value();
         v["edges"]
             .as_array_mut()
             .unwrap()
@@ -286,7 +274,7 @@ mod tests {
 
     #[test]
     fn unknown_schema_version_is_rejected() {
-        let mut v = triage_graph_json();
+        let mut v = triage_value();
         v["schemaVersion"] = 2.into();
         let err = GraphConfig::from_json(&v.to_string()).unwrap_err();
         assert!(matches!(err, GraphError::UnsupportedSchemaVersion(2)));
