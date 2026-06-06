@@ -497,6 +497,21 @@ impl GraphExecutor {
                         trail,
                     });
                 }
+
+                // v2 node kinds — execution support is delivered in a later
+                // task (Task 2+). Reaching these in the drive loop is a graph
+                // construction error; validation should have prevented it from
+                // being loaded, but guard defensively so we never panic.
+                NodeKind::Supervisor { .. } | NodeKind::Parallel | NodeKind::Join => {
+                    return Err(GraphExecError::Graph(super::model::GraphError::Invalid(
+                        format!(
+                            "node '{}' (kind '{}') is a schemaVersion-2 node kind; \
+                             v2 execution is not yet implemented in this executor",
+                            node.id,
+                            node.kind.kind_name(),
+                        ),
+                    )));
+                }
             }
         }
 

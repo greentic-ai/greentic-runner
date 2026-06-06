@@ -21,7 +21,10 @@ pub use executor::{
     GraphRunOutcome, ToolCallRequest, ToolFn,
 };
 pub use http_provider::{CachingGraphProvider, HttpGraphProvider};
-pub use model::{Edge, Graph, GraphConfig, GraphError, Node, NodeKind};
+pub use model::{
+    Edge, Graph, GraphConfig, GraphError, Node, NodeKind, SUPPORTED_SCHEMA_VERSIONS,
+    SupervisorRoute,
+};
 pub use redis_checkpoint::RedisCheckpointStore;
 pub use router::route;
 pub use state::{GraphMessage, GraphRole, GraphRunState};
