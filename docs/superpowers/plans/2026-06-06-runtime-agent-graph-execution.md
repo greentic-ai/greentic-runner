@@ -42,7 +42,7 @@
 - Create: `crates/greentic-aw-runtime/src/graph/model.rs`
 - Modify: `crates/greentic-aw-runtime/src/lib.rs` (add `pub mod graph;`)
 
-- [ ] **Step 1: Read the port source**
+- [x] **Step 1: Read the port source**
 
 Run: `git -C /home/bima-pangestu/Works/greentic/greentic-designer show origin/spike/agent-graph-engine-slice:src/orchestrate/agent_graph/model.rs`
 
@@ -55,7 +55,7 @@ branch: Option<String> }`, `Graph { entry, nodes, edges }`, and the
 exactly one outgoing edge; Router has both a `loop` and a `resolved` branch
 edge; Respond has zero outgoing edges.
 
-- [ ] **Step 2: Write failing tests** (bottom of `model.rs`, `#[cfg(test)] mod tests`)
+- [x] **Step 2: Write failing tests** (bottom of `model.rs`, `#[cfg(test)] mod tests`)
 
 ```rust
 #[cfg(test)]
@@ -131,12 +131,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run tests to verify they fail**
+- [x] **Step 3: Run tests to verify they fail**
 
 Run: `cargo test -p greentic-aw-runtime graph::model --all-features`
 Expected: compile error (types not defined yet) — that counts as the failing state for a new module.
 
-- [ ] **Step 4: Implement**
+- [x] **Step 4: Implement**
 
 `mod.rs`:
 
@@ -194,12 +194,12 @@ five rules from Step 1 (port the designer's `validate`, lines 87–140 of the
 spike file). `Graph` and `Node`/`Edge`/`NodeKind` also derive `Serialize`
 (the checkpoint snapshot serializes the graph back out).
 
-- [ ] **Step 5: Run tests to verify they pass**
+- [x] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p greentic-aw-runtime graph::model --all-features`
 Expected: 6 passed.
 
-- [ ] **Step 6: fmt + clippy + commit**
+- [x] **Step 6: fmt + clippy + commit**
 
 ```bash
 cargo fmt --all && cargo clippy -p greentic-aw-runtime --all-targets --all-features -- -D warnings
@@ -216,7 +216,7 @@ git commit -m "feat(aw-runtime): agent-graph model with schema-versioned envelop
 - Create: `crates/greentic-aw-runtime/src/graph/router.rs`
 - Modify: `crates/greentic-aw-runtime/src/graph/mod.rs` (add modules + re-exports)
 
-- [ ] **Step 1: Read port sources**
+- [x] **Step 1: Read port sources**
 
 `git show` (as in Task 1) for `state.rs` and `router.rs` from the spike.
 Designer's `TriageState` is renamed **`GraphRunState`** here:
@@ -251,7 +251,7 @@ pub fn route(graph: &Graph, router_id: &str, state: &GraphRunState)
 (returns the target node id; `GraphError::Invalid` if the branch edge is
 missing — unreachable after validation, but never panic.)
 
-- [ ] **Step 2: Write failing tests**
+- [x] **Step 2: Write failing tests**
 
 ```rust
 // in router.rs #[cfg(test)]
@@ -282,13 +282,13 @@ Expose the Task 1 `triage_graph_json()` fixture as
 `crates/greentic-aw-runtime/src/graph/test_fixtures.rs` module gated
 `#[cfg(test)]` so all graph tests share it (update Task 1's tests to use it).
 
-- [ ] **Step 3: Run to verify fail** — `cargo test -p greentic-aw-runtime graph::router --all-features` → compile error.
+- [x] **Step 3: Run to verify fail** — `cargo test -p greentic-aw-runtime graph::router --all-features` → compile error.
 
-- [ ] **Step 4: Implement** (port `route()` from the spike `router.rs:9-37`: look up the Router node's `max_iterations`, pick branch `"resolved"` if `state.resolved || state.iterations >= max_iterations`, else `"loop"`, then find the edge `from == router_id && branch == Some(chosen)`).
+- [x] **Step 4: Implement** (port `route()` from the spike `router.rs:9-37`: look up the Router node's `max_iterations`, pick branch `"resolved"` if `state.resolved || state.iterations >= max_iterations`, else `"loop"`, then find the edge `from == router_id && branch == Some(chosen)`).
 
-- [ ] **Step 5: Run tests** — Expected: 3 passed (plus Task 1's 6 still green).
+- [x] **Step 5: Run tests** — Expected: 3 passed (plus Task 1's 6 still green).
 
-- [ ] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): graph run state and router branching"`
+- [x] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): graph run state and router branching"`
 
 ---
 
@@ -298,7 +298,7 @@ Expose the Task 1 `triage_graph_json()` fixture as
 - Create: `crates/greentic-aw-runtime/src/graph/checkpoint.rs`
 - Modify: `crates/greentic-aw-runtime/src/graph/mod.rs`
 
-- [ ] **Step 1: Write the types + trait** (new code, not a port — the designer used raw sqlx):
+- [x] **Step 1: Write the types + trait** (new code, not a port — the designer used raw sqlx):
 
 ```rust
 use std::future::Future;
@@ -359,7 +359,7 @@ pub trait CheckpointStore: Send + Sync {
 (runs keyed without node/attempt). Public — the designer swap and host tests
 both use it (not behind `test-mock`).
 
-- [ ] **Step 2: Write failing tests**
+- [x] **Step 2: Write failing tests**
 
 ```rust
 #[tokio::test]
@@ -404,10 +404,10 @@ async fn tenants_are_isolated() {
 `TenantContext { tenant_id, env_id }` public fields or a different `new`
 signature, adjust the tests to the real API.)
 
-- [ ] **Step 3: Run to verify fail** → compile error.
-- [ ] **Step 4: Implement the in-memory store.**
-- [ ] **Step 5: Run tests** — Expected: 3 passed.
-- [ ] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): graph checkpoint trait with in-memory store"`
+- [x] **Step 3: Run to verify fail** → compile error.
+- [x] **Step 4: Implement the in-memory store.**
+- [x] **Step 5: Run tests** — Expected: 3 passed.
+- [x] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): graph checkpoint trait with in-memory store"`
 
 ---
 
@@ -417,7 +417,7 @@ signature, adjust the tests to the real API.)
 - Create: `crates/greentic-aw-runtime/src/graph/executor.rs`
 - Modify: `crates/greentic-aw-runtime/src/graph/mod.rs`
 
-- [ ] **Step 1: Read the port source** — spike `executor.rs` (drive loop, lines 129–348). Deltas from the designer version:
+- [x] **Step 1: Read the port source** — spike `executor.rs` (drive loop, lines 129–348). Deltas from the designer version:
   - Checkpoint calls go through `Arc<dyn CheckpointStore>` (designer: sqlx).
   - Effects are injected closures:
 
@@ -486,7 +486,7 @@ pub enum GraphExecError {
 }
 ```
 
-- [ ] **Step 2: Write failing tests** (in `executor.rs` tests mod; use the shared triage fixture, `InMemoryCheckpointStore`, and counting mock closures):
+- [x] **Step 2: Write failing tests** (in `executor.rs` tests mod; use the shared triage fixture, `InMemoryCheckpointStore`, and counting mock closures):
 
 ```rust
 fn mock_turns(resolve_on_attempt: u32) -> (AgentTurnFn, Arc<AtomicU32>) {
@@ -551,10 +551,10 @@ async fn global_visit_cap_fails_run() {
 }
 ```
 
-- [ ] **Step 3: Run to verify fail.**
-- [ ] **Step 4: Port + implement** per Step 1 deltas. Keep functions small: `drive()` (the loop), `visit_agent()`, `visit_tool()`, `checkpoint()` helpers.
-- [ ] **Step 5: Run tests** — Expected: 4 new passed, all earlier graph tests green.
-- [ ] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): durable graph executor with replay-before-invoke"`
+- [x] **Step 3: Run to verify fail.**
+- [x] **Step 4: Port + implement** per Step 1 deltas. Keep functions small: `drive()` (the loop), `visit_agent()`, `visit_tool()`, `checkpoint()` helpers.
+- [x] **Step 5: Run tests** — Expected: 4 new passed, all earlier graph tests green.
+- [x] **Step 6: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): durable graph executor with replay-before-invoke"`
 
 ---
 
@@ -563,7 +563,7 @@ async fn global_visit_cap_fails_run() {
 **Files:**
 - Create: `crates/greentic-aw-runtime/tests/graph_crash_resume.rs`
 
-- [ ] **Step 1: Write the test** (failing only if Task 4 got resume wrong — this is the guarantee test):
+- [x] **Step 1: Write the test** (failing only if Task 4 got resume wrong — this is the guarantee test):
 
 ```rust
 //! Simulates a crash mid-run: the first executor drives until the tool node
@@ -604,8 +604,8 @@ propagating an effect error — assert that explicitly; if Task 4's
 implementation saves only after successful visits, fix Task 4: the
 checkpoint after the LAST SUCCESSFUL visit is the resume point.)
 
-- [ ] **Step 2: Run** — `cargo test -p greentic-aw-runtime --test graph_crash_resume --all-features` Expected: PASS (or fix executor until it does).
-- [ ] **Step 3: fmt + clippy + commit** — `git commit -m "test(aw-runtime): crash-resume guarantee for graph runs"`
+- [x] **Step 2: Run** — `cargo test -p greentic-aw-runtime --test graph_crash_resume --all-features` Expected: PASS (or fix executor until it does).
+- [x] **Step 3: fmt + clippy + commit** — `git commit -m "test(aw-runtime): crash-resume guarantee for graph runs"`
 
 ---
 
@@ -615,9 +615,9 @@ checkpoint after the LAST SUCCESSFUL visit is the resume point.)
 - Create: `crates/greentic-aw-runtime/src/graph/redis_checkpoint.rs`
 - Modify: `crates/greentic-aw-runtime/src/graph/mod.rs`
 
-- [ ] **Step 1: Read the conventions source** — `crates/greentic-aw-runtime/src/state_redis.rs` (ConnectionManager wrapper, `STATE_TTL_SECS = 7*24*60*60`, key builders, error mapping into `StateError` — mirror the structure, mapping into `CheckpointError::Backend`).
+- [x] **Step 1: Read the conventions source** — `crates/greentic-aw-runtime/src/state_redis.rs` (ConnectionManager wrapper, `STATE_TTL_SECS = 7*24*60*60`, key builders, error mapping into `StateError` — mirror the structure, mapping into `CheckpointError::Backend`).
 
-- [ ] **Step 2: Implement `RedisCheckpointStore`**
+- [x] **Step 2: Implement `RedisCheckpointStore`**
 
 ```rust
 pub struct RedisCheckpointStore { manager: ConnectionManager }
@@ -639,7 +639,7 @@ fn visit_key(t: &TenantContext, run_id: &str, node_id: &str, attempt: u32) -> St
 - (Adjust field access if `TenantContext` exposes accessors instead of public
   fields — copy whatever `state_redis.rs`'s key builders do.)
 
-- [ ] **Step 3: Write the gated integration test** (same pattern as existing Redis tests in this crate — find one with `grep -rn "REDIS_URL" crates/greentic-aw-runtime/` and mirror its skip mechanism):
+- [x] **Step 3: Write the gated integration test** (same pattern as existing Redis tests in this crate — find one with `grep -rn "REDIS_URL" crates/greentic-aw-runtime/` and mirror its skip mechanism):
 
 ```rust
 #[tokio::test]
@@ -650,8 +650,8 @@ async fn redis_checkpoint_round_trip_and_nx_semantics() {
 }
 ```
 
-- [ ] **Step 4: Run** — `cargo test -p greentic-aw-runtime graph::redis --all-features` (passes trivially without REDIS_URL; run with a local Redis if available: `REDIS_URL=redis://127.0.0.1:6379 cargo test ...`).
-- [ ] **Step 5: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): redis-backed graph checkpoint store"`
+- [x] **Step 4: Run** — `cargo test -p greentic-aw-runtime graph::redis --all-features` (passes trivially without REDIS_URL; run with a local Redis if available: `REDIS_URL=redis://127.0.0.1:6379 cargo test ...`).
+- [x] **Step 5: fmt + clippy + commit** — `git commit -m "feat(aw-runtime): redis-backed graph checkpoint store"`
 
 ---### Task 7: `DwAgentGraph` node handler (runner-host)
 
@@ -659,9 +659,9 @@ async fn redis_checkpoint_round_trip_and_nx_semantics() {
 - Create: `crates/greentic-runner-host/src/runner/graph_node.rs`
 - Modify: `crates/greentic-runner-host/src/runner/mod.rs` (module decl — find where `agent_node` is declared and mirror)
 
-- [ ] **Step 1: Read the mirror source** — `crates/greentic-runner-host/src/runner/agent_node.rs` IN FULL (trait at top, `aw` module gated `#[cfg(feature = "agentic-worker")]`, `HostConfigProvider`, runtime construction, env wiring, tests at bottom). The graph handler mirrors its shape exactly.
+- [x] **Step 1: Read the mirror source** — `crates/greentic-runner-host/src/runner/agent_node.rs` IN FULL (trait at top, `aw` module gated `#[cfg(feature = "agentic-worker")]`, `HostConfigProvider`, runtime construction, env wiring, tests at bottom). The graph handler mirrors its shape exactly.
 
-- [ ] **Step 2: Write the trait + failing contract test**
+- [x] **Step 2: Write the trait + failing contract test**
 
 ```rust
 /// Bridges a `DwAgentGraph` flow node into the graph executor.
@@ -712,7 +712,7 @@ async fn missing_graph_returns_structured_error_reply() {
 async fn missing_user_text_is_input_error() { /* mirrors agent_node behavior — check its test for exact contract */ }
 ```
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 - `GraphConfigSource` trait (in `graph_node.rs`’s `aw` module):
   `fn graph_config<'a>(&'a self, tenant: &'a TenantContext, graph_id: &'a str) -> BoxFut<'a, Result<GraphConfig, ConfigError>>;`
@@ -749,9 +749,9 @@ async fn missing_user_text_is_input_error() { /* mirrors agent_node behavior —
   "terminated_by": "error"}` exactly like `agent_node.rs` does (read its
   error mapping and copy the approach).
 
-- [ ] **Step 4: Run** — `cargo test -p greentic-runner-host graph_node --features agentic-worker` Expected: 4 passed.
-- [ ] **Step 5: Compile check without the feature** — `cargo check -p greentic-runner-host --no-default-features --features verify` Expected: clean (trait compiles, aw module absent).
-- [ ] **Step 6: fmt + clippy + commit** — `git commit -m "feat(runner-host): DwAgentGraph node handler over the graph executor"`
+- [x] **Step 4: Run** — `cargo test -p greentic-runner-host graph_node --features agentic-worker` Expected: 4 passed.
+- [x] **Step 5: Compile check without the feature** — `cargo check -p greentic-runner-host --no-default-features --features verify` Expected: clean (trait compiles, aw module absent).
+- [x] **Step 6: fmt + clippy + commit** — `git commit -m "feat(runner-host): DwAgentGraph node handler over the graph executor"`
 
 ---
 
@@ -787,7 +787,7 @@ Tests: valid sidecar parses (reuse the triage fixture JSON); malformed JSON →
 - Modify: `crates/greentic-aw-runtime/src/lib.rs` (`pub use graph::...` if the crate re-exports at root — match how `state`/`tools` are re-exported)
 - Modify: `docs/agentic-worker-tools.md` or the crate-level doc comment — one paragraph pointing at the graph module + spec.
 
-- [ ] **Step 1: Feature matrix compile checks**
+- [x] **Step 1: Feature matrix compile checks**
 
 ```bash
 cargo check -p greentic-aw-runtime --all-features
@@ -796,17 +796,17 @@ cargo check -p greentic-runner-host --all-features
 ```
 Expected: all clean.
 
-- [ ] **Step 2: Full local CI** — `bash ci/local_check.sh` (from repo root). Expected: fmt + clippy + tests green. If failures are OUTSIDE graph/* scope, record them for the PR description; do not paper over.
+- [x] **Step 2: Full local CI** — `bash ci/local_check.sh` (from repo root). Expected: fmt + clippy + tests green. If failures are OUTSIDE graph/* scope, record them for the PR description; do not paper over.
 
-- [ ] **Step 3: Commit** — `git commit -m "chore(aw-runtime): export graph module surface + docs pointer"`
+- [x] **Step 3: Commit** — `git commit -m "chore(aw-runtime): export graph module surface + docs pointer"`
 
 ---
 
 ### Task 10: Push + PR
 
-- [ ] **Step 1: Pre-push verification** — `git log --oneline origin/research..HEAD` (expect the spec + ~8 implementation commits), re-run `bash ci/local_check.sh` one final time.
-- [ ] **Step 2: Push** — `git push -u origin feat/aw-graph-runtime`
-- [ ] **Step 3: PR to research**
+- [x] **Step 1: Pre-push verification** — `git log --oneline origin/research..HEAD` (expect the spec + ~8 implementation commits), re-run `bash ci/local_check.sh` one final time.
+- [x] **Step 2: Push** — `git push -u origin feat/aw-graph-runtime`
+- [x] **Step 3: PR to research**
 
 ```bash
 gh pr create --repo greenticai/greentic-runner --base research \
