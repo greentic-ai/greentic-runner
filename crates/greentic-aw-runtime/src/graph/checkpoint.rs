@@ -18,12 +18,12 @@
 //! - Run key:   `"{tenant_id}:{env_id}:{run_id}"`
 //! - Visit key: `"{tenant_id}:{env_id}:{run_id}:{node_id}:{attempt}"`
 //!
-//! The Redis implementation (Task 6) **must additionally** prepend the crate's `aw:` namespace
-//! prefix, consistent with [`crate::state_redis::RedisAgentStateStore`] which uses
-//! [`crate::tenant::TenantContext::key_prefix()`] (returning `"aw:{tenant_id}:{env_id}"`).
-//! This yields Redis keys of the form:
-//! - Run key:   `"aw:{tenant_id}:{env_id}:{run_id}"`
-//! - Visit key: `"aw:{tenant_id}:{env_id}:{run_id}:{node_id}:{attempt}"`
+//! The Redis implementation ([`crate::graph::RedisCheckpointStore`]) **additionally** prepends
+//! the crate's `aw:` namespace prefix, consistent with [`crate::state_redis::RedisAgentStateStore`]
+//! which uses [`crate::tenant::TenantContext::key_prefix()`] (returning `"aw:{tenant_id}:{env_id}"`),
+//! and suffixes a `graph` marker. This yields Redis keys of the form:
+//! - Run key:   `"aw:{tenant_id}:{env_id}:{run_id}:graph"`
+//! - Visit key: `"aw:{tenant_id}:{env_id}:{run_id}:graph:visit:{node_id}:{attempt}"`
 
 use std::collections::HashMap;
 use std::future::Future;
