@@ -244,4 +244,4 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.4-research" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.7-research" }
