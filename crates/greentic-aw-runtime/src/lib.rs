@@ -52,6 +52,25 @@ pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
+/// Observer for incremental step progress: token deltas as the LLM streams
+/// its reply, and tool-call activity as the loop dispatches tools.
+///
+/// All methods have no-op default bodies, so callers implement only the
+/// hooks they consume and the non-streaming [`AgentRuntime::step`] path
+/// (which uses [`NoopStepObserver`]) costs nothing.
+pub trait StepObserver: Send + Sync {
+    /// Called with each incremental text chunk of the assistant reply.
+    fn on_token_delta(&self, _chunk: &str) {}
+    /// Called just before a tool is dispatched.
+    fn on_tool_call(&self, _name: &str, _call_id: &str) {}
+    /// Called after a tool dispatch succeeds, with the tool's result.
+    fn on_tool_result(&self, _name: &str, _call_id: &str, _result: &serde_json::Value) {}
+}
+
+/// No-op observer used by the non-streaming [`AgentRuntime::step`].
+pub struct NoopStepObserver;
+impl StepObserver for NoopStepObserver {}
+
 /// The main entry point for executing a single agentic step.
 ///
 /// Construct via [`AgentRuntime::new`] with the trait objects (config,
@@ -98,7 +117,28 @@ impl AgentRuntime {
         agent_id: &str,
         message: AgentInput,
     ) -> Result<AgentOutput, AgentError> {
-        r#loop::run_step(self, tenant, session_id, agent_id, message).await
+        self.step_with_observer(
+            tenant,
+            session_id,
+            agent_id,
+            message,
+            Arc::new(NoopStepObserver),
+        )
+        .await
+    }
+
+    /// Execute one agentic step while reporting incremental progress to
+    /// `observer` (streamed token deltas + tool-call activity).
+    /// [`AgentRuntime::step`] delegates here with a [`NoopStepObserver`].
+    pub async fn step_with_observer(
+        &self,
+        tenant: TenantContext,
+        session_id: &str,
+        agent_id: &str,
+        message: AgentInput,
+        observer: Arc<dyn StepObserver>,
+    ) -> Result<AgentOutput, AgentError> {
+        r#loop::run_step(self, tenant, session_id, agent_id, message, observer).await
     }
 }
 
