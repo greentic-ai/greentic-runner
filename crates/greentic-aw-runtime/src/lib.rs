@@ -65,7 +65,18 @@ use std::sync::Arc;
 /// chunk: &str)` is deliberately minimal; per-iteration context must arrive
 /// through an additional hook so existing implementors keep compiling.
 pub trait StepObserver: Send + Sync {
+    /// Whether this observer wants token-level streaming. Defaults to
+    /// `false` so the non-streaming [`AgentRuntime::step`] path calls
+    /// [`LlmBackend::complete`] and preserves the exact request wire shape
+    /// (no `stream: true`) every existing caller relied on before streaming
+    /// existed. A streaming consumer overrides this to `true`, which makes
+    /// [`r#loop::run_step`] use [`LlmBackend::complete_streaming`] and drive
+    /// [`StepObserver::on_token_delta`].
+    fn wants_streaming(&self) -> bool {
+        false
+    }
     /// Called with each incremental text chunk of the assistant reply.
+    /// Only invoked when [`StepObserver::wants_streaming`] returns `true`.
     fn on_token_delta(&self, _chunk: &str) {}
     /// Called just before a tool is dispatched.
     fn on_tool_call(&self, _name: &str, _call_id: &str) {}

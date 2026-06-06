@@ -85,13 +85,23 @@ pub async fn run_step(
             provider: config.llm.clone(),
         };
 
-        let obs = observer.clone();
-        let on_delta: crate::llm::OnDelta = Box::new(move |chunk: &str| obs.on_token_delta(chunk));
+        // Stream only when the observer actually consumes deltas. A
+        // non-streaming caller (the default `step` path, `NoopStepObserver`)
+        // stays on `complete`, preserving the exact request wire shape — no
+        // `stream: true` — that every pre-streaming caller relied on.
         // On a mid-stream error the provider may have billed for partial
         // tokens, but usage only arrives in the stream's final chunk; those
         // partial tokens are NOT metered here. This matches the blocking
         // path, which likewise meters nothing when complete() errors.
-        let response = match runtime.llm.complete_streaming(request, on_delta).await {
+        let llm_result = if observer.wants_streaming() {
+            let obs = observer.clone();
+            let on_delta: crate::llm::OnDelta =
+                Box::new(move |chunk: &str| obs.on_token_delta(chunk));
+            runtime.llm.complete_streaming(request, on_delta).await
+        } else {
+            runtime.llm.complete(request).await
+        };
+        let response = match llm_result {
             Ok(r) => r,
             Err(LlmError::ServiceUnavailable) => {
                 let _ = runtime.state_store.save(&tenant, session_id, &state).await;
@@ -298,6 +308,9 @@ mod tests {
         tool_calls: std::sync::Mutex<Vec<String>>,
     }
     impl crate::StepObserver for Collecting {
+        fn wants_streaming(&self) -> bool {
+            true
+        }
         fn on_token_delta(&self, chunk: &str) {
             self.deltas.lock().expect("lock").push(chunk.to_string());
         }
@@ -346,5 +359,60 @@ mod tests {
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(*obs.deltas.lock().unwrap(), vec!["hi from llm".to_string()]);
+    }
+
+    /// A non-streaming observer (default `wants_streaming() == false`) must
+    /// keep `step` on the `complete` path: no token deltas are produced, and
+    /// the reply is still returned. This is the regression guard for callers
+    /// (and mocks) that speak the non-streaming OpenAI wire shape — turning
+    /// streaming on unconditionally would send `stream: true` and break them.
+    #[tokio::test]
+    async fn non_streaming_observer_emits_no_deltas() {
+        #[derive(Default)]
+        struct CountOnly {
+            deltas: std::sync::Mutex<u32>,
+        }
+        impl crate::StepObserver for CountOnly {
+            fn on_token_delta(&self, _chunk: &str) {
+                *self.deltas.lock().expect("lock") += 1;
+            }
+        }
+
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("hi from llm".into()),
+            tool_calls: vec![],
+            tokens_in: 10,
+            tokens_out: 20,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger);
+
+        let obs = Arc::new(CountOnly::default());
+        let out = runtime
+            .step_with_observer(
+                tc.clone(),
+                "sess-3",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                },
+                obs.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "hi from llm");
+        assert_eq!(
+            *obs.deltas.lock().unwrap(),
+            0,
+            "no deltas on the non-streaming path"
+        );
     }
 }
