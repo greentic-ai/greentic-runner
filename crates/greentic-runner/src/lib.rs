@@ -71,6 +71,8 @@ mod tests {
             operator_policy: OperatorPolicy::allow_all(),
             #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 

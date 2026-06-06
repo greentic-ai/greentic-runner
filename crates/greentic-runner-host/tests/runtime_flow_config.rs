@@ -83,6 +83,8 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 

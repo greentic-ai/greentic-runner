@@ -95,6 +95,8 @@ fn host_config(tenant: &str, retry: FlowRetryConfig) -> HostConfig {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: HashMap::new(),
     }
 }
 

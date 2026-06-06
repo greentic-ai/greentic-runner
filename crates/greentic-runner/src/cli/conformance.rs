@@ -875,6 +875,8 @@ fn build_host(enable_trace: bool) -> Result<RunnerHost> {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     };
 
     let wasi_policy = RunnerWasiPolicy::default().inherit_stdio(false);

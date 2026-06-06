@@ -5,6 +5,7 @@ pub mod contract_cache;
 pub mod contract_introspection;
 pub mod engine;
 pub mod flow_adapter;
+pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
 pub mod mocks;

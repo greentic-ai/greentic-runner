@@ -5,6 +5,10 @@
 //! point and the trait surface (`AgentStateStore`, `ConfigProvider`,
 //! `LlmBackend`, `Telemetry`) that the production runner-host and the
 //! designer playground both consume.
+//!
+//! The [`graph`] module provides durable multi-agent graph execution
+//! (`GraphExecutor`, `GraphConfig`, `CheckpointStore`); see
+//! `docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md`.
 
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -13,6 +17,7 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod error;
+pub mod graph;
 pub mod http_provider;
 pub mod layered_provider;
 pub mod llm;

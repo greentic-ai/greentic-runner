@@ -55,6 +55,8 @@ pub struct FlowEngine {
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
     #[cfg(feature = "agentic-worker")]
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
+    #[cfg(feature = "agentic-worker")]
+    graph_node_handler: Option<Arc<dyn crate::runner::graph_node::GraphNodeHandler>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -135,6 +137,7 @@ enum NodeKind {
     BuiltinStateSet,
     Wait,
     DwAgent { agent_id: String },
+    DwAgentGraph { graph_id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -282,6 +285,8 @@ impl FlowEngine {
             cross_pack_resolver: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
         })
     }
 
@@ -299,6 +304,19 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::agent_node::AgentNodeHandler>,
     ) {
         self.agent_node_handler = Some(handler);
+    }
+
+    /// Set the handler that bridges `DwAgentGraph` flow nodes into the durable
+    /// graph executor. Constructed by the pack loader (Task 8). Mirrors
+    /// [`set_agent_node_handler`].
+    ///
+    /// [`set_agent_node_handler`]: FlowEngine::set_agent_node_handler
+    #[cfg(feature = "agentic-worker")]
+    pub fn set_graph_node_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::graph_node::GraphNodeHandler>,
+    ) {
+        self.graph_node_handler = Some(handler);
     }
 
     async fn get_or_load_flow(&self, pack_id: &str, flow_id: &str) -> Result<HostFlow> {
@@ -724,6 +742,10 @@ impl FlowEngine {
                 .execute_dw_agent(ctx, agent_id, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::DwAgentGraph { graph_id } => self
+                .execute_dw_agent_graph(ctx, graph_id, payload)
+                .await
+                .map(DispatchOutcome::complete),
         }
     }
 
@@ -760,6 +782,48 @@ impl FlowEngine {
     ) -> Result<NodeOutput> {
         anyhow::bail!(
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
+             `agentic-worker` feature. Rebuild with --features agentic-worker."
+        )
+    }
+
+    /// Dispatch a `DwAgentGraph` flow node to the configured
+    /// [`GraphNodeHandler`]. Mirrors [`execute_dw_agent`]: same tenant/env/
+    /// session-id derivation, same envelope, same "handler not configured"
+    /// error path.
+    ///
+    /// [`execute_dw_agent`]: FlowEngine::execute_dw_agent
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_dw_agent_graph(
+        &self,
+        ctx: &FlowContext<'_>,
+        graph_id: &str,
+        payload: Value,
+    ) -> Result<NodeOutput> {
+        let handler = self.graph_node_handler.as_ref().context(
+            "DwAgentGraph node dispatched but no GraphNodeHandler configured on FlowEngine",
+        )?;
+        let session_id = ctx.session_id.unwrap_or("");
+        let result = handler
+            .execute(
+                ctx.tenant,
+                &self.default_env,
+                graph_id,
+                session_id,
+                &payload,
+            )
+            .await?;
+        Ok(NodeOutput::new(result))
+    }
+
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_dw_agent_graph(
+        &self,
+        _ctx: &FlowContext<'_>,
+        graph_id: &str,
+        _payload: Value,
+    ) -> Result<NodeOutput> {
+        anyhow::bail!(
+            "DwAgentGraph node '{graph_id}' cannot run: this build was compiled without the \
              `agentic-worker` feature. Rebuild with --features agentic-worker."
         )
     }
@@ -1876,6 +1940,9 @@ impl From<Node> for HostNode {
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
                 },
+                "dw.agent_graph" => NodeKind::DwAgentGraph {
+                    graph_id: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -1894,6 +1961,7 @@ impl From<Node> for HostNode {
             NodeKind::BuiltinStateSet => "state.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
+            NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -2536,6 +2604,8 @@ mod tests {
             cross_pack_resolver: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
         }
     }
 
@@ -2958,6 +3028,8 @@ mod tests {
             cross_pack_resolver: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -3099,6 +3171,8 @@ mod tests {
             cross_pack_resolver: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: Some(handler),
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3130,6 +3204,152 @@ mod tests {
         assert!(
             output_str.contains("pong"),
             "expected agent reply in flow output, got: {output_str}"
+        );
+    }
+
+    /// Engine twin of [`dw_agent_node_routes_to_handler_and_returns_reply`]:
+    /// asserts a `dw.agent_graph` node is detected, routed to the configured
+    /// [`GraphNodeHandler`] with the engine-derived tenant/env/session and the
+    /// node's `operation` as the `graph_id`, and its reply lands in the flow
+    /// output. A lightweight recording stub stands in for the durable executor.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn dw_agent_graph_node_routes_to_handler_and_returns_reply() {
+        use std::sync::Mutex;
+
+        use crate::runner::graph_node::GraphNodeHandler;
+
+        /// Records the dispatch arguments and returns a fixed DwAgent envelope.
+        struct RecordingGraphHandler {
+            seen: Mutex<Option<(String, String, String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl GraphNodeHandler for RecordingGraphHandler {
+            async fn execute(
+                &self,
+                tenant_id: &str,
+                env_id: &str,
+                graph_id: &str,
+                session_id: &str,
+                _flow_input: &Value,
+            ) -> Result<Value> {
+                *self.seen.lock().unwrap() = Some((
+                    tenant_id.to_string(),
+                    env_id.to_string(),
+                    graph_id.to_string(),
+                    session_id.to_string(),
+                ));
+                Ok(json!({
+                    "reply": "graph-pong",
+                    "trail": [],
+                    "terminated_by": "respond",
+                }))
+            }
+        }
+
+        let handler = Arc::new(RecordingGraphHandler {
+            seen: Mutex::new(None),
+        });
+        let handler_dyn: Arc<dyn GraphNodeHandler> = handler.clone();
+
+        // --- flow with a single dw.agent_graph node (operation = graph_id) ---
+        let node_id = NodeId::from_str("graph").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent_graph".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("triage".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "ping" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("dwg.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "dwg.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: Some(handler_dyn),
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "dwg.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-1"),
+            provider_id: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(ctx, json!({ "user_text": "ping" })))
+            .unwrap();
+        assert!(matches!(result.status, FlowStatus::Completed));
+
+        // The handler must have been called with the engine-derived
+        // tenant/env/session and the node's operation as graph_id.
+        let seen = handler.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            Some((
+                "demo".to_string(),
+                "local".to_string(),
+                "triage".to_string(),
+                "sess-1".to_string(),
+            )),
+            "dw.agent_graph dispatch must mirror dw.agent's tenant/env/graph_id/session derivation"
+        );
+
+        let output_str = serde_json::to_string(&result.output).unwrap();
+        assert!(
+            output_str.contains("graph-pong"),
+            "expected graph reply in flow output, got: {output_str}"
         );
     }
 
@@ -3194,6 +3414,8 @@ mod tests {
             cross_pack_resolver: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
         }
     }
 

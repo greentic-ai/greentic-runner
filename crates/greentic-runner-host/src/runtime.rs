@@ -239,6 +239,44 @@ impl TenantRuntime {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
             }
+
+            // Collect agent-graph sidecars from each pack. Unlike agents (a
+            // manifest.cbor map), graphs arrive as a pack FILE (`agent-graph.json`)
+            // — one sidecar per pack — so the graph is keyed by `pack_id`. A
+            // sidecar that fails UTF-8 / JSON / schema validation is logged and
+            // skipped (lenient, mirroring `agent_configs_from_manifest`) so a bad
+            // graph never blocks the rest of pack loading. When the same pack_id
+            // appears twice (overlay), the last pack wins.
+            let mut graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig> =
+                HashMap::new();
+            for pack in &pack_runtimes {
+                let Some(bytes) = pack.read_agent_graph_sidecar() else {
+                    continue;
+                };
+                let pack_id = pack.metadata().pack_id.clone();
+                if let Some(config) =
+                    crate::runner::graph_node::graph_config_from_sidecar(&pack_id, &bytes)
+                    && graphs.insert(pack_id.clone(), config).is_some()
+                {
+                    tracing::warn!(
+                        pack_id = pack_id.as_str(),
+                        "agent-graph sidecar for pack_id seen twice; last pack wins"
+                    );
+                }
+            }
+
+            // Producer/operator-declared graphs (HostConfig.graphs) override
+            // pack-sidecar graphs on `graph_id` collision — mirroring the
+            // operator-wins merge for agents.
+            for (graph_id, graph_config) in config.graphs.clone() {
+                graphs.insert(graph_id, graph_config);
+            }
+
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(graphs).await
+            {
+                engine.set_graph_node_handler(handler);
+                tracing::info!("DwAgentGraph runtime wired into FlowEngine");
+            }
         }
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
