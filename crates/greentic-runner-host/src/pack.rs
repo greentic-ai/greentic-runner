@@ -2170,6 +2170,89 @@ impl PackRuntime {
             .unwrap_or_default()
     }
 
+    /// Read the optional `agent-graph.json` sidecar embedded at the pack root.
+    ///
+    /// Returns the raw bytes when present, or `None` when the pack carries no
+    /// sidecar (the common case). Tries the materialized pack directory first,
+    /// then the `.gtpack` archive — mirroring [`load_schema_json`]'s resolution.
+    /// IO/zip errors are logged and treated as "absent" so a damaged or
+    /// unreadable sidecar never aborts pack loading; the caller
+    /// (`graph_node::graph_config_from_sidecar`) then validates the bytes.
+    ///
+    /// [`load_schema_json`]: PackRuntime::load_schema_json
+    pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
+        const SIDECAR_NAME: &str = "agent-graph.json";
+
+        // Materialized pack directory (root holds manifest.cbor + sidecar).
+        if self.path.is_dir() {
+            let candidate = self.path.join(SIDECAR_NAME);
+            if candidate.exists() {
+                match std::fs::read(&candidate) {
+                    Ok(bytes) => return Some(bytes),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %candidate.display(),
+                            error = %error,
+                            "failed to read agent-graph.json from pack directory"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // `.gtpack` archive.
+        let archive_path = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))?;
+        let file = match File::open(archive_path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to open pack archive while reading agent-graph.json"
+                );
+                return None;
+            }
+        };
+        let mut archive = match ZipArchive::new(file) {
+            Ok(archive) => archive,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read pack archive while reading agent-graph.json"
+                );
+                return None;
+            }
+        };
+        match archive.by_name(SIDECAR_NAME) {
+            Ok(mut entry) => {
+                let mut bytes = Vec::new();
+                if let Err(error) = entry.read_to_end(&mut bytes) {
+                    tracing::warn!(
+                        path = %archive_path.display(),
+                        error = %error,
+                        "failed to extract agent-graph.json from pack archive"
+                    );
+                    return None;
+                }
+                Some(bytes)
+            }
+            Err(zip::result::ZipError::FileNotFound) => None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "error reading agent-graph.json from pack archive"
+                );
+                None
+            }
+        }
+    }
+
     pub fn describe_component_contract_v0_6(&self, component_ref: &str) -> Result<Option<Value>> {
         let pack_component = self
             .components

@@ -719,8 +719,10 @@ async fn missing_user_text_is_input_error() { /* mirrors agent_node behavior —
   with `InMemoryGraphProvider` (a `HashMap<String, GraphConfig>` — the pack
   loader fills it, Task 8).
 - `RuntimeGraphNodeHandler { executor_parts }`: builds run_id
-  `format!("{session_id}:{graph_id}")`; on `load` returning a
-  `succeeded|failed` record, retries with `:{n}` suffix (n = 2, 3, …) until
+  `format!("{session_id}__{graph_id}")` (double underscore, NOT `:` — colon
+  is the checkpoint key-segment separator and must not appear inside a
+  run_id; see checkpoint.rs segment constraints); on `load` returning a
+  `succeeded|failed` record, retries with `__{n}` suffix (n = 2, 3, …) until
   an absent or `running` record is found (bounded at 100 → structured error);
   `running` → `resume`, absent → `start`.
 - AgentTurnFn wiring to the real `AgentRuntime` lives in a constructor
@@ -759,7 +761,7 @@ async fn missing_user_text_is_input_error() { /* mirrors agent_node behavior —
 - Modify: `crates/greentic-runner-host/src/runner/graph_node.rs` (loader fn)
 - Modify: the engine/host-config seam — find it: `grep -rn "agent_configs_from_manifest\|HostConfig" crates/greentic-runner-host/src/ | grep -v test` and mirror how `agents` flow from `HostConfig` into the `AgentNodeHandler` construction.
 
-- [ ] **Step 1: Write the loader + failing tests** (in `graph_node.rs`):
+- [x] **Step 1: Write the loader + failing tests** (in `graph_node.rs`):
 
 ```rust
 /// Parse `agent-graph.json` sidecar bytes (from a .gtpack) into a GraphConfig.
@@ -771,10 +773,10 @@ pub fn graph_config_from_sidecar(pack_id: &str, bytes: &[u8]) -> Option<GraphCon
 Tests: valid sidecar parses (reuse the triage fixture JSON); malformed JSON →
 `None` (and does not panic); wrong schemaVersion → `None`.
 
-- [ ] **Step 2: Wire into the host** — add `graphs: HashMap<String, GraphConfig>` alongside wherever `HostConfig.agents` lives (feature-gated identically), populate from pack loading where agent manifests are read (follow the `agents` data path found in Step 1's grep; greentic-start consumes this seam — its env-file variant is OUT of this PR's scope), and pass into `InMemoryGraphProvider` where the runtime handler is constructed. The flow engine's node-kind dispatch for `dw.agent_graph` mirrors `dw.agent`: `grep -rn "dw.agent\|DwAgent" crates/greentic-runner-host/src/runner/engine.rs` and add the graph variant with the same session-id derivation.
+- [x] **Step 2: Wire into the host** — add `graphs: HashMap<String, GraphConfig>` alongside wherever `HostConfig.agents` lives (feature-gated identically), populate from pack loading where agent manifests are read (follow the `agents` data path found in Step 1's grep; greentic-start consumes this seam — its env-file variant is OUT of this PR's scope), and pass into `InMemoryGraphProvider` where the runtime handler is constructed. The flow engine's node-kind dispatch for `dw.agent_graph` mirrors `dw.agent`: `grep -rn "dw.agent\|DwAgent" crates/greentic-runner-host/src/runner/engine.rs` and add the graph variant with the same session-id derivation.
 
-- [ ] **Step 3: Run the full crate tests** — `cargo test -p greentic-runner-host --all-features` Expected: all green.
-- [ ] **Step 4: fmt + clippy + commit** — `git commit -m "feat(runner-host): load agent-graph sidecars and route dw.agent_graph nodes"`
+- [x] **Step 3: Run the full crate tests** — `cargo test -p greentic-runner-host --all-features` Expected: all green.
+- [x] **Step 4: fmt + clippy + commit** — `git commit -m "feat(runner-host): load agent-graph sidecars and route dw.agent_graph nodes"`
 
 ---
 

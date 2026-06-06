@@ -160,6 +160,119 @@ mod aw {
     }
 
     // -----------------------------------------------------------------------
+    // Pack-sidecar graph loader
+    // -----------------------------------------------------------------------
+
+    /// Parse an `agent-graph.json` sidecar (raw bytes from a `.gtpack`) into a
+    /// validated [`GraphConfig`].
+    ///
+    /// Mirrors the lenient posture of
+    /// [`super::super::agent_node::agent_configs_from_manifest`]: every failure
+    /// mode — invalid UTF-8, malformed JSON, schema-version mismatch, or graph
+    /// validation error — is logged via [`tracing::warn!`] (with `pack_id`) and
+    /// yields `None`, so a single bad graph never prevents the rest of the pack
+    /// from loading. The `pack_id` argument is used only in log messages.
+    pub fn graph_config_from_sidecar(pack_id: &str, bytes: &[u8]) -> Option<GraphConfig> {
+        let raw = match std::str::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => {
+                tracing::warn!(
+                    pack_id,
+                    error = %error,
+                    "skipping agent-graph sidecar: not valid UTF-8"
+                );
+                return None;
+            }
+        };
+        match GraphConfig::from_json(raw) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                tracing::warn!(
+                    pack_id,
+                    error = %error,
+                    "skipping malformed agent-graph sidecar in pack"
+                );
+                None
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Production graph-handler construction
+    // -----------------------------------------------------------------------
+
+    /// Build the production `DwAgentGraph` handler if the environment is
+    /// configured. Mirrors
+    /// [`super::super::agent_node::build_agent_node_handler`]: it returns `None`
+    /// (so `DwAgentGraph` flow dispatch errors clearly) under any of these
+    /// graceful-degradation conditions:
+    /// - `graphs` is empty (no graphs from any pack sidecar);
+    /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
+    /// - the AW Redis connection fails;
+    /// - the extension runtime fails to initialise.
+    ///
+    /// The shared runtime Arcs (state store, ext runtime, LLM backend,
+    /// telemetry, token meter, ledger) are built exactly as for the single-agent
+    /// path; the durable checkpoint store reuses the same multiplexed Redis
+    /// connection manager.
+    pub async fn build_graph_node_handler(
+        graphs: HashMap<String, GraphConfig>,
+    ) -> Option<Arc<dyn GraphNodeHandler>> {
+        use greentic_aw_runtime::cost::RedisTokenMeter;
+        use greentic_aw_runtime::graph::RedisCheckpointStore;
+        use greentic_aw_runtime::tools::RedisToolLedger;
+        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
+
+        if graphs.is_empty() {
+            return None; // nothing to serve
+        }
+
+        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
+            Ok(url) if !url.is_empty() => url,
+            _ => {
+                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgentGraph nodes disabled");
+                return None;
+            }
+        };
+
+        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                tracing::warn!(error = %error, "AW Redis connect failed; DwAgentGraph nodes disabled");
+                return None;
+            }
+        };
+
+        // Share the multiplexed connection manager across all Redis-backed
+        // stores (state, checkpoint, token meter, idempotency ledger).
+        let manager = state_store.manager();
+        let checkpoint = Arc::new(RedisCheckpointStore::new(manager.clone()));
+        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
+        let ledger = Arc::new(RedisToolLedger::new(manager));
+
+        let ext_runtime = super::super::agent_node::build_ext_runtime()?;
+        let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
+        let telemetry = Arc::new(OtelTelemetry);
+
+        let graph_count = graphs.len();
+        let provider: Arc<dyn GraphConfigSource> = Arc::new(InMemoryGraphProvider::new(graphs));
+
+        let handler = RuntimeGraphNodeHandler::from_parts(
+            provider,
+            checkpoint,
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+        );
+
+        tracing::info!(graph_count, "AW graph runtime constructed");
+        Some(Arc::new(handler))
+    }
+
+    // -----------------------------------------------------------------------
     // RuntimeGraphNodeHandler
     // -----------------------------------------------------------------------
 
@@ -700,6 +813,45 @@ mod aw {
         }
 
         // -------------------------------------------------------------------
+        // graph_config_from_sidecar tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn sidecar_valid_triage_parses() {
+            let bytes = triage_graph_json(3).into_bytes();
+            let cfg = super::graph_config_from_sidecar("test-pack", &bytes);
+            assert!(cfg.is_some(), "valid triage sidecar must parse");
+        }
+
+        #[test]
+        fn sidecar_malformed_json_returns_none() {
+            let bytes = b"{ this is not valid json";
+            // Must not panic; a malformed sidecar is skipped (None).
+            let cfg = super::graph_config_from_sidecar("test-pack", bytes);
+            assert!(cfg.is_none(), "malformed JSON sidecar must yield None");
+        }
+
+        #[test]
+        fn sidecar_unsupported_schema_version_returns_none() {
+            let bytes = json!({
+                "schemaVersion": 99,
+                "entry": "agent",
+                "nodes": [
+                    {"id": "agent", "kind": "agent", "systemPrompt": "x", "model": "gpt-4o-mini", "tools": []},
+                    {"id": "respond", "kind": "respond"}
+                ],
+                "edges": [{"from": "agent", "to": "respond"}]
+            })
+            .to_string()
+            .into_bytes();
+            let cfg = super::graph_config_from_sidecar("test-pack", &bytes);
+            assert!(
+                cfg.is_none(),
+                "unsupported schemaVersion must be rejected (None)"
+            );
+        }
+
+        // -------------------------------------------------------------------
         // Tests
         // -------------------------------------------------------------------
 
@@ -873,4 +1025,7 @@ mod aw {
 }
 
 #[cfg(feature = "agentic-worker")]
-pub use aw::{GraphConfigSource, InMemoryGraphProvider, RuntimeGraphNodeHandler};
+pub use aw::{
+    GraphConfigSource, InMemoryGraphProvider, RuntimeGraphNodeHandler, build_graph_node_handler,
+    graph_config_from_sidecar,
+};

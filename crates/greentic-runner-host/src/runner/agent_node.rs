@@ -241,7 +241,7 @@ mod aw {
     /// On construction failure (e.g. wasmtime engine init), logs the error and
     /// returns `None`; the caller then disables `DwAgent` nodes rather than
     /// panicking.
-    fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
+    pub(crate) fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig};
 
         let paths = DiscoveryPaths::new(extension_discovery_dir());
@@ -250,6 +250,69 @@ mod aw {
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");
                 None
+            }
+        }
+    }
+
+    /// Resolve the [`LlmBackend`] from the environment.
+    ///
+    /// Prefers the LLM bridge extension when `GREENTIC_AW_LLM_EXTENSION` is set
+    /// (LLM-as-extension); otherwise falls back to the env-keyed in-process
+    /// OpenAI client. Shared by the single-agent (`build_agent_node_handler`)
+    /// and graph (`graph_node::build_graph_node_handler`) construction paths so
+    /// both resolve the backend identically.
+    pub(crate) fn build_llm_backend(
+        ext_runtime: &Arc<greentic_ext_runtime::ExtensionRuntime>,
+    ) -> Arc<dyn greentic_aw_runtime::LlmBackend> {
+        use std::time::Duration;
+
+        use greentic_aw_runtime::{ExtensionLlmBackend, OpenAiLlmBackend, RetryingLlmBackend};
+
+        match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(ext_id) => {
+                let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                    .unwrap_or_default();
+                match bridge_credential(
+                    std::env::var("GREENTIC_LLM_PROVIDER").ok(),
+                    std::env::var("GREENTIC_LLM_MODEL").ok(),
+                    api_key,
+                    std::env::var("GREENTIC_LLM_BASE_URL").ok(),
+                ) {
+                    Some(cred) => {
+                        tracing::info!(
+                            extension = %ext_id, provider = %cred.provider, model = %cred.model,
+                            "AW LLM via bridge extension"
+                        );
+                        Arc::new(RetryingLlmBackend::new(
+                            ExtensionLlmBackend::new(ext_runtime.clone(), ext_id, cred),
+                            3,
+                            Duration::from_millis(250),
+                        ))
+                    }
+                    None => {
+                        tracing::warn!(
+                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
+                             falling back to in-process OpenAI client"
+                        );
+                        Arc::new(RetryingLlmBackend::new(
+                            OpenAiLlmBackend::new(String::new()),
+                            3,
+                            Duration::from_millis(250),
+                        ))
+                    }
+                }
+            }
+            None => {
+                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                Arc::new(RetryingLlmBackend::new(
+                    OpenAiLlmBackend::new(openai_key),
+                    3,
+                    Duration::from_millis(250),
+                ))
             }
         }
     }
@@ -298,17 +361,12 @@ mod aw {
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
-        use std::time::Duration;
-
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::cost::RedisTokenMeter;
         use greentic_aw_runtime::tools::RedisToolLedger;
-        use greentic_aw_runtime::{
-            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore,
-            RetryingLlmBackend,
-        };
+        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
 
         if merged_agents.is_empty() {
             return None; // nothing to serve
@@ -340,53 +398,7 @@ mod aw {
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
-        let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-        {
-            Some(ext_id) => {
-                let api_key = std::env::var("GREENTIC_LLM_API_KEY")
-                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                    .unwrap_or_default();
-                match bridge_credential(
-                    std::env::var("GREENTIC_LLM_PROVIDER").ok(),
-                    std::env::var("GREENTIC_LLM_MODEL").ok(),
-                    api_key,
-                    std::env::var("GREENTIC_LLM_BASE_URL").ok(),
-                ) {
-                    Some(cred) => {
-                        tracing::info!(
-                            extension = %ext_id, provider = %cred.provider, model = %cred.model,
-                            "AW LLM via bridge extension"
-                        );
-                        Arc::new(RetryingLlmBackend::new(
-                            ExtensionLlmBackend::new(ext_runtime.clone(), ext_id, cred),
-                            3,
-                            Duration::from_millis(250),
-                        ))
-                    }
-                    None => {
-                        tracing::warn!(
-                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
-                             falling back to in-process OpenAI client"
-                        );
-                        Arc::new(RetryingLlmBackend::new(
-                            OpenAiLlmBackend::new(String::new()),
-                            3,
-                            Duration::from_millis(250),
-                        ))
-                    }
-                }
-            }
-            None => {
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Arc::new(RetryingLlmBackend::new(
-                    OpenAiLlmBackend::new(openai_key),
-                    3,
-                    Duration::from_millis(250),
-                ))
-            }
-        };
+        let llm = build_llm_backend(&ext_runtime);
 
         let agent_count = merged_agents.len();
         // Base config source = the merged agents (pack-embedded ⊕ operator,
@@ -752,3 +764,6 @@ pub use aw::{
     HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
     build_agent_node_handler, merge_agent_sources,
 };
+
+#[cfg(feature = "agentic-worker")]
+pub(crate) use aw::{build_ext_runtime, build_llm_backend};
