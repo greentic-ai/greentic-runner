@@ -37,9 +37,9 @@ mod aw {
     use greentic_aw_runtime::config_provider::InMemoryConfigProvider;
     use greentic_aw_runtime::error::ConfigError;
     use greentic_aw_runtime::graph::{
-        AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointStore, GraphConfig,
-        GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus, ToolCallRequest,
-        ToolFn,
+        AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointError, CheckpointStore,
+        GraphConfig, GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus,
+        ToolCallRequest, ToolFn,
     };
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
@@ -72,6 +72,28 @@ mod aw {
     /// Upper bound on the number of fresh-run-id suffixes tried when a session's
     /// run id is already in a terminal state (see [`derive_run_id`]).
     const MAX_RUN_ID_SUFFIX: u32 = 100;
+
+    /// Error returned by [`RuntimeGraphNodeHandler::derive_run_id`].
+    ///
+    /// Kept local to `runner-host`: `GraphExecError` (from `greentic-aw-runtime`)
+    /// has no suffix-exhaustion variant and we should not pollute the upstream
+    /// crate with a runner-host-specific concern.
+    #[derive(Debug, thiserror::Error)]
+    enum RunIdError {
+        /// Checkpoint IO failed while scanning for a free slot.
+        ///
+        /// Note: `checkpoint.load` returns `CheckpointError` directly (not
+        /// `GraphExecError`), so we convert both via their respective `From`
+        /// impls. `GraphExecError::Checkpoint` wraps `CheckpointError` upstream;
+        /// here we keep the original for a tighter error surface.
+        #[error(transparent)]
+        Checkpoint(#[from] CheckpointError),
+        /// All `MAX_RUN_ID_SUFFIX` slots for this session are occupied (terminal).
+        /// Distinct from `GraphExecError::IterationCap` (graph visit limit) so
+        /// the caller can surface a targeted user reply.
+        #[error("all run-id slots exhausted for base run `{base_run_id}`")]
+        SuffixExhausted { base_run_id: String },
+    }
 
     /// `true` when `reply` contains the resolution sentinel (case-insensitive).
     fn detect_resolved(reply: &str) -> bool {
@@ -198,10 +220,11 @@ mod aw {
             }
         }
 
-        /// Test/host constructor that injects effect closures directly, bypassing
-        /// per-visit [`AgentRuntime`] construction. Used by the unit tests with
-        /// mock closures, and available to callers that already own effect
-        /// closures.
+        /// **Test-only** constructor that injects effect closures directly,
+        /// bypassing per-visit [`AgentRuntime`] construction. Not available
+        /// outside `#[cfg(test)]`; production code must use [`from_parts`].
+        ///
+        /// [`from_parts`]: RuntimeGraphNodeHandler::from_parts
         #[cfg(test)]
         pub(crate) fn with_effects(
             graphs: Arc<dyn GraphConfigSource>,
@@ -222,18 +245,34 @@ mod aw {
         /// Resolve the run id to drive for this `(session, graph)` and whether
         /// the existing record (if any) is mid-flight.
         ///
-        /// Base run id is `"{session_id}__{graph_id}"` (no `':'`, `'__'` word
-        /// separator — matches the executor's run-id contract). When that record
-        /// is already terminal, retry `"{session_id}__{graph_id}__{n}"` for
-        /// `n = 2..` until a slot is absent (→ start a fresh run) or Running
-        /// (→ resume). Bounded at [`MAX_RUN_ID_SUFFIX`].
+        /// Base run id is `"{safe_session}__{graph_id}"` where `safe_session` is
+        /// the incoming `session_id` with every `':'` replaced by `'_'`.
+        ///
+        /// **Why sanitize `':'`?**  Flow session ids frequently embed channel
+        /// correlation ids that contain colons (e.g. MS Teams thread ids such as
+        /// `msteams:thread:19xyz`). The checkpoint store key contract forbids
+        /// `':'`, so using the raw session id causes every such graph run to fail
+        /// at save-time. The replacement is stable: the same incoming
+        /// `session_id` always maps to the same `safe_session`, so checkpoint
+        /// resume works correctly across calls.
+        ///
+        /// When the base slot is already terminal, retry
+        /// `"{safe_session}__{graph_id}__{n}"` for `n = 2..` until a slot is
+        /// absent (→ start fresh) or Running (→ resume). Bounded at
+        /// [`MAX_RUN_ID_SUFFIX`]. Exhausting all suffixes returns
+        /// [`RunIdError::SuffixExhausted`] (distinct from
+        /// [`GraphExecError::IterationCap`] so the caller can surface a
+        /// targeted reply).
         async fn derive_run_id(
             &self,
             tenant: &TenantContext,
             graph_id: &str,
             session_id: &str,
-        ) -> Result<RunSlot, GraphExecError> {
-            let base = format!("{session_id}__{graph_id}");
+        ) -> Result<RunSlot, RunIdError> {
+            // Sanitize colons: flow session ids (e.g. Teams thread correlation
+            // ids) may contain ':' which the checkpoint key contract forbids.
+            let safe_session = session_id.replace(':', "_");
+            let base = format!("{safe_session}__{graph_id}");
             match self.checkpoint.load(tenant, &base).await? {
                 None => return Ok(RunSlot::start(base)),
                 Some(rec) if rec.status == RunStatus::Running => {
@@ -242,7 +281,7 @@ mod aw {
                 Some(_) => {}
             }
             for n in 2..=MAX_RUN_ID_SUFFIX {
-                let candidate = format!("{session_id}__{graph_id}__{n}");
+                let candidate = format!("{safe_session}__{graph_id}__{n}");
                 match self.checkpoint.load(tenant, &candidate).await? {
                     None => return Ok(RunSlot::start(candidate)),
                     Some(rec) if rec.status == RunStatus::Running => {
@@ -251,7 +290,10 @@ mod aw {
                     Some(_) => continue,
                 }
             }
-            Err(GraphExecError::IterationCap { run_id: base })
+            // All suffix slots are occupied (terminal). This is a distinct
+            // error from the graph's own IterationCap: it means the session has
+            // exhausted the run-id namespace, not that any single run looped.
+            Err(RunIdError::SuffixExhausted { base_run_id: base })
         }
     }
 
@@ -324,7 +366,17 @@ mod aw {
 
             let slot = match self.derive_run_id(&tenant, graph_id, session_id).await {
                 Ok(slot) => slot,
-                Err(error) => {
+                Err(RunIdError::SuffixExhausted { .. }) => {
+                    tracing::warn!(
+                        graph_id,
+                        session_id,
+                        "all run-id slots exhausted for session"
+                    );
+                    return Ok(error_envelope(
+                        "Too many runs for this session. Please start a new conversation.",
+                    ));
+                }
+                Err(RunIdError::Checkpoint(error)) => {
                     tracing::warn!(error = %error, graph_id, session_id, "run-id derivation failed");
                     return Ok(error_envelope(SANITISED_ERROR_REPLY));
                 }
@@ -352,9 +404,10 @@ mod aw {
                 })),
                 Err(error) => {
                     tracing::warn!(error = %error, graph_id, session_id, "graph run failed");
-                    // The DwAgent envelope only carries "respond" / "error", so
-                    // every runtime failure (including IterationCap) maps to
-                    // "error". IterationCap gets a distinct, still user-safe reply.
+                    // The DwAgent envelope only carries "respond" / "error".
+                    // IterationCap (graph's own node-visit limit) gets a distinct,
+                    // still user-safe reply; every other runtime failure falls back
+                    // to the generic sanitised message.
                     let reply = match error {
                         GraphExecError::IterationCap { .. } => {
                             "This is taking longer than expected. Please try again."
@@ -781,6 +834,39 @@ mod aw {
                 out["reply"].as_str(),
                 Some(SANITISED_ERROR_REPLY),
                 "iteration cap should use a distinct reply"
+            );
+        }
+
+        /// Regression test: flow session ids can contain `':'` (e.g. MS Teams
+        /// channel correlation ids like `"msteams:thread:19xyz"`). The checkpoint
+        /// store rejects keys that contain `':'`, so without sanitization every
+        /// such graph run fails at save-time. [`derive_run_id`] must replace every
+        /// `':'` with `'_'` before composing the checkpoint key.
+        #[tokio::test]
+        async fn colon_bearing_session_id_executes_successfully() {
+            let handler = handler_with(
+                provider_with("triage", triage_cfg(3)),
+                agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
+                tool_fn_ok(),
+            );
+
+            // Session id with multiple colons — typical of Teams thread ids.
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "triage",
+                    "msteams:thread:19xyz",
+                    &json!({"user_text": "hello"}),
+                )
+                .await
+                .expect("colon-bearing session id must NOT return Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "colon-bearing session id should complete successfully: {:?}",
+                out
             );
         }
     }
