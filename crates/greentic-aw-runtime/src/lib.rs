@@ -58,6 +58,12 @@ use std::sync::Arc;
 /// All methods have no-op default bodies, so callers implement only the
 /// hooks they consume and the non-streaming [`AgentRuntime::step`] path
 /// (which uses [`NoopStepObserver`]) costs nothing.
+///
+/// **Extending this trait:** add new capabilities as NEW defaulted methods
+/// (e.g. `fn on_iteration_started(&self, _iter: u32) {}`) rather than
+/// changing an existing signature. The current `on_token_delta(&self,
+/// chunk: &str)` is deliberately minimal; per-iteration context must arrive
+/// through an additional hook so existing implementors keep compiling.
 pub trait StepObserver: Send + Sync {
     /// Called with each incremental text chunk of the assistant reply.
     fn on_token_delta(&self, _chunk: &str) {}

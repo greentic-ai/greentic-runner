@@ -87,6 +87,10 @@ pub async fn run_step(
 
         let obs = observer.clone();
         let on_delta: crate::llm::OnDelta = Box::new(move |chunk: &str| obs.on_token_delta(chunk));
+        // On a mid-stream error the provider may have billed for partial
+        // tokens, but usage only arrives in the stream's final chunk; those
+        // partial tokens are NOT metered here. This matches the blocking
+        // path, which likewise meters nothing when complete() errors.
         let response = match runtime.llm.complete_streaming(request, on_delta).await {
             Ok(r) => r,
             Err(LlmError::ServiceUnavailable) => {
