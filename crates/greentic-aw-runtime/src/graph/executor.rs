@@ -43,6 +43,11 @@ use super::state::{GraphRole, GraphRunState};
 // ---------------------------------------------------------------------------
 
 /// Owned heap-allocated future, `Send + 'static`.
+///
+/// Kept `pub` (not `pub(crate)`) because external crates that construct
+/// [`AgentTurnFn`] or [`ToolFn`] closures must be able to name this type as
+/// their return type.  The Task-7 `DwAgentGraph` handler in `greentic-runner-host`
+/// is the primary consumer.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ---------------------------------------------------------------------------
@@ -145,9 +150,16 @@ pub struct GraphRunOutcome {
     /// Last assistant message emitted (what the Respond node returns), or an
     /// empty string if the run never produced an assistant reply.
     pub reply: String,
-    /// One JSON entry per node visit:
-    /// `{"node": id, "kind": "agent|tool|router|respond", "attempt": n,
-    ///  "replayed": bool}`.
+    /// One JSON entry per node visit.
+    ///
+    /// **Drive-loop shape** (normal execution or active resume):
+    /// `{"node": id, "kind": "agent|tool|router|respond", "attempt": n, "replayed": bool}`.
+    ///
+    /// **Terminal-resume shape** (returned by [`GraphExecutor::resume`] when the run
+    /// is already in a terminal state — built by `rebuild_trail_from_state`):
+    /// `{"kind": "user|agent|tool", "content": "…"}`.  The node id and attempt
+    /// count are not available from the stored message log, so this shape is
+    /// intentionally narrower.  Callers that need both shapes must handle both.
     pub trail: Vec<serde_json::Value>,
 }
 
@@ -324,33 +336,33 @@ impl GraphExecutor {
                 } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
 
-                    // Try to load an already-recorded result (crash recovery).
-                    let cached = self
-                        .store
-                        .load_node_visit(tenant, run_id, &cursor, attempt)
+                    // Pre-clone so the closure can own the values it needs.
+                    let node_id_for_err = cursor.clone();
+                    let (raw, replayed) = self
+                        .visit_effect(tenant, run_id, &cursor, attempt, || {
+                            let req = AgentTurnRequest {
+                                node_id: node_id_for_err.clone(),
+                                system_prompt: system_prompt.clone(),
+                                model: model.clone(),
+                                state: state.clone(),
+                            };
+                            let fut = (self.agent_turn)(req);
+                            Box::pin(async move {
+                                let r = fut.await.map_err(|e| {
+                                    GraphExecError::AgentTurn(format!(
+                                        "node '{}' attempt {}: {}",
+                                        node_id_for_err, attempt, e
+                                    ))
+                                })?;
+                                serde_json::to_value(&r)
+                                    .map_err(CheckpointError::Serde)
+                                    .map_err(GraphExecError::Checkpoint)
+                            })
+                        })
                         .await?;
 
-                    let (result, replayed) = if let Some(raw) = cached {
-                        let r: AgentTurnResult =
-                            serde_json::from_value(raw).map_err(CheckpointError::Serde)?;
-                        (r, true)
-                    } else {
-                        // Invoke the agent.
-                        let req = AgentTurnRequest {
-                            node_id: cursor.clone(),
-                            system_prompt: system_prompt.clone(),
-                            model: model.clone(),
-                            state: state.clone(),
-                        };
-                        let fresh = (self.agent_turn)(req).await?;
-                        // Record BEFORE checkpoint (replayable resume).
-                        let as_value =
-                            serde_json::to_value(&fresh).map_err(CheckpointError::Serde)?;
-                        self.store
-                            .record_node_visit(tenant, run_id, &cursor, attempt, &as_value)
-                            .await?;
-                        (fresh, false)
-                    };
+                    let result: AgentTurnResult =
+                        serde_json::from_value(raw).map_err(CheckpointError::Serde)?;
 
                     trail.push(serde_json::json!({
                         "node": cursor,
@@ -385,27 +397,26 @@ impl GraphExecutor {
                 NodeKind::Tool { tool_name } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
 
-                    // Try to load an already-recorded result (crash recovery).
-                    let cached = self
-                        .store
-                        .load_node_visit(tenant, run_id, &cursor, attempt)
+                    // Pre-clone so the closure can own the values it needs.
+                    let node_id_for_err = cursor.clone();
+                    let (result, replayed) = self
+                        .visit_effect(tenant, run_id, &cursor, attempt, || {
+                            let req = ToolCallRequest {
+                                node_id: node_id_for_err.clone(),
+                                tool_name: tool_name.clone(),
+                                state: state.clone(),
+                            };
+                            let fut = (self.tool)(req);
+                            Box::pin(async move {
+                                fut.await.map_err(|e| {
+                                    GraphExecError::Tool(format!(
+                                        "node '{}' attempt {}: {}",
+                                        node_id_for_err, attempt, e
+                                    ))
+                                })
+                            })
+                        })
                         .await?;
-
-                    let (result, replayed) = if let Some(raw) = cached {
-                        (raw, true)
-                    } else {
-                        let req = ToolCallRequest {
-                            node_id: cursor.clone(),
-                            tool_name: tool_name.clone(),
-                            state: state.clone(),
-                        };
-                        let fresh = (self.tool)(req).await?;
-                        // Record BEFORE checkpoint (replayable resume).
-                        self.store
-                            .record_node_visit(tenant, run_id, &cursor, attempt, &fresh)
-                            .await?;
-                        (fresh, false)
-                    };
 
                     trail.push(serde_json::json!({
                         "node": cursor,
@@ -504,6 +515,42 @@ impl GraphExecutor {
         Err(GraphExecError::IterationCap {
             run_id: run_id.to_owned(),
         })
+    }
+
+    /// Load-or-invoke-and-record a single side-effect node visit.
+    ///
+    /// Returns `(serialised_result, replayed)`:
+    /// - `replayed = true` means the result was already stored (crash recovery);
+    ///   the `invoke` closure was NOT called.
+    /// - `replayed = false` means `invoke` was called and its result has been
+    ///   durably recorded before returning.
+    ///
+    /// The `invoke` closure is responsible for wrapping any effect-level error
+    /// with `node_id`/`attempt` context **before** returning it here, so that
+    /// `?`-propagation in the caller carries the full diagnostic.
+    async fn visit_effect(
+        &self,
+        tenant: &TenantContext,
+        run_id: &str,
+        node_id: &str,
+        attempt: u32,
+        invoke: impl FnOnce() -> BoxFut<'static, Result<serde_json::Value, GraphExecError>>,
+    ) -> Result<(serde_json::Value, bool), GraphExecError> {
+        if let Some(cached) = self
+            .store
+            .load_node_visit(tenant, run_id, node_id, attempt)
+            .await?
+        {
+            return Ok((cached, true));
+        }
+
+        // Effect not yet recorded — invoke and record before returning.
+        let value = invoke().await?;
+        // Record BEFORE checkpoint (replayable resume ordering).
+        self.store
+            .record_node_visit(tenant, run_id, node_id, attempt, &value)
+            .await?;
+        Ok((value, false))
     }
 }
 
