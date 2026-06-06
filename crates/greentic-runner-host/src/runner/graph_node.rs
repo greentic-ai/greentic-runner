@@ -33,6 +33,8 @@ mod aw {
     use std::time::Duration;
 
     use anyhow::Result;
+    use greentic_aw_runtime::CachingGraphProvider;
+    use greentic_aw_runtime::HttpGraphProvider;
     use greentic_aw_runtime::ToolLedger;
     use greentic_aw_runtime::config_provider::InMemoryConfigProvider;
     use greentic_aw_runtime::error::ConfigError;
@@ -160,6 +162,101 @@ mod aw {
     }
 
     // -----------------------------------------------------------------------
+    // GraphConfigSource adapter for CachingGraphProvider<HttpGraphProvider>
+    // -----------------------------------------------------------------------
+
+    /// Adapts [`CachingGraphProvider<HttpGraphProvider>`] into the
+    /// [`GraphConfigSource`] trait so it can be stored as an
+    /// `Arc<dyn GraphConfigSource>` alongside [`InMemoryGraphProvider`].
+    ///
+    /// This is a 5-line adapter that bridges the inherent-method API of
+    /// `CachingGraphProvider` (defined in `greentic-aw-runtime`) into the
+    /// trait object used by `runner-host`.
+    impl GraphConfigSource for CachingGraphProvider<HttpGraphProvider> {
+        fn graph_config<'a>(
+            &'a self,
+            tenant: &'a TenantContext,
+            graph_id: &'a str,
+        ) -> BoxFut<'a, Result<GraphConfig, ConfigError>> {
+            Box::pin(async move { self.graph_config(tenant, graph_id).await })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // LayeredGraphProvider
+    // -----------------------------------------------------------------------
+
+    /// Tries the primary [`GraphConfigSource`], falling back to the secondary
+    /// when the primary reports the graph missing or has an infrastructure
+    /// failure. A `Misconfigured` error is propagated, never masked by the
+    /// fallback — matching [`greentic_aw_runtime::LayeredConfigProvider`]'s
+    /// semantics exactly.
+    ///
+    /// Fallback triggers:
+    /// - `ConfigError::AgentNotFound` — graph absent from the primary (HTTP
+    ///   registry doesn't know it yet; local pack may have it).
+    /// - `ConfigError::Internal` — transient infrastructure failure (network
+    ///   timeout, 5xx) — local pack can serve as a degraded fallback.
+    ///
+    /// Non-fallback (surfaces immediately):
+    /// - `ConfigError::Misconfigured` — corrupt document or bad auth token;
+    ///   the operator must fix the document — silently serving stale local
+    ///   data would mask the problem.
+    pub struct LayeredGraphProvider<P: GraphConfigSource, F: GraphConfigSource> {
+        primary: P,
+        fallback: F,
+    }
+
+    impl<P: GraphConfigSource, F: GraphConfigSource> LayeredGraphProvider<P, F> {
+        pub fn new(primary: P, fallback: F) -> Self {
+            Self { primary, fallback }
+        }
+    }
+
+    impl<P: GraphConfigSource, F: GraphConfigSource> GraphConfigSource for LayeredGraphProvider<P, F> {
+        fn graph_config<'a>(
+            &'a self,
+            tenant: &'a TenantContext,
+            graph_id: &'a str,
+        ) -> BoxFut<'a, Result<GraphConfig, ConfigError>> {
+            Box::pin(async move {
+                match self.primary.graph_config(tenant, graph_id).await {
+                    Ok(cfg) => Ok(cfg),
+                    Err(ConfigError::AgentNotFound(_)) | Err(ConfigError::Internal(_)) => {
+                        self.fallback.graph_config(tenant, graph_id).await
+                    }
+                    // Misconfigured + any future ConfigError variant: surface,
+                    // never mask. New variants fall through here and propagate
+                    // by default; revisit only if a new variant should fall back.
+                    Err(other) => Err(other),
+                }
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Admin graph registry wiring
+    // -----------------------------------------------------------------------
+
+    /// Build a cached [`HttpGraphProvider`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
+    /// `GREENTIC_AW_ADMIN_TOKEN`. Returns `None` when either is unset/empty,
+    /// so the runtime keeps using the local pack provider alone.
+    ///
+    /// Mirrors [`super::agent_node::registry_from_env`] exactly — same env
+    /// vars, same "both must be present" semantics.
+    fn graph_registry_from_env() -> Option<CachingGraphProvider<HttpGraphProvider>> {
+        let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(CachingGraphProvider::new(HttpGraphProvider::new(
+            endpoint, token,
+        )))
+    }
+
+    // -----------------------------------------------------------------------
     // Pack-sidecar graph loader
     // -----------------------------------------------------------------------
 
@@ -255,7 +352,25 @@ mod aw {
         let telemetry = Arc::new(OtelTelemetry);
 
         let graph_count = graphs.len();
-        let provider: Arc<dyn GraphConfigSource> = Arc::new(InMemoryGraphProvider::new(graphs));
+        // Build the graph config source: HTTP registry (cached) primary →
+        // InMemoryGraphProvider (local packs) fallback, when the admin env
+        // vars are configured; otherwise local packs only.
+        //
+        // Mirrors the agent-config composition in
+        // `agent_node::build_agent_node_handler`:
+        //   Some(http) → CachingConfigProvider(Layered(http, overlay))
+        //   None       → CachingConfigProvider(overlay)
+        //
+        // The graph path skips the ManifestToolOverlay (no manifest overlay
+        // exists for graphs) and the CachingGraphProvider is already embedded
+        // inside the `CachingGraphProvider<HttpGraphProvider>` returned by
+        // `graph_registry_from_env`. The local InMemoryGraphProvider needs no
+        // separate cache (it is in-memory and O(1)).
+        let local = InMemoryGraphProvider::new(graphs);
+        let provider: Arc<dyn GraphConfigSource> = match graph_registry_from_env() {
+            Some(http) => Arc::new(LayeredGraphProvider::new(http, local)),
+            None => Arc::new(local),
+        };
 
         let handler = RuntimeGraphNodeHandler::from_parts(
             provider,
@@ -1021,11 +1136,141 @@ mod aw {
                 out
             );
         }
+
+        // -------------------------------------------------------------------
+        // LayeredGraphProvider tests
+        // -------------------------------------------------------------------
+
+        /// Provider that always returns the given error.
+        struct ErrGraphProvider(fn() -> ConfigError);
+
+        impl GraphConfigSource for ErrGraphProvider {
+            fn graph_config<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+                _graph_id: &'a str,
+            ) -> BoxFut<'a, Result<GraphConfig, ConfigError>> {
+                let e = (self.0)();
+                Box::pin(async move { Err(e) })
+            }
+        }
+
+        /// Fallback that panics if consulted — proves primary short-circuits.
+        struct PanicGraphProvider;
+
+        impl GraphConfigSource for PanicGraphProvider {
+            fn graph_config<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+                _graph_id: &'a str,
+            ) -> BoxFut<'a, Result<GraphConfig, ConfigError>> {
+                Box::pin(
+                    async move { panic!("fallback must not be consulted when primary returns Ok") },
+                )
+            }
+        }
+
+        #[tokio::test]
+        async fn layered_primary_ok_short_circuits_fallback() {
+            let mut graphs = HashMap::new();
+            graphs.insert("g".to_string(), triage_cfg(3));
+            let primary = InMemoryGraphProvider::new(graphs);
+            let layered = LayeredGraphProvider::new(primary, PanicGraphProvider);
+            let tc = TenantContext::new("t", "e");
+            // If fallback were consulted, PanicGraphProvider panics and fails this.
+            let cfg = layered.graph_config(&tc, "g").await.unwrap();
+            assert_eq!(cfg.graph.entry, "agent");
+        }
+
+        #[tokio::test]
+        async fn layered_falls_back_on_not_found() {
+            let mut graphs = HashMap::new();
+            graphs.insert("g".to_string(), triage_cfg(3));
+            let fb = InMemoryGraphProvider::new(graphs);
+            let layered = LayeredGraphProvider::new(
+                ErrGraphProvider(|| ConfigError::AgentNotFound("g".into())),
+                fb,
+            );
+            let tc = TenantContext::new("t", "e");
+            let cfg = layered.graph_config(&tc, "g").await.unwrap();
+            assert_eq!(cfg.graph.entry, "agent");
+        }
+
+        #[tokio::test]
+        async fn layered_falls_back_on_internal() {
+            let mut graphs = HashMap::new();
+            graphs.insert("g".to_string(), triage_cfg(3));
+            let fb = InMemoryGraphProvider::new(graphs);
+            let layered = LayeredGraphProvider::new(
+                ErrGraphProvider(|| ConfigError::Internal("down".into())),
+                fb,
+            );
+            let tc = TenantContext::new("t", "e");
+            let cfg = layered.graph_config(&tc, "g").await.unwrap();
+            assert_eq!(cfg.graph.entry, "agent");
+        }
+
+        #[tokio::test]
+        async fn layered_propagates_misconfigured_without_fallback() {
+            let fb = InMemoryGraphProvider::new(HashMap::new());
+            let layered = LayeredGraphProvider::new(
+                ErrGraphProvider(|| ConfigError::Misconfigured("bad schema".into())),
+                fb,
+            );
+            let tc = TenantContext::new("t", "e");
+            let result = layered.graph_config(&tc, "g").await;
+            assert!(
+                matches!(result, Err(ConfigError::Misconfigured(_))),
+                "Misconfigured must NOT fall back: {result:?}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // graph_registry_from_env tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn graph_registry_from_env_requires_both_vars() {
+            // SAFETY: #[serial] serializes env-mutating tests; vars cleaned up.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+            assert!(super::graph_registry_from_env().is_none());
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+            }
+            assert!(
+                super::graph_registry_from_env().is_none(),
+                "endpoint alone is not enough"
+            );
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(super::graph_registry_from_env().is_some());
+
+            // Token-alone (no endpoint) must also be None.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+            }
+            assert!(
+                super::graph_registry_from_env().is_none(),
+                "token alone is not enough"
+            );
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+        }
     }
 }
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
-    GraphConfigSource, InMemoryGraphProvider, RuntimeGraphNodeHandler, build_graph_node_handler,
-    graph_config_from_sidecar,
+    GraphConfigSource, InMemoryGraphProvider, LayeredGraphProvider, RuntimeGraphNodeHandler,
+    build_graph_node_handler, graph_config_from_sidecar,
 };
