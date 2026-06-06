@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use greentic_aw_runtime::graph::{
     AgentTurnFn, AgentTurnRequest, AgentTurnResult, CheckpointStore, GraphConfig, GraphExecError,
-    GraphExecutor, InMemoryCheckpointStore, RunStatus, ToolCallRequest, ToolFn,
+    GraphExecutor, InMemoryCheckpointStore, RunStatus, SupervisorFn, SupervisorRequest,
+    ToolCallRequest, ToolFn,
 };
 use greentic_aw_runtime::tenant::TenantContext;
 
@@ -92,6 +93,17 @@ fn tool_fn_always_ok(counter: Arc<AtomicU32>, hits: u32) -> ToolFn {
     })
 }
 
+/// A no-op supervisor fn for tests that do not exercise supervisor nodes.
+fn supervisor_fn_unreachable() -> SupervisorFn {
+    Arc::new(|_req: SupervisorRequest| {
+        Box::pin(async move {
+            Err(GraphExecError::Supervisor(
+                "supervisor fn should not be called in crash-resume tests".into(),
+            ))
+        })
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: resume_after_crash_reexecutes_only_unfinished_work
 //
@@ -132,6 +144,7 @@ async fn resume_after_crash_reexecutes_only_unfinished_work() {
             store.clone(),
             agent_fn_crash_on_second(agent_a_count.clone()),
             tool_fn_always_ok(tool_a_count.clone(), 1),
+            supervisor_fn_unreachable(),
         );
 
         let err = exec_a
@@ -179,6 +192,7 @@ async fn resume_after_crash_reexecutes_only_unfinished_work() {
         store.clone(),
         agent_fn_resolves_always(agent_b_count.clone()),
         tool_fn_always_ok(tool_b_count.clone(), 2),
+        supervisor_fn_unreachable(),
     );
 
     let outcome = exec_b
@@ -278,6 +292,7 @@ async fn resume_replays_ledgered_attempt_across_instances() {
             store.clone(),
             agent_fn_crash_on_second(agent_a_count.clone()),
             tool_fn_always_ok(tool_a_count.clone(), 1),
+            supervisor_fn_unreachable(),
         );
 
         let err = exec_a
@@ -325,6 +340,7 @@ async fn resume_replays_ledgered_attempt_across_instances() {
         store.clone(),
         agent_fn_resolves_always(agent_b_count.clone()),
         tool_fn_always_ok(tool_b_count.clone(), 2),
+        supervisor_fn_unreachable(),
     );
 
     let outcome = exec_b

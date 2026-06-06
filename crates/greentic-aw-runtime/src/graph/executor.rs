@@ -106,6 +106,42 @@ pub type ToolFn = Arc<
 >;
 
 // ---------------------------------------------------------------------------
+// Supervisor effect types
+// ---------------------------------------------------------------------------
+
+/// Request payload delivered to an injected supervisor closure.
+#[derive(Debug, Clone)]
+pub struct SupervisorRequest {
+    /// Graph node id.
+    pub node_id: String,
+    /// System prompt from the supervisor node's configuration.
+    pub system_prompt: String,
+    /// Model identifier from the supervisor node's configuration.
+    pub model: String,
+    /// The declared routes for this supervisor node.
+    pub routes: Vec<crate::graph::model::SupervisorRoute>,
+    /// Current run state at the time of the routing decision.
+    pub state: GraphRunState,
+}
+
+/// Result returned by an injected supervisor closure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorResult {
+    /// The branch label chosen by the supervisor.
+    pub branch: String,
+    /// Raw reply text from the LLM (stored in the message log).
+    pub raw_reply: String,
+}
+
+/// One supervisor routing decision: the host wires this to `AgentRuntime::step`
+/// with a generated routing prompt containing the route menu.
+pub type SupervisorFn = Arc<
+    dyn Fn(SupervisorRequest) -> BoxFut<'static, Result<SupervisorResult, GraphExecError>>
+        + Send
+        + Sync,
+>;
+
+// ---------------------------------------------------------------------------
 // GraphExecError
 // ---------------------------------------------------------------------------
 
@@ -136,6 +172,9 @@ pub enum GraphExecError {
 
     #[error("tool call failed: {0}")]
     Tool(String),
+
+    #[error("supervisor routing failed: {0}")]
+    Supervisor(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -182,15 +221,22 @@ pub struct GraphExecutor {
     store: Arc<dyn CheckpointStore>,
     agent_turn: AgentTurnFn,
     tool: ToolFn,
+    supervisor: SupervisorFn,
 }
 
 impl GraphExecutor {
     /// Construct a new executor.
-    pub fn new(store: Arc<dyn CheckpointStore>, agent_turn: AgentTurnFn, tool: ToolFn) -> Self {
+    pub fn new(
+        store: Arc<dyn CheckpointStore>,
+        agent_turn: AgentTurnFn,
+        tool: ToolFn,
+        supervisor: SupervisorFn,
+    ) -> Self {
         Self {
             store,
             agent_turn,
             tool,
+            supervisor,
         }
     }
 
@@ -498,11 +544,96 @@ impl GraphExecutor {
                     });
                 }
 
-                // v2 node kinds — execution support is delivered in a later
-                // task (Task 2+). Reaching these in the drive loop is a graph
-                // construction error; validation should have prevented it from
-                // being loaded, but guard defensively so we never panic.
-                NodeKind::Supervisor { .. } | NodeKind::Parallel | NodeKind::Join => {
+                NodeKind::Supervisor {
+                    system_prompt,
+                    model,
+                    routes,
+                } => {
+                    let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
+                    let node_id_for_err = cursor.clone();
+                    let routes_clone = routes.clone();
+                    let system_prompt_clone = system_prompt.clone();
+                    let model_clone = model.clone();
+
+                    let (raw, replayed) = self
+                        .visit_effect(tenant, run_id, &cursor, attempt, || {
+                            let req = SupervisorRequest {
+                                node_id: node_id_for_err.clone(),
+                                system_prompt: system_prompt_clone,
+                                model: model_clone,
+                                routes: routes_clone.clone(),
+                                state: state.clone(),
+                            };
+                            let fut = (self.supervisor)(req);
+                            Box::pin(async move {
+                                let r = fut.await.map_err(|e| {
+                                    GraphExecError::Supervisor(format!(
+                                        "node '{}' attempt {}: {}",
+                                        node_id_for_err, attempt, e
+                                    ))
+                                })?;
+                                serde_json::to_value(&r)
+                                    .map_err(CheckpointError::Serde)
+                                    .map_err(GraphExecError::Checkpoint)
+                            })
+                        })
+                        .await?;
+
+                    let result: SupervisorResult =
+                        serde_json::from_value(raw).map_err(CheckpointError::Serde)?;
+
+                    // Validate that the chosen branch is one of the declared routes
+                    // AND has a matching outgoing edge.
+                    let branch = &result.branch;
+                    let branch_is_valid_route = routes.iter().any(|r| &r.branch == branch);
+                    let matching_edge = cfg
+                        .graph
+                        .edges_from(&cursor)
+                        .find(|e| e.branch.as_deref() == Some(branch.as_str()));
+
+                    let next_cursor = match (branch_is_valid_route, matching_edge) {
+                        (true, Some(edge)) => edge.to.clone(),
+                        _ => {
+                            return Err(GraphExecError::Graph(super::model::GraphError::Invalid(
+                                format!(
+                                    "supervisor node '{}': branch '{}' returned by supervisor \
+                                     does not match any declared route or outgoing edge",
+                                    cursor, branch
+                                ),
+                            )));
+                        }
+                    };
+
+                    trail.push(serde_json::json!({
+                        "node": cursor,
+                        "kind": "supervisor",
+                        "attempt": attempt,
+                        "replayed": replayed,
+                        "branch": result.branch,
+                    }));
+
+                    visits.insert(cursor.clone(), attempt);
+                    state.push_message(GraphRole::Assistant, &result.raw_reply);
+
+                    // Supervisor does NOT increment iterations.
+                    cursor = next_cursor;
+
+                    let rec = build_record(
+                        run_id,
+                        &serde_json::to_string(&cfg).map_err(CheckpointError::Serde)?,
+                        &cursor,
+                        &state,
+                        &visits,
+                        RunStatus::Running,
+                    )?;
+                    self.store.save(tenant, &rec).await?;
+                }
+
+                // v2 Parallel/Join — execution support is delivered in Task 3.
+                // Reaching these in the drive loop is a graph construction error;
+                // validation should have prevented it from being loaded, but guard
+                // defensively so we never panic.
+                NodeKind::Parallel | NodeKind::Join => {
                     return Err(GraphExecError::Graph(super::model::GraphError::Invalid(
                         format!(
                             "node '{}' (kind '{}') is a schemaVersion-2 node kind; \
@@ -646,7 +777,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::*;
-    use crate::graph::test_fixtures::triage_json;
+    use crate::graph::test_fixtures::{supervisor_json, triage_json};
     use crate::graph::{GraphConfig, InMemoryCheckpointStore};
     use crate::tenant::TenantContext;
 
@@ -660,6 +791,10 @@ mod tests {
 
     fn triage_cfg() -> GraphConfig {
         GraphConfig::from_json(&triage_json()).expect("fixture is valid")
+    }
+
+    fn supervisor_cfg() -> GraphConfig {
+        GraphConfig::from_json(&supervisor_json()).expect("supervisor fixture is valid")
     }
 
     /// Build an [`AgentTurnFn`] that resolves on the n-th call (1-indexed).
@@ -681,6 +816,35 @@ mod tests {
         })
     }
 
+    /// A no-op supervisor fn that always returns an error (for v1 tests that
+    /// never reach a supervisor node).
+    fn supervisor_fn_unreachable() -> SupervisorFn {
+        Arc::new(|_req: SupervisorRequest| {
+            Box::pin(async move {
+                Err(GraphExecError::Supervisor(
+                    "supervisor fn should not be called in this test".into(),
+                ))
+            })
+        })
+    }
+
+    /// Build a supervisor fn that always routes to `branch`, counting calls.
+    fn supervisor_fn_always_routes_to(
+        counter: Arc<AtomicU32>,
+        branch: &'static str,
+    ) -> SupervisorFn {
+        Arc::new(move |req: SupervisorRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let node = req.node_id.clone();
+            Box::pin(async move {
+                Ok(SupervisorResult {
+                    branch: branch.to_string(),
+                    raw_reply: format!("[[ROUTE:{branch}]] from supervisor at {node}"),
+                })
+            })
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Test 1: happy path — resolves on first agent pass
     // -----------------------------------------------------------------------
@@ -697,6 +861,7 @@ mod tests {
             store.clone(),
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(tool_count.clone()),
+            supervisor_fn_unreachable(),
         );
 
         let outcome = exec
@@ -732,6 +897,7 @@ mod tests {
             store.clone(),
             agent_fn_resolves_on(agent_count.clone(), u32::MAX),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_unreachable(),
         );
 
         let outcome = exec
@@ -761,6 +927,7 @@ mod tests {
             store.clone(),
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(tool_count.clone()),
+            supervisor_fn_unreachable(),
         );
 
         // Drive to completion.
@@ -814,6 +981,7 @@ mod tests {
             // never resolves
             agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), u32::MAX),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_unreachable(),
         );
 
         let err = exec
@@ -880,6 +1048,7 @@ mod tests {
                 store_ref,
                 agent_phase1,
                 tool_fn_counting(tool_count.clone()),
+                supervisor_fn_unreachable(),
             );
 
             let err = exec
@@ -926,6 +1095,7 @@ mod tests {
                 store.clone(),
                 agent_phase2,
                 tool_fn_counting(tool_phase2_count.clone()),
+                supervisor_fn_unreachable(),
             );
 
             let outcome = exec2
@@ -965,6 +1135,7 @@ mod tests {
             store.clone(),
             agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_unreachable(),
         );
 
         exec.start(&tenant(), "run-dup", &triage_cfg(), "first")
@@ -980,5 +1151,194 @@ mod tests {
             matches!(err, GraphExecError::AlreadyCompleted(_)),
             "expected AlreadyCompleted, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Supervisor tests (Task 2)
+    // -----------------------------------------------------------------------
+    //
+    // Supervisor fixture topology (from test_fixtures::supervisor_json):
+    //
+    //   sup (supervisor: routes=[billing, tech])
+    //    ├─[billing]─► agent_billing ─► router_billing ─┬─[loop]──► sup
+    //    │                                               └─[resolved]─► respond
+    //    └─[tech]────► agent_tech    ─► router_tech    ─┬─[loop]──► sup
+    //                                                    └─[resolved]─► respond
+    //
+    // The mock supervisor always routes to a fixed branch; the agent under that
+    // branch resolves on call 1 → router takes "resolved" → respond.
+
+    /// Test 7: supervisor routes to "billing" branch.
+    /// Expected path: sup → agent_billing → router_billing → respond.
+    /// Supervisor invoked once.
+    #[tokio::test]
+    async fn supervisor_routes_to_billing_branch() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let sup_count = Arc::new(AtomicU32::new(0));
+        let agent_count = Arc::new(AtomicU32::new(0));
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent_fn_resolves_on(agent_count.clone(), 1),
+            tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_always_routes_to(sup_count.clone(), "billing"),
+        );
+
+        let outcome = exec
+            .start(
+                &tenant(),
+                "run-sup-billing",
+                &supervisor_cfg(),
+                "I have a billing question",
+            )
+            .await
+            .expect("supervisor billing run should succeed");
+
+        assert_eq!(outcome.status, RunStatus::Succeeded, "status");
+        assert_eq!(
+            sup_count.load(Ordering::SeqCst),
+            1,
+            "supervisor invoked once"
+        );
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "agent invoked once on billing branch"
+        );
+
+        // Trail should contain a supervisor entry with branch="billing".
+        let sup_entry = outcome.trail.iter().find(|e| e["kind"] == "supervisor");
+        assert!(
+            sup_entry.is_some(),
+            "trail must contain a supervisor entry: {:?}",
+            outcome.trail
+        );
+        let sup_entry = sup_entry.unwrap();
+        assert_eq!(
+            sup_entry["branch"], "billing",
+            "supervisor trail branch must be 'billing'"
+        );
+        assert_eq!(
+            sup_entry["replayed"], false,
+            "fresh run: supervisor not replayed"
+        );
+    }
+
+    /// Test 8: supervisor routes to "tech" branch.
+    #[tokio::test]
+    async fn supervisor_routes_to_tech_branch() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let sup_count = Arc::new(AtomicU32::new(0));
+        let agent_count = Arc::new(AtomicU32::new(0));
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent_fn_resolves_on(agent_count.clone(), 1),
+            tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_always_routes_to(sup_count.clone(), "tech"),
+        );
+
+        let outcome = exec
+            .start(
+                &tenant(),
+                "run-sup-tech",
+                &supervisor_cfg(),
+                "I have a tech issue",
+            )
+            .await
+            .expect("supervisor tech run should succeed");
+
+        assert_eq!(outcome.status, RunStatus::Succeeded, "status");
+        assert_eq!(
+            sup_count.load(Ordering::SeqCst),
+            1,
+            "supervisor invoked once"
+        );
+        assert_eq!(
+            agent_count.load(Ordering::SeqCst),
+            1,
+            "agent invoked once on tech branch"
+        );
+
+        let sup_entry = outcome.trail.iter().find(|e| e["kind"] == "supervisor");
+        assert!(sup_entry.is_some(), "trail must have supervisor entry");
+        assert_eq!(sup_entry.unwrap()["branch"], "tech");
+    }
+
+    /// Test 9: replay determinism — complete a supervisor run, then resume the
+    /// same run_id. The supervisor closure must NOT be invoked again; the recorded
+    /// routing decision is replayed from the ledger.
+    #[tokio::test]
+    async fn supervisor_replay_determinism() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let sup_count = Arc::new(AtomicU32::new(0));
+        let agent_count = Arc::new(AtomicU32::new(0));
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent_fn_resolves_on(agent_count.clone(), 1),
+            tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_always_routes_to(sup_count.clone(), "billing"),
+        );
+
+        // Drive to completion.
+        let first = exec
+            .start(
+                &tenant(),
+                "run-sup-replay",
+                &supervisor_cfg(),
+                "billing question",
+            )
+            .await
+            .expect("first run succeeds");
+        assert_eq!(first.status, RunStatus::Succeeded);
+
+        let after_first_sup = sup_count.load(Ordering::SeqCst);
+
+        // Resume the completed run — should return the terminal outcome without
+        // re-invoking the supervisor or agent.
+        let second = exec
+            .resume(&tenant(), "run-sup-replay")
+            .await
+            .expect("resume should succeed");
+        assert_eq!(second.status, RunStatus::Succeeded);
+        assert_eq!(
+            sup_count.load(Ordering::SeqCst),
+            after_first_sup,
+            "supervisor must NOT be called again on resume of a terminal run"
+        );
+    }
+
+    /// Test 10: trail has the supervisor entry with branch and replayed=false on
+    /// fresh run, and replayed=true in a mid-flight crash-recovery scenario.
+    #[tokio::test]
+    async fn supervisor_trail_entry_has_branch_and_replayed_flag() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let sup_count = Arc::new(AtomicU32::new(0));
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
+            tool_fn_counting(Arc::new(AtomicU32::new(0))),
+            supervisor_fn_always_routes_to(sup_count.clone(), "tech"),
+        );
+
+        let outcome = exec
+            .start(&tenant(), "run-sup-trail", &supervisor_cfg(), "need help")
+            .await
+            .expect("run should succeed");
+
+        // Find the supervisor entry in the trail.
+        let sup_entry = outcome
+            .trail
+            .iter()
+            .find(|e| e["kind"] == "supervisor")
+            .expect("trail must contain a supervisor entry");
+
+        assert_eq!(sup_entry["node"], "sup", "supervisor node id");
+        assert_eq!(sup_entry["kind"], "supervisor");
+        assert_eq!(sup_entry["attempt"], 1u32);
+        assert_eq!(sup_entry["replayed"], false);
+        assert_eq!(sup_entry["branch"], "tech");
     }
 }

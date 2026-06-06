@@ -41,7 +41,7 @@ mod aw {
     use greentic_aw_runtime::graph::{
         AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointError, CheckpointStore,
         GraphConfig, GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus,
-        ToolCallRequest, ToolFn,
+        SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
     };
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
@@ -405,6 +405,7 @@ mod aw {
         state_store: Arc<dyn AgentStateStore>,
         agent_turn: AgentTurnFn,
         tool: ToolFn,
+        supervisor: SupervisorFn,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -433,18 +434,27 @@ mod aw {
             let agent_turn = build_agent_turn(
                 state_store.clone(),
                 ext_runtime.clone(),
+                llm.clone(),
+                telemetry.clone(),
+                token_meter.clone(),
+                ledger.clone(),
+            );
+            let tool = build_tool(ext_runtime.clone());
+            let supervisor = build_supervisor(
+                state_store.clone(),
+                ext_runtime,
                 llm,
                 telemetry,
                 token_meter,
                 ledger,
             );
-            let tool = build_tool(ext_runtime);
             Self {
                 graphs,
                 checkpoint,
                 state_store,
                 agent_turn,
                 tool,
+                supervisor,
             }
         }
 
@@ -460,6 +470,7 @@ mod aw {
             state_store: Arc<dyn AgentStateStore>,
             agent_turn: AgentTurnFn,
             tool: ToolFn,
+            supervisor: SupervisorFn,
         ) -> Self {
             Self {
                 graphs,
@@ -467,6 +478,7 @@ mod aw {
                 state_store,
                 agent_turn,
                 tool,
+                supervisor,
             }
         }
 
@@ -614,6 +626,7 @@ mod aw {
                 self.checkpoint.clone(),
                 self.agent_turn.clone(),
                 self.tool.clone(),
+                self.supervisor.clone(),
             );
 
             let result = if slot.resume {
@@ -798,6 +811,170 @@ mod aw {
         })
     }
 
+    /// Routing sentinel that the supervisor LLM must include in its reply to
+    /// select a branch. Parsed case-insensitively.
+    const ROUTE_SENTINEL_PREFIX: &str = "[[ROUTE:";
+    const ROUTE_SENTINEL_SUFFIX: &str = "]]";
+
+    /// Build the [`SupervisorFn`] effect closure.
+    ///
+    /// Each invocation constructs a lightweight [`AgentRuntime`] (same pattern
+    /// as [`build_agent_turn`]) with a system prompt that appends a route menu
+    /// to the node's own `systemPrompt`. The reply is scanned for
+    /// `[[ROUTE:<branch>]]`; if the sentinel is absent or the branch is unknown
+    /// the executor falls back to the FIRST route with a `tracing::warn!`.
+    fn build_supervisor(
+        state_store: Arc<dyn AgentStateStore>,
+        ext_runtime: Arc<ExtensionRuntime>,
+        llm: Arc<dyn LlmBackend>,
+        telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
+    ) -> SupervisorFn {
+        Arc::new(move |req: SupervisorRequest| {
+            let state_store = state_store.clone();
+            let ext_runtime = ext_runtime.clone();
+            let llm = llm.clone();
+            let telemetry = telemetry.clone();
+            let token_meter = token_meter.clone();
+            let ledger = ledger.clone();
+            Box::pin(async move {
+                run_one_supervisor_turn(
+                    req,
+                    state_store,
+                    ext_runtime,
+                    llm,
+                    telemetry,
+                    token_meter,
+                    ledger,
+                )
+                .await
+            }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
+        })
+    }
+
+    /// Drive one supervisor routing turn via [`AgentRuntime::step`].
+    ///
+    /// The routing prompt appends a route menu to the node's `systemPrompt`:
+    ///
+    /// ```text
+    /// <node system_prompt>
+    ///
+    /// Available routes:
+    /// - billing: Billing and payment questions
+    /// - tech: Technical support issues
+    ///
+    /// Reply with [[ROUTE:<branch>]] to select a route.
+    /// ```
+    ///
+    /// The agent reply is scanned for `[[ROUTE:<branch>]]` (case-insensitive).
+    /// If the sentinel is absent or the branch does not match a declared route,
+    /// the first route is used as fallback with a `tracing::warn!`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_supervisor_turn(
+        req: SupervisorRequest,
+        state_store: Arc<dyn AgentStateStore>,
+        ext_runtime: Arc<ExtensionRuntime>,
+        llm: Arc<dyn LlmBackend>,
+        telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
+    ) -> Result<SupervisorResult, GraphExecError> {
+        let tenant = TenantContext::new("graph", "run");
+        let session_id = format!("graph__{}_sup", req.node_id);
+        let agent_id = format!("graph.{}.supervisor", req.node_id);
+
+        // Build the route menu suffix.
+        let mut route_menu = String::from("\n\nAvailable routes:\n");
+        for r in &req.routes {
+            route_menu.push_str(&format!("- {}: {}\n", r.branch, r.description));
+        }
+        route_menu.push_str("\nReply with [[ROUTE:<branch>]] to select a route.");
+
+        let routing_system_prompt = format!("{}{}", req.system_prompt, route_menu);
+
+        let seeded = seed_state_from_graph(&tenant, &session_id, &req.state);
+        if let Err(error) = state_store.save(&tenant, &session_id, &seeded).await {
+            return Err(GraphExecError::Supervisor(format!(
+                "seeding conversation state: {error}"
+            )));
+        }
+
+        let cfg = AgentConfig {
+            agent_id: agent_id.clone(),
+            system_prompt: routing_system_prompt,
+            tools: vec![],
+            llm: LlmProviderRef {
+                provider: "openai".into(),
+                model: req.model.clone(),
+            },
+            limits: AgentLimits::default(),
+        };
+        let mut provider = InMemoryConfigProvider::new();
+        provider.insert(&tenant, &agent_id, cfg);
+
+        let runtime = AgentRuntime::new(
+            Arc::new(provider),
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+        );
+
+        let input = AgentInput {
+            text: String::new(),
+        };
+
+        let out = runtime
+            .step(tenant.clone(), &session_id, &agent_id, input)
+            .await
+            .map_err(|e| GraphExecError::Supervisor(format!("supervisor step failed: {e}")))?;
+
+        let raw_reply = strip_sentinel(&out.reply);
+
+        // Parse [[ROUTE:<branch>]] from the reply (case-insensitive).
+        let branch = parse_route_branch(&out.reply, &req.routes).unwrap_or_else(|| {
+            let fallback = req
+                .routes
+                .first()
+                .map(|r| r.branch.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                node_id = req.node_id,
+                reply = %out.reply,
+                fallback = %fallback,
+                "supervisor reply missing or unknown [[ROUTE:]] sentinel; falling back to first route"
+            );
+            fallback
+        });
+
+        Ok(SupervisorResult { branch, raw_reply })
+    }
+
+    /// Parse `[[ROUTE:<branch>]]` from the reply and return the branch label if
+    /// it matches one of the declared routes. Returns `None` if the sentinel is
+    /// absent or the extracted branch is not in the route list.
+    fn parse_route_branch(
+        reply: &str,
+        routes: &[greentic_aw_runtime::graph::SupervisorRoute],
+    ) -> Option<String> {
+        let lower = reply.to_ascii_lowercase();
+        let prefix_lower = ROUTE_SENTINEL_PREFIX.to_ascii_lowercase();
+        let suffix_lower = ROUTE_SENTINEL_SUFFIX.to_ascii_lowercase();
+        let start = lower.find(&prefix_lower)?;
+        let after_prefix = start + prefix_lower.len();
+        let end = lower[after_prefix..].find(&suffix_lower)?;
+        let branch = reply[after_prefix..after_prefix + end].trim().to_string();
+        // Validate against declared routes (case-sensitive match, per spec).
+        if routes.iter().any(|r| r.branch == branch) {
+            Some(branch)
+        } else {
+            None
+        }
+    }
+
     /// Build the [`ToolFn`] effect closure.
     ///
     /// `tool_name` is parsed as `"extension_id/tool_name"` (split on the FIRST
@@ -853,7 +1030,7 @@ mod aw {
 
         use greentic_aw_runtime::graph::{
             AgentTurnFn, AgentTurnRequest, AgentTurnResult, GraphConfig, InMemoryCheckpointStore,
-            ToolCallRequest, ToolFn,
+            SupervisorFn, SupervisorRequest, ToolCallRequest, ToolFn,
         };
         use greentic_aw_runtime::mock::MockAgentStateStore;
         use serde_json::json;
@@ -913,6 +1090,17 @@ mod aw {
             })
         }
 
+        /// A no-op supervisor fn for tests that do not exercise supervisor nodes.
+        fn supervisor_fn_noop() -> SupervisorFn {
+            Arc::new(|_req: SupervisorRequest| {
+                Box::pin(async move {
+                    Err(greentic_aw_runtime::graph::GraphExecError::Supervisor(
+                        "supervisor fn should not be called in this test".into(),
+                    ))
+                })
+            })
+        }
+
         fn handler_with(
             graphs: Arc<dyn GraphConfigSource>,
             agent_turn: AgentTurnFn,
@@ -924,6 +1112,7 @@ mod aw {
                 Arc::new(MockAgentStateStore::new()),
                 agent_turn,
                 tool,
+                supervisor_fn_noop(),
             )
         }
 
@@ -1014,6 +1203,7 @@ mod aw {
                 state_store,
                 agent_fn_resolves_on(counter, 1),
                 tool_fn_ok(),
+                supervisor_fn_noop(),
             );
 
             let first = handler
