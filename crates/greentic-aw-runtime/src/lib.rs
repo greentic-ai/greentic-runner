@@ -26,6 +26,7 @@ pub mod llm_openai;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
+pub mod mcp_source;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;
@@ -50,6 +51,7 @@ pub use llm_extension::{
 };
 pub use llm_openai::OpenAiLlmBackend;
 pub use manifest_provider::ManifestToolOverlayProvider;
+pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
