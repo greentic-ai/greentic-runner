@@ -77,7 +77,9 @@ pub async fn run_step(
             break;
         }
 
-        let tools_schema = list_tools_for_llm(&runtime.ext_runtime, &config.tools);
+        // Task 3 (MCP-4) threads the real per-tenant catalog here; for now MCP
+        // refs are inert (None → mcp: tools resolve to nothing).
+        let tools_schema = list_tools_for_llm(&runtime.ext_runtime, None, &config.tools);
         let request = LlmRequest {
             system_prompt: config.system_prompt.clone(),
             history: state.messages.clone(),
@@ -160,7 +162,8 @@ pub async fn run_step(
                 // (they should remain retryable on the next turn).
                 observer.on_tool_call(&call.tool_name, &call.call_id);
                 let result =
-                    match dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await {
+                    match dispatch_tool_call(runtime.ext_runtime.clone(), None, call.clone()).await
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             warn!(

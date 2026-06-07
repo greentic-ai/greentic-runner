@@ -154,6 +154,35 @@ impl McpToolCatalog {
     pub fn route(&self, server_id: &str, tool: &str) -> Option<&McpRoute> {
         self.routes.get(&(server_id.to_string(), tool.to_string()))
     }
+
+    /// Build a catalog directly from tool/route maps, bypassing the admin +
+    /// MCP probe. Test-only: lets downstream crates (e.g. `tools.rs`) exercise
+    /// the list/dispatch seams without standing up a wiremock pair.
+    #[cfg(test)]
+    pub(crate) fn for_tests(
+        tools: HashMap<(String, String), McpToolEntry>,
+        routes: HashMap<(String, String), McpRoute>,
+    ) -> Self {
+        Self {
+            tools,
+            routes,
+            fetched_at: Instant::now(),
+        }
+    }
+}
+
+/// Build a dispatch route pointing at `transport_url` for `(server_id, tool)`.
+/// Test-only constructor: `McpRoute` fields are private, so downstream test
+/// code uses this to aim a route at a fake MCP server.
+#[cfg(test)]
+pub(crate) fn route_for_tests(server_id: &str, tool: &str, transport_url: &str) -> McpRoute {
+    McpRoute {
+        server_id: server_id.to_string(),
+        transport_url: transport_url.to_string(),
+        auth_header_name: None,
+        auth_token: None,
+        raw_tool_name: tool.to_string(),
+    }
 }
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
