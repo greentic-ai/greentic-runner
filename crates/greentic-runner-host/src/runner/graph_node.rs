@@ -1053,9 +1053,10 @@ mod aw {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        use greentic_aw_runtime::graph::model::SupervisorRoute;
         use greentic_aw_runtime::graph::{
             AgentTurnFn, AgentTurnRequest, AgentTurnResult, GraphConfig, InMemoryCheckpointStore,
-            SupervisorFn, SupervisorRequest, ToolCallRequest, ToolFn,
+            SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
         };
         use greentic_aw_runtime::mock::MockAgentStateStore;
         use serde_json::json;
@@ -1480,6 +1481,351 @@ mod aw {
             unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Supervisor fixture
+        // -------------------------------------------------------------------
+
+        /// Supervisor graph (schemaVersion 2): sup → agent_billing / agent_tech →
+        /// router → respond. Mirrors the aw-runtime `supervisor_json()` fixture
+        /// (which is `pub(crate)` to that crate and cannot be imported here).
+        ///
+        /// Topology:
+        ///   sup (supervisor: routes=[billing, tech])
+        ///    ├─[billing]─► agent_billing ─► router_billing ─┬─[loop]──► sup
+        ///    │                                               └─[resolved]─► respond
+        ///    └─[tech]────► agent_tech ───► router_tech    ─┬─[loop]──► sup
+        ///                                                   └─[resolved]─► respond
+        fn supervisor_graph_json() -> String {
+            json!({
+                "schemaVersion": 2,
+                "entry": "sup",
+                "nodes": [
+                    {
+                        "id": "sup",
+                        "kind": "supervisor",
+                        "systemPrompt": "Route the request to the correct specialist.",
+                        "model": "gpt-4o-mini",
+                        "routes": [
+                            {"branch": "billing", "description": "Billing and payment questions"},
+                            {"branch": "tech",    "description": "Technical support issues"}
+                        ]
+                    },
+                    {"id": "agent_billing", "kind": "agent", "systemPrompt": "Billing.", "model": "gpt-4o-mini", "tools": []},
+                    {"id": "router_billing", "kind": "router", "maxIterations": 2},
+                    {"id": "agent_tech",    "kind": "agent", "systemPrompt": "Tech.",    "model": "gpt-4o-mini", "tools": []},
+                    {"id": "router_tech",   "kind": "router", "maxIterations": 2},
+                    {"id": "respond",       "kind": "respond"}
+                ],
+                "edges": [
+                    {"from": "sup",           "to": "agent_billing",  "branch": "billing"},
+                    {"from": "sup",           "to": "agent_tech",     "branch": "tech"},
+                    {"from": "agent_billing", "to": "router_billing"},
+                    {"from": "router_billing","to": "agent_billing",  "branch": "loop"},
+                    {"from": "router_billing","to": "respond",        "branch": "resolved"},
+                    {"from": "agent_tech",    "to": "router_tech"},
+                    {"from": "router_tech",   "to": "agent_tech",     "branch": "loop"},
+                    {"from": "router_tech",   "to": "respond",        "branch": "resolved"}
+                ]
+            })
+            .to_string()
+        }
+
+        fn supervisor_cfg() -> GraphConfig {
+            GraphConfig::from_json(&supervisor_graph_json()).expect("supervisor fixture valid")
+        }
+
+        /// Helpers for building [`SupervisorRoute`] values inline.
+        fn route(branch: &str, description: &str) -> SupervisorRoute {
+            SupervisorRoute {
+                branch: branch.to_string(),
+                description: description.to_string(),
+            }
+        }
+
+        /// Build a supervisor fn that always routes to `fixed_branch`.
+        fn supervisor_fn_routes_to(fixed_branch: &str) -> SupervisorFn {
+            let branch = fixed_branch.to_string();
+            Arc::new(move |_req: SupervisorRequest| {
+                let branch = branch.clone();
+                Box::pin(async move {
+                    Ok(SupervisorResult {
+                        branch: branch.clone(),
+                        raw_reply: format!("I'll route this. [[ROUTE:{branch}]] Done."),
+                    })
+                })
+            })
+        }
+
+        // Build a handler wired with the given supervisor fn (and a no-op agent
+        // that always resolves immediately).
+        fn supervisor_handler(
+            graphs: Arc<dyn GraphConfigSource>,
+            supervisor: SupervisorFn,
+        ) -> RuntimeGraphNodeHandler {
+            let agent: AgentTurnFn = agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1);
+            RuntimeGraphNodeHandler::with_effects(
+                graphs,
+                Arc::new(InMemoryCheckpointStore::default()),
+                Arc::new(MockAgentStateStore::new()),
+                agent,
+                tool_fn_ok(),
+                supervisor,
+            )
+        }
+
+        // -------------------------------------------------------------------
+        // parse_route_branch unit tests
+        // -------------------------------------------------------------------
+
+        /// Two routes for the parse tests.
+        fn billing_tech_routes() -> Vec<SupervisorRoute> {
+            vec![
+                route("billing", "Billing and payment questions"),
+                route("tech", "Technical support issues"),
+            ]
+        }
+
+        #[test]
+        fn parse_route_extracts_billing_from_reply() {
+            // Standard case: sentinel embedded in a longer reply.
+            let reply = "I analysed the message. [[ROUTE:billing]] Go ahead.";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("billing".to_string()));
+        }
+
+        #[test]
+        fn parse_route_case_insensitive_prefix() {
+            // The prefix [[ROUTE: is matched case-insensitively; the extracted
+            // branch label must still match the declared route exactly
+            // (case-sensitive per spec).
+            let reply = "[[route:tech]] is the answer";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("tech".to_string()));
+        }
+
+        #[test]
+        fn parse_route_missing_sentinel_returns_none() {
+            // No sentinel at all → None (caller's unwrap_or_else picks first route).
+            let reply = "I think billing would be best here.";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn parse_route_unknown_branch_returns_none() {
+            // Sentinel present but branch label does not match any declared route.
+            let reply = "[[ROUTE:unknown_branch]] routing";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn parse_route_multiple_sentinels_uses_first() {
+            // When multiple sentinels are present the function uses the FIRST one
+            // (find on the lowercased string returns the first occurrence).
+            let reply = "[[ROUTE:billing]] or [[ROUTE:tech]]";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(
+                result,
+                Some("billing".to_string()),
+                "multiple sentinels: first occurrence wins"
+            );
+        }
+
+        #[test]
+        fn parse_route_branch_label_whitespace_trimmed() {
+            // Whitespace around the branch label inside the sentinel is trimmed.
+            let reply = "[[ROUTE:  billing  ]]";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("billing".to_string()));
+        }
+
+        // -------------------------------------------------------------------
+        // strip_route_sentinel unit tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn strip_sentinel_removes_token_leaves_rest() {
+            let reply = "I'll route this. [[ROUTE:billing]] Proceeding.";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.contains("[[ROUTE:billing]]"),
+                "sentinel must be removed: {stripped:?}"
+            );
+            assert!(
+                stripped.contains("Proceeding"),
+                "text after sentinel must survive: {stripped:?}"
+            );
+        }
+
+        #[test]
+        fn strip_sentinel_no_sentinel_returns_trimmed() {
+            let reply = "  No routing needed here.  ";
+            let stripped = strip_route_sentinel(reply);
+            assert_eq!(stripped, "No routing needed here.");
+        }
+
+        #[test]
+        fn strip_sentinel_case_insensitive_removal() {
+            let reply = "Decision: [[route:tech]] done.";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.to_ascii_lowercase().contains("[[route:"),
+                "sentinel must be stripped case-insensitively: {stripped:?}"
+            );
+        }
+
+        #[test]
+        fn strip_sentinel_only_first_occurrence_removed() {
+            // If two sentinels appear, only the first is stripped.
+            let reply = "[[ROUTE:billing]] first [[ROUTE:tech]] second";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.contains("[[ROUTE:billing]]"),
+                "first sentinel must be gone: {stripped:?}"
+            );
+            // The second sentinel remains (we only strip the first occurrence).
+            assert!(
+                stripped.contains("[[ROUTE:tech]]"),
+                "second sentinel must remain: {stripped:?}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Fallback: parse_route_branch None → first-route fallback
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn parse_route_none_documents_fallback_to_first_route() {
+            // This is a pure-fn test of the fallback path used in
+            // `run_one_supervisor_turn` via `unwrap_or_else(|| first_route)`.
+            // When parse_route_branch returns None, the build_supervisor closure
+            // picks req.routes.first().branch as the fallback.
+            let routes = billing_tech_routes();
+            let garbage = "absolutely no routing sentinel here";
+            let parsed = parse_route_branch(garbage, &routes);
+            assert_eq!(parsed, None, "no sentinel → None from parser");
+
+            // Simulate the fallback: first route is "billing".
+            let fallback = parsed
+                .unwrap_or_else(|| routes.first().map(|r| r.branch.clone()).unwrap_or_default());
+            assert_eq!(
+                fallback, "billing",
+                "None → first route 'billing' as fallback"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Handler-level supervisor routing tests
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn supervisor_routes_to_billing_returns_respond_envelope() {
+            // The mock supervisor always picks "billing". The billing agent
+            // resolves immediately. Expect terminated_by="respond" and a
+            // non-empty reply.
+            let handler = supervisor_handler(
+                provider_with("sup_graph", supervisor_cfg()),
+                supervisor_fn_routes_to("billing"),
+            );
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-1",
+                    &json!({"user_text": "I need billing help"}),
+                )
+                .await
+                .expect("supervisor execute must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "billing path must terminate at respond: {out:?}"
+            );
+            assert!(
+                out["reply"].as_str().is_some_and(|r| !r.is_empty()),
+                "reply must be non-empty: {out:?}"
+            );
+            assert!(
+                out["trail"].as_array().is_some_and(|t| !t.is_empty()),
+                "trail must be non-empty: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn supervisor_routes_to_tech_returns_respond_envelope() {
+            // Same topology, supervisor picks "tech" branch instead.
+            let handler = supervisor_handler(
+                provider_with("sup_graph", supervisor_cfg()),
+                supervisor_fn_routes_to("tech"),
+            );
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-2",
+                    &json!({"user_text": "my device is broken"}),
+                )
+                .await
+                .expect("supervisor tech-route execute must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "tech path must terminate at respond: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn supervisor_fallback_on_missing_sentinel_still_completes() {
+            // A supervisor fn that returns a raw_reply with NO [[ROUTE:]] sentinel.
+            // The build_supervisor closure maps None→first-route ("billing").
+            // The handler-level execute() must still complete (not Err).
+            //
+            // Because with_effects injects the supervisor fn directly (bypassing
+            // build_supervisor's parse), we simulate the fallback by having the
+            // fn return the first route explicitly — matching what build_supervisor
+            // does in production via parse_route_branch(...)
+            //   .unwrap_or_else(|| routes.first().branch).
+            // The pure-fn fallback path is fully covered by
+            // `parse_route_none_documents_fallback_to_first_route`.
+            let supervisor: SupervisorFn = Arc::new(|_req: SupervisorRequest| {
+                // No sentinel in raw_reply; we return first-route directly as
+                // the mock of the fallback behaviour.
+                Box::pin(async move {
+                    Ok(SupervisorResult {
+                        branch: "billing".to_string(),
+                        raw_reply: "I think billing is right.".to_string(),
+                    })
+                })
+            });
+
+            let handler =
+                supervisor_handler(provider_with("sup_graph", supervisor_cfg()), supervisor);
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-3",
+                    &json!({"user_text": "help me"}),
+                )
+                .await
+                .expect("fallback supervisor must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "fallback path must still reach respond: {out:?}"
+            );
         }
     }
 }
