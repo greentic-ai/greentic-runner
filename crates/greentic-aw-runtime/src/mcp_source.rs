@@ -188,8 +188,8 @@ impl McpToolSource {
     }
 
     /// Stable per-tenant cache key. `TenantContext` exposes no single opaque
-    /// id, so the `(tenant_id, env_id)` pair is joined — the same string the
-    /// Redis key builder derives from.
+    /// id, so the `(tenant_id, env_id)` pair is joined — the same pair
+    /// `TenantContext::key_prefix` is built from.
     fn cache_key(tenant: &TenantContext) -> String {
         format!("{}:{}", tenant.tenant_id, tenant.env_id)
     }
