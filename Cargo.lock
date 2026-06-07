@@ -2125,8 +2125,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.20"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.20-research#dda7974e55daf09a743bb5f2f93104f2b6f7789e"
+version = "1.2.21"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.21-research#c02ed78d9cd982769243ed539cc31f54a0c483b6"
 dependencies = [
  "anyhow",
  "arc-swap",
