@@ -236,18 +236,21 @@ mod aw {
     }
 
     /// Build an [`McpToolSource`] from the same admin endpoint/token the agent
-    /// registry uses (`GREENTIC_AW_ADMIN_ENDPOINT` + `GREENTIC_AW_ADMIN_TOKEN`),
-    /// gated behind an explicit `GREENTIC_AW_MCP=1` opt-in.
+    /// registry uses (`GREENTIC_AW_ADMIN_ENDPOINT` + `GREENTIC_AW_ADMIN_TOKEN`).
     ///
-    /// The extra opt-in is deliberate: even when admin credentials are present
-    /// for the agent registry, MCP tool dispatch stays off until an operator
-    /// sets `GREENTIC_AW_MCP=1`, so enabling MCP is never an implicit side
-    /// effect of configuring the admin endpoint. Returns `None` when the gate is
-    /// unset/not `1`, or when either credential is missing/empty.
+    /// MCP tools are ON by default whenever the admin credentials are present:
+    /// exposure is already authorized twice upstream (the tenant registers the
+    /// server with the `agentic_worker` role in admin, and the agent's
+    /// allowlist must explicitly reference `mcp:<server_id>`), so a configured
+    /// runner participates without extra ceremony. `GREENTIC_AW_MCP=0` is the
+    /// operator opt-out escape hatch for environments where outbound calls to
+    /// tenant-registered MCP servers must stay disabled. Returns `None` on
+    /// opt-out or when either credential is missing/empty.
     ///
     /// [`McpToolSource`]: greentic_aw_runtime::McpToolSource
     fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
-        if std::env::var("GREENTIC_AW_MCP").ok().as_deref() != Some("1") {
+        if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_MCP=0; MCP tool source disabled");
             return None;
         }
         let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
@@ -256,7 +259,7 @@ mod aw {
         let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
             .ok()
             .filter(|s| !s.is_empty())?;
-        tracing::info!(endpoint = %endpoint, "GREENTIC_AW_MCP enabled; MCP tool source constructed");
+        tracing::info!(endpoint = %endpoint, "MCP tool source constructed");
         Some(Arc::new(greentic_aw_runtime::McpToolSource::new(
             endpoint, token,
         )))
@@ -789,7 +792,7 @@ mod aw {
         #[test]
         #[serial_test::serial]
         #[allow(unsafe_code)]
-        fn mcp_source_from_env_requires_gate_and_both_vars() {
+        fn mcp_source_from_env_default_on_with_opt_out() {
             // SAFETY: #[serial] serializes env-mutating tests (crate convention),
             // so no concurrent test observes a torn env; vars cleaned up at the end.
             unsafe {
@@ -798,24 +801,39 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
 
-            // (a) Gate unset, but endpoint + token present → still None.
+            // (a) Default-on: endpoint + token present, gate unset → Some.
             unsafe {
                 std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
                 std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
-                "MCP must stay off without the GREENTIC_AW_MCP=1 opt-in"
+                super::mcp_source_from_env().is_some(),
+                "MCP is on by default when admin credentials are configured"
             );
 
-            // (b) Gate on, but a credential missing → None.
+            // (b) Explicit opt-out wins even with full credentials.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_MCP", "0");
+            }
+            assert!(
+                super::mcp_source_from_env().is_none(),
+                "GREENTIC_AW_MCP=0 disables MCP regardless of credentials"
+            );
+
+            // (b') Legacy opt-in value still enables (any non-"0" value does).
             unsafe {
                 std::env::set_var("GREENTIC_AW_MCP", "1");
+            }
+            assert!(super::mcp_source_from_env().is_some());
+
+            // (c) Missing credential → None even without an opt-out.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_MCP");
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
             }
             assert!(
                 super::mcp_source_from_env().is_none(),
-                "gate alone without endpoint is not enough"
+                "no endpoint → no MCP source"
             );
 
             unsafe {
@@ -824,14 +842,8 @@ mod aw {
             }
             assert!(
                 super::mcp_source_from_env().is_none(),
-                "gate + endpoint without token is not enough"
+                "no token → no MCP source"
             );
-
-            // (c) Gate on with both credentials → Some.
-            unsafe {
-                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
-            }
-            assert!(super::mcp_source_from_env().is_some());
 
             unsafe {
                 std::env::remove_var("GREENTIC_AW_MCP");
