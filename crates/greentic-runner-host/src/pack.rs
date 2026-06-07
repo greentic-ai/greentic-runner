@@ -77,7 +77,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
+use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -1200,6 +1201,10 @@ pub struct ComponentState {
 
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        // `WasiTlsCtxBuilder::new()` below eagerly builds a rustls client
+        // config, which requires a process-level crypto provider; install it
+        // first (idempotent) so construction never panics.
+        ensure_rustls_provider_installed();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1274,15 +1279,34 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
     Ok(())
 }
 
+/// Install a process-level rustls [`CryptoProvider`] for `wasi-tls`.
+///
+/// `wasmtime-wasi-tls` 45 builds its TLS client config via
+/// `rustls::ClientConfig::builder()`, which relies on the process-default
+/// crypto provider. Because both `aws-lc-rs` (via reqwest/hyper-rustls) and
+/// `ring` (via wasmtime-wasi-tls) are linked, rustls 0.23 cannot auto-select
+/// one and panics on first use. Install `aws-lc-rs` explicitly to match the
+/// provider used by the rest of the runner's HTTP stack.
+///
+/// Idempotent: only installs when no default is set yet, so concurrent callers
+/// (and repeated `register_all` invocations) are safe.
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // `install_default` returns Err if another thread won the race; that is
+        // fine — a provider is installed either way.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
+    ensure_rustls_provider_installed();
+
     add_wasi_to_linker(linker)?;
 
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
-        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
-    })?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1444,6 +1468,15 @@ impl WasiHttpView for ComponentState {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+impl WasiTlsView for ComponentState {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.wasi_tls_ctx,
+            table: &mut self.resource_table,
         }
     }
 }
@@ -4207,6 +4240,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4267,6 +4301,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
