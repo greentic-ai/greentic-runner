@@ -777,6 +777,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
+            None,
         );
 
         // The latest user turn is the most recent user message in the seeded log

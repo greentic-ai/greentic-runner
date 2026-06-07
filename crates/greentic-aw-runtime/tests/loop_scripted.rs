@@ -74,7 +74,16 @@ fn build_runtime(
     let token_meter = Arc::new(MockTokenMeter::new(token_used));
     let ledger = Arc::new(NoopToolLedger);
     let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
-    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
+    let rt = AgentRuntime::new(
+        cp,
+        store,
+        ext,
+        llm,
+        telemetry.clone(),
+        token_meter,
+        ledger,
+        None,
+    );
     (rt, telemetry, tc)
 }
 
@@ -247,7 +256,7 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger = Arc::new(NoopToolLedger);
     let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
-    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger);
+    let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
 
     let err = rt
         .step(tc, "s", "a", AgentInput { text: "x".into() })

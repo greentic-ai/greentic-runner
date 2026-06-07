@@ -425,6 +425,8 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
+            // MCP tool source wiring is Task 4 (runner-host); inert for now.
+            None,
         ));
 
         tracing::info!(agent_count, "AW runtime constructed");
@@ -501,6 +503,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
             ));
             let handler = RuntimeAgentNodeHandler::new(runtime);
 
