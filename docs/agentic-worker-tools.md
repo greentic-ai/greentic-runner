@@ -69,6 +69,32 @@ load time.
 > (The manifest is not stored inside the composed `.gtpack`, so this loose file
 > is the supported delivery path.)
 
+## Method 3 — MCP server tools (opt-in)
+
+Tenant-registered MCP servers (designer-admin → MCP Servers, role
+`agentic_worker`) can be offered to an agent alongside extension tools. An MCP
+tool is declared with the `mcp:` extension-id form — no schema change:
+
+```yaml
+    tools:
+      - extension_id: mcp:<server_id>   # admin's server id, e.g. mcp:gh-issues
+        tool_name: get_issue            # raw tool name on that server
+```
+
+Enablement is a deliberate opt-in on the runner host:
+
+- `GREENTIC_AW_MCP=1` — the gate; without it every `mcp:` ref is inert.
+- `GREENTIC_AW_ADMIN_ENDPOINT` + `GREENTIC_AW_ADMIN_TOKEN` — the same admin
+  endpoint/token the agent registry uses; the tenant's MCP servers are pulled
+  from `/api/v1/designer/tenant/me/mcp-servers` and cached per tenant for
+  5 minutes.
+
+Fail-soft, same spirit as the manifest overlay: an unreachable admin or MCP
+server degrades to "tool not offered" (warn-logged); a tool call that fails at
+runtime returns an in-band `{"error": ...}` value to the LLM. MCP can never
+take an agent step down. Full design:
+`docs/2026-06-07-aw-runtime-mcp-tools-design.md`.
+
 ## Agent graphs
 
 Multi-agent orchestration is supported via the `dw.agent_graph` flow-node kind,
