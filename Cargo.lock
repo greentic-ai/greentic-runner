@@ -2121,8 +2121,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.18"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.18-research#d5c3652af975a9c7fa3ab63a412ec1d194926628"
+version = "1.2.19"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.19-research#06a2e3676c5aac9320f1198a9450eb24aae92c7d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4379,7 +4379,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -7284,7 +7284,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
