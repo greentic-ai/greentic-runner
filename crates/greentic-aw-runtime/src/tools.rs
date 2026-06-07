@@ -124,9 +124,16 @@ pub async fn dispatch_tool_call(
                 let args = call.args.to_string();
                 crate::mcp_source::dispatch_route(route, &args).await
             }
-            None => serde_json::json!({
-                "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
-            }),
+            None => {
+                tracing::warn!(
+                    server = %server_id,
+                    tool = %call.tool_name,
+                    "mcp call has no route in the tenant catalog; returning error value"
+                );
+                serde_json::json!({
+                    "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
+                })
+            }
         };
         return Ok(value);
     }
@@ -416,11 +423,16 @@ mod tests {
         // loads no extensions, so list_tools errors → the ref is skipped,
         // exactly as in `list_tools_for_llm_with_no_extensions_returns_empty`.
         // The presence of a catalog must not change that path.
+        //
+        // The catalog deliberately contains an entry keyed by the FULL
+        // non-mcp extension id — if the mcp branch ever matched non-`mcp:`
+        // ids and consulted the catalog, this entry would be emitted and the
+        // empty assertion below would catch the regression.
         let rt = ExtensionRuntime::for_test();
         let catalog = catalog_with(
-            "s1",
-            "get_issue",
-            "Get an issue",
+            "greentic.tavily",
+            "search",
+            "decoy: must never be emitted for a non-mcp ref",
             serde_json::json!({}),
             None,
         );
