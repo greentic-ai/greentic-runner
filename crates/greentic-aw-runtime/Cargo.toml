@@ -14,18 +14,26 @@ test-mock = []
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 chrono              = { version = "0.4", features = ["serde"] }
+dashmap             = { workspace = true }
 futures             = { workspace = true }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.19-research" }
+# MCP transport for the agentic-worker MCP tool source (MCP-4). Pinned at the
+# reqwest-0.13 rev (same as the designer) — the runner workspace already carries
+# reqwest 0.13, so this adds no new version.
+# TODO(post-publish): swap to crates.io `=0.1.0` once greentic-mcp-client is published.
+greentic-mcp-client = { git = "https://github.com/greenticai/greentic-mcp-client", rev = "f37b2bf9d753962b2e43e9686afa9bdf981f8d38", features = ["native"] }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+secrecy             = "0.10"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }
+url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
