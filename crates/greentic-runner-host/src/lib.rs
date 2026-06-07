@@ -31,6 +31,7 @@ pub mod cache;
 pub mod component_api;
 pub mod config;
 pub mod engine;
+pub mod extension_provider;
 pub mod fault;
 pub mod gtbind;
 pub mod http;

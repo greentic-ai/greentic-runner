@@ -2068,6 +2068,37 @@ impl PackRuntime {
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
+
+            // Extension-provider worlds (greentic:extension-provider@0.2.0 /
+            // @0.1.0) are introspection surfaces (list-channels,
+            // describe-channel, *-schema, dry-run-encode) and deliberately do
+            // NOT export a generic `invoke(op, input)` data-plane call. If a
+            // pack declares such a world for the runtime data plane, dispatch
+            // here would otherwise fall through to the legacy schema-core
+            // bindings and fail with an opaque "no exported instance" wasmtime
+            // error. Detect it up front (declared-world fast path, confirmed by
+            // an instance-level probe) and surface a typed, downcastable
+            // `ProviderInvokeError` instead. The data-plane routing for these
+            // worlds is an open design question (see PR body NEEDS_DECISION);
+            // legacy schema-core remains the default path below.
+            if world.contains("extension-provider") {
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
+                let instance =
+                    block_on(async { pre_instance.instantiate_async(&mut store).await })?;
+                let detected =
+                    crate::extension_provider::probe_provider_world(&mut store, &instance);
+                let version = detected
+                    .map(|w| w.version())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let typed = crate::extension_provider::ProviderInvokeError::Internal(format!(
+                    "extension-provider@{version} world exposes no data-plane invoke; \
+                     operation '{op_owned}' has no extension-provider equivalent (introspection \
+                     surface only)"
+                ));
+                return Err(crate::extension_provider::into_anyhow(typed));
+            }
+
             let use_schema_core_schema = world.contains("provider-schema-core");
             let use_schema_core_path = world.contains("provider/schema-core");
             let result = if use_schema_core_schema {
