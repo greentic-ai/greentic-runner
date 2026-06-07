@@ -18,11 +18,8 @@ dashmap             = { workspace = true }
 futures             = { workspace = true }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.21-research" }
-# MCP transport for the agentic-worker MCP tool source (MCP-4). Pinned at the
-# reqwest-0.13 rev (same as the designer) — the runner workspace already carries
-# reqwest 0.13, so this adds no new version.
-# TODO(post-publish): swap to crates.io `=0.1.0` once greentic-mcp-client is published.
-greentic-mcp-client = { git = "https://github.com/greenticai/greentic-mcp-client", rev = "f37b2bf9d753962b2e43e9686afa9bdf981f8d38", features = ["native"] }
+# MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
+greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }

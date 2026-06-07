@@ -2282,8 +2282,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-mcp-client"
-version = "0.1.0"
-source = "git+https://github.com/greenticai/greentic-mcp-client?rev=f37b2bf9d753962b2e43e9686afa9bdf981f8d38#f37b2bf9d753962b2e43e9686afa9bdf981f8d38"
+version = "1.2.0-research"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9df0ec0eb4d60f45f02e7046a90f902466eb4104d4bbb3519cd74463887fe5c"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
