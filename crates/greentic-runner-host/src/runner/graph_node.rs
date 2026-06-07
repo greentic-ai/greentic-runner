@@ -41,7 +41,7 @@ mod aw {
     use greentic_aw_runtime::graph::{
         AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointError, CheckpointStore,
         GraphConfig, GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus,
-        ToolCallRequest, ToolFn,
+        SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
     };
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
@@ -405,6 +405,7 @@ mod aw {
         state_store: Arc<dyn AgentStateStore>,
         agent_turn: AgentTurnFn,
         tool: ToolFn,
+        supervisor: SupervisorFn,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -433,18 +434,27 @@ mod aw {
             let agent_turn = build_agent_turn(
                 state_store.clone(),
                 ext_runtime.clone(),
+                llm.clone(),
+                telemetry.clone(),
+                token_meter.clone(),
+                ledger.clone(),
+            );
+            let tool = build_tool(ext_runtime.clone());
+            let supervisor = build_supervisor(
+                state_store.clone(),
+                ext_runtime,
                 llm,
                 telemetry,
                 token_meter,
                 ledger,
             );
-            let tool = build_tool(ext_runtime);
             Self {
                 graphs,
                 checkpoint,
                 state_store,
                 agent_turn,
                 tool,
+                supervisor,
             }
         }
 
@@ -460,6 +470,7 @@ mod aw {
             state_store: Arc<dyn AgentStateStore>,
             agent_turn: AgentTurnFn,
             tool: ToolFn,
+            supervisor: SupervisorFn,
         ) -> Self {
             Self {
                 graphs,
@@ -467,6 +478,7 @@ mod aw {
                 state_store,
                 agent_turn,
                 tool,
+                supervisor,
             }
         }
 
@@ -614,6 +626,7 @@ mod aw {
                 self.checkpoint.clone(),
                 self.agent_turn.clone(),
                 self.tool.clone(),
+                self.supervisor.clone(),
             );
 
             let result = if slot.resume {
@@ -798,6 +811,195 @@ mod aw {
         })
     }
 
+    /// Routing sentinel that the supervisor LLM must include in its reply to
+    /// select a branch. Parsed case-insensitively.
+    const ROUTE_SENTINEL_PREFIX: &str = "[[ROUTE:";
+    const ROUTE_SENTINEL_SUFFIX: &str = "]]";
+
+    /// Build the [`SupervisorFn`] effect closure.
+    ///
+    /// Each invocation constructs a lightweight [`AgentRuntime`] (same pattern
+    /// as [`build_agent_turn`]) with a system prompt that appends a route menu
+    /// to the node's own `systemPrompt`. The reply is scanned for
+    /// `[[ROUTE:<branch>]]`; if the sentinel is absent or the branch is unknown
+    /// the executor falls back to the FIRST route with a `tracing::warn!`.
+    fn build_supervisor(
+        state_store: Arc<dyn AgentStateStore>,
+        ext_runtime: Arc<ExtensionRuntime>,
+        llm: Arc<dyn LlmBackend>,
+        telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
+    ) -> SupervisorFn {
+        Arc::new(move |req: SupervisorRequest| {
+            let state_store = state_store.clone();
+            let ext_runtime = ext_runtime.clone();
+            let llm = llm.clone();
+            let telemetry = telemetry.clone();
+            let token_meter = token_meter.clone();
+            let ledger = ledger.clone();
+            Box::pin(async move {
+                run_one_supervisor_turn(
+                    req,
+                    state_store,
+                    ext_runtime,
+                    llm,
+                    telemetry,
+                    token_meter,
+                    ledger,
+                )
+                .await
+            }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
+        })
+    }
+
+    /// Drive one supervisor routing turn via [`AgentRuntime::step`].
+    ///
+    /// The routing prompt appends a route menu to the node's `systemPrompt`:
+    ///
+    /// ```text
+    /// <node system_prompt>
+    ///
+    /// Available routes:
+    /// - billing: Billing and payment questions
+    /// - tech: Technical support issues
+    ///
+    /// Reply with [[ROUTE:<branch>]] to select a route.
+    /// ```
+    ///
+    /// The agent reply is scanned for `[[ROUTE:<branch>]]` (case-insensitive).
+    /// If the sentinel is absent or the branch does not match a declared route,
+    /// the first route is used as fallback with a `tracing::warn!`.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one_supervisor_turn(
+        req: SupervisorRequest,
+        state_store: Arc<dyn AgentStateStore>,
+        ext_runtime: Arc<ExtensionRuntime>,
+        llm: Arc<dyn LlmBackend>,
+        telemetry: Arc<dyn Telemetry>,
+        token_meter: Arc<dyn TokenMeter>,
+        ledger: Arc<dyn ToolLedger>,
+    ) -> Result<SupervisorResult, GraphExecError> {
+        let tenant = TenantContext::new("graph", "run");
+        let session_id = format!("graph__{}_sup", req.node_id);
+        let agent_id = format!("graph.{}.supervisor", req.node_id);
+
+        // Build the route menu suffix.
+        let mut route_menu = String::from("\n\nAvailable routes:\n");
+        for r in &req.routes {
+            route_menu.push_str(&format!("- {}: {}\n", r.branch, r.description));
+        }
+        route_menu.push_str("\nReply with [[ROUTE:<branch>]] to select a route.");
+
+        let routing_system_prompt = format!("{}{}", req.system_prompt, route_menu);
+
+        let seeded = seed_state_from_graph(&tenant, &session_id, &req.state);
+        if let Err(error) = state_store.save(&tenant, &session_id, &seeded).await {
+            return Err(GraphExecError::Supervisor(format!(
+                "seeding conversation state: {error}"
+            )));
+        }
+
+        let cfg = AgentConfig {
+            agent_id: agent_id.clone(),
+            system_prompt: routing_system_prompt,
+            tools: vec![],
+            llm: LlmProviderRef {
+                provider: "openai".into(),
+                model: req.model.clone(),
+            },
+            limits: AgentLimits::default(),
+        };
+        let mut provider = InMemoryConfigProvider::new();
+        provider.insert(&tenant, &agent_id, cfg);
+
+        let runtime = AgentRuntime::new(
+            Arc::new(provider),
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+        );
+
+        let input = AgentInput {
+            text: String::new(),
+        };
+
+        let out = runtime
+            .step(tenant.clone(), &session_id, &agent_id, input)
+            .await
+            .map_err(|e| GraphExecError::Supervisor(format!("supervisor step failed: {e}")))?;
+
+        // Parse [[ROUTE:<branch>]] from the reply (case-insensitive).
+        // Do this BEFORE stripping so we read from the unmodified reply.
+        let branch = parse_route_branch(&out.reply, &req.routes).unwrap_or_else(|| {
+            let fallback = req
+                .routes
+                .first()
+                .map(|r| r.branch.clone())
+                .unwrap_or_default();
+            tracing::warn!(
+                node_id = req.node_id,
+                reply = %out.reply,
+                fallback = %fallback,
+                "supervisor reply missing or unknown [[ROUTE:]] sentinel; falling back to first route"
+            );
+            fallback
+        });
+
+        // Strip the [[ROUTE:<branch>]] sentinel from the stored assistant message
+        // so the message log does not expose routing instructions to downstream nodes.
+        let raw_reply = strip_route_sentinel(&out.reply);
+
+        Ok(SupervisorResult { branch, raw_reply })
+    }
+
+    /// Parse `[[ROUTE:<branch>]]` from the reply and return the branch label if
+    /// it matches one of the declared routes. Returns `None` if the sentinel is
+    /// absent or the extracted branch is not in the route list.
+    fn parse_route_branch(
+        reply: &str,
+        routes: &[greentic_aw_runtime::graph::SupervisorRoute],
+    ) -> Option<String> {
+        let lower = reply.to_ascii_lowercase();
+        let prefix_lower = ROUTE_SENTINEL_PREFIX.to_ascii_lowercase();
+        let suffix_lower = ROUTE_SENTINEL_SUFFIX.to_ascii_lowercase();
+        let start = lower.find(&prefix_lower)?;
+        let after_prefix = start + prefix_lower.len();
+        let end = lower[after_prefix..].find(&suffix_lower)?;
+        let branch = reply[after_prefix..after_prefix + end].trim().to_string();
+        // Validate against declared routes (case-sensitive match, per spec).
+        if routes.iter().any(|r| r.branch == branch) {
+            Some(branch)
+        } else {
+            None
+        }
+    }
+
+    /// Strip the `[[ROUTE:<branch>]]` sentinel (case-insensitive, first occurrence)
+    /// from a supervisor reply, trimming surrounding whitespace.
+    ///
+    /// If no sentinel is present the reply is returned trimmed. Used to clean
+    /// up the text before it is pushed into the message log as an assistant
+    /// message.
+    fn strip_route_sentinel(reply: &str) -> String {
+        let lower = reply.to_ascii_lowercase();
+        let prefix_lower = ROUTE_SENTINEL_PREFIX.to_ascii_lowercase();
+        let suffix_lower = ROUTE_SENTINEL_SUFFIX.to_ascii_lowercase();
+        if let Some(start) = lower.find(&prefix_lower) {
+            let after_prefix = start + prefix_lower.len();
+            if let Some(end) = lower[after_prefix..].find(&suffix_lower) {
+                let sentinel_end = after_prefix + end + suffix_lower.len();
+                let mut out = reply.to_string();
+                out.replace_range(start..sentinel_end, "");
+                return out.trim().to_string();
+            }
+        }
+        reply.trim().to_string()
+    }
+
     /// Build the [`ToolFn`] effect closure.
     ///
     /// `tool_name` is parsed as `"extension_id/tool_name"` (split on the FIRST
@@ -851,9 +1053,10 @@ mod aw {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicU32, Ordering};
 
+        use greentic_aw_runtime::graph::model::SupervisorRoute;
         use greentic_aw_runtime::graph::{
             AgentTurnFn, AgentTurnRequest, AgentTurnResult, GraphConfig, InMemoryCheckpointStore,
-            ToolCallRequest, ToolFn,
+            SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
         };
         use greentic_aw_runtime::mock::MockAgentStateStore;
         use serde_json::json;
@@ -913,6 +1116,17 @@ mod aw {
             })
         }
 
+        /// A no-op supervisor fn for tests that do not exercise supervisor nodes.
+        fn supervisor_fn_noop() -> SupervisorFn {
+            Arc::new(|_req: SupervisorRequest| {
+                Box::pin(async move {
+                    Err(greentic_aw_runtime::graph::GraphExecError::Supervisor(
+                        "supervisor fn should not be called in this test".into(),
+                    ))
+                })
+            })
+        }
+
         fn handler_with(
             graphs: Arc<dyn GraphConfigSource>,
             agent_turn: AgentTurnFn,
@@ -924,6 +1138,7 @@ mod aw {
                 Arc::new(MockAgentStateStore::new()),
                 agent_turn,
                 tool,
+                supervisor_fn_noop(),
             )
         }
 
@@ -1014,6 +1229,7 @@ mod aw {
                 state_store,
                 agent_fn_resolves_on(counter, 1),
                 tool_fn_ok(),
+                supervisor_fn_noop(),
             );
 
             let first = handler
@@ -1265,6 +1481,351 @@ mod aw {
             unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
+        }
+
+        // -------------------------------------------------------------------
+        // Supervisor fixture
+        // -------------------------------------------------------------------
+
+        /// Supervisor graph (schemaVersion 2): sup → agent_billing / agent_tech →
+        /// router → respond. Mirrors the aw-runtime `supervisor_json()` fixture
+        /// (which is `pub(crate)` to that crate and cannot be imported here).
+        ///
+        /// Topology:
+        ///   sup (supervisor: routes=[billing, tech])
+        ///    ├─[billing]─► agent_billing ─► router_billing ─┬─[loop]──► sup
+        ///    │                                               └─[resolved]─► respond
+        ///    └─[tech]────► agent_tech ───► router_tech    ─┬─[loop]──► sup
+        ///                                                   └─[resolved]─► respond
+        fn supervisor_graph_json() -> String {
+            json!({
+                "schemaVersion": 2,
+                "entry": "sup",
+                "nodes": [
+                    {
+                        "id": "sup",
+                        "kind": "supervisor",
+                        "systemPrompt": "Route the request to the correct specialist.",
+                        "model": "gpt-4o-mini",
+                        "routes": [
+                            {"branch": "billing", "description": "Billing and payment questions"},
+                            {"branch": "tech",    "description": "Technical support issues"}
+                        ]
+                    },
+                    {"id": "agent_billing", "kind": "agent", "systemPrompt": "Billing.", "model": "gpt-4o-mini", "tools": []},
+                    {"id": "router_billing", "kind": "router", "maxIterations": 2},
+                    {"id": "agent_tech",    "kind": "agent", "systemPrompt": "Tech.",    "model": "gpt-4o-mini", "tools": []},
+                    {"id": "router_tech",   "kind": "router", "maxIterations": 2},
+                    {"id": "respond",       "kind": "respond"}
+                ],
+                "edges": [
+                    {"from": "sup",           "to": "agent_billing",  "branch": "billing"},
+                    {"from": "sup",           "to": "agent_tech",     "branch": "tech"},
+                    {"from": "agent_billing", "to": "router_billing"},
+                    {"from": "router_billing","to": "agent_billing",  "branch": "loop"},
+                    {"from": "router_billing","to": "respond",        "branch": "resolved"},
+                    {"from": "agent_tech",    "to": "router_tech"},
+                    {"from": "router_tech",   "to": "agent_tech",     "branch": "loop"},
+                    {"from": "router_tech",   "to": "respond",        "branch": "resolved"}
+                ]
+            })
+            .to_string()
+        }
+
+        fn supervisor_cfg() -> GraphConfig {
+            GraphConfig::from_json(&supervisor_graph_json()).expect("supervisor fixture valid")
+        }
+
+        /// Helpers for building [`SupervisorRoute`] values inline.
+        fn route(branch: &str, description: &str) -> SupervisorRoute {
+            SupervisorRoute {
+                branch: branch.to_string(),
+                description: description.to_string(),
+            }
+        }
+
+        /// Build a supervisor fn that always routes to `fixed_branch`.
+        fn supervisor_fn_routes_to(fixed_branch: &str) -> SupervisorFn {
+            let branch = fixed_branch.to_string();
+            Arc::new(move |_req: SupervisorRequest| {
+                let branch = branch.clone();
+                Box::pin(async move {
+                    Ok(SupervisorResult {
+                        branch: branch.clone(),
+                        raw_reply: format!("I'll route this. [[ROUTE:{branch}]] Done."),
+                    })
+                })
+            })
+        }
+
+        // Build a handler wired with the given supervisor fn (and a no-op agent
+        // that always resolves immediately).
+        fn supervisor_handler(
+            graphs: Arc<dyn GraphConfigSource>,
+            supervisor: SupervisorFn,
+        ) -> RuntimeGraphNodeHandler {
+            let agent: AgentTurnFn = agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1);
+            RuntimeGraphNodeHandler::with_effects(
+                graphs,
+                Arc::new(InMemoryCheckpointStore::default()),
+                Arc::new(MockAgentStateStore::new()),
+                agent,
+                tool_fn_ok(),
+                supervisor,
+            )
+        }
+
+        // -------------------------------------------------------------------
+        // parse_route_branch unit tests
+        // -------------------------------------------------------------------
+
+        /// Two routes for the parse tests.
+        fn billing_tech_routes() -> Vec<SupervisorRoute> {
+            vec![
+                route("billing", "Billing and payment questions"),
+                route("tech", "Technical support issues"),
+            ]
+        }
+
+        #[test]
+        fn parse_route_extracts_billing_from_reply() {
+            // Standard case: sentinel embedded in a longer reply.
+            let reply = "I analysed the message. [[ROUTE:billing]] Go ahead.";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("billing".to_string()));
+        }
+
+        #[test]
+        fn parse_route_case_insensitive_prefix() {
+            // The prefix [[ROUTE: is matched case-insensitively; the extracted
+            // branch label must still match the declared route exactly
+            // (case-sensitive per spec).
+            let reply = "[[route:tech]] is the answer";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("tech".to_string()));
+        }
+
+        #[test]
+        fn parse_route_missing_sentinel_returns_none() {
+            // No sentinel at all → None (caller's unwrap_or_else picks first route).
+            let reply = "I think billing would be best here.";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn parse_route_unknown_branch_returns_none() {
+            // Sentinel present but branch label does not match any declared route.
+            let reply = "[[ROUTE:unknown_branch]] routing";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn parse_route_multiple_sentinels_uses_first() {
+            // When multiple sentinels are present the function uses the FIRST one
+            // (find on the lowercased string returns the first occurrence).
+            let reply = "[[ROUTE:billing]] or [[ROUTE:tech]]";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(
+                result,
+                Some("billing".to_string()),
+                "multiple sentinels: first occurrence wins"
+            );
+        }
+
+        #[test]
+        fn parse_route_branch_label_whitespace_trimmed() {
+            // Whitespace around the branch label inside the sentinel is trimmed.
+            let reply = "[[ROUTE:  billing  ]]";
+            let result = parse_route_branch(reply, &billing_tech_routes());
+            assert_eq!(result, Some("billing".to_string()));
+        }
+
+        // -------------------------------------------------------------------
+        // strip_route_sentinel unit tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn strip_sentinel_removes_token_leaves_rest() {
+            let reply = "I'll route this. [[ROUTE:billing]] Proceeding.";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.contains("[[ROUTE:billing]]"),
+                "sentinel must be removed: {stripped:?}"
+            );
+            assert!(
+                stripped.contains("Proceeding"),
+                "text after sentinel must survive: {stripped:?}"
+            );
+        }
+
+        #[test]
+        fn strip_sentinel_no_sentinel_returns_trimmed() {
+            let reply = "  No routing needed here.  ";
+            let stripped = strip_route_sentinel(reply);
+            assert_eq!(stripped, "No routing needed here.");
+        }
+
+        #[test]
+        fn strip_sentinel_case_insensitive_removal() {
+            let reply = "Decision: [[route:tech]] done.";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.to_ascii_lowercase().contains("[[route:"),
+                "sentinel must be stripped case-insensitively: {stripped:?}"
+            );
+        }
+
+        #[test]
+        fn strip_sentinel_only_first_occurrence_removed() {
+            // If two sentinels appear, only the first is stripped.
+            let reply = "[[ROUTE:billing]] first [[ROUTE:tech]] second";
+            let stripped = strip_route_sentinel(reply);
+            assert!(
+                !stripped.contains("[[ROUTE:billing]]"),
+                "first sentinel must be gone: {stripped:?}"
+            );
+            // The second sentinel remains (we only strip the first occurrence).
+            assert!(
+                stripped.contains("[[ROUTE:tech]]"),
+                "second sentinel must remain: {stripped:?}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Fallback: parse_route_branch None → first-route fallback
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn parse_route_none_documents_fallback_to_first_route() {
+            // This is a pure-fn test of the fallback path used in
+            // `run_one_supervisor_turn` via `unwrap_or_else(|| first_route)`.
+            // When parse_route_branch returns None, the build_supervisor closure
+            // picks req.routes.first().branch as the fallback.
+            let routes = billing_tech_routes();
+            let garbage = "absolutely no routing sentinel here";
+            let parsed = parse_route_branch(garbage, &routes);
+            assert_eq!(parsed, None, "no sentinel → None from parser");
+
+            // Simulate the fallback: first route is "billing".
+            let fallback = parsed
+                .unwrap_or_else(|| routes.first().map(|r| r.branch.clone()).unwrap_or_default());
+            assert_eq!(
+                fallback, "billing",
+                "None → first route 'billing' as fallback"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Handler-level supervisor routing tests
+        // -------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn supervisor_routes_to_billing_returns_respond_envelope() {
+            // The mock supervisor always picks "billing". The billing agent
+            // resolves immediately. Expect terminated_by="respond" and a
+            // non-empty reply.
+            let handler = supervisor_handler(
+                provider_with("sup_graph", supervisor_cfg()),
+                supervisor_fn_routes_to("billing"),
+            );
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-1",
+                    &json!({"user_text": "I need billing help"}),
+                )
+                .await
+                .expect("supervisor execute must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "billing path must terminate at respond: {out:?}"
+            );
+            assert!(
+                out["reply"].as_str().is_some_and(|r| !r.is_empty()),
+                "reply must be non-empty: {out:?}"
+            );
+            assert!(
+                out["trail"].as_array().is_some_and(|t| !t.is_empty()),
+                "trail must be non-empty: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn supervisor_routes_to_tech_returns_respond_envelope() {
+            // Same topology, supervisor picks "tech" branch instead.
+            let handler = supervisor_handler(
+                provider_with("sup_graph", supervisor_cfg()),
+                supervisor_fn_routes_to("tech"),
+            );
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-2",
+                    &json!({"user_text": "my device is broken"}),
+                )
+                .await
+                .expect("supervisor tech-route execute must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "tech path must terminate at respond: {out:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn supervisor_fallback_on_missing_sentinel_still_completes() {
+            // A supervisor fn that returns a raw_reply with NO [[ROUTE:]] sentinel.
+            // The build_supervisor closure maps None→first-route ("billing").
+            // The handler-level execute() must still complete (not Err).
+            //
+            // Because with_effects injects the supervisor fn directly (bypassing
+            // build_supervisor's parse), we simulate the fallback by having the
+            // fn return the first route explicitly — matching what build_supervisor
+            // does in production via parse_route_branch(...)
+            //   .unwrap_or_else(|| routes.first().branch).
+            // The pure-fn fallback path is fully covered by
+            // `parse_route_none_documents_fallback_to_first_route`.
+            let supervisor: SupervisorFn = Arc::new(|_req: SupervisorRequest| {
+                // No sentinel in raw_reply; we return first-route directly as
+                // the mock of the fallback behaviour.
+                Box::pin(async move {
+                    Ok(SupervisorResult {
+                        branch: "billing".to_string(),
+                        raw_reply: "I think billing is right.".to_string(),
+                    })
+                })
+            });
+
+            let handler =
+                supervisor_handler(provider_with("sup_graph", supervisor_cfg()), supervisor);
+
+            let out = handler
+                .execute(
+                    "t",
+                    "e",
+                    "sup_graph",
+                    "sess-sup-3",
+                    &json!({"user_text": "help me"}),
+                )
+                .await
+                .expect("fallback supervisor must not Err");
+
+            assert_eq!(
+                out["terminated_by"].as_str(),
+                Some("respond"),
+                "fallback path must still reach respond: {out:?}"
+            );
         }
     }
 }

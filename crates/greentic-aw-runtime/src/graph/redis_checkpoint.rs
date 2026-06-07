@@ -212,6 +212,7 @@ mod tests {
             state_json: "{}".into(),
             status: RunStatus::Running,
             visits_json: "{}".into(),
+            frontier_json: None,
         }
     }
 

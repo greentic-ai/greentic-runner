@@ -18,10 +18,13 @@ pub use checkpoint::{
 };
 pub use executor::{
     AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, GraphExecError, GraphExecutor,
-    GraphRunOutcome, ToolCallRequest, ToolFn,
+    GraphRunOutcome, SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
 };
 pub use http_provider::{CachingGraphProvider, HttpGraphProvider};
-pub use model::{Edge, Graph, GraphConfig, GraphError, Node, NodeKind};
+pub use model::{
+    Edge, Graph, GraphConfig, GraphError, Node, NodeKind, SUPPORTED_SCHEMA_VERSIONS,
+    SupervisorRoute,
+};
 pub use redis_checkpoint::RedisCheckpointStore;
 pub use router::route;
 pub use state::{GraphMessage, GraphRole, GraphRunState};

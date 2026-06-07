@@ -65,6 +65,15 @@ pub struct GraphRunRecord {
     pub status: RunStatus,
     /// Serialised `HashMap<String, u32>` tracking per-node attempt counts.
     pub visits_json: String,
+    /// Serialised `Vec<BranchCursor>` describing the in-flight parallel
+    /// frontier, or `None` when the run is not inside a parallel region.
+    ///
+    /// `#[serde(default)]` + `skip_serializing_if` keep the wire format
+    /// backward-compatible: v1 records (written before this field existed)
+    /// deserialise with `frontier_json: None`, and records outside a parallel
+    /// region omit the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +292,7 @@ mod tests {
             state_json: "{}".into(),
             status: RunStatus::Running,
             visits_json: "{}".into(),
+            frontier_json: None,
         }
     }
 
@@ -409,6 +419,7 @@ mod tests {
             state_json: "{}".into(),
             status: RunStatus::Succeeded,
             visits_json: "{}".into(),
+            frontier_json: None,
         };
         store.save(&t, &rec2).await.unwrap();
 
@@ -436,6 +447,43 @@ mod tests {
             matches!(err, CheckpointError::Backend(ref msg) if msg.contains("run_id")),
             "expected Backend error mentioning run_id, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn v1_record_without_frontier_field_deserialises_to_none() {
+        // A v1-shaped record JSON predates `frontier_json`; serde(default)
+        // must fill it with None so in-flight v1 runs resume unchanged.
+        let json = r#"{
+            "run_id": "r1",
+            "graph_json": "{}",
+            "cursor": "agent",
+            "state_json": "{}",
+            "status": "running",
+            "visits_json": "{}"
+        }"#;
+        let rec: GraphRunRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.run_id, "r1");
+        assert_eq!(rec.frontier_json, None);
+    }
+
+    #[tokio::test]
+    async fn frontier_json_none_is_omitted_from_wire_format() {
+        let rec = make_record("r1");
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("frontier_json"),
+            "None frontier must be skipped on the wire: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn frontier_json_some_round_trips() {
+        let mut rec = make_record("r1");
+        rec.frontier_json = Some(r#"[{"branch":"a"}]"#.into());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("frontier_json"), "json: {json}");
+        let back: GraphRunRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.frontier_json.as_deref(), Some(r#"[{"branch":"a"}]"#));
     }
 
     #[tokio::test]
