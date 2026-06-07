@@ -69,7 +69,7 @@ load time.
 > (The manifest is not stored inside the composed `.gtpack`, so this loose file
 > is the supported delivery path.)
 
-## Method 3 — MCP server tools (opt-in)
+## Method 3 — MCP server tools (on by default)
 
 Tenant-registered MCP servers (designer-admin → MCP Servers, role
 `agentic_worker`) can be offered to an agent alongside extension tools. An MCP
@@ -81,13 +81,19 @@ tool is declared with the `mcp:` extension-id form — no schema change:
         tool_name: get_issue            # raw tool name on that server
 ```
 
-Enablement is a deliberate opt-in on the runner host:
+MCP is active whenever the admin connection is configured — the real
+authorization is upstream (the tenant must register the server with the
+`agentic_worker` role, and the agent's allowlist must explicitly reference
+`mcp:<server_id>`):
 
-- `GREENTIC_AW_MCP=1` — the gate; without it every `mcp:` ref is inert.
 - `GREENTIC_AW_ADMIN_ENDPOINT` + `GREENTIC_AW_ADMIN_TOKEN` — the same admin
   endpoint/token the agent registry uses; the tenant's MCP servers are pulled
   from `/api/v1/designer/tenant/me/mcp-servers` and cached per tenant for
   5 minutes.
+- `GREENTIC_AW_MCP=0` — operator opt-out: disables MCP tools for the whole
+  runner (every `mcp:` ref becomes inert) even when the admin connection is
+  configured. Use for environments where outbound calls to tenant-registered
+  MCP servers must stay off.
 
 Fail-soft, same spirit as the manifest overlay: an unreachable admin or MCP
 server degrades to "tool not offered" (warn-logged); a tool call that fails at
