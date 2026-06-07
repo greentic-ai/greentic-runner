@@ -235,6 +235,33 @@ mod aw {
         ))
     }
 
+    /// Build an [`McpToolSource`] from the same admin endpoint/token the agent
+    /// registry uses (`GREENTIC_AW_ADMIN_ENDPOINT` + `GREENTIC_AW_ADMIN_TOKEN`),
+    /// gated behind an explicit `GREENTIC_AW_MCP=1` opt-in.
+    ///
+    /// The extra opt-in is deliberate: even when admin credentials are present
+    /// for the agent registry, MCP tool dispatch stays off until an operator
+    /// sets `GREENTIC_AW_MCP=1`, so enabling MCP is never an implicit side
+    /// effect of configuring the admin endpoint. Returns `None` when the gate is
+    /// unset/not `1`, or when either credential is missing/empty.
+    ///
+    /// [`McpToolSource`]: greentic_aw_runtime::McpToolSource
+    fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+        if std::env::var("GREENTIC_AW_MCP").ok().as_deref() != Some("1") {
+            return None;
+        }
+        let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        tracing::info!(endpoint = %endpoint, "GREENTIC_AW_MCP enabled; MCP tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::McpToolSource::new(
+            endpoint, token,
+        )))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -425,8 +452,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            // MCP tool source wiring is Task 4 (runner-host); inert for now.
-            None,
+            mcp_source_from_env(),
         ));
 
         tracing::info!(agent_count, "AW runtime constructed");
@@ -755,6 +781,60 @@ mod aw {
             assert!(super::registry_from_env().is_some());
 
             unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn mcp_source_from_env_requires_gate_and_both_vars() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_MCP");
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+
+            // (a) Gate unset, but endpoint + token present → still None.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(
+                super::mcp_source_from_env().is_none(),
+                "MCP must stay off without the GREENTIC_AW_MCP=1 opt-in"
+            );
+
+            // (b) Gate on, but a credential missing → None.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_MCP", "1");
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+            }
+            assert!(
+                super::mcp_source_from_env().is_none(),
+                "gate alone without endpoint is not enough"
+            );
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+            assert!(
+                super::mcp_source_from_env().is_none(),
+                "gate + endpoint without token is not enough"
+            );
+
+            // (c) Gate on with both credentials → Some.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(super::mcp_source_from_env().is_some());
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_MCP");
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
