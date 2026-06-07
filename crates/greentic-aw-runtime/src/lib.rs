@@ -26,6 +26,7 @@ pub mod llm_openai;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
+pub mod mcp_source;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;
@@ -50,6 +51,7 @@ pub use llm_extension::{
 };
 pub use llm_openai::OpenAiLlmBackend;
 pub use manifest_provider::ManifestToolOverlayProvider;
+pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
@@ -108,9 +110,18 @@ pub struct AgentRuntime {
     pub(crate) telemetry: Arc<dyn Telemetry>,
     pub(crate) token_meter: Arc<dyn TokenMeter>,
     pub(crate) ledger: Arc<dyn ToolLedger>,
+    /// Per-tenant agentic-worker MCP tool source. `None` disables MCP tools
+    /// entirely (`mcp:`-prefixed tool refs then resolve to nothing). The real
+    /// per-operator wiring lives in the runner host; tests and non-MCP callers
+    /// pass `None`.
+    pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
 }
 
 impl AgentRuntime {
+    // Each argument is a distinct injected dependency (config, state, ext,
+    // llm, telemetry, token-meter, ledger, mcp); a builder would add ceremony
+    // without removing the coupling, so the wide constructor is intentional.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_provider: Arc<dyn ConfigProvider>,
         state_store: Arc<dyn AgentStateStore>,
@@ -119,6 +130,7 @@ impl AgentRuntime {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
     ) -> Self {
         Self {
             config_provider,
@@ -128,6 +140,7 @@ impl AgentRuntime {
             telemetry,
             token_meter,
             ledger,
+            mcp,
         }
     }
 

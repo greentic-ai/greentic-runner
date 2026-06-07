@@ -790,6 +790,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
+            None,
         );
 
         // The latest user turn is the most recent user message in the seeded log
@@ -921,6 +922,9 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
+            // Supervisor routing runs with an empty tool list; MCP tools are
+            // never offered on this path.
+            None,
         );
 
         let input = AgentInput {
@@ -1042,7 +1046,9 @@ mod aw {
             args: json!({}),
         };
 
-        dispatch_tool_call(ext_runtime, call)
+        // Graph Tool nodes never carry mcp: ids (they use 'extension_id/tool'
+        // syntax over the WASM runtime), so no MCP catalog is threaded here.
+        dispatch_tool_call(ext_runtime, None, call)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }

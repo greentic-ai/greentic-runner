@@ -3116,6 +3116,7 @@ mod tests {
             telemetry,
             token_meter,
             ledger,
+            None,
         ));
         let handler: Arc<dyn AgentNodeHandler> = Arc::new(RuntimeAgentNodeHandler::new(runtime));
 
