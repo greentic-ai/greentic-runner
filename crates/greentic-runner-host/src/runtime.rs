@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use reqwest::Client;
+use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 
@@ -401,6 +402,7 @@ impl TenantRuntime {
         bundle_id: BundleId,
         revision_id: RevisionId,
         customer_id: Option<String>,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -439,7 +441,7 @@ impl TenantRuntime {
                     pack_ref.digest
                 );
             }
-            let pack = Self::load_pack_runtime(
+            let mut pack = Self::load_pack_runtime(
                 &pack_ref.path,
                 &config,
                 mocks.clone(),
@@ -450,6 +452,16 @@ impl TenantRuntime {
                 &secrets_manager,
             )
             .await?;
+            // C4.3: inject the `pack-config.v1.non_secret` map for this pack
+            // before the Arc is shared. `load_pack_runtime` just returned the
+            // Arc, so refcount=1 and `get_mut` is guaranteed to succeed.
+            if let Some(non_secret) =
+                runtime_configs_by_pack_id.get(pack.metadata().pack_id.as_str())
+            {
+                Arc::get_mut(&mut pack)
+                    .expect("PackRuntime Arc uniquely owned right after load_pack_runtime")
+                    .set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
+            }
             packs.push((pack, Some(expected.raw_string())));
         }
         let rollout = RolloutIds {

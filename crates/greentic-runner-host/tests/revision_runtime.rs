@@ -100,6 +100,7 @@ async fn build_revision(
         bundle_id,
         revision_id,
         customer_id,
+        &std::collections::BTreeMap::new(),
     )
     .await
 }
@@ -158,6 +159,72 @@ async fn load_revision_derives_rollout_identity_and_records_digests() -> Result<
     // The verified digest is threaded into the runtime (parity with the legacy
     // index path), not dropped to `None`.
     assert_eq!(runtime.pack_digests(), &[Some(refs[0].digest.clone())]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_revision_injects_pack_config_non_secret_by_pack_id() -> Result<()> {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    // First pass: empty map. Used to discover the fixture pack's pack_id and
+    // confirm the baseline (no map injected).
+    let refs = pinned_pack_refs()?;
+    let runtime = build_revision(
+        &refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await?;
+    let pack = runtime.all_packs().first().cloned().expect("loaded pack");
+    assert!(
+        pack.runtime_config_non_secret().is_none(),
+        "baseline: no map injected when none provided",
+    );
+    let pack_id = pack.metadata().pack_id.clone();
+
+    // Second pass: populated map keyed by the discovered pack_id. The setter
+    // must have fired for that pack, and a non-matching key must not leak in.
+    let mut payload: BTreeMap<String, Value> = BTreeMap::new();
+    payload.insert("default_locale".into(), Value::String("en-GB".into()));
+    let mut configs: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
+    configs.insert(pack_id.clone(), Arc::new(payload.clone()));
+    configs.insert(
+        "some-other-pack-not-loaded".into(),
+        Arc::new(BTreeMap::new()),
+    );
+
+    let config = host_config(&fixture_pack());
+    let session_store = new_session_store();
+    let session_host = session_host_from(Arc::clone(&session_store));
+    let state_store = new_state_store();
+    let state_host = state_host_from(Arc::clone(&state_store));
+    let manager = default_manager().context("default manager")?;
+    let runtime2 = TenantRuntime::load_revision(
+        &refs,
+        config,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        session_host,
+        session_store,
+        state_store,
+        state_host,
+        manager,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+        &configs,
+    )
+    .await?;
+    let pack2 = runtime2.all_packs().first().cloned().expect("loaded pack");
+    let injected = pack2
+        .runtime_config_non_secret()
+        .cloned()
+        .expect("non_secret map injected for the loaded pack_id");
+    assert_eq!(injected.as_ref(), &payload);
     Ok(())
 }
 
