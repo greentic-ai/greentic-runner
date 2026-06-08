@@ -80,6 +80,28 @@ async fn build_revision(
     revision_id: RevisionId,
     customer_id: Option<String>,
 ) -> Result<Arc<TenantRuntime>> {
+    build_revision_with_configs(
+        pack_refs,
+        deployment_id,
+        bundle_id,
+        revision_id,
+        customer_id,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+async fn build_revision_with_configs(
+    pack_refs: &[RevisionPackRef],
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    customer_id: Option<String>,
+    runtime_configs_by_pack_id: &std::collections::BTreeMap<
+        String,
+        Arc<std::collections::BTreeMap<String, serde_json::Value>>,
+    >,
+) -> Result<Arc<TenantRuntime>> {
     let config = host_config(&fixture_pack());
     let session_store = new_session_store();
     let session_host = session_host_from(Arc::clone(&session_store));
@@ -100,6 +122,7 @@ async fn build_revision(
         bundle_id,
         revision_id,
         customer_id,
+        runtime_configs_by_pack_id,
     )
     .await
 }
@@ -158,6 +181,58 @@ async fn load_revision_derives_rollout_identity_and_records_digests() -> Result<
     // The verified digest is threaded into the runtime (parity with the legacy
     // index path), not dropped to `None`.
     assert_eq!(runtime.pack_digests(), &[Some(refs[0].digest.clone())]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_revision_injects_pack_config_non_secret_by_pack_id() -> Result<()> {
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    // First pass: empty map. Used to discover the fixture pack's pack_id and
+    // confirm the baseline (no map injected).
+    let refs = pinned_pack_refs()?;
+    let runtime = build_revision(
+        &refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await?;
+    let pack = runtime.all_packs().first().cloned().expect("loaded pack");
+    assert!(
+        pack.runtime_config_non_secret().is_none(),
+        "baseline: no map injected when none provided",
+    );
+    let pack_id = pack.metadata().pack_id.clone();
+
+    // Second pass: populated map keyed by the discovered pack_id. The setter
+    // must have fired for that pack, and a non-matching key must not leak in.
+    let mut payload: BTreeMap<String, Value> = BTreeMap::new();
+    payload.insert("default_locale".into(), Value::String("en-GB".into()));
+    let mut configs: BTreeMap<String, Arc<BTreeMap<String, Value>>> = BTreeMap::new();
+    configs.insert(pack_id.clone(), Arc::new(payload.clone()));
+    configs.insert(
+        "some-other-pack-not-loaded".into(),
+        Arc::new(BTreeMap::new()),
+    );
+
+    let runtime2 = build_revision_with_configs(
+        &refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+        &configs,
+    )
+    .await?;
+    let pack2 = runtime2.all_packs().first().cloned().expect("loaded pack");
+    let injected = pack2
+        .runtime_config_non_secret()
+        .cloned()
+        .expect("non_secret map injected for the loaded pack_id");
+    assert_eq!(injected.as_ref(), &payload);
     Ok(())
 }
 
@@ -399,5 +474,34 @@ async fn insert_revision_rejects_revision_identity_mismatch() -> Result<()> {
         panic!("revision identity mismatch must be rejected");
     };
     assert!(format!("{err:#}").contains("rollout identity"), "{err:#}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_revision_rejects_duplicate_pack_id() -> Result<()> {
+    // Two refs pointing at the same fixture pack — both resolve to the same
+    // pack_id after loading. The second must be rejected.
+    let single = pinned_pack_refs()?;
+    let duplicate_refs = vec![single[0].clone(), single[0].clone()];
+    let Err(err) = build_revision(
+        &duplicate_refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await
+    else {
+        panic!("duplicate pack_id must be rejected");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    // The fixture path identifies the offending pack — the error message must
+    // include it so an operator can find the duplicate without re-loading.
+    let fixture_path = fixture_pack().display().to_string();
+    assert!(
+        msg.contains(&fixture_path),
+        "expected fixture path `{fixture_path}` in: {msg}"
+    );
     Ok(())
 }

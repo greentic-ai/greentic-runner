@@ -2038,6 +2038,12 @@ impl PackRuntime {
         self.runtime_config_non_secret = map;
     }
 
+    /// Read-only accessor for the injected `pack-config.v1.non_secret` map.
+    /// Used by the revision loader's tests to assert producer plumbing.
+    pub fn runtime_config_non_secret(&self) -> Option<&Arc<BTreeMap<String, Value>>> {
+        self.runtime_config_non_secret.as_ref()
+    }
+
     pub async fn list_flows(&self) -> Result<Vec<FlowDescriptor>> {
         if let Some(cache) = &self.flows {
             return Ok(cache.descriptors.clone());
