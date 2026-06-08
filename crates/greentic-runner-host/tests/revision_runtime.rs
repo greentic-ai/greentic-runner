@@ -102,6 +102,36 @@ async fn build_revision_with_configs(
         Arc<std::collections::BTreeMap<String, serde_json::Value>>,
     >,
 ) -> Result<Arc<TenantRuntime>> {
+    build_revision_with_refs(
+        pack_refs,
+        deployment_id,
+        bundle_id,
+        revision_id,
+        customer_id,
+        runtime_configs_by_pack_id,
+        &std::collections::BTreeMap::new(),
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_revision_with_refs(
+    pack_refs: &[RevisionPackRef],
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    customer_id: Option<String>,
+    runtime_configs_by_pack_id: &std::collections::BTreeMap<
+        String,
+        Arc<std::collections::BTreeMap<String, serde_json::Value>>,
+    >,
+    runtime_refs_by_pack_id: &std::collections::BTreeMap<
+        String,
+        Arc<std::collections::BTreeMap<String, String>>,
+    >,
+    runtime_ref_resolver: Option<Arc<dyn greentic_runner_host::runtime_refs::RuntimeRefResolver>>,
+) -> Result<Arc<TenantRuntime>> {
     let config = host_config(&fixture_pack());
     let session_store = new_session_store();
     let session_host = session_host_from(Arc::clone(&session_store));
@@ -123,8 +153,8 @@ async fn build_revision_with_configs(
         revision_id,
         customer_id,
         runtime_configs_by_pack_id,
-        &std::collections::BTreeMap::new(),
-        None,
+        runtime_refs_by_pack_id,
+        runtime_ref_resolver,
     )
     .await
 }
@@ -504,6 +534,57 @@ async fn load_revision_rejects_duplicate_pack_id() -> Result<()> {
     assert!(
         msg.contains(&fixture_path),
         "expected fixture path `{fixture_path}` in: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_revision_rejects_runtime_refs_without_resolver() -> Result<()> {
+    use std::collections::BTreeMap;
+
+    // Discover the fixture pack's pack_id via a baseline load.
+    let refs = pinned_pack_refs()?;
+    let runtime = build_revision(
+        &refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await?;
+    let pack_id = runtime
+        .all_packs()
+        .first()
+        .expect("loaded pack")
+        .metadata()
+        .pack_id
+        .clone();
+
+    // Build a runtime_refs_by_pack_id with an entry for the fixture pack but
+    // pass `runtime_ref_resolver = None`. This must fail closed.
+    let mut refs_map: BTreeMap<String, Arc<BTreeMap<String, String>>> = BTreeMap::new();
+    let mut inner = BTreeMap::new();
+    inner.insert("some_key".into(), "runtime://some/ref".into());
+    refs_map.insert(pack_id, Arc::new(inner));
+
+    let Err(err) = build_revision_with_refs(
+        &pinned_pack_refs()?,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+        &BTreeMap::new(),
+        &refs_map,
+        None,
+    )
+    .await
+    else {
+        panic!("runtime_refs bound without a resolver must fail closed");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("runtime_refs bound") || msg.contains("RuntimeRefResolver"),
+        "expected fail-closed error mentioning runtime_refs, got: {msg}"
     );
     Ok(())
 }

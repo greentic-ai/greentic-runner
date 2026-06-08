@@ -549,10 +549,13 @@ impl TenantRuntime {
         if let Some(non_secret) = runtime_configs_by_pack_id.get(pack_id.as_str()) {
             pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
         }
-        if let (Some(refs), Some(resolver)) = (
-            runtime_refs_by_pack_id.get(pack_id.as_str()),
-            runtime_ref_resolver,
-        ) {
+        if let Some(refs) = runtime_refs_by_pack_id.get(pack_id.as_str()) {
+            let resolver = runtime_ref_resolver.ok_or_else(|| {
+                anyhow!(
+                    "pack `{}` has runtime_refs bound but no RuntimeRefResolver was provided",
+                    pack_id,
+                )
+            })?;
             pack.set_runtime_refs(Some(crate::runtime_refs::RuntimeRefsInjection {
                 refs: Arc::clone(refs),
                 resolver: Arc::clone(resolver),
