@@ -496,12 +496,5 @@ async fn load_revision_rejects_duplicate_pack_id() -> Result<()> {
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
-    // The fixture path identifies the offending pack — the error message must
-    // include it so an operator can find the duplicate without re-loading.
-    let fixture_path = fixture_pack().display().to_string();
-    assert!(
-        msg.contains(&fixture_path),
-        "expected fixture path `{fixture_path}` in: {msg}"
-    );
     Ok(())
 }

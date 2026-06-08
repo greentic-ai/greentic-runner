@@ -18,6 +18,7 @@ use greentic_types::{
     PackFlowEntry, PackKind, PackManifest, ResourceHints, StateCapabilities, encode_pack_manifest,
 };
 use runner_core::env::PackConfig;
+use runner_core::packs::PackDigest;
 use semver::Version;
 use serial_test::serial;
 use tempfile::TempDir;
@@ -203,7 +204,9 @@ async fn pack_watcher_handles_overlays() -> Result<()> {
     let cache_dir = temp.path().join("cache");
     fs::create_dir_all(&cache_dir)?;
     let index_path = temp.path().join("index-overlay.json");
-    write_overlay_index(&index_path, true)?;
+    let overlay_pack_path = temp.path().join("runner-components-overlay.gtpack");
+    build_overlay_pack(&overlay_pack_path)?;
+    write_overlay_index(&index_path, Some(&overlay_pack_path))?;
 
     let _backend_guard = EnvGuard::set("SECRETS_BACKEND", "env");
 
@@ -232,7 +235,7 @@ async fn pack_watcher_handles_overlays() -> Result<()> {
     )
     .await?;
 
-    write_overlay_index(&index_path, false)?;
+    write_overlay_index(&index_path, None)?;
     reload.trigger().await?;
     let host_for_reload = Arc::clone(&host);
     wait_for_async(
@@ -586,17 +589,20 @@ nodes:
     Ok(())
 }
 
-fn write_overlay_index(path: &std::path::Path, include_overlay: bool) -> Result<()> {
+fn write_overlay_index(path: &std::path::Path, overlay: Option<&Path>) -> Result<()> {
     const DEMO_DIGEST: &str =
         "sha256:a3195ff0a9befb0192ef4fa7f5aa7fea944c9a9fa58aa25a4e80e9e80b5c36c1";
     let pack_path = fixture_path("examples/packs/demo.gtpack");
     let mut overlays = Vec::new();
-    if include_overlay {
+    if let Some(overlay_path) = overlay {
+        let overlay_digest =
+            PackDigest::sha256_from_bytes(&fs::read(overlay_path).context("read overlay pack")?)
+                .raw_string();
         overlays.push(serde_json::json!({
-            "name": "runner.components",
+            "name": "runner.components.overlay",
             "version": "0.1.0",
-            "locator": pack_path.display().to_string(),
-            "digest": DEMO_DIGEST
+            "locator": overlay_path.display().to_string(),
+            "digest": overlay_digest,
         }));
     }
     let index = serde_json::json!({
@@ -611,6 +617,38 @@ fn write_overlay_index(path: &std::path::Path, include_overlay: bool) -> Result<
         }
     });
     fs::write(path, serde_json::to_vec_pretty(&index)?)?;
+    Ok(())
+}
+
+/// Build a minimal overlay pack whose `pack_id` is distinct from
+/// `runner.components`. Used by `pack_watcher_handles_overlays` so the main
+/// pack and overlay don't collide on `pack_id` (which `TenantRuntime` now
+/// rejects).
+fn build_overlay_pack(pack_path: &std::path::Path) -> Result<()> {
+    let manifest = PackManifest {
+        schema_version: "1.0".into(),
+        pack_id: "runner.components.overlay".parse()?,
+        name: None,
+        version: Version::parse("0.1.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: Vec::new(),
+        flows: Vec::new(),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        extensions: None,
+    };
+    let mut writer =
+        ZipWriter::new(std::fs::File::create(pack_path).context("create overlay pack archive")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    writer.start_file("manifest.cbor", options)?;
+    writer.write_all(&manifest_bytes)?;
+    writer.finish().context("finalise overlay pack")?;
     Ok(())
 }
 
