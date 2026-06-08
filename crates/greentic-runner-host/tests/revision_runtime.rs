@@ -80,6 +80,28 @@ async fn build_revision(
     revision_id: RevisionId,
     customer_id: Option<String>,
 ) -> Result<Arc<TenantRuntime>> {
+    build_revision_with_configs(
+        pack_refs,
+        deployment_id,
+        bundle_id,
+        revision_id,
+        customer_id,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+}
+
+async fn build_revision_with_configs(
+    pack_refs: &[RevisionPackRef],
+    deployment_id: DeploymentId,
+    bundle_id: BundleId,
+    revision_id: RevisionId,
+    customer_id: Option<String>,
+    runtime_configs_by_pack_id: &std::collections::BTreeMap<
+        String,
+        Arc<std::collections::BTreeMap<String, serde_json::Value>>,
+    >,
+) -> Result<Arc<TenantRuntime>> {
     let config = host_config(&fixture_pack());
     let session_store = new_session_store();
     let session_host = session_host_from(Arc::clone(&session_store));
@@ -100,7 +122,7 @@ async fn build_revision(
         bundle_id,
         revision_id,
         customer_id,
-        &std::collections::BTreeMap::new(),
+        runtime_configs_by_pack_id,
     )
     .await
 }
@@ -196,22 +218,8 @@ async fn load_revision_injects_pack_config_non_secret_by_pack_id() -> Result<()>
         Arc::new(BTreeMap::new()),
     );
 
-    let config = host_config(&fixture_pack());
-    let session_store = new_session_store();
-    let session_host = session_host_from(Arc::clone(&session_store));
-    let state_store = new_state_store();
-    let state_host = state_host_from(Arc::clone(&state_store));
-    let manager = default_manager().context("default manager")?;
-    let runtime2 = TenantRuntime::load_revision(
+    let runtime2 = build_revision_with_configs(
         &refs,
-        config,
-        None,
-        Arc::new(RunnerWasiPolicy::new()),
-        session_host,
-        session_store,
-        state_store,
-        state_host,
-        manager,
         DeploymentId::new(),
         BundleId::from("customer.support"),
         RevisionId::new(),
@@ -488,22 +496,12 @@ async fn load_revision_rejects_duplicate_pack_id() -> Result<()> {
     };
     let msg = format!("{err:#}");
     assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
-    // The pack_id of the fixture pack must appear in the error message.
-    let expected_pack_id = {
-        let refs = pinned_pack_refs()?;
-        let rt = build_revision(
-            &refs,
-            DeploymentId::new(),
-            BundleId::from("customer.support"),
-            RevisionId::new(),
-            None,
-        )
-        .await?;
-        rt.all_packs()[0].metadata().pack_id.clone()
-    };
+    // The fixture path identifies the offending pack — the error message must
+    // include it so an operator can find the duplicate without re-loading.
+    let fixture_path = fixture_pack().display().to_string();
     assert!(
-        msg.contains(&expected_pack_id),
-        "expected pack_id `{expected_pack_id}` in: {msg}"
+        msg.contains(&fixture_path),
+        "expected fixture path `{fixture_path}` in: {msg}"
     );
     Ok(())
 }

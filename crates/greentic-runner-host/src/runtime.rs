@@ -360,6 +360,7 @@ impl TenantRuntime {
             &session_store,
             &state_store,
             &secrets_manager,
+            &BTreeMap::new(),
         )
         .await?;
         Self::from_packs(
@@ -442,7 +443,7 @@ impl TenantRuntime {
                     pack_ref.digest
                 );
             }
-            let mut pack = Self::load_pack_runtime(
+            let pack = Self::load_pack_runtime(
                 &pack_ref.path,
                 &config,
                 mocks.clone(),
@@ -451,6 +452,7 @@ impl TenantRuntime {
                 &session_store,
                 &state_store,
                 &secrets_manager,
+                runtime_configs_by_pack_id,
             )
             .await?;
             // Reject duplicate pack_id within a single revision — two refs
@@ -464,16 +466,6 @@ impl TenantRuntime {
                     pack_id,
                     pack_ref.path.display(),
                 );
-            }
-            // C4.3: inject the `pack-config.v1.non_secret` map for this pack
-            // before the Arc is shared. `load_pack_runtime` just returned the
-            // Arc, so refcount=1 and `get_mut` is guaranteed to succeed.
-            if let Some(non_secret) =
-                runtime_configs_by_pack_id.get(pack.metadata().pack_id.as_str())
-            {
-                Arc::get_mut(&mut pack)
-                    .expect("PackRuntime Arc uniquely owned right after load_pack_runtime")
-                    .set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
             }
             packs.push((pack, Some(expected.raw_string())));
         }
@@ -500,6 +492,13 @@ impl TenantRuntime {
     /// Load a single [`PackRuntime`] from a path, sharing the tenant's session /
     /// state / secrets backends. Shared by [`load`](Self::load) (one pack) and
     /// [`load_revision`](Self::load_revision) (the revision's pack list).
+    ///
+    /// `runtime_configs_by_pack_id` is consulted AFTER the pack loads (the
+    /// `pack_id` is only known after the manifest read) and BEFORE the
+    /// `Arc<PackRuntime>` is created. A matching entry is injected via
+    /// [`PackRuntime::set_runtime_config_non_secret`] so the C4.3 producer
+    /// plumbing requires no post-hoc `Arc::get_mut` dance — the single-pack
+    /// [`load`](Self::load) path just passes an empty map.
     #[allow(clippy::too_many_arguments)]
     async fn load_pack_runtime(
         pack_path: &Path,
@@ -510,31 +509,34 @@ impl TenantRuntime {
         session_store: &DynSessionStore,
         state_store: &DynStateStore,
         secrets_manager: &DynSecretsManager,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
     ) -> Result<Arc<PackRuntime>> {
         let oauth_config = config.oauth_broker_config();
-        Ok(Arc::new(
-            PackRuntime::load(
-                pack_path,
-                Arc::clone(config),
-                mocks,
-                archive_source,
-                Some(Arc::clone(session_store)),
-                Some(Arc::clone(state_store)),
-                Arc::clone(wasi_policy),
-                Arc::clone(secrets_manager),
-                oauth_config,
-                true,
-                ComponentResolution::default(),
+        let mut pack = PackRuntime::load(
+            pack_path,
+            Arc::clone(config),
+            mocks,
+            archive_source,
+            Some(Arc::clone(session_store)),
+            Some(Arc::clone(state_store)),
+            Arc::clone(wasi_policy),
+            Arc::clone(secrets_manager),
+            oauth_config,
+            true,
+            ComponentResolution::default(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load pack {} for tenant {}",
+                pack_path.display(),
+                config.tenant
             )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to load pack {} for tenant {}",
-                    pack_path.display(),
-                    config.tenant
-                )
-            })?,
-        ))
+        })?;
+        if let Some(non_secret) = runtime_configs_by_pack_id.get(pack.metadata().pack_id.as_str()) {
+            pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
+        }
+        Ok(Arc::new(pack))
     }
 
     #[allow(clippy::too_many_arguments)]
