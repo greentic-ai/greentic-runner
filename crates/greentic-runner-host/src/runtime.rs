@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -411,6 +411,7 @@ impl TenantRuntime {
             );
         }
         let mut packs = Vec::with_capacity(pack_refs.len());
+        let mut seen_pack_ids = HashSet::with_capacity(pack_refs.len());
         for pack_ref in pack_refs {
             let expected = PackDigest::parse(&pack_ref.digest).with_context(|| {
                 format!(
@@ -452,6 +453,18 @@ impl TenantRuntime {
                 &secrets_manager,
             )
             .await?;
+            // Reject duplicate pack_id within a single revision — two refs
+            // resolving to the same pack_id would silently share config/routing
+            // entries and produce an ambiguous runtime.
+            let pack_id = pack.metadata().pack_id.clone();
+            if !seen_pack_ids.insert(pack_id.clone()) {
+                bail!(
+                    "revision for tenant {} contains duplicate pack_id `{}` (path `{}`)",
+                    config.tenant,
+                    pack_id,
+                    pack_ref.path.display(),
+                );
+            }
             // C4.3: inject the `pack-config.v1.non_secret` map for this pack
             // before the Arc is shared. `load_pack_runtime` just returned the
             // Arc, so refcount=1 and `get_mut` is guaranteed to succeed.

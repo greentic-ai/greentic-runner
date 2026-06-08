@@ -468,3 +468,42 @@ async fn insert_revision_rejects_revision_identity_mismatch() -> Result<()> {
     assert!(format!("{err:#}").contains("rollout identity"), "{err:#}");
     Ok(())
 }
+
+#[tokio::test]
+async fn load_revision_rejects_duplicate_pack_id() -> Result<()> {
+    // Two refs pointing at the same fixture pack — both resolve to the same
+    // pack_id after loading. The second must be rejected.
+    let single = pinned_pack_refs()?;
+    let duplicate_refs = vec![single[0].clone(), single[0].clone()];
+    let Err(err) = build_revision(
+        &duplicate_refs,
+        DeploymentId::new(),
+        BundleId::from("customer.support"),
+        RevisionId::new(),
+        None,
+    )
+    .await
+    else {
+        panic!("duplicate pack_id must be rejected");
+    };
+    let msg = format!("{err:#}");
+    assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    // The pack_id of the fixture pack must appear in the error message.
+    let expected_pack_id = {
+        let refs = pinned_pack_refs()?;
+        let rt = build_revision(
+            &refs,
+            DeploymentId::new(),
+            BundleId::from("customer.support"),
+            RevisionId::new(),
+            None,
+        )
+        .await?;
+        rt.all_packs()[0].metadata().pack_id.clone()
+    };
+    assert!(
+        msg.contains(&expected_pack_id),
+        "expected pack_id `{expected_pack_id}` in: {msg}"
+    );
+    Ok(())
+}
