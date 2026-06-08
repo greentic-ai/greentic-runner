@@ -412,6 +412,7 @@ impl TenantRuntime {
             );
         }
         let mut packs = Vec::with_capacity(pack_refs.len());
+        let mut seen_pack_ids = HashSet::with_capacity(pack_refs.len());
         for pack_ref in pack_refs {
             let expected = PackDigest::parse(&pack_ref.digest).with_context(|| {
                 format!(
@@ -454,6 +455,18 @@ impl TenantRuntime {
                 runtime_configs_by_pack_id,
             )
             .await?;
+            // Reject duplicate pack_id within a single revision — two refs
+            // resolving to the same pack_id would silently share config/routing
+            // entries and produce an ambiguous runtime.
+            let pack_id = pack.metadata().pack_id.clone();
+            if !seen_pack_ids.insert(pack_id.clone()) {
+                bail!(
+                    "revision for tenant {} contains duplicate pack_id `{}` (path `{}`)",
+                    config.tenant,
+                    pack_id,
+                    pack_ref.path.display(),
+                );
+            }
             packs.push((pack, Some(expected.raw_string())));
         }
         let rollout = RolloutIds {
@@ -567,23 +580,6 @@ impl TenantRuntime {
         secrets_manager: DynSecretsManager,
         rollout: RolloutIds,
     ) -> Result<Arc<Self>> {
-        // Reject duplicate `pack_id` across the loaded set — two packs sharing
-        // an id would silently overwrite each other's operator bindings in
-        // `OperatorRegistry::build` and share routing/config entries, producing
-        // an ambiguous runtime. Enforced here (rather than in `load_revision`)
-        // so the legacy index path (`from_packs` via `watcher.rs`) is covered
-        // too.
-        let mut seen_pack_ids = HashSet::with_capacity(packs.len());
-        for (pack, _) in &packs {
-            let pack_id = &pack.metadata().pack_id;
-            if !seen_pack_ids.insert(pack_id.clone()) {
-                bail!(
-                    "tenant {} contains duplicate pack_id `{}`",
-                    config.tenant,
-                    pack_id,
-                );
-            }
-        }
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
         let pack_runtimes = packs
