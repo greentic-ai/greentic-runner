@@ -55,6 +55,7 @@ fn secrets_store_put_allows_write_when_policy_allows() -> Result<()> {
         Some("component.alpha".to_string()),
         false,
         None,
+        None,
     )?;
 
     SecretsStoreHostV1_1::put(&mut host_state, "demo-key".to_string(), b"value".to_vec());
@@ -90,6 +91,7 @@ fn secrets_store_put_denies_when_policy_blocks() -> Result<()> {
         None,
         Some("component.beta".to_string()),
         false,
+        None,
         None,
     )?;
 

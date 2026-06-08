@@ -44,6 +44,7 @@ pub mod provider_core_only;
 pub mod routing;
 pub mod runner;
 pub mod runtime;
+pub mod runtime_refs;
 pub mod runtime_wasmtime;
 pub mod secrets;
 pub mod storage;

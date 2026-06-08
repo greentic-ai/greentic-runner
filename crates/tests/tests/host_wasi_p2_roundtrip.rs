@@ -68,6 +68,7 @@ fn run_component(wasm: &Path, config: Arc<HostConfig>, policy: RunnerWasiPolicy)
         None,
         false,
         None,
+        None,
     )?;
     let store_state = ComponentState::new(host_state, Arc::new(policy))?;
     let mut store = Store::new(&engine, store_state);
