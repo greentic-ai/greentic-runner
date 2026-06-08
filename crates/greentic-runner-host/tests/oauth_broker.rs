@@ -35,6 +35,7 @@ fn instantiate_component(wasm: &Path, config: Arc<HostConfig>) -> Result<()> {
         None,
         None,
         false,
+        None,
     )?;
     let policy = Arc::new(RunnerWasiPolicy::default());
     let state = ComponentState::new(host_state, policy)?;

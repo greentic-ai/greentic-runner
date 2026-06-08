@@ -29,6 +29,7 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     self as host_v1, HostFns, add_all_v1_to_linker,
     runner_host_http::RunnerHostHttp,
     runner_host_kv::RunnerHostKv,
+    runtime_config::{ConfigError, RuntimeConfigHost},
     secrets_store::{SecretsError, SecretsErrorV1_1, SecretsStoreHost, SecretsStoreHostV1_1},
     state_store::{
         OpAck as StateOpAck, StateKey as HostStateKey, StateStoreError as StateError,
@@ -138,6 +139,12 @@ pub struct PackRuntime {
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
     cache: CacheManager,
+    /// `pack-config.v1.non_secret` map plumbed into each `HostState` for the
+    /// `greentic:runtime-config@1.0.0` host import. Defaults to `None` when no
+    /// producer (greentic-start) has materialized a `PackConfig` yet; in that
+    /// case all runtime-config lookups fall through to the secrets-store
+    /// compat shim.
+    runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
 }
 
 struct PackComponent {
@@ -305,6 +312,12 @@ pub struct HostState {
     exec_ctx: Option<ComponentExecCtx>,
     component_ref: Option<String>,
     provider_core_component: bool,
+    /// `pack-config.v1.non_secret` map for the `greentic:runtime-config@1.0.0`
+    /// host import. Populated by the producer (greentic-start) from the
+    /// deployed `PackConfig`; `None` when no PackConfig was published, in
+    /// which case lookups fall back to the secrets-store compat shim with
+    /// a once-per-process deprecation warning.
+    runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
 }
 
 impl HostState {
@@ -322,6 +335,7 @@ impl HostState {
         exec_ctx: Option<ComponentExecCtx>,
         component_ref: Option<String>,
         provider_core_component: bool,
+        runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
     ) -> Result<Self> {
         let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
         Ok(Self {
@@ -338,6 +352,7 @@ impl HostState {
             exec_ctx,
             component_ref,
             provider_core_component,
+            runtime_config_non_secret,
         })
     }
 
@@ -810,6 +825,67 @@ impl SecretsStoreHostV1_1 for HostState {
         {
             warn!(secret = %key, canonical = %canonical_key, error = %err, "secret write failed");
             panic!("secret write failed for key {key}");
+        }
+    }
+}
+
+/// Process-global set of `pack-config.v1` keys for which the compat shim has
+/// already logged a deprecation warning. Used to debounce once-per-process
+/// per-key so resolving the same legacy key from many invocations does not
+/// spam the log.
+static WARNED_COMPAT_KEYS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn warn_compat_fallback_once(key: &str) {
+    let mut warned = WARNED_COMPAT_KEYS.lock();
+    if warned.insert(key.to_string()) {
+        warn!(
+            key = %key,
+            "runtime-config key resolved via secrets-store compat fallback; \
+             move this value into pack-config.v1.non_secret"
+        );
+    }
+}
+
+impl RuntimeConfigHost for HostState {
+    fn get(&mut self, key: String) -> Result<Option<String>, ConfigError> {
+        if key.trim().is_empty() {
+            return Err(ConfigError::InvalidKey);
+        }
+
+        // 1) Primary channel: pack-config.v1.non_secret. Values are stored as
+        //    `serde_json::Value`; the WIT contract returns UTF-8 strings
+        //    conventionally JSON-encoded, so stringify here.
+        if let Some(map) = self.runtime_config_non_secret.as_ref()
+            && let Some(value) = map.get(&key)
+        {
+            return serde_json::to_string(value).map(Some).map_err(|err| {
+                warn!(key = %key, error = %err, "runtime-config value JSON-encode failed");
+                ConfigError::Internal
+            });
+        }
+
+        // 2) Compat fallback: try the secrets-store. Warn once per key per
+        //    process so this stays visible without spamming the log.
+        match SecretsStoreHost::get(self, key.clone()) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(value) => {
+                    warn_compat_fallback_once(&key);
+                    Ok(Some(value))
+                }
+                Err(_) => {
+                    warn!(
+                        key = %key,
+                        "runtime-config compat fallback found non-UTF-8 secret bytes; \
+                         returning not-found"
+                    );
+                    Err(ConfigError::Internal)
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(SecretsError::NotFound) => Ok(None),
+            Err(SecretsError::Denied) => Err(ConfigError::Denied),
+            Err(SecretsError::InvalidKey) => Err(ConfigError::InvalidKey),
+            Err(SecretsError::Internal) => Err(ConfigError::Internal),
         }
     }
 }
@@ -1441,6 +1517,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
+            runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
@@ -1950,7 +2027,15 @@ impl PackRuntime {
             secrets,
             oauth_config,
             cache,
+            runtime_config_non_secret: None,
         })
+    }
+
+    /// Inject the `pack-config.v1.non_secret` map for this pack. Called by
+    /// the producer (greentic-start, C4.3) after loading the deployed
+    /// `PackConfig`. Passing `None` clears any previously-set map.
+    pub fn set_runtime_config_non_secret(&mut self, map: Option<Arc<BTreeMap<String, Value>>>) {
+        self.runtime_config_non_secret = map;
     }
 
     pub async fn list_flows(&self) -> Result<Vec<FlowDescriptor>> {
@@ -2060,6 +2145,7 @@ impl PackRuntime {
             Self::merge_component_config_into_input_json(config_json.as_deref(), &input_json)
                 .context("merge component config into invocation payload")?;
         let ctx_owned = ctx;
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
 
         run_on_wasi_thread("component.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -2078,6 +2164,7 @@ impl PackRuntime {
                 Some(ctx_owned.clone()),
                 Some(component_ref_owned.clone()),
                 false,
+                runtime_config_non_secret,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2167,6 +2254,7 @@ impl PackRuntime {
         let op_owned = op.to_string();
         let ctx_owned = ctx;
         let world = binding.world.clone();
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
 
         run_on_wasi_thread("provider.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -2184,6 +2272,7 @@ impl PackRuntime {
                 Some(ctx_owned.clone()),
                 Some(component_ref_owned.clone()),
                 true,
+                runtime_config_non_secret,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2283,6 +2372,7 @@ impl PackRuntime {
         // instantiate_pre), but the WASI sandbox is the tightest we
         // can enforce today. See [`register_identity_probe`] docs.
         let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
         run_on_wasi_thread("provider.identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
@@ -2298,6 +2388,7 @@ impl PackRuntime {
                 None,
                 Some(component_ref_owned.clone()),
                 true,
+                runtime_config_non_secret,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2358,6 +2449,7 @@ impl PackRuntime {
         // Locked-down WASI policy — same rationale as
         // `invoke_identify_instance`. See [`register_identity_probe`] docs.
         let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
         run_on_wasi_thread("provider.describe_identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
@@ -2373,6 +2465,7 @@ impl PackRuntime {
                 None,
                 Some(component_ref_owned.clone()),
                 true,
+                runtime_config_non_secret,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2686,6 +2779,7 @@ impl PackRuntime {
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
 
         run_on_wasi_thread("component.describe", move || {
             let mut linker = Linker::new(&engine);
@@ -2704,6 +2798,7 @@ impl PackRuntime {
                 None,
                 Some(component_ref_owned),
                 false,
+                runtime_config_non_secret,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2905,6 +3000,7 @@ impl PackRuntime {
             secrets: crate::secrets::default_manager()?,
             oauth_config: None,
             cache,
+            runtime_config_non_secret: None,
         })
     }
 }
