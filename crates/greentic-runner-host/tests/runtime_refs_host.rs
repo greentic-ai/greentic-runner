@@ -1,9 +1,9 @@
 //! C5 — `RuntimeConfigHost::get` runtime-refs channel.
 //!
 //! Verifies the three-arm precedence (non_secret → runtime_refs →
-//! compat-shim), the resolver error mapping (NotFound→Ok(None),
-//! Invalid→InvalidKey, Internal→Internal), and the per-pack `refs` map
-//! gating which keys this channel claims.
+//! compat-shim), the resolver error mapping (Invalid→InvalidKey,
+//! Internal→Internal), and the per-pack `refs` map gating which keys this
+//! channel claims.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,6 @@ struct StubResolver {
 enum ResolveOutcome {
     Found(Value),
     Missing,
-    NotFound,
     Invalid(String),
     Internal(String),
 }
@@ -62,7 +61,6 @@ impl RuntimeRefResolver for StubResolver {
         match outcomes.get(runtime_ref).cloned() {
             Some(ResolveOutcome::Found(v)) => Ok(Some(v)),
             Some(ResolveOutcome::Missing) | None => Ok(None),
-            Some(ResolveOutcome::NotFound) => Err(RuntimeRefResolverError::NotFound),
             Some(ResolveOutcome::Invalid(msg)) => Err(RuntimeRefResolverError::Invalid(msg)),
             Some(ResolveOutcome::Internal(msg)) => Err(RuntimeRefResolverError::Internal(msg)),
         }
@@ -227,26 +225,6 @@ fn non_secret_takes_precedence_over_runtime_refs() -> Result<()> {
 
     let value = RuntimeConfigHost::get(&mut host, "shared".to_string()).expect("non_secret wins");
     assert_eq!(value.as_deref(), Some("\"from-non-secret\""));
-    Ok(())
-}
-
-#[test]
-#[serial]
-fn resolver_not_found_returns_ok_none() -> Result<()> {
-    let _guard = EnvGuard::set("GREENTIC_PROVIDER_CORE_ONLY", "0");
-    let resolver = StubResolver::new();
-    resolver.set(
-        "runtime://local/discovered/alb_dns",
-        ResolveOutcome::NotFound,
-    );
-    let injection = injection(
-        &[("alb_dns", "runtime://local/discovered/alb_dns")],
-        Arc::clone(&resolver),
-    );
-    let mut host = make_host_state("not-found", None, Some(injection))?;
-
-    let value = RuntimeConfigHost::get(&mut host, "alb_dns".to_string()).expect("Ok(None)");
-    assert!(value.is_none());
     Ok(())
 }
 

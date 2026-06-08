@@ -891,7 +891,7 @@ impl RuntimeConfigHost for HostState {
                     warn!(key = %key, error = %err, "runtime-ref value JSON-encode failed");
                     ConfigError::Internal
                 }),
-                Ok(None) | Err(RuntimeRefResolverError::NotFound) => Ok(None),
+                Ok(None) => Ok(None),
                 Err(err @ RuntimeRefResolverError::Invalid(_)) => {
                     warn!(key = %key, error = %err, "runtime-ref rejected");
                     Err(ConfigError::InvalidKey)

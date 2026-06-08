@@ -20,12 +20,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 /// Errors a [`RuntimeRefResolver`] can return. Mapped onto
-/// `greentic:runtime-config@1.0.0::ConfigError` by the host import.
+/// `greentic:runtime-config@1.0.0::ConfigError` by the host import. The
+/// "not bound in the current snapshot" case is signalled by `Ok(None)`
+/// from [`RuntimeRefResolver::resolve`], not by an error.
 #[derive(Debug, Error)]
 pub enum RuntimeRefResolverError {
-    /// The URI did not resolve in the current `EnvironmentRuntime` snapshot.
-    #[error("runtime-ref not found")]
-    NotFound,
     /// URI shape was rejected by the resolver (parse / env mismatch).
     #[error("runtime-ref invalid: {0}")]
     Invalid(String),
@@ -51,7 +50,7 @@ pub trait RuntimeRefResolver: Debug + Send + Sync {
 /// `pack-config.v1.runtime_refs` plus the env-wide resolver. The resolver
 /// is shared across every pack in the env (one `ArcSwap` snapshot owner);
 /// the `refs` map is per-pack.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RuntimeRefsInjection {
     /// `key → "runtime://<env>/discovered/<path>"`. Keys are what the WASM
     /// component asks for; URIs are opaque to runner-host and forwarded to
@@ -60,15 +59,6 @@ pub struct RuntimeRefsInjection {
     /// Env-shared resolver. Reads start's `EnvironmentRuntime` snapshot on
     /// every call so hot-reloads land immediately.
     pub resolver: Arc<dyn RuntimeRefResolver>,
-}
-
-impl Debug for RuntimeRefsInjection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeRefsInjection")
-            .field("refs", &self.refs)
-            .field("resolver", &self.resolver)
-            .finish()
-    }
 }
 
 #[cfg(test)]
