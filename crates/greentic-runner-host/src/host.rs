@@ -533,6 +533,16 @@ impl RunnerHost {
         activity: Activity,
     ) -> Result<Vec<Activity>> {
         let activity = apply_fast2flow_routing(runtime, tenant, activity)?;
+
+        // Fast2Flow Respond/Deny returns a pre-built response activity
+        // (kind = Custom { action: "response" }, no flow_id/pack_id).
+        // Short-circuit: return it directly — do NOT resolve a flow or
+        // enter the state machine, otherwise a Deny still executes the
+        // tenant entry flow with the denial payload.
+        if activity.action() == Some("response") && activity.flow_id().is_none() {
+            return Ok(vec![activity]);
+        }
+
         let (pack_id, flow_id) = resolve_flow_id(runtime, &activity)?;
         let action = activity.action().map(|value| value.to_string());
         let session = activity.session_id().map(|value| value.to_string());
