@@ -19,6 +19,7 @@ use crate::provider_core::{
     schema_core_schema::SchemaCorePre as SchemaSchemaCorePre,
 };
 use crate::provider_core_only;
+use crate::runtime_refs::RuntimeRefsInjection;
 use crate::runtime_wasmtime::{Component, Engine, InstancePre, Linker, ResourceTable};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
@@ -145,6 +146,13 @@ pub struct PackRuntime {
     /// case all runtime-config lookups fall through to the secrets-store
     /// compat shim.
     runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+    /// `pack-config.v1.runtime_refs` (C5): per-pack `key → URI` bindings plus
+    /// the env-shared [`RuntimeRefResolver`]. Consulted by the
+    /// `greentic:runtime-config@1.0.0` host import AFTER `non_secret` and
+    /// BEFORE the compat shim. `None` when no producer set it yet.
+    ///
+    /// [`RuntimeRefResolver`]: crate::runtime_refs::RuntimeRefResolver
+    runtime_refs: Option<RuntimeRefsInjection>,
 }
 
 struct PackComponent {
@@ -318,6 +326,10 @@ pub struct HostState {
     /// which case lookups fall back to the secrets-store compat shim with
     /// a once-per-process deprecation warning.
     runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+    /// `pack-config.v1.runtime_refs` (C5) injection: per-pack `key → URI`
+    /// bindings plus the env-shared resolver. The host import resolves the
+    /// URI on every call so the value tracks `runtime.json` hot-reloads.
+    runtime_refs: Option<RuntimeRefsInjection>,
 }
 
 impl HostState {
@@ -336,6 +348,7 @@ impl HostState {
         component_ref: Option<String>,
         provider_core_component: bool,
         runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+        runtime_refs: Option<RuntimeRefsInjection>,
     ) -> Result<Self> {
         let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
         Ok(Self {
@@ -353,6 +366,7 @@ impl HostState {
             component_ref,
             provider_core_component,
             runtime_config_non_secret,
+            runtime_refs,
         })
     }
 
@@ -862,6 +876,31 @@ impl RuntimeConfigHost for HostState {
                 warn!(key = %key, error = %err, "runtime-config value JSON-encode failed");
                 ConfigError::Internal
             });
+        }
+
+        // 1b) C5 channel: pack-config.v1.runtime_refs. Resolved on every call
+        //     so values track `runtime.json` hot-reloads. The per-pack `refs`
+        //     map gates which keys this channel claims; non-bound keys fall
+        //     through to the compat shim.
+        if let Some(injection) = self.runtime_refs.as_ref()
+            && let Some(uri) = injection.refs.get(&key)
+        {
+            use crate::runtime_refs::RuntimeRefResolverError;
+            return match injection.resolver.resolve(uri) {
+                Ok(Some(value)) => serde_json::to_string(&value).map(Some).map_err(|err| {
+                    warn!(key = %key, error = %err, "runtime-ref value JSON-encode failed");
+                    ConfigError::Internal
+                }),
+                Ok(None) | Err(RuntimeRefResolverError::NotFound) => Ok(None),
+                Err(err @ RuntimeRefResolverError::Invalid(_)) => {
+                    warn!(key = %key, error = %err, "runtime-ref rejected");
+                    Err(ConfigError::InvalidKey)
+                }
+                Err(err @ RuntimeRefResolverError::Internal(_)) => {
+                    warn!(key = %key, error = %err, "runtime-ref resolution failed");
+                    Err(ConfigError::Internal)
+                }
+            };
         }
 
         // 2) Compat fallback: try the secrets-store. Warn once per key per
@@ -2028,6 +2067,7 @@ impl PackRuntime {
             oauth_config,
             cache,
             runtime_config_non_secret: None,
+            runtime_refs: None,
         })
     }
 
@@ -2042,6 +2082,20 @@ impl PackRuntime {
     /// Used by the revision loader's tests to assert producer plumbing.
     pub fn runtime_config_non_secret(&self) -> Option<&Arc<BTreeMap<String, Value>>> {
         self.runtime_config_non_secret.as_ref()
+    }
+
+    /// Inject the `pack-config.v1.runtime_refs` channel (C5): per-pack
+    /// `key → URI` bindings plus the env-shared resolver. Called by
+    /// greentic-start after loading the deployed `PackConfig`. Passing
+    /// `None` clears any previously-set injection.
+    pub fn set_runtime_refs(&mut self, injection: Option<RuntimeRefsInjection>) {
+        self.runtime_refs = injection;
+    }
+
+    /// Read-only accessor for the injected runtime-refs channel. Used by
+    /// the revision loader's tests to assert producer plumbing.
+    pub fn runtime_refs(&self) -> Option<&RuntimeRefsInjection> {
+        self.runtime_refs.as_ref()
     }
 
     pub async fn list_flows(&self) -> Result<Vec<FlowDescriptor>> {
@@ -2152,6 +2206,7 @@ impl PackRuntime {
                 .context("merge component config into invocation payload")?;
         let ctx_owned = ctx;
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("component.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -2171,6 +2226,7 @@ impl PackRuntime {
                 Some(component_ref_owned.clone()),
                 false,
                 runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2261,6 +2317,7 @@ impl PackRuntime {
         let ctx_owned = ctx;
         let world = binding.world.clone();
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("provider.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -2279,6 +2336,7 @@ impl PackRuntime {
                 Some(component_ref_owned.clone()),
                 true,
                 runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2379,6 +2437,7 @@ impl PackRuntime {
         // can enforce today. See [`register_identity_probe`] docs.
         let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
         run_on_wasi_thread("provider.identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
@@ -2395,6 +2454,7 @@ impl PackRuntime {
                 Some(component_ref_owned.clone()),
                 true,
                 runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2456,6 +2516,7 @@ impl PackRuntime {
         // `invoke_identify_instance`. See [`register_identity_probe`] docs.
         let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
         run_on_wasi_thread("provider.describe_identify_instance", move || {
             let mut linker = Linker::new(&engine);
             register_identity_probe(&mut linker)?;
@@ -2472,6 +2533,7 @@ impl PackRuntime {
                 Some(component_ref_owned.clone()),
                 true,
                 runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2786,6 +2848,7 @@ impl PackRuntime {
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
         let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("component.describe", move || {
             let mut linker = Linker::new(&engine);
@@ -2805,6 +2868,7 @@ impl PackRuntime {
                 Some(component_ref_owned),
                 false,
                 runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -3007,6 +3071,7 @@ impl PackRuntime {
             oauth_config: None,
             cache,
             runtime_config_non_secret: None,
+            runtime_refs: None,
         })
     }
 }

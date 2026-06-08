@@ -129,6 +129,7 @@ fn make_host_state(
         Some("component.alpha".to_string()),
         false,
         non_secret,
+        None,
     )
 }
 

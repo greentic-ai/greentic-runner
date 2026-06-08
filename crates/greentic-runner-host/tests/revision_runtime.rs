@@ -123,6 +123,8 @@ async fn build_revision_with_configs(
         revision_id,
         customer_id,
         runtime_configs_by_pack_id,
+        &std::collections::BTreeMap::new(),
+        None,
     )
     .await
 }

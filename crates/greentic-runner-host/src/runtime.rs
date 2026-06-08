@@ -361,6 +361,8 @@ impl TenantRuntime {
             &state_store,
             &secrets_manager,
             &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
         )
         .await?;
         Self::from_packs(
@@ -404,6 +406,8 @@ impl TenantRuntime {
         revision_id: RevisionId,
         customer_id: Option<String>,
         runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
     ) -> Result<Arc<Self>> {
         if pack_refs.is_empty() {
             bail!(
@@ -453,6 +457,8 @@ impl TenantRuntime {
                 &state_store,
                 &secrets_manager,
                 runtime_configs_by_pack_id,
+                runtime_refs_by_pack_id,
+                runtime_ref_resolver.as_ref(),
             )
             .await?;
             // Reject duplicate pack_id within a single revision — two refs
@@ -499,6 +505,10 @@ impl TenantRuntime {
     /// [`PackRuntime::set_runtime_config_non_secret`] so the C4.3 producer
     /// plumbing requires no post-hoc `Arc::get_mut` dance — the single-pack
     /// [`load`](Self::load) path just passes an empty map.
+    ///
+    /// `runtime_refs_by_pack_id` mirrors the same shape for the C5
+    /// `pack-config.v1.runtime_refs` channel; a matching entry is injected
+    /// via [`PackRuntime::set_runtime_refs`] alongside `runtime_ref_resolver`.
     #[allow(clippy::too_many_arguments)]
     async fn load_pack_runtime(
         pack_path: &Path,
@@ -510,6 +520,8 @@ impl TenantRuntime {
         state_store: &DynStateStore,
         secrets_manager: &DynSecretsManager,
         runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<&Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
     ) -> Result<Arc<PackRuntime>> {
         let oauth_config = config.oauth_broker_config();
         let mut pack = PackRuntime::load(
@@ -533,8 +545,18 @@ impl TenantRuntime {
                 config.tenant
             )
         })?;
-        if let Some(non_secret) = runtime_configs_by_pack_id.get(pack.metadata().pack_id.as_str()) {
+        let pack_id = pack.metadata().pack_id.clone();
+        if let Some(non_secret) = runtime_configs_by_pack_id.get(pack_id.as_str()) {
             pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
+        }
+        if let (Some(refs), Some(resolver)) = (
+            runtime_refs_by_pack_id.get(pack_id.as_str()),
+            runtime_ref_resolver,
+        ) {
+            pack.set_runtime_refs(Some(crate::runtime_refs::RuntimeRefsInjection {
+                refs: Arc::clone(refs),
+                resolver: Arc::clone(resolver),
+            }));
         }
         Ok(Arc::new(pack))
     }
