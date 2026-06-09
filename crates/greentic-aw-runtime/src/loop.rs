@@ -131,6 +131,15 @@ pub async fn run_step(
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
+            // Record the assistant's tool-call turn BEFORE the tool results.
+            // OpenAI requires every `tool` message to follow an assistant
+            // message carrying the matching `tool_calls`; without this the next
+            // turn 400s ("messages with role 'tool' must be a response to a
+            // preceeding message with 'tool_calls'").
+            state.messages.push(ChatMessage::Assistant {
+                content: response.content.clone().unwrap_or_default(),
+                tool_calls: response.tool_calls.clone(),
+            });
             for call in response.tool_calls {
                 if !is_tool_allowed(&call, &config.tools) {
                     state.messages.push(ChatMessage::Tool {

@@ -271,17 +271,51 @@ mod aw {
     /// On construction failure (e.g. wasmtime engine init), logs the error and
     /// returns `None`; the caller then disables `DwAgent` nodes rather than
     /// panicking.
+    ///
+    /// Unlike the designer (which installs extensions through an explicit flow),
+    /// the runner has no install step — so it performs an initial scan of the
+    /// `design/` kind directory under the discovery root and registers each
+    /// on-disk extension here. Without this the agentic worker would boot with
+    /// an empty tool runtime and every extension tool would be silently dropped.
+    /// Per-extension failures (bad signature, malformed describe) are logged and
+    /// skipped so one broken extension never aborts boot; the watcher still
+    /// hot-reloads later changes.
     pub(crate) fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
-        use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig};
+        use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig, discovery};
 
-        let paths = DiscoveryPaths::new(extension_discovery_dir());
-        match ExtensionRuntime::new(RuntimeConfig::from_paths(paths)) {
-            Ok(runtime) => Some(Arc::new(runtime)),
+        let root = extension_discovery_dir();
+        let paths = DiscoveryPaths::new(root.clone());
+        let mut runtime = match ExtensionRuntime::new(RuntimeConfig::from_paths(paths)) {
+            Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");
-                None
+                return None;
+            }
+        };
+
+        // Initial load of on-disk design extensions (agentic-worker tools live
+        // in `<root>/design/<ext>/`).
+        let design_dir = root.join("design");
+        match discovery::scan_kind_dir(&design_dir) {
+            Ok(ext_dirs) => {
+                let mut loaded = 0usize;
+                for ext_dir in ext_dirs {
+                    match runtime.register_loaded_from_dir(&ext_dir) {
+                        Ok(()) => loaded += 1,
+                        Err(error) => tracing::warn!(
+                            error = %error, dir = %ext_dir.display(),
+                            "skipping extension that failed to load"
+                        ),
+                    }
+                }
+                tracing::info!(loaded, dir = %design_dir.display(), "loaded design extensions");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, dir = %design_dir.display(), "scanning design extensions failed")
             }
         }
+
+        Some(Arc::new(runtime))
     }
 
     /// Resolve the [`LlmBackend`] from the environment.
