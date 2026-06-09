@@ -4,7 +4,8 @@ use crate::component_api::node::{ExecCtx as ComponentExecCtx, TenantCtx as Compo
 use crate::pack::PackRuntime;
 use greentic_x_runtime::{
     ComponentInvocationEnvelope, ComponentInvocationResultEnvelope, ComponentProvider,
-    Fast2FlowRouteRequest, Fast2FlowRouteResult, Fast2FlowRoutingProvider, RuntimeError,
+    Fast2FlowRouteRequest, Fast2FlowRouteResult, Fast2FlowRoutingProvider, InMemoryComponentCache,
+    RuntimeError, execute_component_with_strategies,
 };
 use serde_json::Value;
 use tokio::runtime::{Builder, Runtime};
@@ -21,6 +22,7 @@ pub struct RunnerPackComponentProvider {
     default_operation: String,
     tenant: String,
     flow_id: String,
+    strategy_cache: Arc<InMemoryComponentCache>,
 }
 
 impl RunnerPackComponentProvider {
@@ -38,6 +40,7 @@ impl RunnerPackComponentProvider {
             default_operation: "invoke".to_owned(),
             tenant: "default".to_owned(),
             flow_id: "greentic-x.component-invocation".to_owned(),
+            strategy_cache: Arc::new(InMemoryComponentCache::new()),
         })
     }
 
@@ -62,6 +65,11 @@ impl RunnerPackComponentProvider {
 
     fn operation(&self, envelope: &ComponentInvocationEnvelope) -> String {
         metadata_string(envelope, "operation").unwrap_or_else(|| self.default_operation.clone())
+    }
+
+    pub fn with_strategy_cache(mut self, cache: Arc<InMemoryComponentCache>) -> Self {
+        self.strategy_cache = cache;
+        self
     }
 
     fn exec_ctx(&self, envelope: &ComponentInvocationEnvelope) -> ComponentExecCtx {
@@ -91,8 +99,8 @@ impl RunnerPackComponentProvider {
     }
 }
 
-impl ComponentProvider for RunnerPackComponentProvider {
-    fn invoke_component(
+impl RunnerPackComponentProvider {
+    fn invoke_component_once(
         &self,
         envelope: ComponentInvocationEnvelope,
     ) -> Result<ComponentInvocationResultEnvelope, RuntimeError> {
@@ -125,6 +133,34 @@ impl ComponentProvider for RunnerPackComponentProvider {
             component_id,
             output,
         ))
+    }
+}
+
+struct RunnerPackComponentInvocation<'a> {
+    provider: &'a RunnerPackComponentProvider,
+}
+
+impl ComponentProvider for RunnerPackComponentInvocation<'_> {
+    fn invoke_component(
+        &self,
+        envelope: ComponentInvocationEnvelope,
+    ) -> Result<ComponentInvocationResultEnvelope, RuntimeError> {
+        self.provider.invoke_component_once(envelope)
+    }
+}
+
+impl ComponentProvider for RunnerPackComponentProvider {
+    fn invoke_component(
+        &self,
+        envelope: ComponentInvocationEnvelope,
+    ) -> Result<ComponentInvocationResultEnvelope, RuntimeError> {
+        let one_shot_provider = RunnerPackComponentInvocation { provider: self };
+        execute_component_with_strategies(
+            &one_shot_provider,
+            envelope,
+            Some(self.strategy_cache.as_ref()),
+        )
+        .map(|outcome| outcome.result)
     }
 }
 
