@@ -69,6 +69,18 @@ The `greentic-runner` crate is the thin entrypoint. Almost all runtime logic liv
 5. Each node may: invoke a WASM component, call a provider, emit a response, or `session.wait` (pause)
 6. On `session.wait`: snapshot persisted → next inbound activity resumes from that point
 
+### Agentic Workers (`dw.agent` node)
+
+A flow node keyed `dw.agent.<agent_id>` (component `dw.agent`, operation = agent_id)
+dispatches to the agentic-worker runtime (`crates/greentic-aw-runtime`, Plan-Act-Observe
+loop). Gated behind the `agentic-worker` feature (default-on). Tools come from
+`.gtxpack` design-extensions loaded from `GREENTIC_EXTENSIONS_DIR/design/` at boot
+(`agent_node::build_ext_runtime` scans + registers them) and from per-tenant MCP servers;
+the OpenAI backend encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
+Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`).
+Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
+manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
+
 ### WASM Component Model
 
 - **Target**: `wasm32-wasip2` (WASI Preview 2, Component Model)
