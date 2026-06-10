@@ -178,6 +178,22 @@ impl Activity {
         self
     }
 
+    pub(crate) fn with_payload_field(mut self, key: impl Into<String>, value: Value) -> Self {
+        match &mut self.payload {
+            Value::Object(object) => {
+                object.insert(key.into(), value);
+            }
+            existing => {
+                let original = std::mem::replace(existing, Value::Null);
+                *existing = json!({
+                    key.into(): value,
+                    "value": original,
+                });
+            }
+        }
+        self
+    }
+
     /// Attach a session identifier used for retries/idempotency.
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
@@ -318,6 +334,18 @@ mod tests {
     fn with_messaging_endpoint_sets_field() {
         let activity = Activity::text("hi").with_messaging_endpoint("teams-legal");
         assert_eq!(activity.messaging_endpoint_id(), Some("teams-legal"));
+    }
+
+    #[test]
+    fn with_payload_field_adds_field_to_object_payload() {
+        let activity = Activity::text("show traffic")
+            .with_payload_field("fast2flow", json!({"entities": [{"kind": "date"}]}));
+
+        assert_eq!(
+            activity.payload()["fast2flow"]["entities"][0]["kind"],
+            "date"
+        );
+        assert_eq!(activity.payload()["text"], "show traffic");
     }
 
     #[test]
