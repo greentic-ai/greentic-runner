@@ -2414,9 +2414,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-x-runtime"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1582469ddfd4599f6d94a87a087c7e8f807f92fd25eb3b708e56a85779c8075"
+checksum = "e390a853405705357cea3662e6cd7161f5603fd53e862d115bbbea94ca83eda1"
 dependencies = [
  "greentic-x-contracts",
  "greentic-x-events",
@@ -2429,9 +2429,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-x-types"
-version = "0.4.18"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "484d88fbb00b6327e9656c628680c0f244c47fa25b62a8a86c8c58bf9d2667d9"
+checksum = "ce6538987908354003ecebfe68a820b629b919639214329711a4d7e53dab2685"
 dependencies = [
  "serde",
  "serde_json",
