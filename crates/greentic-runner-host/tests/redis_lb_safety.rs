@@ -23,6 +23,7 @@ mod redis_lb {
             action: Some("messaging".into()),
             session_hint: Some("demo:provider:chan:conv:user".into()),
             provider: Some("provider".into()),
+            messaging_endpoint_id: None,
             channel: Some("conv".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),

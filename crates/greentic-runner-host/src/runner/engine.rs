@@ -18,14 +18,22 @@ use super::templating::{TemplateOptions, render_template_value};
 use crate::config::{FlowRetryConfig, HostConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
 use crate::runner::invocation::{InvocationMeta, build_invocation_envelope};
-use crate::telemetry::{FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context};
+use crate::telemetry::{
+    FlowSpanAttributes, RolloutIds, annotate_span, backoff_delay_ms, set_flow_context,
+};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::validate::{
     ValidationConfig, ValidationIssue, ValidationMode, validate_component_envelope,
     validate_tool_envelope,
 };
+use greentic_flow::SLOT_SCHEMA_METADATA_KEY;
 use greentic_types::{Flow, Node, NodeId, Routing};
+
+/// Component ID of the slot-extractor WASM component. Used to detect
+/// slot-extractor nodes and inject flow-level `slot_schema` as
+/// `slot_definitions` into the invocation payload (Phase D).
+const SLOT_EXTRACTOR_COMPONENT_ID: &str = "ai.greentic.component-slot-extractor";
 
 /// Callback trait for resolving cross-pack provider invocations.
 ///
@@ -53,6 +61,11 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    /// Rollout identifiers of the revision-keyed runtime this engine belongs to,
+    /// stamped onto every per-invocation `TenantCtx` for telemetry attribution
+    /// (C5.4). Empty for tenant-only (legacy) runtimes; the Phase-D revision
+    /// dispatcher supplies real IDs via [`with_rollout_ids`](Self::with_rollout_ids).
+    rollout_ids: RolloutIds,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -94,6 +107,9 @@ struct HostFlow {
     id: String,
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
+    /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
+    /// Injected into slot-extractor component invocations at dispatch time (Phase D).
+    slot_schema: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,7 +293,25 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         })
+    }
+
+    /// Bind the rollout identifiers of the revision-keyed runtime this engine
+    /// serves, so every invocation's telemetry carries deployment/bundle/
+    /// revision attribution (C5.4). Called by the Phase-D revision dispatcher
+    /// when it constructs a revision runtime; tenant-only runtimes leave the
+    /// default (empty) IDs.
+    pub fn with_rollout_ids(mut self, rollout_ids: RolloutIds) -> Self {
+        self.rollout_ids = rollout_ids;
+        self
+    }
+
+    /// The rollout identifiers bound to this engine (read counterpart to
+    /// [`with_rollout_ids`](Self::with_rollout_ids)). Empty by default for the
+    /// legacy tenant-only path.
+    pub fn rollout_ids(&self) -> &RolloutIds {
+        &self.rollout_ids
     }
 
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
@@ -316,7 +350,13 @@ impl FlowEngine {
         Ok(host_flow)
     }
 
-    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    /// Create the `flow.execute` span and install per-invocation telemetry:
+    /// declared span fields, the task-local tenant context, and the **exported**
+    /// `gt.*` attribution — the live `pack_id` plus any rollout identifiers from
+    /// the owning revision runtime (C5.4). Returned for the caller to
+    /// `.instrument()`. Both `execute` and `resume` route through here so every
+    /// per-invocation entry point carries the same attribution.
+    fn flow_execute_span(&self, ctx: &FlowContext<'_>) -> tracing::Span {
         let span = tracing::info_span!(
             "flow.execute",
             tenant = tracing::field::Empty,
@@ -336,13 +376,21 @@ impl FlowEngine {
             },
         );
         set_flow_context(
+            &span,
             &self.default_env,
             ctx.tenant,
             ctx.flow_id,
             ctx.node_id,
             ctx.provider_id,
             ctx.session_id,
+            ctx.pack_id,
+            &self.rollout_ids,
         );
+        span
+    }
+
+    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
         let mut ctx = ctx;
@@ -437,7 +485,9 @@ impl FlowEngine {
         // entry is non-null.
         state.replace_input(input.clone());
         state.entry = input;
+        let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+            .instrument(span)
             .await
     }
 
@@ -504,11 +554,25 @@ impl FlowEngine {
                 maybe_fail(FaultPoint::TemplateRender, fault_ctx)
                     .map_err(|err| anyhow!(err.to_string()))?;
             }
-            let payload =
+            let mut payload =
                 render_template_value(&payload_template, &ctx_value, TemplateOptions::default())
                     .context("failed to render node input template")?;
-            let observed_payload = payload.clone();
             let node_id = current.clone();
+
+            // Phase D: inject flow-level slot_schema as slot_definitions into
+            // the slot-extractor's input when the author omitted inline
+            // definitions. Explicit inline `slot_definitions` win
+            // (back-compat with M2.4 NDA demo).
+            if let NodeKind::Exec { target_component } = &node.kind
+                && target_component == SLOT_EXTRACTOR_COMPONENT_ID
+                && let Some(schema) = flow_ir.slot_schema.as_ref()
+                && let Some(map) = payload.as_object_mut()
+            {
+                let input = map.entry("input").or_insert(Value::Null);
+                inject_slot_definitions(input, schema, step_ctx.flow_id, node_id.as_str());
+            }
+
+            let observed_payload = payload.clone();
             let event = NodeEvent {
                 context: &step_ctx,
                 node_id: node_id.as_str(),
@@ -952,6 +1016,7 @@ impl FlowEngine {
             overrides.operation,
             node.operation_in_mapping.as_deref(),
         )?;
+
         let call = ComponentCall {
             component_ref,
             operation,
@@ -1850,10 +1915,20 @@ impl From<Flow> for HostFlow {
             .and_then(Value::as_str)
             .and_then(|id| NodeId::from_str(id).ok())
             .or_else(|| nodes.keys().next().cloned());
+        // Extract flow-level slot_schema from metadata.extra (Phase D).
+        // The producer side (greentic-flow compile_flow) stores it under
+        // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
+        let slot_schema = value
+            .metadata
+            .extra
+            .get(SLOT_SCHEMA_METADATA_KEY)
+            .filter(|v| !v.is_null())
+            .cloned();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
+            slot_schema,
         }
     }
 }
@@ -2184,6 +2259,35 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if let Some(locale) = locale {
         map.insert("locale".into(), Value::String(locale.to_string()));
     }
+}
+
+/// Inject flow-level `slot_schema` as `slot_definitions` into the
+/// slot-extractor component's input value. Skips injection when the input
+/// already contains an explicit `slot_definitions` key (back-compat with
+/// M2.4 NDA demo inline definitions). When the input is `Null`, promotes it
+/// to an empty object first.
+fn inject_slot_definitions(input: &mut Value, slot_schema: &Value, flow_id: &str, node_id: &str) {
+    if input.is_null() {
+        *input = Value::Object(serde_json::Map::new());
+    }
+    let Some(map) = input.as_object_mut() else {
+        tracing::warn!(
+            flow_id,
+            node_id,
+            "slot-extractor input is not an object; cannot inject slot_definitions"
+        );
+        return;
+    };
+    if map.contains_key("slot_definitions") {
+        return;
+    }
+    let slot_count = slot_schema.as_array().map_or(0, Vec::len);
+    tracing::debug!(
+        flow_id,
+        slot_count,
+        "injecting flow-level slot_schema as slot_definitions into slot-extractor input"
+    );
+    map.insert("slot_definitions".to_string(), slot_schema.clone());
 }
 
 /// Pre-resolve `card_source: "asset"` entries by reading the referenced JSON
@@ -2577,6 +2681,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         }
     }
 
@@ -2997,6 +3102,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -3087,6 +3193,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         }
     }
 
@@ -3108,6 +3215,20 @@ mod tests {
             observer: None,
             mocks: None,
         }
+    }
+
+    #[test]
+    fn with_rollout_ids_binds_revision_identity() {
+        let engine = minimal_engine().with_rollout_ids(RolloutIds {
+            customer_id: Some("cust-acme".into()),
+            deployment_id: Some("01JTKS".into()),
+            bundle_id: Some("customer.support".into()),
+            revision_id: Some("01JTKR".into()),
+        });
+        assert_eq!(engine.rollout_ids.revision_id.as_deref(), Some("01JTKR"));
+        assert_eq!(engine.rollout_ids.deployment_id.as_deref(), Some("01JTKS"));
+        // A freshly-built engine carries no rollout identity (legacy runtime).
+        assert!(minimal_engine().rollout_ids.is_empty());
     }
 
     #[test]
@@ -3222,6 +3343,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            slot_schema: None,
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -3333,6 +3455,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3422,6 +3545,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3442,6 +3566,204 @@ mod tests {
         };
         let result = engine.execute(ctx, Value::Null).await;
         assert!(result.is_err(), "non-user-facing flow must propagate Err");
+    }
+
+    // ---- Phase D: slot_schema injection tests ----
+
+    #[test]
+    fn host_flow_extracts_slot_schema_from_metadata_extra() {
+        use greentic_types::FlowMetadata;
+        use std::collections::BTreeSet;
+
+        let schema = json!([
+            {"name": "counterparty", "slot_type": "string", "required": true},
+            {"name": "due_date", "slot_type": "date", "required": true}
+        ]);
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: BTreeSet::new(),
+                extra: json!({(SLOT_SCHEMA_METADATA_KEY): schema}),
+            },
+        };
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&schema),
+            "HostFlow must extract slot_schema from metadata.extra"
+        );
+    }
+
+    #[test]
+    fn host_flow_slot_schema_is_none_when_absent() {
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: Default::default(),
+        };
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when metadata.extra has no greentic.slot_schema"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_adds_to_object_input() {
+        let schema = json!([
+            {"name": "city", "slot_type": "string"}
+        ]);
+        let mut input = json!({"utterance": "hello"});
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"utterance": "hello", "slot_definitions": schema}),
+            "slot_definitions must be injected into existing object"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_wraps_null_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = Value::Null;
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"slot_definitions": schema}),
+            "null input must become an object with slot_definitions"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_preserves_explicit_inline() {
+        let flow_schema = json!([{"name": "city", "slot_type": "string"}]);
+        let inline_defs = json!([{"name": "country", "slot_type": "string"}]);
+        let mut input = json!({
+            "utterance": "hello",
+            "slot_definitions": inline_defs
+        });
+        inject_slot_definitions(&mut input, &flow_schema, "f", "n");
+        assert_eq!(
+            input["slot_definitions"], inline_defs,
+            "explicit inline slot_definitions must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_skips_non_object_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = json!("a string");
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!("a string"),
+            "non-object input must be left unchanged"
+        );
+    }
+
+    fn make_flow_doc_for_test(
+        id: &str,
+        node_name: &str,
+        component: &str,
+        slot_schema: Option<Value>,
+    ) -> greentic_flow::model::FlowDoc {
+        use greentic_flow::model::{FlowDoc, NodeDoc};
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            node_name.to_string(),
+            NodeDoc {
+                raw: {
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "component.exec".to_string(),
+                        json!({ "component": component }),
+                    );
+                    m
+                },
+                routing: json!([{ "out": true }]),
+                ..Default::default()
+            },
+        );
+
+        FlowDoc {
+            id: id.into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some(node_name.into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema,
+            nodes,
+        }
+    }
+
+    /// Integration test: exercises the real `greentic_flow::compile_flow`
+    /// producer path with a `FlowDoc` carrying `slot_schema`, then converts
+    /// through `HostFlow::from` and verifies the runtime-side `slot_schema`
+    /// field is populated — closing the gap Codex flagged where the existing
+    /// unit tests constructed `FlowMetadata` directly.
+    #[test]
+    fn compile_flow_round_trips_slot_schema_into_host_flow() {
+        let slot_defs = json!([
+            { "name": "counterparty", "slot_type": "string", "required": true,
+              "pattern": ".+" },
+            { "name": "due_date", "slot_type": "date", "required": true,
+              "pattern": "\\d{4}-\\d{2}-\\d{2}" }
+        ]);
+        let doc = make_flow_doc_for_test(
+            "slot-test",
+            "extractor",
+            "slot-extractor",
+            Some(slot_defs.clone()),
+        );
+
+        let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
+        assert_eq!(
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY),
+            Some(&slot_defs),
+            "compile_flow must forward slot_schema into metadata.extra"
+        );
+
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&slot_defs),
+            "HostFlow.slot_schema must survive the compile_flow -> HostFlow round-trip"
+        );
+    }
+
+    /// Verify that `compile_flow` without `slot_schema` produces a `Flow`
+    /// whose `metadata.extra` has no `greentic.slot_schema` key, and that
+    /// `HostFlow.slot_schema` stays `None` through the real compile path.
+    #[test]
+    fn compile_flow_without_slot_schema_leaves_host_flow_none() {
+        let doc = make_flow_doc_for_test("no-slots", "echo", "echo", None);
+
+        let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
+        assert!(
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY).is_none(),
+            "metadata.extra must not contain greentic.slot_schema when FlowDoc.slot_schema is None"
+        );
+
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when FlowDoc has no slot_schema"
+        );
     }
 }
 

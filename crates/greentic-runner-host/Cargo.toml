@@ -16,76 +16,90 @@ verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
+# Declared but off by default. C5.4 introduced #[cfg(feature = "telemetry")]
+# gates around greentic_telemetry::annotate_span calls; turning the gate on
+# activates explicit span annotation (greentic-telemetry is always linked).
+telemetry = []
+greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
 [dependencies]
+async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
-async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
-blake3.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 cron.workspace = true
-dashmap.workspace = true
-futures.workspace = true
-greentic-config.workspace = true
-greentic-config-types.workspace = true
-greentic-distributor-client.workspace = true
 greentic-flow.workspace = true
-greentic-interfaces.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
-greentic-secrets-lib.workspace = true
-greentic-session.workspace = true
-greentic-state.workspace = true
-greentic-telemetry = { workspace = true }
+greentic-interfaces.workspace = true
+greentic-x-runtime = { workspace = true, optional = true }
+greentic-x-types = { workspace = true, optional = true }
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
-handlebars.workspace = true
+greentic-distributor-client.workspace = true
+greentic-deploy-spec.workspace = true
+greentic-session.workspace = true
+greentic-state.workspace = true
+greentic-secrets-lib.workspace = true
+greentic-config.workspace = true
+greentic-config-types.workspace = true
 hex.workspace = true
-hmac.workspace = true
 humantime.workspace = true
 indexmap.workspace = true
-jsonschema.workspace = true
 lru.workspace = true
-once_cell.workspace = true
 opentelemetry = "0.31"
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
-runner-core.workspace = true
 rustls.workspace = true
+runner-core.workspace = true
 serde = { workspace = true }
 serde_cbor.workspace = true
 serde_json.workspace = true
 serde_yaml_bw.workspace = true
-sha1.workspace = true
 sha2.workspace = true
-tempfile.workspace = true
 thiserror.workspace = true
-time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+time.workspace = true
 tracing.workspace = true
 url.workspace = true
 wasmparser.workspace = true
+zip.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hmac.workspace = true
+sha1.workspace = true
+blake3.workspace = true
+once_cell.workspace = true
+tempfile.workspace = true
+handlebars.workspace = true
+dashmap.workspace = true
+wasmtime-environ.workspace = true
+jsonschema.workspace = true
 
 # External stack components
 wasmtime = { workspace = true }
-wasmtime-environ.workspace = true
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 wasmtime-wasi-tls = { workspace = true }
-zip.workspace = true
+greentic-telemetry = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
-once_cell.workspace = true
-proptest.workspace = true
-semver.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
+once_cell.workspace = true
+semver.workspace = true
+proptest.workspace = true
+# C5.4 export regression: a real OTLP exporter to prove gt.* attribution reaches
+# exported spans. Versions match greentic-telemetry's OTel stack.
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 
 [[bench]]
 name = "perf"

@@ -1,147 +1,181 @@
 [workspace]
 members = [
     "crates/greentic-runner",
-    "crates/greentic-runner-desktop",
     "crates/greentic-runner-host",
-    "crates/runner-core",
+    "crates/greentic-runner-desktop",
     "crates/tests",
-    "tests/assets/component-v0-6-dummy",
+    "crates/runner-core",
     "tests/fixtures/packs/secrets_store_smoke/components",
+    "tests/assets/component-v0-6-dummy",
 ]
 resolver = "2"
 exclude = [
-    "tests/assets/provider-core-dummy",
-    "tests/fixtures/component-echo",
     "tests/fixtures/oauth-broker-component",
+    "tests/fixtures/component-echo",
     "tests/fixtures/runner-components",
     "tests/fixtures/wasi-p2-smoke",
+    "tests/assets/provider-core-dummy",
 ]
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "0.5.21"
+version = "1.1.0-dev.0"
 
 [workspace.dependencies]
-anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
+anyhow = "1"
 base64 = "0.22"
-blake3 = "1"
-bytes = "1"
-criterion = "0.8"
-cron = "0.16"
-dashmap = "6"
 futures = "0.3"
-greentic-config = ">=0.5.0-0, <0.6.0-0"
-greentic-config-types = ">=0.5.0-0, <0.6.0-0"
-greentic-flow = ">=0.5.0-0, <0.6.0-0"
-greentic-secrets-lib = ">=0.5.0-0, <0.6.0-0"
-greentic-session = ">=0.5.0-0, <0.6.0-0"
-greentic-state = ">=0.5.0-0, <0.6.0-0"
-greentic-telemetry = ">=0.5.0-0, <0.6.0-0"
-handlebars = "6"
+# Floor pinned to the version that introduced `greentic_flow::SLOT_SCHEMA_METADATA_KEY`,
+# consumed by the runner's `HostFlow::from(Flow)` conversion.
+greentic-flow = ">=1.1.0-dev.26799910683, <1.2.0-0"
+greentic-session = ">=1.1.0-dev, <1.2.0-0"
+greentic-state = ">=1.1.0-dev, <1.2.0-0"
+greentic-config = ">=1.1.0-dev, <1.2.0-0"
+greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
+greentic-deploy-spec = ">=0.1.0-0, <0.2.0-0"
+greentic-secrets-lib = ">=1.1.0-dev, <1.2.0-0"
 hex = "0.4"
-hmac = "0.13"
 humantime = "2.1"
-indexmap = "2"
-jsonschema = "0.46"
-lru = "0.18"
+lru = "0.16"
 once_cell = "1"
 parking_lot = "0.12"
-proptest = "1"
 rand = "0.10"
-semver = "1"
-serde_cbor = "0.11"
 serde_json = "1"
-serial_test = "3"
-sha1 = "0.11"
+serde_cbor = "0.11"
 sha2 = "0.11"
-tempfile = "3"
 thiserror = "2.0"
-tiny_http = "0.12"
 tokio-util = "0.7"
-toml = "1"
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+wasmparser = "0.246"
+cron = "0.16"
 url = "2"
+indexmap = "2"
+bytes = "1"
+criterion = "0.8"
+hmac = "0.13"
+sha1 = "0.11"
+blake3 = "1"
+semver = "1"
+tempfile = "3"
+tiny_http = "0.12"
+serial_test = "3"
+toml = "1"
+# Floor pinned to the C5.1 publish: `TelemetryCtx::kv()` must include
+# `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
+greentic-telemetry = ">=1.1.0-dev.26432434860, <1.2.0-0"
 walkdir = "2"
-wasmparser = "0.250"
 wasmtime-wasi-http = "45"
 wasmtime-wasi-tls = "45"
+jsonschema = "0.45"
+handlebars = "6"
+dashmap = "6"
+proptest = "1"
 
 [workspace.dependencies.axum]
 version = "0.8"
-features = ["macros", "json"]
+features = [
+    "macros",
+    "json",
+]
+
+[workspace.dependencies.clap]
+version = "4"
+features = [
+    "derive",
+]
 
 [workspace.dependencies.chrono]
 version = "0.4"
 default-features = false
-features = ["clock"]
-
-[workspace.dependencies.clap]
-version = "4"
-features = ["derive"]
+features = [
+    "clock",
+]
 
 [workspace.dependencies.ed25519-dalek]
 version = "2"
-features = ["pkcs8"]
+features = [
+    "pkcs8",
+]
 
-[workspace.dependencies.greentic-distributor-client]
-version = ">=0.5.0-0, <0.6.0-0"
-features = ["dist-client"]
-
-[workspace.dependencies.greentic-interfaces]
-version = ">=0.5.0-0, <0.6.0-0"
-default-features = false
-features = ["bindings-rust"]
-
-[workspace.dependencies.greentic-interfaces-guest]
-version = ">=0.5.0-0, <0.6.0-0"
-default-features = false
-
-[workspace.dependencies.greentic-interfaces-host]
-version = ">=0.5.0-0, <0.6.0-0"
-
-[workspace.dependencies.greentic-interfaces-wasmtime]
-version = ">=0.5.0-0, <0.6.0-0"
-
-[workspace.dependencies.greentic-oauth-host]
-version = ">=0.5.0-0, <0.6.0-0"
-
-[workspace.dependencies.greentic-oauth-sdk]
-version = ">=0.5.0-0, <0.6.0-0"
-
-[workspace.dependencies.greentic-runner-desktop]
-path = "crates/greentic-runner-desktop"
-version = ">=0.5.0-0, <0.6.0-0"
-
-[workspace.dependencies.greentic-runner-host]
-path = "crates/greentic-runner-host"
-version = ">=0.5.0-0, <0.6.0-0"
-
+# Floor pinned to the M1.4b-ii publish (PR #134): adds
+# `attr_keys::MESSAGING_ENDPOINT_ID` and the `tenant_ctx_to_telemetry` bridge
+# mapping it onto `TelemetryCtx::messaging_endpoint_id`. Earlier dev publishes
+# (incl. M1.1a) lack the const, so `tenant_ctx()` in
+# `engine::runtime::IngressEnvelope` would fail to compile.
 [workspace.dependencies.greentic-types]
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev.26640931069, <1.2.0-0"
 default-features = false
-features = ["std", "serde", "time", "otel-keys"]
+features = [
+    "std",
+    "serde",
+    "time",
+    "otel-keys",
+]
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = ">=0.5.0-0, <0.6.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 
-[workspace.dependencies.insta]
-version = "1"
-features = ["json"]
+[workspace.dependencies.greentic-distributor-client]
+version = ">=1.1.0-dev, <1.2.0-0"
+features = [
+    "dist-client",
+]
+
+[workspace.dependencies.greentic-interfaces]
+version = ">=1.1.0-dev, <1.2.0-0"
+default-features = false
+features = [
+    "bindings-rust",
+]
+
+[workspace.dependencies.greentic-interfaces-guest]
+version = ">=1.1.0-dev, <1.2.0-0"
+default-features = false
+
+[workspace.dependencies.greentic-interfaces-host]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.greentic-interfaces-wasmtime]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.greentic-x-runtime]
+version = "0.4.20"
+
+[workspace.dependencies.greentic-x-types]
+version = "0.4.20"
+
+[workspace.dependencies.greentic-oauth-sdk]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.greentic-oauth-host]
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.greentic-runner-host]
+path = "crates/greentic-runner-host"
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.greentic-runner-desktop]
+path = "crates/greentic-runner-desktop"
+version = ">=1.1.0-dev, <1.2.0-0"
+
+[workspace.dependencies.runner-core]
+path = "crates/runner-core"
+version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
 default-features = false
-features = ["json", "rustls", "blocking"]
-
-[workspace.dependencies.runner-core]
-path = "crates/runner-core"
-version = ">=0.5.0-0, <0.6.0-0"
+features = [
+    "json",
+    "rustls",
+    "blocking",
+]
 
 [workspace.dependencies.rustls]
 version = "0.23"
@@ -150,7 +184,9 @@ features = ["aws_lc_rs"]
 
 [workspace.dependencies.serde]
 version = "1.0"
-features = ["derive"]
+features = [
+    "derive",
+]
 
 [workspace.dependencies.serde_yaml_bw]
 package = "serde_yaml_gtc"
@@ -158,7 +194,10 @@ version = "2.5.2"
 
 [workspace.dependencies.time]
 version = "0.3"
-features = ["macros", "serde-well-known"]
+features = [
+    "macros",
+    "serde-well-known",
+]
 
 [workspace.dependencies.tokio]
 version = "1"
@@ -173,31 +212,48 @@ features = [
     "fs",
 ]
 
+[workspace.dependencies.wit-bindgen]
+version = "0.55"
+default-features = false
+
 [workspace.dependencies.uuid]
 version = "1"
-features = ["v4"]
-
-[workspace.dependencies.wasmtime]
-version = "45"
-default-features = false
-features = ["component-model", "cranelift", "runtime", "std"]
-
-[workspace.dependencies.wasmtime-environ]
-version = "45"
-
-[workspace.dependencies.wasmtime-wasi]
-version = "45"
-default-features = false
-features = ["p2"]
-
-[workspace.dependencies.wit-bindgen]
-version = "0.57"
-default-features = false
+features = [
+    "v4",
+]
 
 [workspace.dependencies.zip]
 version = "8"
 default-features = false
-features = ["deflate-flate2"]
+features = [
+    "deflate-flate2",
+]
+
+[workspace.dependencies.wasmtime]
+version = "45"
+default-features = false
+features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+]
+
+[workspace.dependencies.wasmtime-wasi]
+version = "45"
+default-features = false
+features = [
+    "p2",
+]
+
+[workspace.dependencies.wasmtime-environ]
+version = "45"
+
+[workspace.dependencies.insta]
+version = "1"
+features = [
+    "json",
+]
 
 [profile.release.package.echo-secret]
 opt-level = "z"

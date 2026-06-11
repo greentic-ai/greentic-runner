@@ -94,6 +94,7 @@ fn ingress_with_text(text: &str, session_hint: Option<String>) -> IngressEnvelop
         action: Some("messaging".into()),
         session_hint,
         provider: Some("teams".into()),
+        messaging_endpoint_id: None,
         channel: Some("chat".into()),
         conversation: Some("chat".into()),
         user: Some("user".into()),

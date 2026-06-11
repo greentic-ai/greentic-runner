@@ -54,6 +54,8 @@ fn host_gets_canonical_key() -> Result<()> {
         None,
         Some("component.alpha".to_string()),
         false,
+        None,
+        None,
     )?;
 
     let result = SecretsStoreHost::get(&mut host_state, "TELEGRAM_BOT_TOKEN".to_string());
@@ -88,6 +90,8 @@ fn host_direct_get_secret_uses_canonical_key() -> Result<()> {
         None,
         Some("component.alpha".to_string()),
         false,
+        None,
+        None,
     )?;
 
     let result = host_state.get_secret("OLLAMA_API_KEY");

@@ -129,6 +129,67 @@ impl ProviderRegistry {
             .collect()
     }
 
+    /// Resolve `(provider_id, provider_type)` to a binding, returning
+    /// `Ok(None)` when no provider runtime is registered for the type
+    /// (the "missing binding is OK" case for fan-out probes) and `Err`
+    /// only on hard failures (multi-binding collision, id/type mismatch,
+    /// instance-file load errors).
+    ///
+    /// Encapsulates the brittle "no provider runtime found for type"
+    /// string discrimination that fan-out callers (identify-instance,
+    /// describe-identify-instance) need to skip-vs-fail-closed.
+    pub fn try_resolve(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+    ) -> Result<Option<ProviderBinding>> {
+        match self.resolve(provider_id, provider_type) {
+            Ok(binding) => Ok(Some(binding)),
+            Err(err)
+                if err
+                    .to_string()
+                    .starts_with("no provider runtime found for type") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Like [`try_resolve`] but also returns the declared `ops` list from
+    /// the matching inline `provider-extension.v1` declaration.
+    ///
+    /// Used by Phase D revision-aware host APIs to gate component
+    /// invocations against the declared op allowlist before crossing the
+    /// WASM call boundary — a defense-in-depth check that ensures a
+    /// caller bug or misrouted URL can't run an undeclared op even if
+    /// the binding itself resolves.
+    ///
+    /// `ops` is sourced from the manifest decl whose `provider_type`
+    /// matches the resolved binding. For instance-file-loaded bindings
+    /// (where the registry has no inline decl for that exact
+    /// `provider_id`) the type-matched decl's ops are used; if no inline
+    /// decl exposes the type, the returned list is empty and any op
+    /// allowlist check will fail closed.
+    ///
+    /// [`try_resolve`]: ProviderRegistry::try_resolve
+    pub fn try_resolve_with_ops(
+        &self,
+        provider_id: Option<&str>,
+        provider_type: Option<&str>,
+    ) -> Result<Option<(ProviderBinding, Vec<String>)>> {
+        let Some(binding) = self.try_resolve(provider_id, provider_type)? else {
+            return Ok(None);
+        };
+        let ops = self
+            .inline
+            .iter()
+            .find(|decl| decl.provider_type == binding.provider_type)
+            .map(|decl| decl.ops.clone())
+            .unwrap_or_default();
+        Ok(Some((binding, ops)))
+    }
+
     pub fn resolve(
         &self,
         provider_id: Option<&str>,
@@ -139,17 +200,32 @@ impl ProviderRegistry {
         }
 
         if let Some(id) = provider_id {
-            if let Some(binding) = self.load_instance(id)? {
-                return Ok(binding);
-            }
-            if let Some(ext) = self
+            let binding = if let Some(binding) = self.load_instance(id)? {
+                binding
+            } else if let Some(ext) = self
                 .inline
                 .iter()
                 .find(|decl| decl.provider_id.as_deref() == Some(id))
             {
-                return Ok(binding_from_decl(ext, self.pack_ref.clone(), None));
+                binding_from_decl(ext, self.pack_ref.clone(), None)
+            } else {
+                bail!("provider_id `{id}` not found");
+            };
+
+            // Defense-in-depth: when caller supplies both, the resolved
+            // binding's provider_type must match the requested provider_type.
+            // Catches drift between an instance file's provider_type and the
+            // caller's expectation (e.g. an instance retyped from Teams→Slack
+            // while flows still target it by id).
+            if let Some(ty) = provider_type
+                && binding.provider_type != ty
+            {
+                bail!(
+                    "provider_id `{id}` resolved to provider_type `{}`, but caller requested `{ty}`",
+                    binding.provider_type
+                );
             }
-            bail!("provider_id `{id}` not found");
+            return Ok(binding);
         }
 
         let provider_type = provider_type.unwrap();
@@ -196,11 +272,26 @@ fn extract_inline_providers(manifest: &PackManifest) -> Result<Vec<ProviderExtDe
         return Ok(Vec::new());
     };
 
+    // Trust boundary: validate the wire payload before building any runtime
+    // registry from it. validate_basic enforces non-empty/unique provider_type,
+    // unique non-empty provider_id, no cross-namespace collisions, and
+    // populated runtime fields. Without this gate, OperatorRegistry::build
+    // (last-wins HashMap) and ProviderRegistry::resolve (first-wins Vec scan)
+    // can diverge on a pack with duplicate provider_ids, routing op metadata
+    // to one decl and the actual runtime invocation to another.
+    inline
+        .validate_basic()
+        .context("provider extension inline failed validation")?;
+
     let providers = inline
         .providers
         .iter()
         .map(|provider| ProviderExtDecl {
-            provider_id: Some(provider.provider_type.clone()),
+            // M1.1b hard-cutover: preserve the wire `provider_id` verbatim
+            // (Option<String>). Previously synthesized as `Some(provider_type)`,
+            // which conflated identity with type and made cross-namespace
+            // collisions ambiguous.
+            provider_id: provider.provider_id.clone(),
             provider_type: provider.provider_type.clone(),
             capabilities: provider.capabilities.clone(),
             ops: provider.ops.clone(),
@@ -247,5 +338,87 @@ fn binding_from_instance(instance: ProviderInstance) -> ProviderBinding {
         export: instance.export,
         world: instance.world,
         pack_ref: instance.pack_ref,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ext_decl(provider_type: &str, ops: &[&str]) -> ProviderExtDecl {
+        ProviderExtDecl {
+            provider_id: None,
+            provider_type: provider_type.to_string(),
+            capabilities: Vec::new(),
+            ops: ops.iter().map(|s| s.to_string()).collect(),
+            config_schema_ref: None,
+            state_schema_ref: None,
+            runtime: ProviderExtRuntime {
+                component_ref: format!("components/{provider_type}.wasm"),
+                export: "greentic:provider/schema-core@1.0.0".to_string(),
+                world: "greentic:provider/schema-core@1.0.0".to_string(),
+            },
+            docs_ref: None,
+        }
+    }
+
+    fn registry(inline: Vec<ProviderExtDecl>) -> ProviderRegistry {
+        let tenant = TenantCtx::new(
+            EnvId::from_str("local").expect("env"),
+            TenantId::from_str("demo").expect("tenant"),
+        );
+        ProviderRegistry {
+            pack_ref: Some("test-pack@0.0.0".to_string()),
+            inline,
+            state_store: None,
+            tenant,
+        }
+    }
+
+    #[test]
+    fn try_resolve_with_ops_returns_none_for_unknown_type() {
+        let reg = registry(vec![ext_decl("messaging.telegram.bot", &["ingest_http"])]);
+        let result = reg
+            .try_resolve_with_ops(None, Some("messaging.teams.bot"))
+            .expect("try_resolve_with_ops");
+        assert!(
+            result.is_none(),
+            "unknown provider_type must surface as Ok(None) so fan-out callers can fail-closed at the host layer"
+        );
+    }
+
+    #[test]
+    fn try_resolve_with_ops_returns_declared_ops_for_matching_type() {
+        let reg = registry(vec![ext_decl(
+            "messaging.telegram.bot",
+            &["ingest_http", "send_message"],
+        )]);
+        let (binding, ops) = reg
+            .try_resolve_with_ops(None, Some("messaging.telegram.bot"))
+            .expect("try_resolve_with_ops")
+            .expect("match");
+        assert_eq!(binding.provider_type, "messaging.telegram.bot");
+        assert_eq!(
+            ops,
+            vec!["ingest_http".to_string(), "send_message".to_string()],
+            "declared ops must round-trip in manifest order so the host's allowlist check matches the wire contract"
+        );
+    }
+
+    #[test]
+    fn try_resolve_with_ops_empty_ops_disables_allowlist_pass() {
+        // A decl with no declared ops produces an empty allowlist; the
+        // host's `declared_ops.contains(op)` check therefore fails closed
+        // for every op. This guards the "decl with missing/empty ops"
+        // edge case that would otherwise admit any op silently.
+        let reg = registry(vec![ext_decl("messaging.telegram.bot", &[])]);
+        let (_, ops) = reg
+            .try_resolve_with_ops(None, Some("messaging.telegram.bot"))
+            .expect("try_resolve_with_ops")
+            .expect("match");
+        assert!(
+            ops.is_empty(),
+            "empty declared ops must remain empty so the host-side allowlist rejects every op"
+        );
     }
 }

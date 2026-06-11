@@ -30,8 +30,11 @@ pub mod component_api;
 pub mod config;
 pub mod engine;
 pub mod fault;
+#[cfg(feature = "greentic-x-provider")]
+pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
+pub mod identify_hint;
 pub mod metrics;
 pub mod operator_metrics;
 pub mod operator_registry;
@@ -42,6 +45,7 @@ pub mod provider_core_only;
 pub mod routing;
 pub mod runner;
 pub mod runtime;
+pub mod runtime_refs;
 pub mod runtime_wasmtime;
 pub mod secrets;
 pub mod storage;
@@ -59,7 +63,7 @@ mod activity;
 mod host;
 pub mod oauth;
 
-pub use activity::{Activity, ActivityKind};
+pub use activity::{Activity, ActivityKind, WelcomeFlowHint};
 pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;
