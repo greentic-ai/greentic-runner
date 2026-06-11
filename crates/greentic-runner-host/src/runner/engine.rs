@@ -394,7 +394,10 @@ impl FlowEngine {
         let retry_config = ctx.retry_config;
         let original_input = input;
         let mut ctx = ctx;
-        async move {
+        let metric_tenant = ctx.tenant.to_string();
+        let metric_flow_id = ctx.flow_id.to_string();
+        let started = std::time::Instant::now();
+        let result = async move {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
@@ -445,7 +448,11 @@ impl FlowEngine {
             }
         }
         .instrument(span)
-        .await
+        .await;
+        let status = if result.is_ok() { "ok" } else { "err" };
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
+        result
     }
 
     pub async fn resume(
@@ -1278,9 +1285,24 @@ impl FlowEngine {
             maybe_fail(FaultPoint::BeforeToolCall, fault_ctx)
                 .map_err(|err| anyhow!(err.to_string()))?;
         }
-        let result = pack
+        let provider_metric_id = payload
+            .provider_id
+            .as_deref()
+            .or(payload.provider_type.as_deref())
+            .unwrap_or("unknown");
+        let invoke_started = std::time::Instant::now();
+        let invoke_result = pack
             .invoke_provider(&binding, exec_ctx, &op, input_json)
-            .await?;
+            .await;
+        let invoke_duration_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
+        crate::metrics::record_provider_invocation(
+            ctx.tenant,
+            provider_metric_id,
+            &op,
+            if invoke_result.is_ok() { "ok" } else { "err" },
+            invoke_duration_ms,
+        );
+        let result = invoke_result?;
         #[cfg(feature = "fault-injection")]
         {
             let fault_ctx = FaultContext {

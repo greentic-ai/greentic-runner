@@ -35,6 +35,7 @@ pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
 pub mod identify_hint;
+pub mod metrics;
 pub mod operator_metrics;
 pub mod operator_registry;
 pub mod pack;
