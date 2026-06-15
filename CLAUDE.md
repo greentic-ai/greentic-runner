@@ -48,6 +48,10 @@ crates/
                              #   ingress adapters, session/state, admin API
   greentic-runner-desktop/   # Desktop CLI integration
   runner-core/               # Pack resolution, signing verification, cache helpers
+  greentic-aw-runtime/       # Agentic-worker runtime (Plan-Act-Observe loop) +
+                             #   `serve` mode (NATS) + `aw-serve` test-mock bin
+  aw-event-bridge/           # NATS bridge: consumes greentic.agentic.request.v1,
+                             #   dispatches to AgentDispatchInvoker (agentic.call side)
   greentic-i18n/             # Compile-time i18n (embedded locale bundles)
   tests/                     # Integration test harness
 ```
@@ -99,6 +103,27 @@ node appends opaque `::thread=<t>::reply=<r>` markers to the correlation id (omi
 empty) and `RuntimeSessionResumer` parses them back into the synthesized `ReplyScope` so
 `FlowResumeStore::fetch` recomputes the same `scope_hash` as `save`. The sorx bridge echoes
 the correlation verbatim, so no sorx change is required.
+
+### Agentic dispatch serve mode (`agentic.call` runtime side)
+
+The `agentic.call` node uses runtime name `"agentic"` → subjects
+`greentic.agentic.request.v1` / `greentic.agentic.response.v1` (same contract,
+headers, and correlation-marker rules as `sorla.call`). The runtime-side consumer
+is the `aw-event-bridge` crate: it shares the `greentic-types::runtime_dispatch`
+contract directly (aw-runtime pins the same types lineage as the runner, so no
+mirroring) and exposes an `AgentDispatchInvoker` seam + `run_bridge`. The
+production invoker (`greentic_aw_runtime::serve::RuntimeAgentDispatchInvoker`)
+maps `target` → agent id, `input.user_text` → `AgentInput`, the correlation hint
+→ session id, and serialises `AgentOutput` to `{reply, trail, terminated_by}`
+(identical to the in-process `dw.agent` node output). Serve entries:
+`greentic_aw_runtime::serve::serve(nats_url, runtime)` and the host-level
+`agent_node::serve_agentic(nats_url, merged_agents)` (reuses the shared
+`build_agent_runtime` so in-process and serve paths build an identical runtime).
+For a credit-free live e2e there is an `aw-serve` bin (features `serve,test-mock`):
+`GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 cargo run -p greentic-aw-runtime
+--features serve,test-mock --bin aw-serve` (env `AW_SERVE_AGENT_ID`,
+`AW_SERVE_REPLY`). `dw.agent` (in-process) stays untouched — `agentic.call` is the
+out-of-process path.
 
 ### WASM Component Model
 

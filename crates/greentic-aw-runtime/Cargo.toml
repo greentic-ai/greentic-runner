@@ -9,10 +9,21 @@ publish     = false
 [features]
 default   = []
 test-mock = []
+# NATS serve mode (agentic.call out-of-process dispatch). Pulls in the event
+# bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
+# credit-free canned-reply runtime.
+serve     = ["dep:aw-event-bridge", "dep:async-nats"]
+
+[[bin]]
+name = "aw-serve"
+path = "src/bin/aw_serve.rs"
+required-features = ["serve", "test-mock"]
 
 [dependencies]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
+async-nats          = { version = "0.46", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
