@@ -1,22 +1,23 @@
-//! Broker-gated, cross-process live end-to-end test for the `sorla.call` await
-//! path. Unlike `tests/runtime_session_resumer.rs` (which resumes by calling the
-//! resumer directly with an in-test stub dispatcher), this test stands up the
-//! REAL runner side:
+//! Broker-gated, cross-process live end-to-end tests for the `sorla.call` and
+//! `operala.call` await paths. Unlike `tests/runtime_session_resumer.rs` (which
+//! resumes by calling the resumer directly with an in-test stub dispatcher),
+//! these tests stand up the REAL runner side:
 //!
 //!   * a real [`NatsDispatcher`] as the engine's remote dispatch handler, so the
-//!     `sorla.call` node publishes a real request onto real NATS, and
+//!     `sorla.call` / `operala.call` node publishes a real request onto real NATS,
+//!     and
 //!   * a real [`run_response_listener`] spawned over a
 //!     [`RuntimeSessionResumer`], so the runtime resumes itself when a response
-//!     arrives on `greentic.sorla.response.v1`.
+//!     arrives on `greentic.sorla.response.v1` / `greentic.operala.response.v1`.
 //!
-//! The test does NOT respond to the request itself. The response MUST come from
-//! an EXTERNAL bridge process (e.g. `sorx-event-bridge` or a small echo bridge)
-//! subscribed to `greentic.sorla.request.v1` that replies on
-//! `greentic.sorla.response.v1`, echoing the `Greentic-Correlation-Id` header.
+//! The tests do NOT respond to the request themselves. The response MUST come
+//! from an EXTERNAL bridge process subscribed to the appropriate request subject
+//! that replies on the corresponding response subject, echoing the
+//! `Greentic-Correlation-Id` header.
 //!
-//! What it proves end-to-end:
-//!   1. a real flow with a `sorla.call` await node PAUSES (a wait is saved in the
-//!      shared `FlowResumeStore`),
+//! What each test proves end-to-end:
+//!   1. a real flow with a remote-dispatch await node PAUSES (a wait is saved in
+//!      the shared `FlowResumeStore`),
 //!   2. the real `NatsDispatcher` published the request the external bridge
 //!      answers,
 //!   3. the real `run_response_listener` + `RuntimeSessionResumer` consume the
@@ -78,6 +79,13 @@ const RUNTIME_NAME: &str = "sorla";
 const SORX_FLOW_ID: &str = "sorla.live.sorx.flow";
 /// The real sorx endpoint exercised by the real-deployment variant.
 const SORX_TARGET_OPERATION: &str = "tenant.create";
+/// Runtime name for the operala dispatch path (subjects `greentic.operala.*`).
+const OPERALA_RUNTIME_NAME: &str = "operala";
+/// Flow id for the real-operax variant. Distinct from all sorla flow ids so its
+/// correlation key never collides with sorla tests on a shared broker.
+const OPERALA_FLOW_ID: &str = "operala.live.operax.flow";
+/// The operax endpoint exercised by the real-deployment variant.
+const OPERAX_TARGET_OPERATION: &str = "run";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -139,20 +147,24 @@ fn host_config(bindings_path: &Path) -> HostConfig {
 /// The await node routes forward to `done` so the resume has a node to advance
 /// into. Mirrors `build_sorla_wait_pack` in `tests/runtime_session_resumer.rs`.
 fn build_sorla_wait_pack(pack_path: &Path) -> Result<()> {
-    build_sorla_wait_pack_with(
+    build_remote_call_wait_pack(
         pack_path,
+        "sorla.call",
         SORLA_FLOW_ID,
         "echo.do",
         json!({ "await": true, "operation": "echo.do", "input": { "hi": 1 } }),
     )
 }
 
-/// Parameterized pack builder: a single-flow `.gtpack` whose `sorla.call` await
-/// node targets `target_operation` with the given `node_input`, routing forward
-/// to a terminal `emit.response`. Lets the echo variant and the real-sorx
-/// variant share one builder while differing only in target/input.
-fn build_sorla_wait_pack_with(
+/// Parameterized pack builder: a single-flow `.gtpack` whose remote-dispatch
+/// await node (identified by `component`, e.g. `"sorla.call"` or
+/// `"operala.call"`) targets `target_operation` with the given `node_input`,
+/// routing forward to a terminal `emit.response`. Lets the echo, real-sorx,
+/// and real-operax variants share one builder while differing only in
+/// component / target / input.
+fn build_remote_call_wait_pack(
     pack_path: &Path,
+    component: &str,
     flow_id: &str,
     target_operation: &str,
     node_input: serde_json::Value,
@@ -163,7 +175,7 @@ fn build_sorla_wait_pack_with(
         "start": "call",
         "nodes": {
             "call": {
-                "component": "sorla.call",
+                "component": component,
                 "operation": target_operation,
                 "input": node_input,
                 "routing": { "next": { "node_id": "done" } }
@@ -510,8 +522,14 @@ async fn sorla_call_resumes_via_real_sorx_deployment() {
             "active": "true"
         }
     });
-    build_sorla_wait_pack_with(&pack_path, SORX_FLOW_ID, SORX_TARGET_OPERATION, node_input)
-        .expect("build sorla await pack targeting the real sorx tenant.create endpoint");
+    build_remote_call_wait_pack(
+        &pack_path,
+        "sorla.call",
+        SORX_FLOW_ID,
+        SORX_TARGET_OPERATION,
+        node_input,
+    )
+    .expect("build sorla await pack targeting the real sorx tenant.create endpoint");
 
     let config = Arc::new(host_config(&bindings_path));
     let (runtime, session_store) =
@@ -597,5 +615,166 @@ async fn sorla_call_resumes_via_real_sorx_deployment() {
         "PASSED: sorla.call await flow dispatched to the REAL sorx tenant.create \
          endpoint, the observed response was ok and contained \"tenant-1\", \
          and the real listener + resumer consumed the saved wait"
+    );
+}
+
+/// LIVE CROSS-PROCESS TEST against a REAL `greentic-operax` deployment. A real
+/// `operala.call` await flow targets the operax `run` endpoint; an EXTERNAL real
+/// operax process (started separately, `gtc operax serve`) serves that endpoint
+/// and auto-runs its bridge on the same NATS, replying on
+/// `greentic.operala.response.v1`.
+///
+/// Two assertions, in order:
+///   1. REAL ENDPOINT EXECUTED — an OBSERVER subscribed to
+///      `greentic.operala.response.v1` BEFORE triggering receives a message
+///      whose body deserializes as a well-formed `RuntimeDispatchResponse`.
+///      Core pub/sub fan-out delivers the same message to BOTH the observer and
+///      the runner's listener, so observing does not steal the runner's copy.
+///   2. FLOW RESUMED — the saved wait in the shared `FlowResumeStore` is CONSUMED
+///      (fetch returns `None`), proving the real listener + resumer drove the
+///      resume to completion off the real reply.
+///
+/// Assertions are intentionally LOOSE on the response payload: operax's dry-run
+/// result on a minimal `{ transactions: [] }` input is not guaranteed to be `ok`,
+/// and the test does not assert any specific substring in the body. What matters
+/// is that a well-formed `RuntimeDispatchResponse` was received (the real operax
+/// processed the request) and the flow resumed (the runner consumed it).
+///
+/// Self-skips when `GREENTIC_TEST_NATS_URL` is unset (broker-free CI). Requires
+/// a live broker AND a real `greentic-operax` serving `run` with its bridge
+/// enabled on the same NATS:
+/// ```text
+/// GREENTIC_TEST_NATS_URL=nats://127.0.0.1:4222 \
+///   cargo test -p greentic-runner-host --test live_cross_process_e2e \
+///   operala_call_resumes_via_real_operax_deployment -- --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+async fn operala_call_resumes_via_real_operax_deployment() {
+    let Ok(url) = std::env::var("GREENTIC_TEST_NATS_URL") else {
+        eprintln!(
+            "skipping: GREENTIC_TEST_NATS_URL not set \
+             (needs NATS + a real greentic-operax serving `run` with the bridge enabled)"
+        );
+        return;
+    };
+
+    // 1. Connect three clients: dispatcher (engine), listener (runner resume),
+    //    and an independent OBSERVER that proves the real endpoint executed.
+    let dispatcher_client = async_nats::connect(&url)
+        .await
+        .expect("connect dispatcher client to NATS");
+    let listener_client = async_nats::connect(&url)
+        .await
+        .expect("connect listener client to NATS");
+    let observer_client = async_nats::connect(&url)
+        .await
+        .expect("connect observer client to NATS");
+
+    // 2. Subscribe the observer to the operala response subject BEFORE triggering
+    //    so the real operax reply is captured. Core pub/sub fan-out also delivers
+    //    the same message to the runner's listener without stealing it.
+    use futures::StreamExt as _;
+    let operala_response_subject = greentic_types::response_topic(OPERALA_RUNTIME_NAME);
+    let mut observer_subscription = observer_client
+        .subscribe(operala_response_subject)
+        .await
+        .expect("observer subscription to the operala response subject");
+
+    // 3. Build the real runtime + engine; wire the real NatsDispatcher. The flow's
+    //    operala.call node targets the REAL operax `run` endpoint with a minimal
+    //    input; operax may return ok=false on this input, which is acceptable.
+    let temp = TempDir::new().expect("temp dir");
+    let pack_path = temp.path().join("live-operax.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo").expect("write bindings");
+    let node_input = json!({
+        "await": true,
+        "operation": OPERAX_TARGET_OPERATION,
+        "input": { "transactions": [] }
+    });
+    build_remote_call_wait_pack(
+        &pack_path,
+        "operala.call",
+        OPERALA_FLOW_ID,
+        OPERAX_TARGET_OPERATION,
+        node_input,
+    )
+    .expect("build operala await pack targeting the real operax run endpoint");
+
+    let config = Arc::new(host_config(&bindings_path));
+    let (runtime, session_store) =
+        build_runtime_with_nats_dispatch(&pack_path, Arc::clone(&config), dispatcher_client)
+            .await
+            .expect("build runtime with NATS dispatcher");
+
+    // A sibling resume store over the SAME backing session store; used only to
+    // OBSERVE whether the saved wait is still present (Some) or consumed (None).
+    let observe_store = FlowResumeStore::new(Arc::clone(&session_store));
+
+    // 4. Build the production resumer over the runtime and spawn the REAL
+    //    response listener tuned to the `operala` runtime name, so the real
+    //    operax reply drives the resume.
+    let resumer: Arc<dyn SessionResumer> =
+        Arc::new(RuntimeSessionResumer::new(Arc::clone(&runtime)));
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_response_listener(listener_client, OPERALA_RUNTIME_NAME.to_owned(), resumer).await
+        {
+            eprintln!("operala response listener exited with error: {error}");
+        }
+    });
+
+    // Give the listener + observer subscriptions a moment to be acknowledged by
+    // the broker before the dispatcher publishes (so the response is not missed).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 5. Trigger the flow. The operala.call await node publishes a real request
+    //    to the real operax endpoint and the flow PAUSES awaiting the response.
+    let envelope = sorla_inbound_envelope_for(OPERALA_FLOW_ID);
+    runtime.handle(envelope.clone()).await.expect(
+        "turn 1 should run the operala.call node and pause awaiting the real operax response",
+    );
+
+    // 6. OBSERVE the real reply: await the observer for ~10s and deserialize it
+    //    as a RuntimeDispatchResponse (confirms the real operax processed the
+    //    request). We do NOT assert ok==true — operax dry-run on minimal input
+    //    may legitimately return ok=false.
+    let observed = tokio::time::timeout(Duration::from_secs(10), observer_subscription.next())
+        .await
+        .expect(
+            "timed out after 10s waiting for the real operax response on \
+             greentic.operala.response.v1 — a real greentic-operax serving `run` \
+             with its bridge enabled must be running on the same NATS",
+        )
+        .expect("observer subscription closed before a response arrived");
+
+    let _response: greentic_types::RuntimeDispatchResponse =
+        serde_json::from_slice(&observed.payload)
+            .expect("observed operala response body should deserialize as RuntimeDispatchResponse");
+
+    // 7. Poll until the saved wait is CONSUMED (fetch returns None), proving the
+    //    real listener + resumer resumed + completed the flow off the real reply.
+    let consumed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match observe_store.fetch(&envelope) {
+                Ok(None) => break,
+                Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
+                Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        consumed.is_ok(),
+        "timed out after 10s waiting for the saved wait to be consumed — \
+         the real operax reply must drive the runner's listener + resumer to resume the flow"
+    );
+
+    eprintln!(
+        "PASSED: operala.call await flow dispatched to the REAL operax run endpoint, \
+         a well-formed RuntimeDispatchResponse was observed on \
+         greentic.operala.response.v1, and the real listener + resumer consumed the \
+         saved wait"
     );
 }
