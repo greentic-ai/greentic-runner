@@ -2088,7 +2088,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#1fb6b13d6e2629ac65b894722cf280079263d229"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#dfec86cfde13ed9633189774a07444c1a40f3507"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -2103,7 +2103,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#1fb6b13d6e2629ac65b894722cf280079263d229"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#dfec86cfde13ed9633189774a07444c1a40f3507"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -2114,7 +2114,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#1fb6b13d6e2629ac65b894722cf280079263d229"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#dfec86cfde13ed9633189774a07444c1a40f3507"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -2125,8 +2125,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.21"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.21-research#c02ed78d9cd982769243ed539cc31f54a0c483b6"
+version = "1.2.22"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.22-research#a94f2edb026edc9fd391d6b8df3d9a64df756f48"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2149,11 +2149,12 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.2.7-research"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.7-research#c025e04f00a5d6d3a1f87c0fc61664d5fd54dbe7"
+version = "1.2.8-research"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.8-research#b0458a015f96642ee59e2649d00bfcbb882ee0f5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek",
  "jsonschema 0.30.0",
  "semver",
@@ -4396,7 +4397,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -7310,7 +7311,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
