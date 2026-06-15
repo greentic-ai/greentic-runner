@@ -255,6 +255,7 @@ fn flow_ctx<'a>(
         action: Some("messaging"),
         session_id: Some(session_id),
         provider_id: Some("provider"),
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,

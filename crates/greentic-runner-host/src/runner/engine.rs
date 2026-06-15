@@ -519,6 +519,7 @@ impl FlowEngine {
                 action: ctx.action,
                 session_id: ctx.session_id,
                 provider_id: ctx.provider_id,
+                reply_scope: ctx.reply_scope,
                 retry_config: ctx.retry_config,
                 attempt: ctx.attempt,
                 observer: ctx.observer,
@@ -871,7 +872,27 @@ impl FlowEngine {
         // or has accreted a marker.
         let raw_hint = ctx.session_id.unwrap_or_default();
         let bare_hint = raw_hint.split("::").next().unwrap_or_default();
-        let correlation_id = format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
+        // The store key (`FlowResumeStore::save`) hashes the inbound reply
+        // scope's `conversation`/`thread`/`reply_to`. The bare canonical hint
+        // only encodes `conversation`, so a wait saved against a non-empty
+        // `thread`/`reply_to` would be un-keyable on resume. Append OPAQUE
+        // `::thread=`/`::reply=` markers so `RuntimeSessionResumer` can rebuild
+        // the EXACT reply scope and recompute the same `scope_hash`. The sorx
+        // bridge echoes the correlation verbatim, so this needs no sorx change.
+        // Markers are omitted when their value is empty (back-compat with the
+        // no-thread case).
+        let mut correlation_id =
+            format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
+        if let Some(scope) = ctx.reply_scope {
+            if let Some(thread) = scope.thread.as_deref().filter(|value| !value.is_empty()) {
+                correlation_id.push_str("::thread=");
+                correlation_id.push_str(thread);
+            }
+            if let Some(reply_to) = scope.reply_to.as_deref().filter(|value| !value.is_empty()) {
+                correlation_id.push_str("::reply=");
+                correlation_id.push_str(reply_to);
+            }
+        }
         let mode = if await_mode {
             greentic_types::DispatchMode::Await
         } else {
@@ -1114,6 +1135,7 @@ impl FlowEngine {
             action: Some(action),
             session_id: ctx.session_id,
             provider_id: ctx.provider_id,
+            reply_scope: ctx.reply_scope,
             retry_config: ctx.retry_config,
             attempt: ctx.attempt,
             observer: ctx.observer,
@@ -2969,6 +2991,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -3034,6 +3057,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -3175,6 +3199,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3319,6 +3344,7 @@ mod tests {
             action: None,
             session_id: Some("sess-1"),
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3454,6 +3480,7 @@ mod tests {
             action: None,
             session_id: Some("sess-1"),
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3567,6 +3594,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3726,6 +3754,14 @@ pub struct FlowContext<'a> {
     pub action: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
+    /// Reply scope of the originating inbound activity, when known.
+    ///
+    /// Carried so async-dispatch nodes (`sorla.call await`) can encode the
+    /// inbound `thread`/`reply_to` into the published correlation id. Without
+    /// it, a wait saved against a threaded scope cannot be re-keyed on resume
+    /// (the resumer would synthesize an empty thread/reply_to and miss the
+    /// saved wait). See `execute_sorla_call` and `RuntimeSessionResumer`.
+    pub reply_scope: Option<&'a greentic_types::ReplyScope>,
     pub retry_config: RetryConfig,
     pub attempt: u32,
     pub observer: Option<&'a dyn ExecutionObserver>,

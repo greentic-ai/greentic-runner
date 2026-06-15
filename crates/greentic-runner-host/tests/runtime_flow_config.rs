@@ -239,6 +239,7 @@ fn runtime_extension_preserves_component_config_for_direct_component_nodes() -> 
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,

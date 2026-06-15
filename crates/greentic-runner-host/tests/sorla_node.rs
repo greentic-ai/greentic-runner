@@ -283,6 +283,7 @@ fn flow_ctx<'a>(config: &'a HostConfig, pack_id: &'a str) -> FlowContext<'a> {
         action: Some("messaging"),
         session_id: Some(SESSION_HINT),
         provider_id: Some("provider"),
+        reply_scope: None,
         retry_config: config.retry.clone().into(),
         attempt: 1,
         observer: None,

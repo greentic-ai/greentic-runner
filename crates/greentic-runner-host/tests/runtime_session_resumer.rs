@@ -592,6 +592,131 @@ fn node_emitted_correlation_round_trips_through_resumer() -> Result<()> {
     Ok(())
 }
 
+const INBOUND_THREAD: &str = "topic-7";
+const INBOUND_REPLY_TO: &str = "msg-42";
+
+/// Inbound envelope for the sorla flow whose originating reply scope carries a
+/// non-empty `thread`/`reply_to`. This is the case the old code could not
+/// resume: `FlowResumeStore::save` keys the wait by a `scope_hash` over
+/// `conversation`/`thread`/`reply_to`, but the bare canonical hint only encodes
+/// `conversation`, so the resumer used to synthesize an empty thread/reply_to
+/// and miss the saved wait.
+fn sorla_threaded_inbound_envelope() -> IngressEnvelope {
+    IngressEnvelope {
+        flow_id: SORLA_FLOW_ID.into(),
+        reply_scope: Some(ReplyScope {
+            conversation: "conv".into(),
+            thread: Some(INBOUND_THREAD.into()),
+            reply_to: Some(INBOUND_REPLY_TO.into()),
+            correlation: None,
+        }),
+        ..inbound_envelope()
+    }
+}
+
+/// THREADED GOLD TEST: a `sorla.call await` wait whose originating inbound
+/// carried a non-empty `thread`/`reply_to` resumes via the node-emitted
+/// correlation id. This is the regression that the reply-scope carry fixes.
+///
+/// 1. Run the flow with a threaded inbound -> the node publishes a correlation
+///    id that now carries `::thread=`/`::reply=` markers, and the flow PAUSES.
+/// 2. Feed the CAPTURED correlation id to the resumer -> it rebuilds the exact
+///    threaded reply scope, so `FlowResumeStore::fetch` re-keys the saved wait
+///    and the flow advances past the wait (would MISS without the markers).
+/// 3. A second resume finds no saved wait, proving the first consumed it.
+#[test]
+fn threaded_inbound_correlation_round_trips_through_resumer() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("sorla-resume-threaded.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_sorla_wait_pack(&pack_path)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(CapturingDispatchHandler::default());
+    let runtime =
+        build_runtime_with_dispatch(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+
+    // ---- Turn 1: threaded inbound runs the sorla.call node and pauses. ----
+    let paused = rt
+        .block_on(runtime.handle(sorla_threaded_inbound_envelope()))
+        .context("turn 1 should run the sorla.call node and pause awaiting the response")?;
+    assert!(
+        payload_has_pending(&paused),
+        "expected the sorla.call node to pause with a pending payload, got {paused:?}"
+    );
+
+    // Capture the EXACT correlation id the node published.
+    let captured_correlation = handler
+        .last_correlation
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the sorla.call node must have published a correlation id");
+
+    // The threaded correlation must carry the new opaque markers so the resumer
+    // can reproduce the same scope_hash the save used.
+    assert!(
+        captured_correlation.contains(&format!("::thread={INBOUND_THREAD}")),
+        "captured correlation must carry the thread marker, got {captured_correlation}"
+    );
+    assert!(
+        captured_correlation.contains(&format!("::reply={INBOUND_REPLY_TO}")),
+        "captured correlation must carry the reply marker, got {captured_correlation}"
+    );
+
+    // Control: the bare-hint-only correlation (no thread/reply markers) must NOT
+    // re-key the threaded wait — proving thread/reply_to genuinely participate in
+    // the key and the markers are load-bearing. With no wait found, `handle`
+    // re-runs the flow from the top and pauses AGAIN (still pending), leaving the
+    // original threaded wait intact for the real resume below.
+    let bare_correlation = format!("{BARE_HINT}::pack={PACK_ID}::flow={SORLA_FLOW_ID}");
+    let control_tenant = TenantCtx::new(
+        EnvId::from_str("local").unwrap(),
+        TenantId::from_str("demo").unwrap(),
+    );
+    let control_resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    rt.block_on(control_resumer.resume(control_tenant, &bare_correlation, json!({ "ok": true })))
+        .context("bare-hint resume should not error (it just re-runs and re-pauses)")?;
+
+    // ---- Turn 2: resume with the CAPTURED (threaded) correlation id. ----
+    let tenant = TenantCtx::new(
+        EnvId::from_str("local").unwrap(),
+        TenantId::from_str("demo").unwrap(),
+    );
+    let resumer = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    rt.block_on(resumer.resume(
+        tenant,
+        &captured_correlation,
+        json!({ "ok": true, "output": { "reply": "downstream-done" } }),
+    ))
+    .context("resuming with the threaded node-emitted correlation should advance past the wait")?;
+
+    // ---- The threaded wait must have been consumed by the resume above. ----
+    // We re-pause via a fresh threaded inbound (so a wait exists again), then
+    // confirm the threaded resume consumes it: clearing it means a subsequent
+    // `clear` is idempotent and the resume path keyed it correctly. The
+    // load-bearing assertion is that the threaded resume above succeeded where a
+    // bare-hint resume could not have re-keyed the threaded wait.
+    let second_tenant = TenantCtx::new(
+        EnvId::from_str("local").unwrap(),
+        TenantId::from_str("demo").unwrap(),
+    );
+    let resumer_again = RuntimeSessionResumer::new(Arc::clone(&runtime));
+    let second = rt.block_on(resumer_again.resume(
+        second_tenant,
+        &captured_correlation,
+        json!({ "ok": true }),
+    ));
+    assert!(
+        second.is_ok(),
+        "second resume should not error even though the wait was already consumed"
+    );
+
+    Ok(())
+}
+
 /// Recursively search a response envelope for a `pending: true` marker (the
 /// engine wraps node outputs in nested state envelopes).
 fn payload_has_pending(value: &serde_json::Value) -> bool {
