@@ -434,6 +434,7 @@ fn run_flow(
         attempt: 1,
         observer,
         mocks: None,
+        reply_scope: None,
     };
 
     let execution = runtime.block_on(engine.execute(ctx, Value::Null));

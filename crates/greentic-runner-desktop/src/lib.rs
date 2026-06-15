@@ -457,6 +457,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         attempt: 1,
         observer: Some(recorder_ref),
         mocks: Some(mock_ref),
+        reply_scope: None,
     };
 
     // Resume support: if the caller wired up a session_state_dir AND ctx
