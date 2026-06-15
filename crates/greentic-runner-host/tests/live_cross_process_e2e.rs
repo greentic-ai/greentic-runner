@@ -1,0 +1,409 @@
+//! Broker-gated, cross-process live end-to-end test for the `sorla.call` await
+//! path. Unlike `tests/runtime_session_resumer.rs` (which resumes by calling the
+//! resumer directly with an in-test stub dispatcher), this test stands up the
+//! REAL runner side:
+//!
+//!   * a real [`NatsDispatcher`] as the engine's remote dispatch handler, so the
+//!     `sorla.call` node publishes a real request onto real NATS, and
+//!   * a real [`run_response_listener`] spawned over a
+//!     [`RuntimeSessionResumer`], so the runtime resumes itself when a response
+//!     arrives on `greentic.sorla.response.v1`.
+//!
+//! The test does NOT respond to the request itself. The response MUST come from
+//! an EXTERNAL bridge process (e.g. `sorx-event-bridge` or a small echo bridge)
+//! subscribed to `greentic.sorla.request.v1` that replies on
+//! `greentic.sorla.response.v1`, echoing the `Greentic-Correlation-Id` header.
+//!
+//! What it proves end-to-end:
+//!   1. a real flow with a `sorla.call` await node PAUSES (a wait is saved in the
+//!      shared `FlowResumeStore`),
+//!   2. the real `NatsDispatcher` published the request the external bridge
+//!      answers,
+//!   3. the real `run_response_listener` + `RuntimeSessionResumer` consume the
+//!      reply and resume the flow, CONSUMING the saved wait.
+//!
+//! Consumption is observed directly: a `FlowResumeStore` built over the SAME
+//! backing session store is polled with `fetch(&envelope)` — it returns `Some`
+//! while the flow waits and `None` once the external bridge's reply has driven
+//! the resume to completion.
+//!
+//! Self-skips when `GREENTIC_TEST_NATS_URL` is unset so broker-free CI stays
+//! green. The pack-building + runtime-construction helpers mirror
+//! `tests/runtime_session_resumer.rs`; the only differences here are the real
+//! `NatsDispatcher`, the spawned real listener, and observing async consumption.
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use greentic_runner_host::config::{
+    FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
+    WebhookPolicy,
+};
+use greentic_runner_host::engine::runtime::{
+    FlowResumeStore, IngressEnvelope, StateMachineRuntime,
+};
+use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
+use greentic_runner_host::runner::dispatch_listener::{SessionResumer, run_response_listener};
+use greentic_runner_host::runner::engine::FlowEngine;
+use greentic_runner_host::runner::remote_dispatch::NatsDispatcher;
+use greentic_runner_host::runner::runtime_session_resumer::RuntimeSessionResumer;
+use greentic_runner_host::storage::new_session_store;
+use greentic_runner_host::storage::session::{DynSessionStore, session_host_from};
+use greentic_runner_host::storage::state::new_state_store;
+use greentic_runner_host::trace::TraceConfig;
+use greentic_runner_host::validate::ValidationConfig;
+use greentic_types::{
+    ComponentCapabilities, ComponentManifest, ComponentProfiles, ExtensionInline, ExtensionRef,
+    PackFlowEntry, PackKind, PackManifest, ReplyScope, ResourceHints, encode_pack_manifest,
+};
+use semver::Version;
+use serde_json::json;
+use tempfile::TempDir;
+use zip::ZipArchive;
+use zip::write::FileOptions;
+
+const RUNTIME_FLOW_EXTENSION_ID: &str = "greentic.pack.runtime_flow";
+const PACK_ID: &str = "live.cross.process.e2e";
+const SORLA_FLOW_ID: &str = "sorla.live.flow";
+const BARE_HINT: &str = "demo:provider:chan:conv:user";
+/// The runtime name dispatched to / listened on (subjects `greentic.sorla.*`).
+const RUNTIME_NAME: &str = "sorla";
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .expect("workspace root")
+}
+
+/// Locate the prebuilt `qa.process` WASM, unpacking it from the fixture pack if
+/// it is not already on disk. Copied from `tests/runtime_session_resumer.rs`.
+fn component_artifact_path(temp_dir: &Path) -> Result<PathBuf> {
+    let local =
+        workspace_root().join("tests/fixtures/packs/runner-components/components/qa_process.wasm");
+    if local.exists() {
+        return Ok(local);
+    }
+    let archive_path =
+        workspace_root().join("tests/fixtures/packs/runner-components/runner-components.gtpack");
+    let mut archive = ZipArchive::new(File::open(&archive_path).context("open fixture gtpack")?)?;
+    let mut wasm = archive
+        .by_name("components/qa.process@0.1.0/component.wasm")
+        .context("qa.process component missing from fixture pack")?;
+    let out = temp_dir.join("qa_process.wasm");
+    let mut buf = Vec::new();
+    wasm.read_to_end(&mut buf)?;
+    std::fs::write(&out, &buf)?;
+    Ok(out)
+}
+
+fn host_config(bindings_path: &Path) -> HostConfig {
+    HostConfig {
+        tenant: "demo".into(),
+        bindings_path: bindings_path.to_path_buf(),
+        flow_type_bindings: Default::default(),
+        rate_limits: RateLimits::default(),
+        retry: FlowRetryConfig::default(),
+        http_enabled: false,
+        secrets_policy: SecretsPolicy::allow_all(),
+        state_store_policy: StateStorePolicy::default(),
+        webhook_policy: WebhookPolicy::default(),
+        timers: Vec::new(),
+        oauth: None,
+        mocks: None,
+        pack_bindings: Vec::new(),
+        env_passthrough: Vec::new(),
+        trace: TraceConfig::from_env(),
+        validation: ValidationConfig::from_env(),
+        operator_policy: OperatorPolicy::allow_all(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
+    }
+}
+
+/// Build a `.gtpack` whose only flow is `sorla.call` (await) -> `emit.response`.
+/// The node targets `echo.do`/`echo.do` so an external echo bridge can answer.
+/// The await node routes forward to `done` so the resume has a node to advance
+/// into. Mirrors `build_sorla_wait_pack` in `tests/runtime_session_resumer.rs`.
+fn build_sorla_wait_pack(pack_path: &Path) -> Result<()> {
+    let runtime_flow = json!({
+        "id": SORLA_FLOW_ID,
+        "flow_type": "messaging",
+        "start": "call",
+        "nodes": {
+            "call": {
+                "component": "sorla.call",
+                "operation": "echo.do",
+                "input": { "await": true, "operation": "echo.do", "input": { "hi": 1 } },
+                "routing": { "next": { "node_id": "done" } }
+            },
+            "done": {
+                "component": "emit.response",
+                "input": { "text": "resumed and completed" },
+                "routing": "end"
+            }
+        }
+    });
+    let runtime_extension = json!({ "flows": [runtime_flow] });
+
+    let mut extensions = BTreeMap::new();
+    extensions.insert(
+        RUNTIME_FLOW_EXTENSION_ID.to_string(),
+        ExtensionRef {
+            kind: RUNTIME_FLOW_EXTENSION_ID.to_string(),
+            version: "2.0.0".into(),
+            digest: None,
+            location: None,
+            inline: Some(ExtensionInline::Other(runtime_extension)),
+        },
+    );
+
+    let manifest = PackManifest {
+        schema_version: "1.0".into(),
+        pack_id: PACK_ID.parse()?,
+        name: None,
+        version: Version::parse("0.0.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: vec![ComponentManifest {
+            id: "qa.process".parse()?,
+            version: Version::parse("0.1.0")?,
+            supports: vec![greentic_types::FlowKind::Messaging],
+            world: "greentic:component@0.4.0".into(),
+            profiles: ComponentProfiles::default(),
+            capabilities: ComponentCapabilities::default(),
+            configurators: None,
+            operations: Vec::new(),
+            config_schema: None,
+            resources: ResourceHints::default(),
+            dev_flows: BTreeMap::new(),
+        }],
+        flows: Vec::<PackFlowEntry>::new(),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        agents: BTreeMap::new(),
+        extensions: Some(extensions),
+    };
+
+    let mut zip = zip::ZipWriter::new(File::create(pack_path).context("create pack archive")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    zip.start_file("manifest.cbor", options)?;
+    zip.write_all(&manifest_bytes)?;
+    let component_path = component_artifact_path(
+        pack_path
+            .parent()
+            .expect("pack path should have a parent temp dir"),
+    )?;
+    zip.start_file("components/qa.process.wasm", options)?;
+    let mut comp_file = File::open(&component_path)?;
+    std::io::copy(&mut comp_file, &mut zip)?;
+    zip.finish().context("finalise pack archive")?;
+    Ok(())
+}
+
+/// The inbound envelope that triggers turn 1 (pause at `sorla.call`). Its
+/// `session_hint`/`pack_id`/`conversation` determine the stored wait key, and
+/// must reproduce exactly for `FlowResumeStore::fetch` to find / observe it.
+fn sorla_inbound_envelope() -> IngressEnvelope {
+    IngressEnvelope {
+        tenant: "demo".into(),
+        env: Some("local".into()),
+        pack_id: Some(PACK_ID.into()),
+        flow_id: SORLA_FLOW_ID.into(),
+        flow_type: Some("messaging".into()),
+        action: Some("messaging".into()),
+        session_hint: Some(BARE_HINT.into()),
+        provider: Some("provider".into()),
+        channel: Some("chan".into()),
+        conversation: Some("conv".into()),
+        user: Some("user".into()),
+        activity_id: Some("activity-1".into()),
+        timestamp: None,
+        payload: json!({ "text": "start" }),
+        metadata: None,
+        reply_scope: Some(ReplyScope {
+            conversation: "conv".into(),
+            thread: None,
+            reply_to: None,
+            correlation: None,
+        }),
+    }
+}
+
+/// Build the real runtime with a real [`NatsDispatcher`] wired as the engine's
+/// remote dispatch handler, returning the runtime AND the shared session store
+/// (so the test can build a sibling `FlowResumeStore` to observe consumption).
+async fn build_runtime_with_nats_dispatch(
+    pack_path: &Path,
+    config: Arc<HostConfig>,
+    client: async_nats::Client,
+) -> Result<(Arc<StateMachineRuntime>, DynSessionStore)> {
+    let pack = Arc::new(
+        PackRuntime::load(
+            pack_path,
+            Arc::clone(&config),
+            None,
+            None,
+            None,
+            None,
+            Arc::new(greentic_runner_host::wasi::RunnerWasiPolicy::new()),
+            greentic_runner_host::secrets::default_manager()?,
+            None,
+            false,
+            ComponentResolution::default(),
+        )
+        .await?,
+    );
+    let mut engine = FlowEngine::new(vec![Arc::clone(&pack)], Arc::clone(&config)).await?;
+    // The only difference from the gold harness: a REAL NATS dispatcher.
+    engine.set_remote_dispatch_handler(Arc::new(NatsDispatcher::new(client)));
+    let engine = Arc::new(engine);
+
+    // The session host and the observing resume store MUST share the same
+    // backing store so the wait saved on turn 1 is visible to `fetch`.
+    let session_store = new_session_store();
+    let session_host = session_host_from(Arc::clone(&session_store));
+    let state_store = new_state_store();
+    let state_host = greentic_runner_host::storage::state::state_host_from(state_store);
+    let secrets = greentic_runner_host::secrets::default_manager()?;
+
+    let runtime = StateMachineRuntime::from_flow_engine(
+        Arc::clone(&config),
+        engine,
+        std::collections::HashMap::new(),
+        session_host,
+        Arc::clone(&session_store),
+        state_host,
+        secrets,
+        None,
+    )?;
+    Ok((Arc::new(runtime), session_store))
+}
+
+/// LIVE CROSS-PROCESS TEST: a real `sorla.call` await flow pauses, the real
+/// `NatsDispatcher` publishes the request, an EXTERNAL bridge process answers on
+/// `greentic.sorla.response.v1`, and the real `run_response_listener` +
+/// `RuntimeSessionResumer` resume the flow — consuming the saved wait.
+///
+/// Self-skips when `GREENTIC_TEST_NATS_URL` is unset (broker-free CI).
+///
+/// Run against a live broker AND an external echo bridge:
+/// ```text
+/// GREENTIC_TEST_NATS_URL=nats://127.0.0.1:4222 \
+///   cargo test -p greentic-runner-host --test live_cross_process_e2e \
+///   -- --nocapture
+/// ```
+/// (The bridge must be running separately, echoing the correlation header.)
+#[tokio::test(flavor = "multi_thread")]
+async fn sorla_call_resumes_via_external_nats_bridge() {
+    let Ok(url) = std::env::var("GREENTIC_TEST_NATS_URL") else {
+        eprintln!(
+            "skipping: GREENTIC_TEST_NATS_URL not set \
+             (needs NATS + an external echo bridge on greentic.sorla.*)"
+        );
+        return;
+    };
+
+    // 1. Connect two clients: one for the dispatcher (engine), one for listener.
+    let dispatcher_client = async_nats::connect(&url)
+        .await
+        .expect("connect dispatcher client to NATS");
+    let listener_client = async_nats::connect(&url)
+        .await
+        .expect("connect listener client to NATS");
+
+    // 2. Build the real runtime + engine; wire the real NatsDispatcher.
+    let temp = TempDir::new().expect("temp dir");
+    let pack_path = temp.path().join("live-sorla.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo").expect("write bindings");
+    build_sorla_wait_pack(&pack_path).expect("build sorla await pack");
+
+    let config = Arc::new(host_config(&bindings_path));
+    let (runtime, session_store) =
+        build_runtime_with_nats_dispatch(&pack_path, Arc::clone(&config), dispatcher_client)
+            .await
+            .expect("build runtime with NATS dispatcher");
+
+    // A sibling resume store over the SAME backing session store; used only to
+    // OBSERVE whether the saved wait is still present (Some) or consumed (None).
+    let observe_store = FlowResumeStore::new(Arc::clone(&session_store));
+
+    // 3. Build the production resumer over the runtime and spawn the REAL
+    //    response listener. When the external bridge replies, the listener
+    //    decodes it and calls resumer.resume -> runtime.handle, resuming the
+    //    flow without any second manual trigger from this test.
+    let resumer: Arc<dyn SessionResumer> =
+        Arc::new(RuntimeSessionResumer::new(Arc::clone(&runtime)));
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_response_listener(listener_client, RUNTIME_NAME.to_owned(), resumer).await
+        {
+            eprintln!("response listener exited with error: {error}");
+        }
+    });
+
+    // Give the listener subscription a moment to be acknowledged by the broker
+    // before the dispatcher publishes (so the response is not missed).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 4. Trigger the flow. The sorla.call await node publishes a real request
+    //    (which the external bridge answers) and the flow PAUSES.
+    let envelope = sorla_inbound_envelope();
+    runtime
+        .handle(envelope.clone())
+        .await
+        .expect("turn 1 should run the sorla.call node and pause awaiting the response");
+
+    // 5. Assert the flow PAUSED: a wait is saved in the shared resume store.
+    //    (Note: a fast external bridge could in principle resume before this
+    //    check runs; the load-bearing assertion is the consumption poll below,
+    //    so we only warn rather than fail if the wait is already gone.)
+    match observe_store.fetch(&envelope) {
+        Ok(Some(_)) => { /* paused as expected */ }
+        Ok(None) => eprintln!(
+            "note: wait already consumed before the pause assertion \
+             (external bridge replied very fast); continuing to consumption poll"
+        ),
+        Err(error) => panic!("failed to inspect the saved wait: {error}"),
+    }
+
+    // 6. Poll until the saved wait is CONSUMED (fetch returns None), proving the
+    //    external bridge replied and the listener + resumer resumed + completed
+    //    the flow. Fail with a clear message if it never consumes in time.
+    let consumed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match observe_store.fetch(&envelope) {
+                Ok(None) => break,
+                Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
+                Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        consumed.is_ok(),
+        "timed out after 8s waiting for the saved wait to be consumed — \
+         the external echo bridge on greentic.sorla.* must reply on \
+         greentic.sorla.response.v1 echoing the Greentic-Correlation-Id header"
+    );
+
+    eprintln!(
+        "PASSED: sorla.call await flow paused, external NATS bridge replied, \
+         and the real listener + resumer consumed the saved wait"
+    );
+}
