@@ -73,6 +73,11 @@ const SORLA_FLOW_ID: &str = "sorla.live.flow";
 const BARE_HINT: &str = "demo:provider:chan:conv:user";
 /// The runtime name dispatched to / listened on (subjects `greentic.sorla.*`).
 const RUNTIME_NAME: &str = "sorla";
+/// Flow id for the real-sorx variant (distinct correlation key from the echo
+/// variant so the two tests never collide on a shared broker).
+const SORX_FLOW_ID: &str = "sorla.live.sorx.flow";
+/// The real sorx endpoint exercised by the real-deployment variant.
+const SORX_TARGET_OPERATION: &str = "tenant.create";
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -134,15 +139,33 @@ fn host_config(bindings_path: &Path) -> HostConfig {
 /// The await node routes forward to `done` so the resume has a node to advance
 /// into. Mirrors `build_sorla_wait_pack` in `tests/runtime_session_resumer.rs`.
 fn build_sorla_wait_pack(pack_path: &Path) -> Result<()> {
+    build_sorla_wait_pack_with(
+        pack_path,
+        SORLA_FLOW_ID,
+        "echo.do",
+        json!({ "await": true, "operation": "echo.do", "input": { "hi": 1 } }),
+    )
+}
+
+/// Parameterized pack builder: a single-flow `.gtpack` whose `sorla.call` await
+/// node targets `target_operation` with the given `node_input`, routing forward
+/// to a terminal `emit.response`. Lets the echo variant and the real-sorx
+/// variant share one builder while differing only in target/input.
+fn build_sorla_wait_pack_with(
+    pack_path: &Path,
+    flow_id: &str,
+    target_operation: &str,
+    node_input: serde_json::Value,
+) -> Result<()> {
     let runtime_flow = json!({
-        "id": SORLA_FLOW_ID,
+        "id": flow_id,
         "flow_type": "messaging",
         "start": "call",
         "nodes": {
             "call": {
                 "component": "sorla.call",
-                "operation": "echo.do",
-                "input": { "await": true, "operation": "echo.do", "input": { "hi": 1 } },
+                "operation": target_operation,
+                "input": node_input,
                 "routing": { "next": { "node_id": "done" } }
             },
             "done": {
@@ -218,11 +241,17 @@ fn build_sorla_wait_pack(pack_path: &Path) -> Result<()> {
 /// `session_hint`/`pack_id`/`conversation` determine the stored wait key, and
 /// must reproduce exactly for `FlowResumeStore::fetch` to find / observe it.
 fn sorla_inbound_envelope() -> IngressEnvelope {
+    sorla_inbound_envelope_for(SORLA_FLOW_ID)
+}
+
+/// As [`sorla_inbound_envelope`] but for an arbitrary `flow_id`, so the real-sorx
+/// variant triggers its own flow with its own (distinct) correlation key.
+fn sorla_inbound_envelope_for(flow_id: &str) -> IngressEnvelope {
     IngressEnvelope {
         tenant: "demo".into(),
         env: Some("local".into()),
         pack_id: Some(PACK_ID.into()),
-        flow_id: SORLA_FLOW_ID.into(),
+        flow_id: flow_id.into(),
         flow_type: Some("messaging".into()),
         action: Some("messaging".into()),
         session_hint: Some(BARE_HINT.into()),
@@ -404,6 +433,169 @@ async fn sorla_call_resumes_via_external_nats_bridge() {
 
     eprintln!(
         "PASSED: sorla.call await flow paused, external NATS bridge replied, \
+         and the real listener + resumer consumed the saved wait"
+    );
+}
+
+/// LIVE CROSS-PROCESS TEST against a REAL `greentic-sorx` deployment (not an echo
+/// bridge). A real `sorla.call` await flow targets the real sorx `tenant.create`
+/// endpoint; an EXTERNAL real sorx process (started separately) serves that
+/// endpoint and auto-runs its bridge on the same NATS, replying on
+/// `greentic.sorla.response.v1`.
+///
+/// Two assertions, in order:
+///   1. REAL ENDPOINT EXECUTED — an OBSERVER subscribed to the response subject
+///      BEFORE triggering receives a `RuntimeDispatchResponse` with `ok == true`
+///      whose serialized body contains the substring `"tenant-1"` (the id the
+///      real `tenant.create` endpoint echoes back in `result.id`). NATS core
+///      pub/sub fan-out delivers the same message to BOTH the observer and the
+///      runner's listener, so observing does not steal the runner's copy.
+///   2. FLOW RESUMED — the saved wait in the shared `FlowResumeStore` is CONSUMED
+///      (fetch returns `None`), proving the real listener + resumer drove the
+///      resume to completion off the real reply.
+///
+/// Self-skips when `GREENTIC_TEST_NATS_URL` is unset (broker-free CI). Requires a
+/// live broker AND a real `greentic-sorx` serving `tenant.create` with its bridge
+/// enabled on the same NATS:
+/// ```text
+/// GREENTIC_TEST_NATS_URL=nats://127.0.0.1:4222 \
+///   cargo test -p greentic-runner-host --test live_cross_process_e2e \
+///   sorla_call_resumes_via_real_sorx_deployment -- --nocapture
+/// ```
+#[tokio::test(flavor = "multi_thread")]
+async fn sorla_call_resumes_via_real_sorx_deployment() {
+    let Ok(url) = std::env::var("GREENTIC_TEST_NATS_URL") else {
+        eprintln!(
+            "skipping: GREENTIC_TEST_NATS_URL not set \
+             (needs NATS + a real greentic-sorx serving tenant.create with the bridge enabled)"
+        );
+        return;
+    };
+
+    // 1. Connect three clients: dispatcher (engine), listener (runner resume),
+    //    and an independent OBSERVER that proves the real endpoint executed.
+    let dispatcher_client = async_nats::connect(&url)
+        .await
+        .expect("connect dispatcher client to NATS");
+    let listener_client = async_nats::connect(&url)
+        .await
+        .expect("connect listener client to NATS");
+    let observer_client = async_nats::connect(&url)
+        .await
+        .expect("connect observer client to NATS");
+
+    // 2. Subscribe the observer to the response subject BEFORE triggering so the
+    //    real sorx reply is captured. Core pub/sub fan-out also delivers the same
+    //    message to the runner's listener, so this does not steal the response.
+    use futures::StreamExt as _;
+    let response_subject = greentic_types::response_topic(RUNTIME_NAME);
+    let mut observer_subscription = observer_client
+        .subscribe(response_subject)
+        .await
+        .expect("observer subscription to the sorla response subject");
+
+    // 3. Build the real runtime + engine; wire the real NatsDispatcher. The flow's
+    //    sorla.call node targets the REAL sorx `tenant.create` endpoint.
+    let temp = TempDir::new().expect("temp dir");
+    let pack_path = temp.path().join("live-sorx.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo").expect("write bindings");
+    let node_input = json!({
+        "await": true,
+        "operation": SORX_TARGET_OPERATION,
+        "input": {
+            "id": "tenant-1",
+            "landlord_id": "landlord-1",
+            "name": "Avery Stone",
+            "active": "true"
+        }
+    });
+    build_sorla_wait_pack_with(&pack_path, SORX_FLOW_ID, SORX_TARGET_OPERATION, node_input)
+        .expect("build sorla await pack targeting the real sorx tenant.create endpoint");
+
+    let config = Arc::new(host_config(&bindings_path));
+    let (runtime, session_store) =
+        build_runtime_with_nats_dispatch(&pack_path, Arc::clone(&config), dispatcher_client)
+            .await
+            .expect("build runtime with NATS dispatcher");
+
+    // A sibling resume store over the SAME backing session store; used only to
+    // OBSERVE whether the saved wait is still present (Some) or consumed (None).
+    let observe_store = FlowResumeStore::new(Arc::clone(&session_store));
+
+    // 4. Build the production resumer over the runtime and spawn the REAL
+    //    response listener, so the real sorx reply drives the resume.
+    let resumer: Arc<dyn SessionResumer> =
+        Arc::new(RuntimeSessionResumer::new(Arc::clone(&runtime)));
+    tokio::spawn(async move {
+        if let Err(error) =
+            run_response_listener(listener_client, RUNTIME_NAME.to_owned(), resumer).await
+        {
+            eprintln!("response listener exited with error: {error}");
+        }
+    });
+
+    // Give the listener + observer subscriptions a moment to be acknowledged by
+    // the broker before the dispatcher publishes (so the response is not missed).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 5. Trigger the flow. The sorla.call await node publishes a real request to
+    //    the real sorx endpoint and the flow PAUSES awaiting the response.
+    let envelope = sorla_inbound_envelope_for(SORX_FLOW_ID);
+    runtime
+        .handle(envelope.clone())
+        .await
+        .expect("turn 1 should run the sorla.call node and pause awaiting the real sorx response");
+
+    // 6. OBSERVE the real reply: await the observer for ~8s, deserialize it as a
+    //    RuntimeDispatchResponse, and assert the REAL endpoint executed — ok and
+    //    its serialized body contains "tenant-1" (loose nesting-independent check).
+    let observed = tokio::time::timeout(Duration::from_secs(8), observer_subscription.next())
+        .await
+        .expect(
+            "timed out after 8s waiting for the real sorx response on \
+             greentic.sorla.response.v1 — a real greentic-sorx serving tenant.create \
+             with its bridge enabled must be running on the same NATS",
+        )
+        .expect("observer subscription closed before a response arrived");
+
+    let response: greentic_types::RuntimeDispatchResponse =
+        serde_json::from_slice(&observed.payload)
+            .expect("observed response body should deserialize as RuntimeDispatchResponse");
+    assert!(
+        response.ok,
+        "real sorx response was not ok: {:?}",
+        response.error
+    );
+    let serialized = serde_json::to_string(&response).expect("re-serialize observed response");
+    assert!(
+        serialized.contains("tenant-1"),
+        "observed real sorx response did not contain the expected id \"tenant-1\"; \
+         the real tenant.create endpoint should echo result.id == \"tenant-1\". body: {serialized}"
+    );
+
+    // 7. Poll until the saved wait is CONSUMED (fetch returns None), proving the
+    //    real listener + resumer resumed + completed the flow off the real reply.
+    let consumed = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            match observe_store.fetch(&envelope) {
+                Ok(None) => break,
+                Ok(Some(_)) => tokio::time::sleep(Duration::from_millis(150)).await,
+                Err(error) => panic!("failed to inspect the saved wait while polling: {error}"),
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        consumed.is_ok(),
+        "timed out after 8s waiting for the saved wait to be consumed — \
+         the real sorx reply must drive the runner's listener + resumer to resume the flow"
+    );
+
+    eprintln!(
+        "PASSED: sorla.call await flow dispatched to the REAL sorx tenant.create \
+         endpoint, the observed response was ok and contained \"tenant-1\", \
          and the real listener + resumer consumed the saved wait"
     );
 }
