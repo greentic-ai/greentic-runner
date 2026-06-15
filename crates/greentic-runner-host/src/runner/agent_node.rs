@@ -540,6 +540,73 @@ mod aw {
         }
     }
 
+    /// Load process-level base agent configs from the manifests directory.
+    ///
+    /// Reads every `<agent_id>.json` file in [`manifests_discovery_dir`] as a
+    /// full [`AgentConfig`] (NOT the tool-only Digital Worker manifest consumed
+    /// by [`ManifestToolOverlayProvider`]). This is the ONLY process-level base
+    /// agent source: pack-embedded agents and `HostConfig::agents` are both
+    /// per-tenant and only materialise inside `TenantRuntime::from_packs`, so an
+    /// in-process serve started at process startup cannot see them.
+    ///
+    /// Returns an empty map when the directory is absent or unreadable. Files
+    /// that fail to decode into an [`AgentConfig`], or whose `agent_id` does not
+    /// match the file stem, are logged and skipped so one malformed file never
+    /// aborts loading. The file stem is the authoritative key (the in-map id is
+    /// taken from the stem), mirroring the `<agent_id>.json` convention.
+    pub fn load_process_agent_configs() -> HashMap<String, AgentConfig> {
+        let dir = manifests_discovery_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "agent manifests dir not readable; no process-level agents loaded"
+                );
+                return HashMap::new();
+            }
+        };
+
+        let mut agents: HashMap<String, AgentConfig> = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_json = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if !is_json {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "agent config read failed; skipping");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<AgentConfig>(&bytes) {
+                Ok(config) => {
+                    if config.agent_id != stem {
+                        tracing::warn!(
+                            file_stem = stem,
+                            agent_id = config.agent_id.as_str(),
+                            "agent config id does not match filename; keying by filename"
+                        );
+                    }
+                    agents.insert(stem.to_string(), config);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "agent config decode failed; skipping");
+                }
+            }
+        }
+        agents
+    }
+
     #[cfg(test)]
     mod tests {
         use std::collections::HashMap;
@@ -929,13 +996,135 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
         }
+
+        #[test]
+        #[allow(unsafe_code)]
+        fn load_process_agent_configs_reads_full_configs_and_skips_bad_files() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // Valid full AgentConfig keyed by file stem.
+            let good = sample_agent_config("greeter");
+            std::fs::write(
+                dir.path().join("greeter.json"),
+                serde_json::to_vec(&good).expect("serialize"),
+            )
+            .expect("write good");
+
+            // Malformed JSON — skipped, must not abort the load.
+            std::fs::write(dir.path().join("broken.json"), b"{ not json").expect("write broken");
+
+            // Non-JSON file — ignored.
+            std::fs::write(dir.path().join("README.md"), b"ignore me").expect("write md");
+
+            let previous = std::env::var("GREENTIC_AGENT_MANIFESTS_DIR").ok();
+            unsafe {
+                std::env::set_var("GREENTIC_AGENT_MANIFESTS_DIR", dir.path());
+            }
+            let loaded = super::load_process_agent_configs();
+            unsafe {
+                match &previous {
+                    Some(value) => std::env::set_var("GREENTIC_AGENT_MANIFESTS_DIR", value),
+                    None => std::env::remove_var("GREENTIC_AGENT_MANIFESTS_DIR"),
+                }
+            }
+
+            assert_eq!(loaded.len(), 1, "only the valid config should load");
+            assert!(loaded.contains_key("greeter"));
+            assert_eq!(loaded["greeter"].agent_id, "greeter");
+        }
     }
+}
+
+#[cfg(test)]
+mod gating_tests {
+    use super::should_serve_agentic_inproc;
+    use std::collections::HashMap;
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    #[test]
+    fn skips_when_opt_in_unset() {
+        let env = env_from(&[("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222")]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn skips_when_nats_url_unset() {
+        let env = env_from(&[("GREENTIC_AGENTIC_SERVE_INPROC", "1")]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn skips_when_nats_url_blank() {
+        let env = env_from(&[
+            ("GREENTIC_AGENTIC_SERVE_INPROC", "1"),
+            ("GREENTIC_EVENTS_NATS_URL", "   "),
+        ]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn serves_when_both_set() {
+        for truthy in ["1", "true", "TRUE", "yes", "on"] {
+            let env = env_from(&[
+                ("GREENTIC_AGENTIC_SERVE_INPROC", truthy),
+                ("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222"),
+            ]);
+            assert!(should_serve_agentic_inproc(env), "{truthy} should enable");
+        }
+    }
+
+    #[test]
+    fn skips_on_falsey_opt_in() {
+        for falsey in ["0", "false", "no", "off", "maybe"] {
+            let env = env_from(&[
+                ("GREENTIC_AGENTIC_SERVE_INPROC", falsey),
+                ("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222"),
+            ]);
+            assert!(!should_serve_agentic_inproc(env), "{falsey} should skip");
+        }
+    }
+}
+
+/// Decide whether the runner process should host the agentic-worker NATS
+/// service in-process (the opt-in co-host path).
+///
+/// Returns `true` only when BOTH gates are satisfied:
+/// - `GREENTIC_AGENTIC_SERVE_INPROC` is truthy (`1`/`true`/`yes`/`on`,
+///   case-insensitive) — opt-in, default OFF; and
+/// - `GREENTIC_EVENTS_NATS_URL` is set to a non-empty value (no NATS bus means
+///   nothing to serve on).
+///
+/// Pure over its `get_env` closure so it is unit-testable without touching the
+/// real process environment. Feature-independent (no `agentic-worker` gate) so
+/// the gating logic stays trivially testable; the actual spawn is gated at the
+/// call site.
+pub fn should_serve_agentic_inproc(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    let opt_in = get_env("GREENTIC_AGENTIC_SERVE_INPROC")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let nats_set = get_env("GREENTIC_EVENTS_NATS_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    opt_in && nats_set
 }
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
     HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
-    build_agent_node_handler, build_agent_runtime, merge_agent_sources, serve_agentic,
+    build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
+    serve_agentic,
 };
 
 #[cfg(feature = "agentic-worker")]
