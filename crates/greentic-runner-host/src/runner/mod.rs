@@ -12,6 +12,7 @@ pub mod invocation;
 pub mod mocks;
 pub mod operator;
 pub mod remote_dispatch;
+pub mod runtime_session_resumer;
 pub mod schema_validator;
 pub mod templating;
 

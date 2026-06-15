@@ -278,6 +278,35 @@ impl TenantRuntime {
                 tracing::info!("DwAgentGraph runtime wired into FlowEngine");
             }
         }
+        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
+        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
+        // so the dispatcher must be attached while `engine` is still owned and
+        // mutable. The response listener (which needs the post-build ingress
+        // handle) is spawned further below, after the runtime is constructed.
+        //
+        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
+        // disabled and existing behaviour is unchanged. When set but NATS cannot
+        // be reached we log a warning and continue (the engine simply has no
+        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
+        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(nats_url) => match async_nats::connect(&nats_url).await {
+                Ok(client) => {
+                    engine.set_remote_dispatch_handler(Arc::new(
+                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
+                    ));
+                    Some(client)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
@@ -292,6 +321,25 @@ impl TenantRuntime {
             )
             .context("failed to initialise state machine runtime")?,
         );
+
+        // Spawn the Sorla response listener now that the ingress handle
+        // (`state_machine`) exists. The listener resumes paused flows by feeding
+        // a synthesized ingress envelope through `StateMachineRuntime::handle`
+        // (see `RuntimeSessionResumer`). Only started when the dispatcher above
+        // connected successfully.
+        if let Some(client) = dispatch_nats_client {
+            let resumer = Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
+                    &state_machine,
+                )),
+            );
+            tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
+                client,
+                "sorla".to_string(),
+                resumer,
+            ));
+            tracing::info!("Sorla remote-dispatch (NATS) wired into runtime");
+        }
         let http_client = Client::builder().build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
