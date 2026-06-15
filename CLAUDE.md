@@ -125,6 +125,23 @@ For a credit-free live e2e there is an `aw-serve` bin (features `serve,test-mock
 `AW_SERVE_REPLY`). `dw.agent` (in-process) stays untouched — `agentic.call` is the
 out-of-process path.
 
+**Opt-in in-process co-host (`GREENTIC_AGENTIC_SERVE_INPROC`)**: a single-node
+deployment can co-host the agentic-worker service inside the main runner process
+instead of running a separate `aw-serve`. **Default OFF** — distributed deploys
+run `aw-serve` standalone so the agentic service scales independently. When
+`GREENTIC_AGENTIC_SERVE_INPROC` is truthy (`1`/`true`/`yes`/`on`) AND
+`GREENTIC_EVENTS_NATS_URL` is set, `greentic_runner_host::run()` spawns
+`serve_agentic` exactly once per process (NOT per-tenant — a per-tenant spawn
+would put multiple competing subscribers on `greentic.agentic.request.v1`). The
+gate is the pure `agent_node::should_serve_agentic_inproc`; the spawn is
+`maybe_spawn_inproc_agentic_serve` in `lib.rs`, feature-gated behind
+`agentic-worker`. Process-level base agent configs come ONLY from
+`GREENTIC_AGENT_MANIFESTS_DIR` (`<agent_id>.json` full `AgentConfig` files, loaded
+by `agent_node::load_process_agent_configs`) — pack-embedded and per-tenant
+`HostConfig.agents` are not visible at process startup. Skips with a warning (and
+the runner continues normally) when no agents are configured, or when the runtime
+cannot be built (no `GREENTIC_AW_REDIS_URL` / no LLM key).
+
 ### WASM Component Model
 
 - **Target**: `wasm32-wasip2` (WASI Preview 2, Component Model)
@@ -196,6 +213,10 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `DEFAULT_TENANT` | Fallback tenant for routing |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
+| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`agentic.call` dispatch + in-proc agentic serve |
+| `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
+| `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
+| `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 
