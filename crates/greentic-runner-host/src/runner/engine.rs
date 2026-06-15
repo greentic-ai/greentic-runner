@@ -157,6 +157,18 @@ enum NodeKind {
     SorlaCall {
         target: String,
     },
+    /// Native runtime-dispatch node for the Operala runtime. Mirrors
+    /// [`SorlaCall`] but routes to the `"operala"` runtime name.
+    OperalaCall {
+        target: String,
+    },
+    /// Native runtime-dispatch node for an out-of-process agentic runtime.
+    /// Mirrors [`SorlaCall`] but routes to the `"agentic"` runtime name.
+    /// This is an ADDITIONAL path: the in-process `dw.agent` node is
+    /// completely separate and untouched.
+    AgenticCall {
+        target: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +790,12 @@ impl FlowEngine {
                 .await
                 .map(DispatchOutcome::complete),
             NodeKind::SorlaCall { target } => self.execute_sorla_call(ctx, target, payload).await,
+            NodeKind::OperalaCall { target } => {
+                self.execute_operala_call(ctx, target, payload).await
+            }
+            NodeKind::AgenticCall { target } => {
+                self.execute_agentic_call(ctx, target, payload).await
+            }
         }
     }
 
@@ -844,10 +862,63 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        let handler = self
-            .remote_dispatch_handler
-            .as_ref()
-            .context("SorlaCall node dispatched but no RemoteDispatchHandler configured")?;
+        self.execute_remote_dispatch(ctx, "sorla", target, payload)
+            .await
+    }
+
+    /// Dispatch an `operala.call` flow node via the shared remote-dispatch seam.
+    /// Identical to [`execute_sorla_call`] except the runtime name is `"operala"`.
+    async fn execute_operala_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "operala", target, payload)
+            .await
+    }
+
+    /// Dispatch an `agentic.call` flow node via the shared remote-dispatch seam.
+    /// Identical to [`execute_sorla_call`] except the runtime name is `"agentic"`.
+    /// This is the out-of-process agentic path; the in-process `dw.agent` node
+    /// is completely separate and untouched.
+    async fn execute_agentic_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "agentic", target, payload)
+            .await
+    }
+
+    /// Shared body for all native remote-dispatch flow nodes (`sorla.call`,
+    /// `operala.call`, `agentic.call`). Routes through the injected
+    /// [`RemoteDispatchHandler`] with the given `runtime` name.
+    ///
+    /// Input payload contract (JSON):
+    /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
+    ///    "input": any }`.
+    ///
+    /// The correlation id is the canonical session hint (`ctx.session_id`)
+    /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers so the resume
+    /// path (`RuntimeSessionResumer`) can route the response back.
+    ///
+    /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
+    /// - `await=false` -> publish + complete immediately with
+    ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    async fn execute_remote_dispatch(
+        &self,
+        ctx: &FlowContext<'_>,
+        runtime: &str,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
+            format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
+        })?;
 
         let await_mode = payload
             .get("await")
@@ -877,8 +948,8 @@ impl FlowEngine {
         // only encodes `conversation`, so a wait saved against a non-empty
         // `thread`/`reply_to` would be un-keyable on resume. Append OPAQUE
         // `::thread=`/`::reply=` markers so `RuntimeSessionResumer` can rebuild
-        // the EXACT reply scope and recompute the same `scope_hash`. The sorx
-        // bridge echoes the correlation verbatim, so this needs no sorx change.
+        // the EXACT reply scope and recompute the same `scope_hash`. The remote
+        // bridge echoes the correlation verbatim, so this needs no bridge change.
         // Markers are omitted when their value is empty (back-compat with the
         // no-thread case).
         let mut correlation_id =
@@ -903,7 +974,7 @@ impl FlowEngine {
             .dispatch(crate::runner::remote_dispatch::RemoteDispatch {
                 tenant: ctx.tenant.to_string(),
                 env: self.default_env.clone(),
-                runtime: "sorla".to_string(),
+                runtime: runtime.to_string(),
                 target: target.to_string(),
                 operation,
                 mode,
@@ -2034,7 +2105,9 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("session.")
             || full_ref.starts_with("provider.")
             || full_ref.starts_with("dw.")
-            || full_ref.starts_with("sorla.");
+            || full_ref.starts_with("sorla.")
+            || full_ref.starts_with("operala.")
+            || full_ref.starts_with("agentic.");
         let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
             (full_ref, node.component.operation.clone())
         } else if let Some(dot) = full_ref.rfind('.') {
@@ -2096,6 +2169,12 @@ impl From<Node> for HostNode {
                 "sorla.call" => NodeKind::SorlaCall {
                     target: raw_operation.clone().unwrap_or_default(),
                 },
+                "operala.call" => NodeKind::OperalaCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
+                "agentic.call" => NodeKind::AgenticCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -2116,6 +2195,8 @@ impl From<Node> for HostNode {
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
             NodeKind::SorlaCall { .. } => "sorla.call".to_string(),
+            NodeKind::OperalaCall { .. } => "operala.call".to_string(),
+            NodeKind::AgenticCall { .. } => "agentic.call".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
