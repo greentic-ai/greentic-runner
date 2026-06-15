@@ -53,6 +53,9 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
+    /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
+    remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
     #[cfg(feature = "agentic-worker")]
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
     #[cfg(feature = "agentic-worker")]
@@ -128,16 +131,32 @@ impl HostNode {
 
 #[derive(Clone, Debug)]
 enum NodeKind {
-    Exec { target_component: String },
-    PackComponent { component_ref: String },
+    Exec {
+        target_component: String,
+    },
+    PackComponent {
+        component_ref: String,
+    },
     ProviderInvoke,
     FlowCall,
-    BuiltinEmit { kind: EmitKind },
+    BuiltinEmit {
+        kind: EmitKind,
+    },
     BuiltinStateGet,
     BuiltinStateSet,
     Wait,
-    DwAgent { agent_id: String },
-    DwAgentGraph { graph_id: String },
+    DwAgent {
+        agent_id: String,
+    },
+    DwAgentGraph {
+        graph_id: String,
+    },
+    /// Native runtime-dispatch node: publishes work to a separate runtime
+    /// (e.g. sorx) via the injected [`RemoteDispatchHandler`]. `target` is the
+    /// node operation (the logical runtime target).
+    SorlaCall {
+        target: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -283,6 +302,7 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
@@ -294,6 +314,16 @@ impl FlowEngine {
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
         self.cross_pack_resolver = Some(resolver);
+    }
+
+    /// Set the handler that bridges `sorla.call` flow nodes into a separate
+    /// runtime over pub/sub. Constructed by the runner binary when a transport
+    /// (e.g. NATS) is configured.
+    pub fn set_remote_dispatch_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) {
+        self.remote_dispatch_handler = Some(handler);
     }
 
     /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
@@ -746,6 +776,7 @@ impl FlowEngine {
                 .execute_dw_agent_graph(ctx, graph_id, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::SorlaCall { target } => self.execute_sorla_call(ctx, target, payload).await,
         }
     }
 
@@ -784,6 +815,86 @@ impl FlowEngine {
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
              `agentic-worker` feature. Rebuild with --features agentic-worker."
         )
+    }
+
+    /// Dispatch a `sorla.call` flow node to the configured
+    /// [`RemoteDispatchHandler`], publishing the work to a separate runtime.
+    ///
+    /// Input payload contract (JSON):
+    /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
+    ///    "input": any }`.
+    ///
+    /// The correlation id is the opaque canonical session hint (`ctx.session_id`)
+    /// — it already encodes the conversation, so it is NOT re-derived per node.
+    ///
+    /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
+    /// - `await=false` -> publish + complete immediately with
+    ///   `{ "dispatched": true, "correlation_id": <hint> }`.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    async fn execute_sorla_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        let handler = self
+            .remote_dispatch_handler
+            .as_ref()
+            .context("SorlaCall node dispatched but no RemoteDispatchHandler configured")?;
+
+        let await_mode = payload
+            .get("await")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let operation = payload
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let deadline_ms = payload.get("deadline_ms").and_then(Value::as_u64);
+        let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
+
+        let correlation_id = ctx.session_id.unwrap_or_default().to_string();
+        let mode = if await_mode {
+            greentic_types::DispatchMode::Await
+        } else {
+            greentic_types::DispatchMode::FireAndForget
+        };
+
+        let action = handler
+            .dispatch(crate::runner::remote_dispatch::RemoteDispatch {
+                tenant: ctx.tenant.to_string(),
+                env: self.default_env.clone(),
+                runtime: "sorla".to_string(),
+                target: target.to_string(),
+                operation,
+                mode,
+                correlation_id: correlation_id.clone(),
+                input: inner_input,
+                deadline_ms,
+            })
+            .await?;
+
+        match action {
+            crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
+                correlation_id,
+            } => {
+                let reason = format!("await-runtime:{correlation_id}");
+                let output = NodeOutput::new(serde_json::json!({
+                    "pending": true,
+                    "correlation_id": correlation_id,
+                }));
+                Ok(DispatchOutcome::wait(output, Some(reason)))
+            }
+            crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched => {
+                let output = NodeOutput::new(serde_json::json!({
+                    "dispatched": true,
+                    "correlation_id": correlation_id,
+                }));
+                Ok(DispatchOutcome::complete(output))
+            }
+        }
     }
 
     /// Dispatch a `DwAgentGraph` flow node to the configured
@@ -1884,7 +1995,8 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("emit.")
             || full_ref.starts_with("session.")
             || full_ref.starts_with("provider.")
-            || full_ref.starts_with("dw.");
+            || full_ref.starts_with("dw.")
+            || full_ref.starts_with("sorla.");
         let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
             (full_ref, node.component.operation.clone())
         } else if let Some(dot) = full_ref.rfind('.') {
@@ -1943,6 +2055,9 @@ impl From<Node> for HostNode {
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
                 },
+                "sorla.call" => NodeKind::SorlaCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -1962,6 +2077,7 @@ impl From<Node> for HostNode {
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
+            NodeKind::SorlaCall { .. } => "sorla.call".to_string(),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -2602,6 +2718,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
@@ -3026,6 +3143,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
@@ -3170,6 +3288,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: Some(handler),
             #[cfg(feature = "agentic-worker")]
@@ -3304,6 +3423,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
@@ -3413,6 +3533,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
