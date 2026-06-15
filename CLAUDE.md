@@ -81,6 +81,22 @@ Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPEN
 Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
 
+### Async runtime dispatch (`sorla.call` node)
+
+A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target)
+dispatches work to the separate `greentic-sorx` runtime over NATS pub/sub. Node input:
+`{ "await": true|false, "operation": "<op>", "deadline_ms": <u64?>, "input": {...} }`.
+`await: true` PAUSES the flow (reuses `FlowResumeStore`/ingress resume) and resumes when the
+runtime's response arrives; `await: false` continues immediately. Implemented natively
+(`runner/remote_dispatch.rs` `RemoteDispatchHandler`/`NatsDispatcher`, `runner/engine.rs`
+`execute_sorla_call`, `runner/dispatch_listener.rs` response-listener,
+`runner/runtime_session_resumer.rs`), wired in `runtime.rs` when `GREENTIC_EVENTS_NATS_URL`
+is set. Subjects: `greentic.sorla.request.v1` / `greentic.sorla.response.v1`; correlation id
+= `<bare session hint>::pack=<id>::flow=<id>`. Contract in `greentic-types::runtime_dispatch`;
+sorx side is the `sorx-event-bridge` crate. Same pattern is intended for `agentic.call` /
+`operala.call`. Known limit: waits from an inbound with non-empty thread/reply_to aren't
+resumable from the correlation alone.
+
 ### WASM Component Model
 
 - **Target**: `wasm32-wasip2` (WASI Preview 2, Component Model)

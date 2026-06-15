@@ -2698,6 +2698,7 @@ dependencies = [
 [[package]]
 name = "greentic-types"
 version = "1.1.0-dev.26731975668"
+source = "git+https://github.com/greenticai/greentic-types.git?rev=064a024d5231f0390121c288e9750a0c67620f5b#064a024d5231f0390121c288e9750a0c67620f5b"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2727,6 +2728,7 @@ dependencies = [
 [[package]]
 name = "greentic-types-macros"
 version = "1.1.0-dev.26731975668"
+source = "git+https://github.com/greenticai/greentic-types.git?rev=064a024d5231f0390121c288e9750a0c67620f5b#064a024d5231f0390121c288e9750a0c67620f5b"
 dependencies = [
  "proc-macro2",
  "quote",
