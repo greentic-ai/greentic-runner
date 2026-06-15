@@ -251,4 +251,4 @@ greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greenti
 # (1.1.0-dev.26731975668) lives only on the research branch and is not yet
 # republished, so redirect the registry requirement onto that branch until a
 # dev build carrying `agents` lands on crates.io.
-greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "ce5ae20f6f68d28408fe7fa54a30cd94ebbd1a46" }
+greentic-types = { path = "/Users/bimapangestu/Desktop/Works/personal/greentic/greentic-types/.worktrees/async-runtime-dispatch" }

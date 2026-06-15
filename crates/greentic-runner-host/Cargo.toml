@@ -23,6 +23,7 @@ component-v0-6-introspection = []
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
 
 [dependencies]
+async-nats = "0.46"
 async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true

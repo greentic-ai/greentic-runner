@@ -10,6 +10,7 @@ pub mod i18n;
 pub mod invocation;
 pub mod mocks;
 pub mod operator;
+pub mod remote_dispatch;
 pub mod schema_validator;
 pub mod templating;
 
