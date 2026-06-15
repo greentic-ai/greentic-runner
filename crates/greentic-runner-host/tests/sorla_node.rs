@@ -389,6 +389,29 @@ fn sorla_call_await_pauses_with_session_hint_correlation() -> Result<()> {
     assert_eq!(recorded.mode, DispatchMode::Await);
     assert_eq!(recorded.target, "dep-1");
     assert_eq!(recorded.operation, "create");
-    assert_eq!(recorded.correlation_id, SESSION_HINT);
+    // The node now emits a correlation id carrying `::pack=`/`::flow=` markers so
+    // the resume path can route the response back to the registered
+    // `(pack_id, flow_id)`. The bare canonical hint (everything before the first
+    // `::` marker) is preserved so the store key still matches.
+    let bare_hint = SESSION_HINT.split("::").next().unwrap();
+    let expected_correlation = format!(
+        "{}::pack={}::flow={}",
+        bare_hint,
+        pack.metadata().pack_id.as_str(),
+        FLOW_ID
+    );
+    assert_eq!(recorded.correlation_id, expected_correlation);
+    // Markers present and bare hint preserved.
+    assert!(recorded.correlation_id.starts_with(bare_hint));
+    assert!(
+        recorded
+            .correlation_id
+            .contains(&format!("::pack={}", pack.metadata().pack_id.as_str()))
+    );
+    assert!(
+        recorded
+            .correlation_id
+            .contains(&format!("::flow={FLOW_ID}"))
+    );
     Ok(())
 }

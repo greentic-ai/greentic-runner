@@ -824,12 +824,17 @@ impl FlowEngine {
     /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
     ///    "input": any }`.
     ///
-    /// The correlation id is the opaque canonical session hint (`ctx.session_id`)
-    /// — it already encodes the conversation, so it is NOT re-derived per node.
+    /// The correlation id is the canonical session hint (`ctx.session_id`)
+    /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers. The bare hint
+    /// already encodes the conversation; the markers let the resume path
+    /// (`RuntimeSessionResumer`) route the response back to a registered
+    /// `(pack_id, flow_id)` and re-derive the store key. The markers are the
+    /// exact inverse of the resumer's parsing (`::flow=` then `::pack=`,
+    /// split off the trailing end).
     ///
     /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
     /// - `await=false` -> publish + complete immediately with
-    ///   `{ "dispatched": true, "correlation_id": <hint> }`.
+    ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
     ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
     async fn execute_sorla_call(
@@ -855,7 +860,18 @@ impl FlowEngine {
         let deadline_ms = payload.get("deadline_ms").and_then(Value::as_u64);
         let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
 
-        let correlation_id = ctx.session_id.unwrap_or_default().to_string();
+        // The resume path (`RuntimeSessionResumer`) recovers `pack_id` and
+        // `flow_id` from `::pack=`/`::flow=` markers on the correlation id to
+        // route the synthesized resume envelope, then strips them to recover the
+        // bare canonical hint used as the store key. So the published
+        // correlation id MUST carry those markers and preserve the bare hint.
+        //
+        // Bare canonical hint = everything before the first `::` marker. This is
+        // robust whether `ctx.session_id` is already bare (the production case)
+        // or has accreted a marker.
+        let raw_hint = ctx.session_id.unwrap_or_default();
+        let bare_hint = raw_hint.split("::").next().unwrap_or_default();
+        let correlation_id = format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
         let mode = if await_mode {
             greentic_types::DispatchMode::Await
         } else {
