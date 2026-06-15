@@ -42,9 +42,14 @@
 //! work, the dispatch side must therefore emit a correlation id of the form
 //! `<bare hint>::pack=<pack_id>::flow=<flow_id>` (or the wire contract must be
 //! extended to carry pack/flow, or a server-side `correlation_id → (pack, flow,
-//! scope)` map must exist). A bare canonical hint alone is NOT resumable. Waits
-//! whose original inbound used a non-empty `thread`/`reply_to` are likewise not
-//! recoverable from the hint and must be resumed by an inbound activity.
+//! scope)` map must exist). A bare canonical hint alone is NOT resumable.
+//!
+//! Waits whose original inbound used a non-empty `thread`/`reply_to` ARE
+//! resumable: `execute_sorla_call` appends `::thread=<t>`/`::reply=<r>` markers
+//! (each omitted when empty), and this resumer strips them and feeds them back
+//! into the synthesized `ReplyScope` so `fetch` recomputes the same
+//! `scope_hash` `save` used. The no-thread case is unchanged (no markers
+//! emitted → `thread`/`reply_to` stay `None`).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -64,6 +69,18 @@ const PACK_HINT_MARKER: &str = "::pack=";
 /// envelope through `StateMachine::step`, which requires a registered
 /// `(pack_id, flow_id)`. It is stripped before the store hint is derived.
 const FLOW_HINT_MARKER: &str = "::flow=";
+
+/// Marker carrying the originating inbound `ReplyScope.thread`. The store key
+/// (`FlowResumeStore::save`) hashes the reply scope's `thread`/`reply_to`, so a
+/// wait saved against a non-empty thread is only re-keyable if the resumer
+/// reproduces that thread. The dispatch side (`execute_sorla_call`) appends this
+/// marker (omitting it when the thread is empty). It is stripped before the
+/// store hint is derived and fed back into the synthesized `ReplyScope`.
+const THREAD_HINT_MARKER: &str = "::thread=";
+
+/// Marker carrying the originating inbound `ReplyScope.reply_to`. See
+/// [`THREAD_HINT_MARKER`]; same contract for `reply_to`.
+const REPLY_HINT_MARKER: &str = "::reply=";
 
 /// Resumes paused flow sessions by driving the runtime ingress entry.
 pub struct RuntimeSessionResumer {
@@ -110,7 +127,13 @@ impl RuntimeSessionResumer {
         correlation_id: &str,
         output: Value,
     ) -> IngressEnvelope {
-        let (without_flow, flow_marker) = split_marker(correlation_id, FLOW_HINT_MARKER);
+        // Strip markers in the REVERSE of the order they were appended at
+        // dispatch (`pack`, `flow`, `thread`, `reply`) so each `rsplit_once`
+        // sees its own marker last. Each marker is optional — absent markers
+        // leave the string unchanged (back-compat with the no-thread case).
+        let (without_reply, reply_to) = split_marker(correlation_id, REPLY_HINT_MARKER);
+        let (without_thread, thread) = split_marker(&without_reply, THREAD_HINT_MARKER);
+        let (without_flow, flow_marker) = split_marker(&without_thread, FLOW_HINT_MARKER);
         let (bare_hint, pack_id) = split_pack_suffix(&without_flow);
         let parts: Vec<&str> = bare_hint.splitn(5, ':').collect();
         let provider = parts.get(1).map(|segment| segment.to_string());
@@ -145,10 +168,15 @@ impl RuntimeSessionResumer {
             timestamp: None,
             payload: output,
             metadata: None,
+            // Reproduce the EXACT reply scope used at save time so
+            // `FlowResumeStore::fetch` recomputes the same `scope_hash`. The
+            // conversation comes from the bare hint; thread/reply_to are
+            // recovered from the `::thread=`/`::reply=` markers (absent markers
+            // → `None`, matching the no-thread case).
             reply_scope: conversation.map(|conversation| ReplyScope {
                 conversation,
-                thread: None,
-                reply_to: None,
+                thread,
+                reply_to,
                 correlation: None,
             }),
         }
@@ -263,6 +291,56 @@ mod tests {
             Some("demo:provider:chan:conv:user")
         );
         assert_eq!(envelope.conversation.as_deref(), Some("conv"));
+    }
+
+    #[test]
+    fn build_resume_envelope_recovers_thread_and_reply_into_scope() {
+        let envelope = RuntimeSessionResumer::build_resume_envelope(
+            &tenant_ctx(),
+            "demo:provider:chan:conv:user::pack=greentic.demo::flow=wait.flow::thread=topic-7::reply=msg-42",
+            json!(null),
+        );
+        // routing markers still recovered with thread/reply present.
+        assert_eq!(envelope.flow_id, "wait.flow");
+        assert_eq!(envelope.pack_id.as_deref(), Some("greentic.demo"));
+        // bare hint is clean of every marker.
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+        let scope = envelope.reply_scope.expect("reply scope with thread/reply");
+        assert_eq!(scope.conversation, "conv");
+        assert_eq!(scope.thread.as_deref(), Some("topic-7"));
+        assert_eq!(scope.reply_to.as_deref(), Some("msg-42"));
+    }
+
+    #[test]
+    fn build_resume_envelope_recovers_thread_without_reply() {
+        let envelope = RuntimeSessionResumer::build_resume_envelope(
+            &tenant_ctx(),
+            "demo:provider:chan:conv:user::pack=greentic.demo::flow=wait.flow::thread=topic-7",
+            json!(null),
+        );
+        let scope = envelope.reply_scope.expect("reply scope with thread");
+        assert_eq!(scope.thread.as_deref(), Some("topic-7"));
+        assert!(scope.reply_to.is_none());
+        assert_eq!(
+            envelope.session_hint.as_deref(),
+            Some("demo:provider:chan:conv:user")
+        );
+    }
+
+    #[test]
+    fn build_resume_envelope_without_markers_leaves_thread_and_reply_none() {
+        // Back-compat: the no-thread gold path must keep thread/reply_to None.
+        let envelope = RuntimeSessionResumer::build_resume_envelope(
+            &tenant_ctx(),
+            "demo:provider:chan:conv:user::pack=greentic.demo::flow=wait.flow",
+            json!(null),
+        );
+        let scope = envelope.reply_scope.expect("reply scope from conversation");
+        assert!(scope.thread.is_none());
+        assert!(scope.reply_to.is_none());
     }
 
     #[test]

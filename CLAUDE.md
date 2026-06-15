@@ -94,8 +94,11 @@ runtime's response arrives; `await: false` continues immediately. Implemented na
 is set. Subjects: `greentic.sorla.request.v1` / `greentic.sorla.response.v1`; correlation id
 = `<bare session hint>::pack=<id>::flow=<id>`. Contract in `greentic-types::runtime_dispatch`;
 sorx side is the `sorx-event-bridge` crate. Same pattern is intended for `agentic.call` /
-`operala.call`. Known limit: waits from an inbound with non-empty thread/reply_to aren't
-resumable from the correlation alone.
+`operala.call`. Waits from an inbound with a non-empty thread/reply_to ARE resumable: the
+node appends opaque `::thread=<t>::reply=<r>` markers to the correlation id (omitted when
+empty) and `RuntimeSessionResumer` parses them back into the synthesized `ReplyScope` so
+`FlowResumeStore::fetch` recomputes the same `scope_hash` as `save`. The sorx bridge echoes
+the correlation verbatim, so no sorx change is required.
 
 ### WASM Component Model
 
