@@ -36,6 +36,9 @@ pub mod tools;
 #[cfg(feature = "test-mock")]
 pub mod mock;
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]

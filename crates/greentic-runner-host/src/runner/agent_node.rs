@@ -425,6 +425,23 @@ mod aw {
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        let runtime = build_agent_runtime(merged_agents).await?;
+        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+    }
+
+    /// Construct the shared [`AgentRuntime`] from the environment.
+    ///
+    /// Factored out of [`build_agent_node_handler`] so both the in-process
+    /// `dw.agent`/`agentic.call` flow node and the out-of-process NATS serve
+    /// mode ([`serve_agentic`]) build an identical runtime (Redis state, env-
+    /// resolved LLM backend, design extensions, agent config providers, MCP).
+    ///
+    /// Returns `None` under the same graceful-degradation conditions as the node
+    /// handler: empty agent map, missing/unreachable `GREENTIC_AW_REDIS_URL`, or
+    /// extension-runtime init failure.
+    pub async fn build_agent_runtime(
+        merged_agents: HashMap<String, AgentConfig>,
+    ) -> Option<Arc<AgentRuntime>> {
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
@@ -493,7 +510,34 @@ mod aw {
         ));
 
         tracing::info!(agent_count, "AW runtime constructed");
-        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+        Some(runtime)
+    }
+
+    /// Run the agentic-worker runtime as a NATS-consuming service.
+    ///
+    /// Builds the production [`AgentRuntime`] via [`build_agent_runtime`] and,
+    /// when it could be constructed, serves `greentic.agentic.request.v1`
+    /// forever via the shared `aw-event-bridge`. This is the out-of-process
+    /// (`agentic.call`) counterpart to the in-process `dw.agent` node.
+    ///
+    /// Returns `Ok(())` immediately (a no-op) when the runtime cannot be built
+    /// (e.g. no agents, no Redis) so the host can call this unconditionally.
+    pub async fn serve_agentic(
+        nats_url: &str,
+        merged_agents: HashMap<String, AgentConfig>,
+    ) -> anyhow::Result<()> {
+        match build_agent_runtime(merged_agents).await {
+            Some(runtime) => {
+                tracing::info!(nats_url, "agentic serve mode starting");
+                greentic_aw_runtime::serve::serve(nats_url, runtime).await
+            }
+            None => {
+                tracing::info!(
+                    "agentic serve mode skipped: no agentic runtime could be constructed"
+                );
+                Ok(())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -891,7 +935,7 @@ mod aw {
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
     HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
-    build_agent_node_handler, merge_agent_sources,
+    build_agent_node_handler, build_agent_runtime, merge_agent_sources, serve_agentic,
 };
 
 #[cfg(feature = "agentic-worker")]
