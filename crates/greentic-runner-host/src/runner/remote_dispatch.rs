@@ -5,7 +5,10 @@
 use anyhow::Result;
 use async_nats::HeaderMap;
 use async_trait::async_trait;
-use greentic_types::{DispatchMode, RuntimeDispatchRequest, request_topic};
+use greentic_types::{
+    DispatchError, DispatchMode, RuntimeDispatchRequest, RuntimeDispatchResponse, request_topic,
+    response_topic,
+};
 use serde_json::Value;
 
 /// Everything needed to dispatch one unit of work to a runtime.
@@ -70,6 +73,51 @@ pub fn build_request(req: &RemoteDispatch) -> Result<BuiltRequest> {
     })
 }
 
+/// Build the subject, headers, and serialized body for a timeout error response.
+///
+/// This is a pure function (no I/O) that constructs the message a spawned
+/// timeout task should publish when `deadline_ms` elapses before the real
+/// runtime responds.
+///
+/// # Parameters
+/// - `runtime` - the runtime name (e.g. `"sorla"`)
+/// - `correlation_id` - echoed verbatim in the `Greentic-Correlation-Id` header
+/// - `tenant` - echoed in `Greentic-Tenant`
+/// - `env` - echoed in `Greentic-Env`
+/// - `deadline_ms` - the timeout that expired; used in the error message
+///
+/// # Returns
+/// A tuple of `(subject, headers, body_bytes)` ready to pass to
+/// `async_nats::Client::publish_with_headers`.
+pub fn build_timeout_response_message(
+    runtime: &str,
+    correlation_id: &str,
+    tenant: &str,
+    env: &str,
+    deadline_ms: u64,
+) -> (String, HeaderMap, Vec<u8>) {
+    let subject = response_topic(runtime);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Greentic-Correlation-Id", correlation_id);
+    headers.insert("Greentic-Tenant", tenant);
+    headers.insert("Greentic-Env", env);
+
+    let response = RuntimeDispatchResponse {
+        ok: false,
+        output: Value::Null,
+        events: vec![],
+        error: Some(DispatchError {
+            code: "timeout".into(),
+            message: format!("no response within {deadline_ms}ms"),
+        }),
+    };
+    // Serialization of well-formed types is infallible in practice.
+    let body = serde_json::to_vec(&response).unwrap_or_default();
+
+    (subject, headers, body)
+}
+
 /// Transport-agnostic publisher for runtime dispatch requests. Implemented over
 /// raw `async-nats` today; the trait lets a greentic-events EventBus be swapped
 /// in later without changing the flow engine.
@@ -92,10 +140,50 @@ impl NatsDispatcher {
 #[async_trait]
 impl RemoteDispatchHandler for NatsDispatcher {
     async fn dispatch(&self, request: RemoteDispatch) -> Result<RemoteDispatchAction> {
+        // Capture fields needed by the timeout task BEFORE moving `request`
+        // into `build_request`.
+        let maybe_timeout = match (request.mode, request.deadline_ms) {
+            (DispatchMode::Await, Some(deadline_ms)) => Some((
+                deadline_ms,
+                request.runtime.clone(),
+                request.correlation_id.clone(),
+                request.tenant.clone(),
+                request.env.clone(),
+            )),
+            _ => None,
+        };
+
         let built = build_request(&request)?;
         self.client
             .publish_with_headers(built.subject, built.headers, built.body.into())
             .await?;
+
+        // Spawn the deadline watchdog AFTER the request is on the wire.
+        if let Some((deadline_ms, runtime, correlation_id, tenant, env)) = maybe_timeout {
+            let timeout_client = self.client.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(deadline_ms)).await;
+                let (subject, headers, body) = build_timeout_response_message(
+                    &runtime,
+                    &correlation_id,
+                    &tenant,
+                    &env,
+                    deadline_ms,
+                );
+                if let Err(publish_error) = timeout_client
+                    .publish_with_headers(subject, headers, body.into())
+                    .await
+                {
+                    tracing::warn!(
+                        %publish_error,
+                        %correlation_id,
+                        deadline_ms,
+                        "failed to publish timeout response for awaited dispatch"
+                    );
+                }
+            });
+        }
+
         Ok(built.action)
     }
 }
@@ -103,7 +191,7 @@ impl RemoteDispatchHandler for NatsDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use greentic_types::{DispatchMode, RuntimeDispatchRequest};
+    use greentic_types::{DispatchMode, RuntimeDispatchRequest, RuntimeDispatchResponse};
     use serde_json::json;
 
     fn sample(mode: DispatchMode) -> RemoteDispatch {
@@ -148,5 +236,38 @@ mod tests {
     fn fire_and_forget_action_is_dispatched() {
         let built = build_request(&sample(DispatchMode::FireAndForget)).unwrap();
         assert!(matches!(built.action, RemoteDispatchAction::Dispatched));
+    }
+
+    #[test]
+    fn build_timeout_response_message_uses_response_topic() {
+        let (subject, _headers, _body) =
+            build_timeout_response_message("sorla", "corr-1", "t1", "default", 500);
+        assert_eq!(subject, "greentic.sorla.response.v1");
+    }
+
+    #[test]
+    fn build_timeout_response_message_echoes_correlation_header() {
+        let (_subject, headers, _body) =
+            build_timeout_response_message("sorla", "my-corr-id", "t1", "default", 1000);
+        assert_eq!(
+            headers.get("Greentic-Correlation-Id").map(|v| v.as_str()),
+            Some("my-corr-id")
+        );
+    }
+
+    #[test]
+    fn build_timeout_response_message_body_deserializes_to_timeout_error() {
+        let (_subject, _headers, body) =
+            build_timeout_response_message("sorla", "corr-1", "t1", "default", 200);
+        let response: RuntimeDispatchResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!response.ok, "ok must be false");
+        assert_eq!(response.output, serde_json::Value::Null);
+        let error = response.error.expect("error must be present");
+        assert_eq!(error.code, "timeout");
+        assert!(
+            error.message.contains("200ms"),
+            "message must mention deadline: {:?}",
+            error.message
+        );
     }
 }
