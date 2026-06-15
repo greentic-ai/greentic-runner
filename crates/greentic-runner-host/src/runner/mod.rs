@@ -3,6 +3,7 @@ pub mod adapt_timer;
 pub mod agent_node;
 pub mod contract_cache;
 pub mod contract_introspection;
+pub mod dispatch_listener;
 pub mod engine;
 pub mod flow_adapter;
 pub mod graph_node;
