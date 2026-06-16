@@ -28,7 +28,7 @@ chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.22-research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.23-research" }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
 greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 greentic-state      = { workspace = true }
