@@ -102,6 +102,7 @@ semver.workspace = true
 proptest.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
+wiremock = "0.6"
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.2.0-research", features = ["test-mock"] }
 
 [[bench]]
