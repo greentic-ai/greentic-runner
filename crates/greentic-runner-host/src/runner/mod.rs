@@ -9,6 +9,8 @@ pub mod flow_adapter;
 pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
+#[cfg(feature = "long-term-chronicle")]
+pub mod long_term_memory;
 pub mod mocks;
 pub mod operator;
 pub mod remote_dispatch;
