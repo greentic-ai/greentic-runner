@@ -257,6 +257,10 @@ mod aw {
     /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
     /// API key is present. Defaults: provider "openai", model "gpt-4o". Pure (no
     /// env) so it is unit-testable without global state.
+    ///
+    /// Only used in tests now that the production bridge path uses
+    /// `SecretsBackedCredentialResolver`.
+    #[cfg(test)]
     pub(super) fn bridge_credential(
         provider: Option<String>,
         model: Option<String>,
@@ -297,6 +301,8 @@ mod aw {
     /// [`HostConfig`]; this mirrors the existing env-config convention.
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
@@ -345,38 +351,21 @@ mod aw {
             .filter(|s| !s.trim().is_empty())
         {
             Some(ext_id) => {
-                let api_key = std::env::var("GREENTIC_LLM_API_KEY")
-                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
-                    .unwrap_or_default();
-                match bridge_credential(
-                    std::env::var("GREENTIC_LLM_PROVIDER").ok(),
-                    std::env::var("GREENTIC_LLM_MODEL").ok(),
-                    api_key,
-                    std::env::var("GREENTIC_LLM_BASE_URL").ok(),
-                ) {
-                    Some(cred) => {
-                        tracing::info!(
-                            extension = %ext_id, provider = %cred.provider, model = %cred.model,
-                            "AW LLM via bridge extension"
-                        );
-                        Arc::new(RetryingLlmBackend::new(
-                            ExtensionLlmBackend::new(ext_runtime.clone(), ext_id, cred),
-                            3,
-                            Duration::from_millis(250),
-                        ))
-                    }
-                    None => {
-                        tracing::warn!(
-                            "GREENTIC_AW_LLM_EXTENSION set but no LLM API key; \
-                             falling back to in-process OpenAI client"
-                        );
-                        Arc::new(RetryingLlmBackend::new(
-                            OpenAiLlmBackend::new(String::new()),
-                            3,
-                            Duration::from_millis(250),
-                        ))
-                    }
-                }
+                use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
+                let resolver = Arc::new(SecretsBackedCredentialResolver::new(
+                    secrets.clone(),
+                    tenant.clone(),
+                ));
+                tracing::info!(
+                    extension = %ext_id,
+                    tenant = %tenant,
+                    "AW LLM via bridge (per-tenant creds)"
+                );
+                Arc::new(RetryingLlmBackend::new(
+                    ExtensionLlmBackend::with_resolver_runtime(ext_runtime.clone(), ext_id, resolver),
+                    3,
+                    Duration::from_millis(250),
+                ))
             }
             None => {
                 let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
