@@ -457,6 +457,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         attempt: 1,
         observer: Some(recorder_ref),
         mocks: Some(mock_ref),
+        reply_scope: None,
     };
 
     // Resume support: if the caller wired up a session_state_dir AND ctx
@@ -755,11 +756,13 @@ fn build_host_config(
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
-        // The `agents` field is present only when the host is compiled with
-        // the `agentic-worker` feature, which this crate propagates via its
-        // own same-named feature flag.
+        // The `agents` and `graphs` fields are present only when the host is
+        // compiled with the `agentic-worker` feature, which this crate
+        // propagates via its own same-named feature flag.
         #[cfg(feature = "agentic-worker")]
         agents: HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: HashMap::new(),
     }
 }
 

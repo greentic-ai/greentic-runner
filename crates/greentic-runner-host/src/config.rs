@@ -40,6 +40,15 @@ pub struct HostConfig {
     /// Only populated when the `agentic-worker` feature is enabled.
     #[cfg(feature = "agentic-worker")]
     pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
+    /// Operator/producer-declared agent-graph configs, keyed by `graph_id`.
+    /// The pack loader (Task 8) reads `agent-graph.json` sidecars directly, but
+    /// this map is the contract that external producers (e.g. greentic-start's
+    /// env-file path, the admin registry hand-off) populate to supply graphs
+    /// that do not ship as a pack sidecar. Merged with pack-sidecar graphs at
+    /// runtime construction (producer entries win on `graph_id` collision).
+    /// Only populated when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    pub graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -68,6 +77,13 @@ pub struct BindingsFile {
     #[cfg(feature = "agentic-worker")]
     #[serde(default)]
     pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
+    /// Operator-declared agent-graph configs keyed by `graph_id`. The whole
+    /// section is optional; each value must be a complete `GraphConfig`
+    /// (camelCase fields, same wire shape as the `agent-graph.json` sidecar).
+    /// Only present when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    #[serde(default)]
+    pub graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,6 +221,8 @@ impl HostConfig {
             operator_policy: OperatorPolicy::from_config(bindings.operator.clone()),
             #[cfg(feature = "agentic-worker")]
             agents: bindings.agents.clone(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: bindings.graphs.clone(),
         })
     }
 
@@ -236,6 +254,10 @@ impl HostConfig {
             // TenantBindings to carry them and populate this map here.
             #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
+            // TODO(phase-4): likewise, gtbind carries no agent-graph section;
+            // pack sidecars remain the local source of graphs for now.
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 
@@ -529,6 +551,8 @@ mod tests {
             operator_policy: OperatorPolicy::allow_all(),
             #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 

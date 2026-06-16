@@ -243,7 +243,74 @@ impl TenantRuntime {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
             }
+
+            // Collect agent-graph sidecars from each pack. Unlike agents (a
+            // manifest.cbor map), graphs arrive as a pack FILE (`agent-graph.json`)
+            // — one sidecar per pack — so the graph is keyed by `pack_id`. A
+            // sidecar that fails UTF-8 / JSON / schema validation is logged and
+            // skipped (lenient, mirroring `agent_configs_from_manifest`) so a bad
+            // graph never blocks the rest of pack loading. When the same pack_id
+            // appears twice (overlay), the last pack wins.
+            let mut graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig> =
+                HashMap::new();
+            for pack in &pack_runtimes {
+                let Some(bytes) = pack.read_agent_graph_sidecar() else {
+                    continue;
+                };
+                let pack_id = pack.metadata().pack_id.clone();
+                if let Some(config) =
+                    crate::runner::graph_node::graph_config_from_sidecar(&pack_id, &bytes)
+                    && graphs.insert(pack_id.clone(), config).is_some()
+                {
+                    tracing::warn!(
+                        pack_id = pack_id.as_str(),
+                        "agent-graph sidecar for pack_id seen twice; last pack wins"
+                    );
+                }
+            }
+
+            // Producer/operator-declared graphs (HostConfig.graphs) override
+            // pack-sidecar graphs on `graph_id` collision — mirroring the
+            // operator-wins merge for agents.
+            for (graph_id, graph_config) in config.graphs.clone() {
+                graphs.insert(graph_id, graph_config);
+            }
+
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(graphs).await
+            {
+                engine.set_graph_node_handler(handler);
+                tracing::info!("DwAgentGraph runtime wired into FlowEngine");
+            }
         }
+        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
+        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
+        // so the dispatcher must be attached while `engine` is still owned and
+        // mutable. The response listener (which needs the post-build ingress
+        // handle) is spawned further below, after the runtime is constructed.
+        //
+        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
+        // disabled and existing behaviour is unchanged. When set but NATS cannot
+        // be reached we log a warning and continue (the engine simply has no
+        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
+        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(nats_url) => match async_nats::connect(&nats_url).await {
+                Ok(client) => {
+                    engine.set_remote_dispatch_handler(Arc::new(
+                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
+                    ));
+                    Some(client)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
@@ -258,6 +325,33 @@ impl TenantRuntime {
             )
             .context("failed to initialise state machine runtime")?,
         );
+
+        // Spawn the response listeners now that the ingress handle
+        // (`state_machine`) exists. Each listener resumes paused flows by feeding
+        // a synthesized ingress envelope through `StateMachineRuntime::handle`
+        // (see `RuntimeSessionResumer`). The resumer is runtime-agnostic (it
+        // resumes by correlation id), so one shared resumer serves all runtimes;
+        // we run one listener per runtime so every `*.call` node's responses
+        // (`greentic.<runtime>.response.v1`) are consumed. Only started when the
+        // dispatcher above connected successfully.
+        if let Some(client) = dispatch_nats_client {
+            let resumer = Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
+                    &state_machine,
+                )),
+            );
+            for runtime_name in ["sorla", "operala", "agentic"] {
+                tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
+                    client.clone(),
+                    runtime_name.to_string(),
+                    Arc::clone(&resumer)
+                        as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                ));
+            }
+            tracing::info!(
+                "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call"
+            );
+        }
         let http_client = Client::builder().build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),

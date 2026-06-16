@@ -96,6 +96,14 @@ pub enum LlmError {
 }
 
 #[derive(Debug, Error)]
+pub enum MemoryError {
+    #[error("memory provider unavailable: {0}")]
+    Backend(String),
+    #[error("memory provider not configured")]
+    NotConfigured,
+}
+
+#[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("agent_id {0} not found for tenant")]
     AgentNotFound(String),
@@ -137,6 +145,7 @@ mod tests {
                 provider_failure_message: message.map(str::to_string),
                 ..AgentLimits::default()
             },
+            memory: None,
         }
     }
 

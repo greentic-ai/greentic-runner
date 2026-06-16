@@ -492,11 +492,26 @@ fn build_tool_call_record(call_id: String, name: &str, raw_args: &str) -> ToolCa
     }
 }
 
-/// Split an LLM-emitted tool name like `"http.fetch"` into
-/// `(extension_id, tool_name)`. No dot → `("", whole)`.
+/// Encode an `(extension_id, tool_name)` pair into a single OpenAI function
+/// name. OpenAI requires `^[a-zA-Z0-9_-]+$` (no dots), but `extension_id`s are
+/// dotted (e.g. `greentic.telco-x-tools`) and the historical `{ext}.{tool}`
+/// join inserted yet another dot — so every extension tool was rejected with a
+/// 400 (`tools[..].function.name` invalid). We escape dots to `_DOT_` and join
+/// with `_FN_`, both of which round-trip exactly via [`split_tool_name`]. An
+/// empty extension id encodes to the bare tool name (legacy "no dot" case).
+fn encode_tool_name(extension_id: &str, tool_name: &str) -> String {
+    if extension_id.is_empty() {
+        return tool_name.to_string();
+    }
+    format!("{}_FN_{}", extension_id.replace('.', "_DOT_"), tool_name)
+}
+
+/// Inverse of [`encode_tool_name`]: split an LLM-emitted function name back into
+/// `(extension_id, tool_name)`, restoring escaped dots. No separator → the whole
+/// string is the tool name with an empty extension id.
 fn split_tool_name(name: &str) -> (String, String) {
-    match name.split_once('.') {
-        Some((ext, tool)) => (ext.to_string(), tool.to_string()),
+    match name.split_once("_FN_") {
+        Some((ext, tool)) => (ext.replace("_DOT_", "."), tool.to_string()),
         None => (String::new(), name.to_string()),
     }
 }
@@ -524,7 +539,7 @@ fn build_messages(req: &LlmRequest) -> Vec<OaMessage> {
                         id: tc.call_id.clone(),
                         typ: "function",
                         function: OaToolFn {
-                            name: format!("{}.{}", tc.extension_id, tc.tool_name),
+                            name: encode_tool_name(&tc.extension_id, &tc.tool_name),
                             arguments: tc.args.to_string(),
                         },
                     })
@@ -549,7 +564,7 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
     OaTool {
         typ: "function",
         function: OaToolDef {
-            name: format!("{}.{}", t.extension_id, t.tool_name),
+            name: encode_tool_name(&t.extension_id, &t.tool_name),
             description: &t.description,
             parameters: &t.parameters,
         },
@@ -562,11 +577,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_tool_name_parses_extension_prefix() {
-        assert_eq!(
-            split_tool_name("http.fetch"),
-            ("http".into(), "fetch".into())
-        );
+    fn tool_name_round_trips_and_is_openai_safe() {
+        // Dotted extension ids are the common case. OpenAI forbids dots in
+        // function names (^[a-zA-Z0-9_-]+$), so encode escapes them; split must
+        // restore the exact id (it's used for dispatch lookup).
+        for (ext, tool) in [
+            ("greentic.telco-x-tools", "tx_resolve_prefix"),
+            ("greentic.tavily", "tavily_search"),
+            ("http", "fetch"),
+        ] {
+            let encoded = encode_tool_name(ext, tool);
+            assert!(
+                !encoded.contains('.'),
+                "encoded name must be OpenAI-safe (no dots): {encoded}"
+            );
+            assert_eq!(split_tool_name(&encoded), (ext.into(), tool.into()));
+        }
+        // No extension id → bare tool name, both directions.
+        assert_eq!(encode_tool_name("", "toolname-no-ext"), "toolname-no-ext");
         assert_eq!(
             split_tool_name("toolname-no-ext"),
             (String::new(), "toolname-no-ext".into())
@@ -674,7 +702,7 @@ mod tests {
         let lines = [
             r#"data: {"choices":[{"delta":{"content":"Hel"}}]}"#,
             r#"data: {"choices":[{"delta":{"content":"lo"}}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"kb.lookup","arguments":"{\"q\":"}}]}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"kb_FN_lookup","arguments":"{\"q\":"}}]}}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"x\"}"}}]}}]}"#,
             r#"data: {"usage":{"prompt_tokens":7,"completion_tokens":9},"choices":[]}"#,
             "data: [DONE]",

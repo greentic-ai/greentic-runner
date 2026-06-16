@@ -5,6 +5,10 @@
 //! point and the trait surface (`AgentStateStore`, `ConfigProvider`,
 //! `LlmBackend`, `Telemetry`) that the production runner-host and the
 //! designer playground both consume.
+//!
+//! The [`graph`] module provides durable multi-agent graph execution
+//! (`GraphExecutor`, `GraphConfig`, `CheckpointStore`); see
+//! `docs/superpowers/specs/2026-06-06-runtime-agent-graph-execution-design.md`.
 
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -13,15 +17,19 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod error;
+pub mod graph;
 pub mod http_provider;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
 pub mod llm_extension;
 pub mod llm_openai;
+pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
+pub mod mcp_source;
+pub mod memory;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;
@@ -31,12 +39,16 @@ pub mod tools;
 #[cfg(feature = "test-mock")]
 pub mod mock;
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
-pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
+pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
@@ -44,7 +56,13 @@ pub use llm_extension::{
     BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
 };
 pub use llm_openai::OpenAiLlmBackend;
+pub use long_term::{
+    EpisodeIngest, EpisodeSource, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
+    RecalledFact,
+};
 pub use manifest_provider::ManifestToolOverlayProvider;
+pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
+pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
@@ -103,9 +121,22 @@ pub struct AgentRuntime {
     pub(crate) telemetry: Arc<dyn Telemetry>,
     pub(crate) token_meter: Arc<dyn TokenMeter>,
     pub(crate) ledger: Arc<dyn ToolLedger>,
+    /// Per-tenant agentic-worker MCP tool source. `None` disables MCP tools
+    /// entirely (`mcp:`-prefixed tool refs then resolve to nothing). The real
+    /// per-operator wiring lives in the runner host; tests and non-MCP callers
+    /// pass `None`.
+    pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
+    /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
+    /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
+    /// concrete backend is injected at the runner-host edge, never compiled in.
+    pub(crate) long_term_memory: Option<Arc<dyn long_term::LongTermMemory>>,
 }
 
 impl AgentRuntime {
+    // Each argument is a distinct injected dependency (config, state, ext,
+    // llm, telemetry, token-meter, ledger, mcp); a builder would add ceremony
+    // without removing the coupling, so the wide constructor is intentional.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config_provider: Arc<dyn ConfigProvider>,
         state_store: Arc<dyn AgentStateStore>,
@@ -114,6 +145,7 @@ impl AgentRuntime {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
     ) -> Self {
         Self {
             config_provider,
@@ -123,7 +155,46 @@ impl AgentRuntime {
             telemetry,
             token_meter,
             ledger,
+            mcp,
+            long_term_memory: None,
         }
+    }
+
+    /// Wire the episodic long-term memory backend (e.g. Chronicle). Coexists
+    /// with the short-term/working memory; defaults off when not set.
+    #[must_use]
+    pub fn with_long_term_memory(mut self, memory: Arc<dyn long_term::LongTermMemory>) -> Self {
+        self.long_term_memory = Some(memory);
+        self
+    }
+
+    /// Ingest one episode (conversation turn, document, event) into long-term
+    /// memory. Returns [`LongTermMemoryError::NotConfigured`] when no long-term
+    /// backend is wired.
+    pub async fn remember_episode(
+        &self,
+        tenant: &TenantContext,
+        episode: long_term::EpisodeIngest,
+    ) -> Result<long_term::IngestOutcome, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.ingest_episode(&ctx, episode).await
+    }
+
+    /// Semantic recall over long-term memory. Returns
+    /// [`LongTermMemoryError::NotConfigured`] when no long-term backend is wired.
+    pub async fn recall_long_term(
+        &self,
+        tenant: &TenantContext,
+        query: long_term::RecallQuery,
+    ) -> Result<Vec<long_term::RecalledFact>, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.recall(&ctx, query).await
     }
 
     /// Execute one agentic step against the given session.

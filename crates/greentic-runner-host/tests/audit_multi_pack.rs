@@ -40,6 +40,8 @@ fn host_config(tenant: &str) -> HostConfig {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 
@@ -196,6 +198,7 @@ async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,
@@ -210,6 +213,7 @@ async fn flow_engine_allows_duplicate_flow_ids_across_packs() -> Result<()> {
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,

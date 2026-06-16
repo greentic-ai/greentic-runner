@@ -61,6 +61,7 @@ mod tests {
                 credential_ref: None,
             },
             limits: AgentLimits::default(),
+            memory: None,
         }
     }
 

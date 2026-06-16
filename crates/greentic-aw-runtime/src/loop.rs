@@ -57,6 +57,15 @@ pub async fn run_step(
         content: message.text,
     });
 
+    // Resolve the per-tenant agentic-worker MCP catalog once per step. The
+    // source is infallible (degrades to an empty catalog on any admin/server
+    // failure) and TTL-cached, so a stable config does not re-hit the network
+    // across iterations. `None` source → no MCP tools at all.
+    let mcp_catalog = match runtime.mcp.as_ref() {
+        Some(src) => Some(src.catalog(&tenant).await),
+        None => None,
+    };
+
     let mut total_tokens: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
     let mut terminated_by = TerminationReason::MaxIterations;
@@ -77,7 +86,8 @@ pub async fn run_step(
             break;
         }
 
-        let tools_schema = list_tools_for_llm(&runtime.ext_runtime, &config.tools);
+        let tools_schema =
+            list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
         let request = LlmRequest {
             system_prompt: config.system_prompt.clone(),
             history: state.messages.clone(),
@@ -121,6 +131,15 @@ pub async fn run_step(
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
+            // Record the assistant's tool-call turn BEFORE the tool results.
+            // OpenAI requires every `tool` message to follow an assistant
+            // message carrying the matching `tool_calls`; without this the next
+            // turn 400s ("messages with role 'tool' must be a response to a
+            // preceeding message with 'tool_calls'").
+            state.messages.push(ChatMessage::Assistant {
+                content: response.content.clone().unwrap_or_default(),
+                tool_calls: response.tool_calls.clone(),
+            });
             for call in response.tool_calls {
                 if !is_tool_allowed(&call, &config.tools) {
                     state.messages.push(ChatMessage::Tool {
@@ -159,27 +178,32 @@ pub async fn run_step(
                 // continue. Failed calls are NOT recorded in the ledger
                 // (they should remain retryable on the next turn).
                 observer.on_tool_call(&call.tool_name, &call.call_id);
-                let result =
-                    match dispatch_tool_call(runtime.ext_runtime.clone(), call.clone()).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            warn!(
-                                error = %e, tool = %call.tool_name,
-                                "tool dispatch failed; recording as observation and continuing"
-                            );
-                            let err_obs = serde_json::json!({ "error": e.to_string() });
-                            state.messages.push(ChatMessage::Tool {
-                                call_id: call.call_id.clone(),
-                                content: err_obs.clone(),
-                            });
-                            trail.push(AgentStep::ToolCall {
-                                name: call.tool_name.clone(),
-                                call_id: call.call_id.clone(),
-                                result: err_obs,
-                            });
-                            continue;
-                        }
-                    };
+                let result = match dispatch_tool_call(
+                    runtime.ext_runtime.clone(),
+                    mcp_catalog.clone(),
+                    call.clone(),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(
+                            error = %e, tool = %call.tool_name,
+                            "tool dispatch failed; recording as observation and continuing"
+                        );
+                        let err_obs = serde_json::json!({ "error": e.to_string() });
+                        state.messages.push(ChatMessage::Tool {
+                            call_id: call.call_id.clone(),
+                            content: err_obs.clone(),
+                        });
+                        trail.push(AgentStep::ToolCall {
+                            name: call.tool_name.clone(),
+                            call_id: call.call_id.clone(),
+                            result: err_obs,
+                        });
+                        continue;
+                    }
+                };
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
 
@@ -263,6 +287,7 @@ mod tests {
                 credential_ref: None,
             },
             limits: AgentLimits::default(),
+            memory: None,
         }
     }
 
@@ -285,8 +310,16 @@ mod tests {
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
-        let runtime =
-            AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm,
+            telemetry.clone(),
+            token_meter,
+            ledger,
+            None,
+        );
 
         let out = runtime
             .step(
@@ -342,8 +375,16 @@ mod tests {
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
-        let runtime =
-            AgentRuntime::new(cp, store, ext, llm, telemetry.clone(), token_meter, ledger);
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm,
+            telemetry.clone(),
+            token_meter,
+            ledger,
+            None,
+        );
 
         let obs = Arc::new(Collecting::default());
         let out = runtime
@@ -394,7 +435,7 @@ mod tests {
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
-        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
 
         let obs = Arc::new(CountOnly::default());
         let out = runtime

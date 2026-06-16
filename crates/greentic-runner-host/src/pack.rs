@@ -77,7 +77,8 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::{LinkOptions, WasiTls, WasiTlsCtx, WasiTlsCtxBuilder};
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
+use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
@@ -1200,6 +1201,10 @@ pub struct ComponentState {
 
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
+        // `WasiTlsCtxBuilder::new()` below eagerly builds a rustls client
+        // config, which requires a process-level crypto provider; install it
+        // first (idempotent) so construction never panics.
+        ensure_rustls_provider_installed();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1274,15 +1279,34 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
     Ok(())
 }
 
+/// Install a process-level rustls [`CryptoProvider`] for `wasi-tls`.
+///
+/// `wasmtime-wasi-tls` 45 builds its TLS client config via
+/// `rustls::ClientConfig::builder()`, which relies on the process-default
+/// crypto provider. Because both `aws-lc-rs` (via reqwest/hyper-rustls) and
+/// `ring` (via wasmtime-wasi-tls) are linked, rustls 0.23 cannot auto-select
+/// one and panics on first use. Install `aws-lc-rs` explicitly to match the
+/// provider used by the rest of the runner's HTTP stack.
+///
+/// Idempotent: only installs when no default is set yet, so concurrent callers
+/// (and repeated `register_all` invocations) are safe.
+fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        // `install_default` returns Err if another thread won the race; that is
+        // fine — a provider is installed either way.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
+    ensure_rustls_provider_installed();
+
     add_wasi_to_linker(linker)?;
 
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::add_to_linker(linker, &mut opts, |h: &mut ComponentState| {
-        WasiTls::new(&h.wasi_tls_ctx, &mut h.resource_table)
-    })?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1299,6 +1323,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
+            runtime_config: None,
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
@@ -1444,6 +1469,15 @@ impl WasiHttpView for ComponentState {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+impl WasiTlsView for ComponentState {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.wasi_tls_ctx,
+            table: &mut self.resource_table,
         }
     }
 }
@@ -1860,6 +1894,7 @@ impl PackRuntime {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -2035,6 +2070,37 @@ impl PackRuntime {
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
+
+            // Extension-provider worlds (greentic:extension-provider@0.2.0 /
+            // @0.1.0) are introspection surfaces (list-channels,
+            // describe-channel, *-schema, dry-run-encode) and deliberately do
+            // NOT export a generic `invoke(op, input)` data-plane call. If a
+            // pack declares such a world for the runtime data plane, dispatch
+            // here would otherwise fall through to the legacy schema-core
+            // bindings and fail with an opaque "no exported instance" wasmtime
+            // error. Detect it up front (declared-world fast path, confirmed by
+            // an instance-level probe) and surface a typed, downcastable
+            // `ProviderInvokeError` instead. The data-plane routing for these
+            // worlds is an open design question (see PR body NEEDS_DECISION);
+            // legacy schema-core remains the default path below.
+            if world.contains("extension-provider") {
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
+                let instance =
+                    block_on(async { pre_instance.instantiate_async(&mut store).await })?;
+                let detected =
+                    crate::extension_provider::probe_provider_world(&mut store, &instance);
+                let version = detected
+                    .map(|w| w.version())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let typed = crate::extension_provider::ProviderInvokeError::Internal(format!(
+                    "extension-provider@{version} world exposes no data-plane invoke; \
+                     operation '{op_owned}' has no extension-provider equivalent (introspection \
+                     surface only)"
+                ));
+                return Err(crate::extension_provider::into_anyhow(typed));
+            }
+
             let use_schema_core_schema = world.contains("provider-schema-core");
             let use_schema_core_path = world.contains("provider/schema-core");
             let result = if use_schema_core_schema {
@@ -2168,6 +2234,89 @@ impl PackRuntime {
             .as_ref()
             .map(|m| m.agents.clone())
             .unwrap_or_default()
+    }
+
+    /// Read the optional `agent-graph.json` sidecar embedded at the pack root.
+    ///
+    /// Returns the raw bytes when present, or `None` when the pack carries no
+    /// sidecar (the common case). Tries the materialized pack directory first,
+    /// then the `.gtpack` archive — mirroring [`load_schema_json`]'s resolution.
+    /// IO/zip errors are logged and treated as "absent" so a damaged or
+    /// unreadable sidecar never aborts pack loading; the caller
+    /// (`graph_node::graph_config_from_sidecar`) then validates the bytes.
+    ///
+    /// [`load_schema_json`]: PackRuntime::load_schema_json
+    pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
+        const SIDECAR_NAME: &str = "agent-graph.json";
+
+        // Materialized pack directory (root holds manifest.cbor + sidecar).
+        if self.path.is_dir() {
+            let candidate = self.path.join(SIDECAR_NAME);
+            if candidate.exists() {
+                match std::fs::read(&candidate) {
+                    Ok(bytes) => return Some(bytes),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %candidate.display(),
+                            error = %error,
+                            "failed to read agent-graph.json from pack directory"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // `.gtpack` archive.
+        let archive_path = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))?;
+        let file = match File::open(archive_path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to open pack archive while reading agent-graph.json"
+                );
+                return None;
+            }
+        };
+        let mut archive = match ZipArchive::new(file) {
+            Ok(archive) => archive,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read pack archive while reading agent-graph.json"
+                );
+                return None;
+            }
+        };
+        match archive.by_name(SIDECAR_NAME) {
+            Ok(mut entry) => {
+                let mut bytes = Vec::new();
+                if let Err(error) = entry.read_to_end(&mut bytes) {
+                    tracing::warn!(
+                        path = %archive_path.display(),
+                        error = %error,
+                        "failed to extract agent-graph.json from pack archive"
+                    );
+                    return None;
+                }
+                Some(bytes)
+            }
+            Err(zip::result::ZipError::FileNotFound) => None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "error reading agent-graph.json from pack archive"
+                );
+                None
+            }
+        }
     }
 
     pub fn describe_component_contract_v0_6(&self, component_ref: &str) -> Result<Option<Value>> {
@@ -4124,6 +4273,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4184,6 +4334,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 

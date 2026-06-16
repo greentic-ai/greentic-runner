@@ -9,24 +9,45 @@ publish     = false
 [features]
 default   = []
 test-mock = []
+# NATS serve mode (agentic.call out-of-process dispatch). Pulls in the event
+# bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
+# credit-free canned-reply runtime.
+serve     = ["dep:aw-event-bridge", "dep:async-nats"]
+
+[[bin]]
+name = "aw-serve"
+path = "src/bin/aw_serve.rs"
+required-features = ["serve", "test-mock"]
 
 [dependencies]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
+async-nats          = { version = "0.46", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
 chrono              = { version = "0.4", features = ["serde"] }
+dashmap             = { workspace = true }
 futures             = { workspace = true }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.17-research" }
+# Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
+# the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
+# the runner-host edge, never compiled into this runtime crate.
+greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.24-research" }
 greentic-secrets-lib = { workspace = true }
+greentic-types       = { workspace = true }
+# MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
+greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+secrecy             = "0.10"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = { workspace = true }
 thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }
+url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]

@@ -640,6 +640,10 @@ impl Adapter for PackFlowAdapter {
             action: action_owned.as_deref(),
             session_id: Some(session_owned.as_str()),
             provider_id: provider_owned.as_deref(),
+            // Carry the inbound reply scope so async-dispatch nodes can encode
+            // the originating thread/reply_to into the dispatch correlation id
+            // (so a threaded wait can be re-keyed on resume).
+            reply_scope: envelope.reply_scope.as_ref(),
             retry_config,
             attempt: 1,
             observer: trace

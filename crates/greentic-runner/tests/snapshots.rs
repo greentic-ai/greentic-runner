@@ -95,6 +95,8 @@ fn host_config(tenant: &str, retry: FlowRetryConfig) -> HostConfig {
         operator_policy: OperatorPolicy::allow_all(),
         #[cfg(feature = "agentic-worker")]
         agents: HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: HashMap::new(),
     }
 }
 
@@ -432,6 +434,7 @@ fn run_flow(
         attempt: 1,
         observer,
         mocks: None,
+        reply_scope: None,
     };
 
     let execution = runtime.block_on(engine.execute(ctx, Value::Null));
