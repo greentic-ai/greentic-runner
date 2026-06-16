@@ -16,6 +16,7 @@ pub mod error;
 pub mod http_provider;
 pub mod layered_provider;
 pub mod llm;
+pub mod llm_credential;
 pub mod llm_extension;
 pub mod llm_openai;
 pub mod r#loop;
