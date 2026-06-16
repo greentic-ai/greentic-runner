@@ -1035,6 +1035,7 @@ mod aw {
     }
 }
 
+#[allow(clippy::items_after_test_module)] // helper fn + re-exports follow
 #[cfg(test)]
 mod gating_tests {
     use super::should_serve_agentic_inproc;

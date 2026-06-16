@@ -232,6 +232,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::expect_used)] // test asserts the mock path succeeds
     async fn mock_invoker_returns_reply_output() {
         let runtime = build_test_mock_runtime("greeter", "pong");
         let invoker = RuntimeAgentDispatchInvoker::new(runtime);

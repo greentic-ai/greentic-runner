@@ -175,8 +175,11 @@ mod tests {
     use serde_json::json;
     use std::sync::Mutex;
 
+    /// (tenant/env elided, target, operation, payload, idempotency_key)
+    type SeenCall = (String, String, Value, Option<String>);
+
     struct StubInvoker {
-        seen: Mutex<Vec<(String, String, Value, Option<String>)>>,
+        seen: Mutex<Vec<SeenCall>>,
     }
 
     #[async_trait]
