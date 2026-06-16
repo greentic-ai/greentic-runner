@@ -14,19 +14,27 @@ mod inner {
     use crate::config_provider::ConfigProvider;
     use crate::error::{ConfigError, LlmError, StateError, TerminationReason};
     use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
+    use crate::long_term::{
+        EpisodeIngest, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery, RecalledFact,
+    };
     use crate::state::{AgentStateStore, ConversationState, SessionLock, SessionLockInner};
     use crate::telemetry::{StepTelemetryCtx, Telemetry};
     use crate::tenant::TenantContext;
+    use greentic_types::TenantCtx;
+    use tokio::sync::Notify;
 
-    /// LLM mock with a scripted response queue.
+    /// LLM mock with a scripted response queue. Records the `system_prompt` of
+    /// every request it sees so tests can assert on prompt augmentation.
     pub struct MockLlmBackend {
         pub responses: Mutex<Vec<Result<LlmResponse, LlmError>>>,
+        pub seen_system_prompts: Mutex<Vec<String>>,
     }
 
     impl MockLlmBackend {
         pub fn new(responses: Vec<Result<LlmResponse, LlmError>>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                seen_system_prompts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -34,8 +42,12 @@ mod inner {
     impl LlmBackend for MockLlmBackend {
         fn complete<'a>(
             &'a self,
-            _req: LlmRequest,
+            req: LlmRequest,
         ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+            self.seen_system_prompts
+                .lock()
+                .expect("mock llm prompt lock poisoned")
+                .push(req.system_prompt.clone());
             // Eagerly extract the next scripted response so the future is Send + 'a.
             let next = {
                 let mut queue = self.responses.lock().expect("mock LLM mutex poisoned");
@@ -46,6 +58,82 @@ mod inner {
                 }
             };
             Box::pin(async move { next })
+        }
+    }
+
+    /// In-memory long-term backend for tests. Returns `scripted_facts` from
+    /// `recall`, records every `ingest_episode` body, and notifies after each
+    /// ingest so fire-and-forget callers can be awaited deterministically.
+    pub struct MockLongTermMemory {
+        scripted_facts: Vec<RecalledFact>,
+        ingested: Mutex<Vec<EpisodeIngest>>,
+        ingested_notify: Notify,
+    }
+
+    impl MockLongTermMemory {
+        pub fn new(scripted_facts: Vec<RecalledFact>) -> Self {
+            Self {
+                scripted_facts,
+                ingested: Mutex::new(Vec::new()),
+                ingested_notify: Notify::new(),
+            }
+        }
+
+        /// Snapshot of the episodes ingested so far.
+        pub fn ingested(&self) -> Vec<EpisodeIngest> {
+            self.ingested
+                .lock()
+                .expect("mock ingest lock poisoned")
+                .clone()
+        }
+
+        /// Wait until at least `n` episodes have been ingested (deterministic
+        /// alternative to sleeping for a fire-and-forget ingest).
+        pub async fn wait_for_ingests(&self, n: usize) {
+            loop {
+                // Register interest BEFORE checking, so a notify that fires
+                // between the check and the await is not missed.
+                let notified = self.ingested_notify.notified();
+                if self
+                    .ingested
+                    .lock()
+                    .expect("mock ingest lock poisoned")
+                    .len()
+                    >= n
+                {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LongTermMemory for MockLongTermMemory {
+        async fn ingest_episode(
+            &self,
+            _tenant: &TenantCtx,
+            episode: EpisodeIngest,
+        ) -> Result<IngestOutcome, LongTermMemoryError> {
+            let id = format!("ep-{}", episode.name);
+            self.ingested
+                .lock()
+                .expect("mock ingest lock poisoned")
+                .push(episode);
+            self.ingested_notify.notify_waiters();
+            Ok(IngestOutcome {
+                episode_id: id,
+                fact_count: 0,
+                entity_count: 0,
+            })
+        }
+
+        async fn recall(
+            &self,
+            _tenant: &TenantCtx,
+            _query: RecallQuery,
+        ) -> Result<Vec<RecalledFact>, LongTermMemoryError> {
+            Ok(self.scripted_facts.clone())
         }
     }
 
@@ -233,6 +321,6 @@ mod inner {
 }
 
 pub use inner::{
-    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
-    assert_terminated_by,
+    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockLongTermMemory, MockTelemetry,
+    NoopToolLedger, assert_terminated_by,
 };
