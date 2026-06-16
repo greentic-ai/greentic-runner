@@ -13,9 +13,6 @@ use serde::Deserialize;
 /// Convert a canonical `secrets://{env}/{tenant}/{team}/{cat}/{name}` URI into
 /// the broker `/v1/...` request path. Path segments are preserved verbatim
 /// (the broker treats `_` as the tenant-wide team).
-// Not yet referenced outside this module; will be used when wired into the
-// host builder in a follow-up task.
-#[allow(dead_code)]
 pub(crate) fn broker_path_from_uri(uri: &str) -> Result<String, SecretError> {
     let rest = uri
         .strip_prefix("secrets://")
@@ -26,7 +23,6 @@ pub(crate) fn broker_path_from_uri(uri: &str) -> Result<String, SecretError> {
     Ok(format!("/v1/{rest}"))
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct SecretResponse {
     value: String,
@@ -34,8 +30,6 @@ struct SecretResponse {
     encoding: String, // "utf8" | "base64"
 }
 
-// Not yet instantiated from outside this module; follow-up tasks wire it in.
-#[allow(dead_code)]
 pub(crate) struct BrokerSecretsManager {
     client: Client,
     endpoint: String,
@@ -43,7 +37,6 @@ pub(crate) struct BrokerSecretsManager {
 }
 
 impl BrokerSecretsManager {
-    #[allow(dead_code)]
     pub(crate) fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             client: Client::builder()
