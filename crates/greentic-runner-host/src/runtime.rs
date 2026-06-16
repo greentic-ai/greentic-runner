@@ -233,8 +233,12 @@ impl TenantRuntime {
             // Operator config overrides pack-provided agents on collision.
             let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
 
-            if let Some(handler) =
-                crate::runner::agent_node::build_agent_node_handler(merged_agents).await
+            if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(
+                merged_agents,
+                config.tenant.clone(),
+                Arc::clone(&secrets_manager),
+            )
+            .await
             {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");

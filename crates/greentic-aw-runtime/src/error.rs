@@ -139,6 +139,7 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4".into(),
+                credential_ref: None,
             },
             limits: AgentLimits {
                 provider_failure_message: message.map(str::to_string),

@@ -776,6 +776,7 @@ mod aw {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
             memory: None,
@@ -909,6 +910,7 @@ mod aw {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
             memory: None,

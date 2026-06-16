@@ -740,6 +740,7 @@ mod tests {
             provider: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                credential_ref: None,
             },
         };
         let value = serde_json::to_value(build_messages(&req)).unwrap();

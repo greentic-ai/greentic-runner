@@ -175,6 +175,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         llm: LlmProviderRef {
             provider: "mock".to_string(),
             model: "mock".to_string(),
+            credential_ref: None,
         },
         limits: AgentLimits::default(),
         memory: None,

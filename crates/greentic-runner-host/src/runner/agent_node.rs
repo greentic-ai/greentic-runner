@@ -422,10 +422,119 @@ mod aw {
     /// Redis is sourced from the environment because the runner uses an
     /// in-memory flow-state store by default and carries no Redis URL in
     /// [`HostConfig`]; this mirrors the existing env-config convention.
+    ///
+    /// The `tenant` and `secrets` arguments wire in per-tenant LLM credential
+    /// resolution when `GREENTIC_AW_LLM_EXTENSION` is set: requests resolve
+    /// credentials from the secrets broker for the calling tenant rather than
+    /// reading global env vars. Callers without per-tenant context (e.g.
+    /// `serve_agentic`) should use [`build_agent_runtime`] directly, which uses
+    /// the env-keyed backend and accepts no secrets context.
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
-        let runtime = build_agent_runtime(merged_agents).await?;
+        use std::time::Duration;
+
+        use greentic_aw_runtime::LayeredConfigProvider;
+        use greentic_aw_runtime::ManifestToolOverlayProvider;
+        use greentic_aw_runtime::config_provider::CachingConfigProvider;
+        use greentic_aw_runtime::cost::RedisTokenMeter;
+        use greentic_aw_runtime::tools::RedisToolLedger;
+        use greentic_aw_runtime::{
+            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry,
+            RedisAgentStateStore, RetryingLlmBackend,
+        };
+
+        if merged_agents.is_empty() {
+            return None;
+        }
+
+        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
+            Ok(url) if !url.is_empty() => url,
+            _ => {
+                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let manager = state_store.manager();
+        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
+        let ledger = Arc::new(RedisToolLedger::new(manager));
+
+        let ext_runtime = build_ext_runtime()?;
+
+        // When the LLM bridge extension is configured, resolve credentials
+        // per-tenant from the secrets broker rather than from global env vars.
+        // The env-keyed OpenAI fallback is preserved for both branches.
+        let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(ext_id) => {
+                use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
+                let resolver = Arc::new(SecretsBackedCredentialResolver::new(
+                    secrets.clone(),
+                    tenant.clone(),
+                ));
+                tracing::info!(
+                    extension = %ext_id,
+                    tenant = %tenant,
+                    "AW LLM via bridge (per-tenant creds)"
+                );
+                Arc::new(RetryingLlmBackend::new(
+                    ExtensionLlmBackend::with_resolver_runtime(
+                        ext_runtime.clone(),
+                        ext_id,
+                        resolver,
+                    ),
+                    3,
+                    Duration::from_millis(250),
+                ))
+            }
+            None => {
+                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                Arc::new(RetryingLlmBackend::new(
+                    OpenAiLlmBackend::new(openai_key),
+                    3,
+                    Duration::from_millis(250),
+                ))
+            }
+        };
+
+        let agent_count = merged_agents.len();
+        let overlay = ManifestToolOverlayProvider::new(
+            HostConfigProvider::new(merged_agents),
+            manifests_discovery_dir(),
+        );
+        let config_provider: Arc<dyn ConfigProvider> = match registry_from_env() {
+            Some(http) => Arc::new(CachingConfigProvider::new(LayeredConfigProvider::new(
+                http, overlay,
+            ))),
+            None => Arc::new(CachingConfigProvider::new(overlay)),
+        };
+        let telemetry = Arc::new(OtelTelemetry);
+
+        let runtime = Arc::new(AgentRuntime::new(
+            config_provider,
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+            mcp_source_from_env(),
+        ));
+
+        tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed (per-tenant creds)");
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
     }
 
@@ -479,6 +588,9 @@ mod aw {
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
+        // NOTE: this path has no per-tenant secrets context (it is used by
+        // `serve_agentic` and process-level in-proc serve). Per-tenant
+        // credential resolution is only available via `build_agent_node_handler`.
         let llm = build_llm_backend(&ext_runtime);
 
         let agent_count = merged_agents.len();
@@ -631,6 +743,7 @@ mod aw {
                 llm: LlmProviderRef {
                     provider: "openai".into(),
                     model: "gpt-4o-mini".into(),
+                    credential_ref: None,
                 },
                 limits: AgentLimits::default(),
                 memory: None,
@@ -660,6 +773,7 @@ mod aw {
                     llm: LlmProviderRef {
                         provider: "mock".into(),
                         model: "m".into(),
+                        credential_ref: None,
                     },
                     limits: AgentLimits::default(),
                     memory: None,

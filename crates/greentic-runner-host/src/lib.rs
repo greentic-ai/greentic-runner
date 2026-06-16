@@ -46,6 +46,7 @@ pub mod runner;
 pub mod runtime;
 pub mod runtime_wasmtime;
 pub mod secrets;
+pub(crate) mod secrets_broker;
 pub mod sql;
 pub mod storage;
 pub mod telemetry;

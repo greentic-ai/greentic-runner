@@ -159,6 +159,7 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
             memory: None,

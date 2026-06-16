@@ -1323,6 +1323,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
+            runtime_config: None,
         },
     )?;
     add_http_client_client_world_aliases(linker)?;

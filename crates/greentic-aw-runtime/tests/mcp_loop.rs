@@ -82,6 +82,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),
+            credential_ref: None,
         },
         limits: AgentLimits {
             max_iter: 4,
