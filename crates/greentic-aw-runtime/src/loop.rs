@@ -53,9 +53,28 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
+    let user_message = message.text.clone();
     state.messages.push(ChatMessage::User {
         content: message.text,
     });
+
+    // --- Long-term recall: inject relevant facts into this turn's prompt ---
+    let system_prompt =
+        if crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config) {
+            let facts = runtime
+                .recall_long_term(
+                    &tenant,
+                    crate::long_term::RecallQuery {
+                        query: user_message.clone(),
+                        limit: Some(crate::long_term::AUTO_INJECT_K),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
+        } else {
+            config.system_prompt.clone()
+        };
 
     // Resolve the per-tenant agentic-worker MCP catalog once per step. The
     // source is infallible (degrades to an empty catalog on any admin/server
@@ -89,7 +108,7 @@ pub async fn run_step(
         let tools_schema =
             list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
         let request = LlmRequest {
-            system_prompt: config.system_prompt.clone(),
+            system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
