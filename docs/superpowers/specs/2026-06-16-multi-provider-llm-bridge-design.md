@@ -141,24 +141,24 @@ form→config mapping in the plan.
 
 ## Decomposition into sub-projects
 
-This is too large for one implementation plan. Brainstorm/plan **sub-project 1 first**.
+Per decision (2026-06-16): build the **full 9-provider set in one plan** (sub-projects 1+2
+merged). Plan **sub-project 1** next; sub-project 3 is an optional follow-up.
 
-### Sub-project 1 — vertical slice end-to-end (OpenAI + Anthropic)
-Proves the entire chain with two providers.
-1. Bridge extension with OpenAI + Anthropic mappers + `complete` tool; build + publish `.gtxpack`.
+### Sub-project 1 — full end-to-end, all 9 providers
+Proves the entire chain AND ships every provider.
+1. Bridge extension with **all 9** provider mappers (openai, anthropic, deepseek, gemini, cohere,
+   ollama, groq, perplexity, xai) + `complete` tool; build + publish `.gtxpack`. Build the chain
+   on OpenAI + Anthropic first (the two best-understood mappers) to validate the wire contract,
+   then add the remaining seven mappers behind the same `complete` interface — internal sequencing
+   only, single deliverable.
 2. Runner broker `SecretsManager` client + `SecretsBackend::Broker` + config.
 3. Runner per-request credential resolution in `ExtensionLlmBackend`; thread
    SecretsManager + TenantContext; default the bridge env.
-4. Two catalog entries (openai, anthropic) → refresh into designer assets; pin provider-string
-   mapping.
-5. Deploy env + **live smoke**: one Anthropic worker answering through a deployed operator.
+4. **Nine** catalog entries → refresh into designer assets; pin provider-string mapping.
+5. Deploy env + **live smoke**: at least one provider (Anthropic) answering through a deployed
+   operator; per-provider unit fixtures cover the other eight.
 
-### Sub-project 2 — fan-out remaining 7 providers
-deepseek, gemini, cohere, ollama, groq, perplexity, xai: add mappers + catalog entries +
-per-provider request/response fixtures. (azure-openai/bedrock-style custom auth, if wanted later,
-tracked separately — harder in wasm.)
-
-### Sub-project 3 — productionize per-tenant credentials (if needed)
+### Sub-project 3 — productionize per-tenant credentials (optional follow-up)
 Admin UI coverage for per-tenant LLM credential management (verify against Slice C) + cloud KMS
 backend wiring for the broker in production.
 
