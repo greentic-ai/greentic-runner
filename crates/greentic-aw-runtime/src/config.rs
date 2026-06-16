@@ -27,6 +27,7 @@ pub struct LlmProviderRef {
 /// tiers. Mirrors the composer `ProviderBinding` projected into runtime config.
 /// `capability` distinguishes the tier (`cap://memory/short-term` vs
 /// `cap://memory/long-term`).
+// `Eq` deliberately omitted: `params` holds `serde_json::Value`, which is not `Eq`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryProviderRef {
     pub provider: String,
