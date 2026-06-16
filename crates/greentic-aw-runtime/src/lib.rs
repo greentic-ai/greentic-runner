@@ -23,6 +23,7 @@ pub mod layered_provider;
 pub mod llm;
 pub mod llm_extension;
 pub mod llm_openai;
+pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
@@ -54,6 +55,10 @@ pub use llm_extension::{
     BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
 };
 pub use llm_openai::OpenAiLlmBackend;
+pub use long_term::{
+    EpisodeIngest, EpisodeSource, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
+    RecalledFact,
+};
 pub use manifest_provider::ManifestToolOverlayProvider;
 pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
@@ -120,6 +125,10 @@ pub struct AgentRuntime {
     /// per-operator wiring lives in the runner host; tests and non-MCP callers
     /// pass `None`.
     pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
+    /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
+    /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
+    /// concrete backend is injected at the runner-host edge, never compiled in.
+    pub(crate) long_term_memory: Option<Arc<dyn long_term::LongTermMemory>>,
 }
 
 impl AgentRuntime {
@@ -146,7 +155,45 @@ impl AgentRuntime {
             token_meter,
             ledger,
             mcp,
+            long_term_memory: None,
         }
+    }
+
+    /// Wire the episodic long-term memory backend (e.g. Chronicle). Coexists
+    /// with the short-term/working memory; defaults off when not set.
+    #[must_use]
+    pub fn with_long_term_memory(mut self, memory: Arc<dyn long_term::LongTermMemory>) -> Self {
+        self.long_term_memory = Some(memory);
+        self
+    }
+
+    /// Ingest one episode (conversation turn, document, event) into long-term
+    /// memory. Returns [`LongTermMemoryError::NotConfigured`] when no long-term
+    /// backend is wired.
+    pub async fn remember_episode(
+        &self,
+        tenant: &TenantContext,
+        episode: long_term::EpisodeIngest,
+    ) -> Result<long_term::IngestOutcome, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.ingest_episode(&ctx, episode).await
+    }
+
+    /// Semantic recall over long-term memory. Returns
+    /// [`LongTermMemoryError::NotConfigured`] when no long-term backend is wired.
+    pub async fn recall_long_term(
+        &self,
+        tenant: &TenantContext,
+        query: long_term::RecallQuery,
+    ) -> Result<Vec<long_term::RecalledFact>, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.recall(&ctx, query).await
     }
 
     /// Execute one agentic step against the given session.
