@@ -778,6 +778,7 @@ mod aw {
                 model: req.model.clone(),
             },
             limits: AgentLimits::default(),
+            memory: None,
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
@@ -910,6 +911,7 @@ mod aw {
                 model: req.model.clone(),
             },
             limits: AgentLimits::default(),
+            memory: None,
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);

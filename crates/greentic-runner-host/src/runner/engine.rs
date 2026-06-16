@@ -3342,6 +3342,7 @@ mod tests {
                     model: "m".into(),
                 },
                 limits: AgentLimits::default(),
+                memory: None,
             },
         );
         let config_provider = Arc::new(config_provider);

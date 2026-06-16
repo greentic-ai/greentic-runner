@@ -60,6 +60,7 @@ mod tests {
                 model: "m".into(),
             },
             limits: AgentLimits::default(),
+            memory: None,
         }
     }
 

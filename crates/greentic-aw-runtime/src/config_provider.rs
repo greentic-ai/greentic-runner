@@ -161,6 +161,7 @@ mod tests {
                 model: "gpt-4o-mini".into(),
             },
             limits: AgentLimits::default(),
+            memory: None,
         }
     }
 

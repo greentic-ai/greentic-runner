@@ -23,6 +23,30 @@ pub struct LlmProviderRef {
     pub model: String,    // "gpt-4o-mini" | "claude-3-haiku" | ...
 }
 
+/// Reference to a memory provider extension bound to one of an agent's memory
+/// tiers. Mirrors the composer `ProviderBinding` projected into runtime config.
+/// `capability` distinguishes the tier (`cap://memory/short-term` vs
+/// `cap://memory/long-term`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryProviderRef {
+    pub provider: String,
+    pub capability: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+/// Short-term and long-term memory bindings for an agent. Either tier may be
+/// absent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemorySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_term: Option<MemoryProviderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term: Option<MemoryProviderRef>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub agent_id: String,
@@ -31,6 +55,8 @@ pub struct AgentConfig {
     pub llm: LlmProviderRef,
     #[serde(default)]
     pub limits: AgentLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySettings>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,7 +175,7 @@ mod limits_serde_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -179,6 +205,7 @@ mod tests {
                 model: "gpt-4o-mini".into(),
             },
             limits: AgentLimits::default(),
+            memory: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -186,5 +213,49 @@ mod tests {
         assert_eq!(round.limits.max_iter, 8);
         assert_eq!(round.limits.timeout, Duration::from_secs(60));
         assert_eq!(round.limits.llm_retry_backoff, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn agent_config_memory_defaults_to_none_when_omitted() {
+        let json = r#"{
+            "agent_id": "greeter",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.memory.is_none());
+    }
+
+    #[test]
+    fn agent_config_memory_roundtrips_both_tiers() {
+        let json = r#"{
+            "agent_id": "greeter",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" },
+            "memory": {
+                "short_term": { "provider": "redis", "capability": "cap://memory/short-term" },
+                "long_term": {
+                    "provider": "chronicle",
+                    "capability": "cap://memory/long-term",
+                    "params": { "backend": "surrealdb" },
+                    "credential_ref": "vault://acme/surreal"
+                }
+            }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        let mem = cfg.memory.clone().expect("memory present");
+        let long = mem.long_term.expect("long_term present");
+        assert_eq!(long.provider, "chronicle");
+        assert_eq!(long.capability, "cap://memory/long-term");
+        assert_eq!(long.credential_ref.as_deref(), Some("vault://acme/surreal"));
+        assert_eq!(
+            mem.short_term.expect("short_term present").provider,
+            "redis"
+        );
+        let reser = serde_json::to_string(&cfg).unwrap();
+        let back: AgentConfig = serde_json::from_str(&reser).unwrap();
+        assert_eq!(back.memory, cfg.memory);
     }
 }

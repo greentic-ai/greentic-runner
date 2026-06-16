@@ -633,6 +633,7 @@ mod aw {
                     model: "gpt-4o-mini".into(),
                 },
                 limits: AgentLimits::default(),
+                memory: None,
             }
         }
 
@@ -661,6 +662,7 @@ mod aw {
                         model: "m".into(),
                     },
                     limits: AgentLimits::default(),
+                    memory: None,
                 },
             );
             let config_provider = Arc::new(config_provider);

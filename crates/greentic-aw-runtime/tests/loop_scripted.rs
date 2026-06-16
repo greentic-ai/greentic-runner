@@ -33,6 +33,7 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
             daily_token_cap_per_tenant: cap,
             ..AgentLimits::default()
         },
+        memory: None,
     }
 }
 
