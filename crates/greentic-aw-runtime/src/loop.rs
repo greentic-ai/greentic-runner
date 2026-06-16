@@ -53,9 +53,28 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
+    let user_message = message.text.clone();
     state.messages.push(ChatMessage::User {
         content: message.text,
     });
+
+    // --- Long-term recall: inject relevant facts into this turn's prompt ---
+    let system_prompt =
+        if crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config) {
+            let facts = runtime
+                .recall_long_term(
+                    &tenant,
+                    crate::long_term::RecallQuery {
+                        query: user_message.clone(),
+                        limit: Some(crate::long_term::AUTO_INJECT_K),
+                    },
+                )
+                .await
+                .unwrap_or_default();
+            crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
+        } else {
+            config.system_prompt.clone()
+        };
 
     // Resolve the per-tenant agentic-worker MCP catalog once per step. The
     // source is infallible (degrades to an empty catalog on any admin/server
@@ -89,7 +108,7 @@ pub async fn run_step(
         let tools_schema =
             list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
         let request = LlmRequest {
-            system_prompt: config.system_prompt.clone(),
+            system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
@@ -245,6 +264,32 @@ pub async fn run_step(
     state.truncate_history(config.limits.max_history_turns);
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
+    }
+
+    // --- Long-term ingest: persist this turn as an episode (fire-and-forget) ---
+    if !reply.is_empty()
+        && crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config)
+        && let Some(memory) = runtime.long_term_memory.clone()
+    {
+        match crate::long_term::to_types_tenant(&tenant) {
+            Ok(ctx) => {
+                let episode = crate::long_term::EpisodeIngest {
+                    name: format!("{session_id}:turn"),
+                    body: format!("{user_message}\n\n{reply}"),
+                    source: crate::long_term::EpisodeSource::Message,
+                    source_description: Some("agentic-worker turn".into()),
+                    reference_time: chrono::Utc::now(),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = memory.ingest_episode(&ctx, episode).await {
+                        warn!(error = %e, "background long-term ingest failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
+            }
+        }
     }
 
     runtime.telemetry.record_step(&StepTelemetryCtx {
