@@ -106,11 +106,21 @@ through exactly that interface (the existing `llm-openai` exposes *design-time*
   `secrets://env/tenant/team/pack/key` helper.
 - Default `GREENTIC_AW_LLM_EXTENSION` to the published bridge id in deploy config.
 
-**Open contract detail:** reconcile the identifier chain — catalog `provider_id`
-(e.g. `provider.llm.anthropic.chat`) → `AgentConfig.llm.provider` (e.g. `anthropic`) →
-admin `tenant_llm_providers.id` / broker key under the `llm` category. The string the runner
-reads from the broker MUST equal the key admin writes. Pin the canonical provider string and the
-form→config mapping in the plan.
+**RESOLVED (2026-06-16) — identifier chain.** Admin stores the LLM key at
+`secrets://default/{tenant}/_/llm/{provider_id}` where `provider_id` is the **admin
+`tenant_llm_providers.id` UUID**, not a slug. The runner only has the provider *slug* + model.
+Decision: **carry the credential ref in the worker config.** Extend `LlmProviderRef` with
+`credential_ref: Option<String>` (= the admin provider UUID); the designer
+`dw_form_to_agent_config` populates it from the form's selected credential; the runner reads
+`secrets://default/{tenant}/_/llm/{credential_ref}`. `provider` (slug) still drives bridge
+routing; `model` still comes from `request.provider.model`. This is multi-tenant-safe and
+supports multiple credentials per brand. Adds a coordinated change to `greentic-designer`
+(form→config mapping) and the shared `LlmProviderRef` type.
+
+**Provider mapper families (simplification).** The 9 providers collapse to **4 mapper shapes**:
+OpenAI-style `/v1/chat/completions` + Bearer (openai, deepseek, groq, perplexity, xai, ollama,
+openai-compatible — one parameterized mapper by base_url/model), Anthropic `/v1/messages`,
+Gemini `:generateContent`, Cohere `/v2/chat`.
 
 ### 3. Designer catalog (in `greentic-dw` → designer assets)
 
