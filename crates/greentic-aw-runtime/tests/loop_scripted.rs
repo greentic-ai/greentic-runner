@@ -6,10 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use greentic_aw_runtime::config::{MemoryProviderRef, MemorySettings};
 use greentic_aw_runtime::cost::MockTokenMeter;
 use greentic_aw_runtime::error::{AgentError, TerminationReason};
 use greentic_aw_runtime::llm::LlmResponse;
-use greentic_aw_runtime::config::{MemoryProviderRef, MemorySettings};
 use greentic_aw_runtime::long_term::RecalledFact;
 use greentic_aw_runtime::mock::{
     MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockLongTermMemory, MockTelemetry,
@@ -321,7 +321,9 @@ fn build_lt_runtime(
 
 #[tokio::test]
 async fn long_term_facts_are_injected_into_system_prompt() {
-    let mem = Arc::new(MockLongTermMemory::new(vec![fact("Alice prefers dark mode")]));
+    let mem = Arc::new(MockLongTermMemory::new(vec![fact(
+        "Alice prefers dark mode",
+    )]));
     let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
     rt.step(
         tc,
@@ -342,7 +344,11 @@ async fn long_term_facts_are_injected_into_system_prompt() {
 async fn no_injection_when_long_term_disabled() {
     // Provider attached but the agent has no long-term binding -> inactive.
     let mem = Arc::new(MockLongTermMemory::new(vec![fact("should not appear")]));
-    let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg(8, 60_000, vec![], None), mem);
+    let (rt, llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem,
+    );
     rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
         .await
         .unwrap();
@@ -383,8 +389,11 @@ async fn turn_is_ingested_as_episode_in_background() {
 #[tokio::test]
 async fn no_ingest_when_long_term_disabled() {
     let mem = Arc::new(MockLongTermMemory::new(vec![]));
-    let (rt, _llm, tc) =
-        build_lt_runtime(vec![Ok(final_reply("hi"))], cfg(8, 60_000, vec![], None), mem.clone());
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem.clone(),
+    );
     rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
         .await
         .unwrap();

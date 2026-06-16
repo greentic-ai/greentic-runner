@@ -269,26 +269,25 @@ pub async fn run_step(
     // --- Long-term ingest: persist this turn as an episode (fire-and-forget) ---
     if !reply.is_empty()
         && crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config)
+        && let Some(memory) = runtime.long_term_memory.clone()
     {
-        if let Some(memory) = runtime.long_term_memory.clone() {
-            match crate::long_term::to_types_tenant(&tenant) {
-                Ok(ctx) => {
-                    let episode = crate::long_term::EpisodeIngest {
-                        name: format!("{session_id}:turn"),
-                        body: format!("{user_message}\n\n{reply}"),
-                        source: crate::long_term::EpisodeSource::Message,
-                        source_description: Some("agentic-worker turn".into()),
-                        reference_time: chrono::Utc::now(),
-                    };
-                    tokio::spawn(async move {
-                        if let Err(e) = memory.ingest_episode(&ctx, episode).await {
-                            warn!(error = %e, "background long-term ingest failed");
-                        }
-                    });
-                }
-                Err(e) => {
-                    warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
-                }
+        match crate::long_term::to_types_tenant(&tenant) {
+            Ok(ctx) => {
+                let episode = crate::long_term::EpisodeIngest {
+                    name: format!("{session_id}:turn"),
+                    body: format!("{user_message}\n\n{reply}"),
+                    source: crate::long_term::EpisodeSource::Message,
+                    source_description: Some("agentic-worker turn".into()),
+                    reference_time: chrono::Utc::now(),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = memory.ingest_episode(&ctx, episode).await {
+                        warn!(error = %e, "background long-term ingest failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
             }
         }
     }

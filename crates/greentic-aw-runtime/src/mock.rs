@@ -15,7 +15,8 @@ mod inner {
     use crate::error::{ConfigError, LlmError, StateError, TerminationReason};
     use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
     use crate::long_term::{
-        EpisodeIngest, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery, RecalledFact,
+        EpisodeIngest, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
+        RecalledFact,
     };
     use crate::state::{AgentStateStore, ConversationState, SessionLock, SessionLockInner};
     use crate::telemetry::{StepTelemetryCtx, Telemetry};
