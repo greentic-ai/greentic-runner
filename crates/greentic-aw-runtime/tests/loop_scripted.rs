@@ -350,3 +350,45 @@ async fn no_injection_when_long_term_disabled() {
     assert_eq!(prompts[0], "sys");
     assert!(!prompts[0].contains("<long_term_memory>"));
 }
+
+#[tokio::test]
+async fn turn_is_ingested_as_episode_in_background() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("you like dark mode"))],
+        cfg_with_long_term(8),
+        mem.clone(),
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "what do I like?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "you like dark mode");
+
+    // Ingest is fire-and-forget; await it deterministically.
+    mem.wait_for_ingests(1).await;
+    let episodes = mem.ingested();
+    assert_eq!(episodes.len(), 1);
+    assert!(episodes[0].body.contains("what do I like?"));
+    assert!(episodes[0].body.contains("you like dark mode"));
+}
+
+#[tokio::test]
+async fn no_ingest_when_long_term_disabled() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, _llm, tc) =
+        build_lt_runtime(vec![Ok(final_reply("hi"))], cfg(8, 60_000, vec![], None), mem.clone());
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    // Give any erroneously-spawned task a chance to run, then assert none did.
+    tokio::task::yield_now().await;
+    assert!(mem.ingested().is_empty());
+}
