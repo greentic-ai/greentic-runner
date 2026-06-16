@@ -2061,10 +2061,12 @@ dependencies = [
  "dashmap",
  "futures",
  "greentic-dw-manifest",
+ "greentic-dw-memory-long-term",
  "greentic-ext-runtime",
  "greentic-mcp-client",
  "greentic-state",
  "greentic-telemetry",
+ "greentic-types",
  "redis",
  "reqwest 0.12.28",
  "secrecy",
@@ -2166,6 +2168,18 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "greentic-dw-memory-long-term"
+version = "1.2.0-research"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#bdf71daa499af8b6aae1aa2fa1e47c121507617c"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "greentic-types",
+ "serde",
  "thiserror 2.0.18",
 ]
 

@@ -28,7 +28,12 @@ chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
 greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
+# Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
+# the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
+# the runner-host edge, never compiled into this runtime crate.
+greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.23-research" }
+greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
 greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 greentic-state      = { workspace = true }
