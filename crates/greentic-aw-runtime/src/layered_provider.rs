@@ -58,6 +58,7 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "m".into(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
         }

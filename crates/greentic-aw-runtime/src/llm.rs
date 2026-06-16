@@ -192,6 +192,7 @@ mod tests {
             provider: crate::config::LlmProviderRef {
                 provider: "openai".into(),
                 model: "x".into(),
+                credential_ref: None,
             },
         }
     }
@@ -262,6 +263,7 @@ mod tests {
                     provider: crate::config::LlmProviderRef {
                         provider: "openai".into(),
                         model: "m".into(),
+                        credential_ref: None,
                     },
                 },
                 on_delta,

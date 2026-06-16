@@ -3028,6 +3028,7 @@ mod tests {
                 llm: LlmProviderRef {
                     provider: "mock".into(),
                     model: "m".into(),
+                    credential_ref: None,
                 },
                 limits: AgentLimits::default(),
             },

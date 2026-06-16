@@ -21,6 +21,11 @@ pub struct ToolRef {
 pub struct LlmProviderRef {
     pub provider: String, // "openai" | "anthropic" | ...
     pub model: String,    // "gpt-4o-mini" | "claude-3-haiku" | ...
+    /// Per-tenant credential identifier (admin provider UUID) used by the
+    /// runner to resolve `secrets://default/{tenant}/_/llm/{credential_ref}`.
+    /// `None` falls back to env-keyed credentials (legacy single-provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,6 +159,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn llm_provider_ref_defaults_credential_ref_to_none() {
+        let r: LlmProviderRef =
+            serde_json::from_str(r#"{ "provider":"anthropic","model":"claude-3" }"#).unwrap();
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.credential_ref, None);
+    }
+
+    #[test]
     fn defaults_match_spec_5_2() {
         let l = AgentLimits::default();
         assert_eq!(l.max_iter, 8);
@@ -177,6 +190,7 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
         };

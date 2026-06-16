@@ -161,6 +161,7 @@ mod tests {
             provider: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                credential_ref: None,
             },
         }
     }

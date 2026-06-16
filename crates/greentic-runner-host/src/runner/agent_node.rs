@@ -443,6 +443,7 @@ mod aw {
                 llm: LlmProviderRef {
                     provider: "openai".into(),
                     model: "gpt-4o-mini".into(),
+                    credential_ref: None,
                 },
                 limits: AgentLimits::default(),
             }
@@ -471,6 +472,7 @@ mod aw {
                     llm: LlmProviderRef {
                         provider: "mock".into(),
                         model: "m".into(),
+                        credential_ref: None,
                     },
                     limits: AgentLimits::default(),
                 },
