@@ -2164,6 +2164,7 @@ dependencies = [
  "futures",
  "greentic-dw-manifest",
  "greentic-ext-runtime",
+ "greentic-secrets-lib",
  "greentic-state",
  "greentic-telemetry",
  "redis",
