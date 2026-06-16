@@ -21,6 +21,11 @@ component-v0-6-introspection = []
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
+# memory backend into the agentic worker. Heavy (pulls the Chronicle graph
+# engine); off by default. Operator supplies the Neo4j connection via
+# GREENTIC_CHRONICLE_NEO4J_* env vars; absent that, long-term stays disabled.
+long-term-chronicle = ["agentic-worker", "dep:greentic-dw-memory-chronicle"]
 
 [dependencies]
 async-nats = "0.46"
@@ -32,6 +37,7 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.2.0-research", features = ["serve"], optional = true }
+greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.24-research", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
