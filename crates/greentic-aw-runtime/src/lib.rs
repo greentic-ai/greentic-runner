@@ -27,6 +27,7 @@ pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_source;
+pub mod memory;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;
@@ -44,7 +45,7 @@ pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigP
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
-pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
@@ -55,6 +56,7 @@ pub use llm_extension::{
 pub use llm_openai::OpenAiLlmBackend;
 pub use manifest_provider::ManifestToolOverlayProvider;
 pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
+pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};

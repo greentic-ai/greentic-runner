@@ -177,6 +177,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
             model: "mock".to_string(),
         },
         limits: AgentLimits::default(),
+        memory: None,
     };
     for (tenant, env) in [
         ("default", "default"),

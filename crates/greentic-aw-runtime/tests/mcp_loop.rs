@@ -88,6 +88,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
             timeout: Duration::from_secs(60),
             ..AgentLimits::default()
         },
+        memory: None,
     }
 }
 
