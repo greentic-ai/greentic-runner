@@ -8,6 +8,7 @@
 //! injected at the runner-host edge; this crate depends only on the lightweight
 //! trait so it stays buildable without graph infrastructure.
 
+use crate::AgentConfig;
 use crate::tenant::TenantContext;
 use greentic_types::{EnvId, TenantCtx, TenantId};
 
@@ -27,6 +28,49 @@ pub(crate) fn to_types_tenant(ctx: &TenantContext) -> Result<TenantCtx, LongTerm
         LongTermMemoryError::InvalidTenant(format!("tenant_id '{}': {e}", ctx.tenant_id))
     })?;
     Ok(TenantCtx::new(env, tenant))
+}
+
+/// Default number of facts auto-injected into the prompt each turn.
+pub(crate) const AUTO_INJECT_K: usize = 5;
+
+/// Whether the long-term tier is active for this turn: a backend is wired AND
+/// the agent's config enables the long-term memory binding.
+pub(crate) fn long_term_active(has_provider: bool, config: &AgentConfig) -> bool {
+    has_provider
+        && config
+            .memory
+            .as_ref()
+            .and_then(|m| m.long_term.as_ref())
+            .is_some()
+}
+
+/// Build the system prompt for a turn: the base prompt followed by a delimited
+/// `<long_term_memory>` block listing the recalled facts. Returns the base
+/// prompt unchanged when there are no facts (no empty block).
+pub(crate) fn augment_system_prompt(base: &str, facts: &[RecalledFact]) -> String {
+    if facts.is_empty() {
+        return base.to_string();
+    }
+    let mut out = String::with_capacity(base.len() + 64 * facts.len());
+    out.push_str(base);
+    out.push_str("\n\n<long_term_memory>\nRelevant facts recalled from earlier interactions:\n");
+    for f in facts {
+        out.push_str("- ");
+        out.push_str(&f.fact);
+        if !f.relation.is_empty() {
+            out.push_str(" (");
+            out.push_str(&f.relation);
+            out.push(')');
+        }
+        if let Some(valid) = f.valid_at {
+            out.push_str(" [valid ");
+            out.push_str(&valid.to_rfc3339());
+            out.push(']');
+        }
+        out.push('\n');
+    }
+    out.push_str("</long_term_memory>");
+    out
 }
 
 #[cfg(test)]
@@ -117,5 +161,64 @@ mod tests {
             .unwrap();
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact, "recalled for: preferences");
+    }
+
+    fn fact(text: &str, relation: &str) -> RecalledFact {
+        RecalledFact {
+            fact: text.into(),
+            relation: relation.into(),
+            valid_at: None,
+            invalid_at: None,
+            source_episode_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn augment_with_facts_wraps_a_block() {
+        let facts = vec![
+            fact("Alice prefers dark mode", "prefers"),
+            fact("Bob works at Acme", "works_at"),
+        ];
+        let out = augment_system_prompt("base prompt", &facts);
+        assert!(out.starts_with("base prompt"));
+        assert!(out.contains("<long_term_memory>"));
+        assert!(out.contains("</long_term_memory>"));
+        assert!(out.contains("Alice prefers dark mode"));
+        assert!(out.contains("Bob works at Acme"));
+    }
+
+    #[test]
+    fn augment_with_no_facts_returns_base_unchanged() {
+        let out = augment_system_prompt("base prompt", &[]);
+        assert_eq!(out, "base prompt");
+    }
+
+    #[test]
+    fn long_term_active_requires_provider_and_enabled_binding() {
+        use crate::config::{MemoryProviderRef, MemorySettings};
+        let mut cfg = AgentConfig {
+            agent_id: "a".into(),
+            system_prompt: "s".into(),
+            tools: vec![],
+            llm: crate::LlmProviderRef {
+                provider: "m".into(),
+                model: "m".into(),
+            },
+            limits: crate::AgentLimits::default(),
+            memory: None,
+        };
+        assert!(!long_term_active(false, &cfg));
+        assert!(!long_term_active(true, &cfg));
+        cfg.memory = Some(MemorySettings {
+            short_term: None,
+            long_term: Some(MemoryProviderRef {
+                provider: "provider.memory.chronicle".into(),
+                capability: "cap://memory/long-term".into(),
+                params: serde_json::Map::new(),
+                credential_ref: None,
+            }),
+        });
+        assert!(long_term_active(true, &cfg));
+        assert!(!long_term_active(false, &cfg));
     }
 }
