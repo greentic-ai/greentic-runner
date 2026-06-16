@@ -2632,6 +2632,7 @@ dependencies = [
  "wasmtime-wasi 43.0.2",
  "wasmtime-wasi-http",
  "wasmtime-wasi-tls",
+ "wiremock",
  "zip 8.6.0",
 ]
 
