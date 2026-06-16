@@ -203,6 +203,7 @@ mod tests {
             llm: crate::LlmProviderRef {
                 provider: "m".into(),
                 model: "m".into(),
+                credential_ref: None,
             },
             limits: crate::AgentLimits::default(),
             memory: None,
