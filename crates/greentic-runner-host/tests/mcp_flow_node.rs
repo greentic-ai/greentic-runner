@@ -39,6 +39,7 @@ use greentic_runner_host::config::{
 };
 use greentic_runner_host::pack::{ComponentResolution, PackRuntime};
 use greentic_runner_host::runner::engine::{FlowContext, FlowEngine, FlowStatus};
+use greentic_runner_host::runner::flow_adapter::{NodeIR, flow_doc_to_ir};
 use greentic_runner_host::trace::TraceConfig;
 use greentic_runner_host::validate::ValidationConfig;
 use greentic_types::{
@@ -296,7 +297,306 @@ fn find_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
+// ── YGTC op-key load path (flow_doc_to_ir) ───────────────────────────────────
+//
+// The designer's packc injection writes the MCP node as the YGTC op-key shape
+//
+//   nodes:
+//     lookup:
+//       mcp:
+//         server: <id>
+//         tool: <name>
+//         arguments: { ... }   # values may be {{ }} templates
+//         output: <state_key>
+//       routing: [ ... ]
+//
+// (see greentic-designer `inject_mcp_nodes`). The runner deserialises that into
+// `greentic_flow::model::FlowDoc` and lowers it with the REAL flow adapter
+// `flow_doc_to_ir`. This is the load primitive the runner uses; the assertions
+// below start from the op-key text (NOT a hand-built runtime node with
+// `component` pre-set) and prove the op-key passes through verbatim as
+// `component == "mcp"` with the payload intact.
+
+/// Build the YGTC op-key node text for `lookup` and lower it through the real
+/// runner adapter `flow_doc_to_ir`, returning the derived `(component, payload,
+/// routes)` for that node.
+///
+/// `flow_doc_to_ir` performs STRUCTURAL op-key extraction: it reads the single
+/// flattened `raw` key off `NodeDoc` (here `mcp`) and carries it through as the
+/// component, independent of `greentic-flow`'s own `classify_node_type` /
+/// `NodeKind` lowering. This is the evidence for the release-ordering answer:
+/// the runner does not depend on greentic-flow's `NodeKind::Mcp` to recognise
+/// the node at runtime.
+fn lower_ygtc_mcp_node(node_payload: Value, routing: Value) -> Result<NodeIR> {
+    let doc_json = json!({
+        "id": FLOW_ID,
+        "type": "messaging",
+        "start": "lookup",
+        "nodes": {
+            "lookup": {
+                "mcp": node_payload,
+                "routing": routing,
+            }
+        }
+    });
+    let doc: greentic_flow::model::FlowDoc =
+        serde_json::from_value(doc_json).context("deserialise YGTC FlowDoc")?;
+    let ir = flow_doc_to_ir(doc).context("flow_doc_to_ir lowering")?;
+    let node = ir
+        .nodes
+        .get("lookup")
+        .cloned()
+        .context("`lookup` node missing from lowered FlowIR")?;
+    Ok(node)
+}
+
+/// Build a single-flow `.gtpack` whose `lookup` node is derived END-TO-END from
+/// the YGTC op-key shape via [`lower_ygtc_mcp_node`]. The runtime-flow node's
+/// `component`/`input`/`routing` are taken from the adapter output (NOT
+/// hand-set), so a regression that drops the `mcp` op-key (or wraps it in
+/// `component.exec`) would surface here as a non-`mcp` component.
+fn build_ygtc_mcp_pack(pack_path: &Path, node_ir: &NodeIR) -> Result<()> {
+    // Translate the adapter's `routes` back into the runtime-flow `routing`
+    // shape the loader understands: a single terminal route -> `"end"`.
+    let routing = if node_ir.routes.iter().all(|r| r.out || r.to.is_none()) {
+        json!("end")
+    } else {
+        serde_json::to_value(&node_ir.routes)?
+    };
+
+    let mut nodes = serde_json::Map::new();
+    nodes.insert(
+        "lookup".to_string(),
+        json!({
+            "component": node_ir.component,
+            "input": node_ir.payload_expr,
+            "routing": routing,
+        }),
+    );
+
+    let runtime_flow = json!({
+        "id": FLOW_ID,
+        "flow_type": "messaging",
+        "start": "lookup",
+        "nodes": Value::Object(nodes),
+    });
+    let runtime_extension = json!({ "flows": [runtime_flow] });
+
+    let mut extensions = BTreeMap::new();
+    extensions.insert(
+        RUNTIME_FLOW_EXTENSION_ID.to_string(),
+        ExtensionRef {
+            kind: RUNTIME_FLOW_EXTENSION_ID.to_string(),
+            version: "2.0.0".into(),
+            digest: None,
+            location: None,
+            inline: Some(ExtensionInline::Other(runtime_extension)),
+        },
+    );
+
+    let manifest = PackManifest {
+        schema_version: "1.0".into(),
+        pack_id: PACK_ID.parse()?,
+        name: None,
+        version: Version::parse("0.0.0")?,
+        kind: PackKind::Application,
+        publisher: "test".into(),
+        components: Vec::new(),
+        flows: Vec::<PackFlowEntry>::new(),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        signatures: Default::default(),
+        secret_requirements: Vec::new(),
+        bootstrap: None,
+        agents: BTreeMap::new(),
+        extensions: Some(extensions),
+    };
+
+    let mut zip = zip::ZipWriter::new(File::create(pack_path).context("create pack archive")?);
+    let options: FileOptions<'_, ()> =
+        FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let manifest_bytes = encode_pack_manifest(&manifest)?;
+    zip.start_file("manifest.cbor", options)?;
+    zip.write_all(&manifest_bytes)?;
+    zip.finish().context("finalise pack archive")?;
+    Ok(())
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Release-ordering proof: the runner's CURRENT pinned `greentic-flow`
+/// (1.1.x-dev, WITHOUT `NodeKind::Mcp`) already lowers the YGTC op-key
+/// `{ mcp: { ... }, routing }` into a FlowIR node with `component == "mcp"` and
+/// the payload intact — purely via `flow_doc_to_ir`'s structural op-key
+/// extraction. No `greentic-flow` PR #235 is required at runtime.
+#[test]
+fn flow_doc_to_ir_preserves_mcp_op_key_verbatim() -> Result<()> {
+    let node = lower_ygtc_mcp_node(
+        json!({
+            "server": "github",
+            "tool": "get_issue",
+            "arguments": { "id": "{{ entry.issue_id }}" },
+            "output": "issue"
+        }),
+        json!([{ "out": true }]),
+    )?;
+
+    // The op-key survives verbatim as the component...
+    assert_eq!(
+        node.component, "mcp",
+        "expected the `mcp` op-key to pass through `flow_doc_to_ir` verbatim, got `{}`",
+        node.component
+    );
+    // ...and `mcp` is a valid ComponentId, so `flow_ir_to_flow` /
+    // `ComponentId::from_str` accepts it at pack load.
+    assert!(
+        greentic_types::ComponentId::from_str(&node.component).is_ok(),
+        "derived component `{}` must be a valid ComponentId",
+        node.component
+    );
+    // ...and the payload (server/tool/arguments/output) is carried intact.
+    assert_eq!(node.payload_expr["server"], json!("github"));
+    assert_eq!(node.payload_expr["tool"], json!("get_issue"));
+    assert_eq!(
+        node.payload_expr["arguments"]["id"],
+        json!("{{ entry.issue_id }}")
+    );
+    assert_eq!(node.payload_expr["output"], json!("issue"));
+    Ok(())
+}
+
+/// End-to-end from the YGTC op-key shape through `flow_doc_to_ir` -> runtime
+/// flow -> `FlowEngine`: the lowered MCP node calls the tool with templated
+/// arguments rendered from flow state and binds the result under `output`.
+#[test]
+fn mcp_node_from_ygtc_op_key_calls_tool_and_binds_output() -> Result<()> {
+    let _guard = ENV_GUARD.lock().unwrap();
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-ygtc-ok.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let mcp = rt.block_on(fake_mcp_server(
+        json!({ "structuredContent": { "title": "Bug" } }),
+    ));
+    let admin = rt.block_on(fake_admin(&mcp.uri()));
+
+    // Start from the YGTC op-key text and lower it with the REAL adapter.
+    let node = lower_ygtc_mcp_node(
+        json!({
+            "server": "github",
+            "tool": "get_issue",
+            "arguments": { "id": "{{ entry.issue_id }}" },
+            "output": "issue"
+        }),
+        json!([{ "out": true }]),
+    )?;
+    assert_eq!(
+        node.component, "mcp",
+        "YGTC op-key must lower to component `mcp` for the engine to dispatch it"
+    );
+    build_ygtc_mcp_pack(&pack_path, &node)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+
+    // SAFETY: serialized by ENV_GUARD; cleared after the run below.
+    unsafe {
+        std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", admin.uri());
+        std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_test");
+        std::env::remove_var("GREENTIC_AW_MCP");
+    }
+
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config))?;
+
+    unsafe {
+        std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+        std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+    }
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, json!({ "issue_id": "42" })))
+        .context("mcp ygtc flow run")?;
+
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => anyhow::bail!("flow paused unexpectedly: {:?}", wait.reason),
+    }
+
+    let issue = find_key(&execution.output, "issue")
+        .with_context(|| format!("output key `issue` missing, got {:?}", execution.output))?;
+    assert_eq!(
+        issue,
+        &json!({ "title": "Bug" }),
+        "bound output mismatch, got {:?}",
+        execution.output
+    );
+    assert!(
+        find_key(&execution.output, "error").is_none(),
+        "unexpected error in output: {:?}",
+        execution.output
+    );
+    Ok(())
+}
+
+/// Graceful-degrade twin of the YGTC-op-key path: with the admin unconfigured
+/// the lowered MCP node fails with a structured error while the flow still
+/// COMPLETES (no panic, no aborted runtime).
+#[test]
+fn mcp_node_from_ygtc_op_key_degrades_gracefully_when_unconfigured() -> Result<()> {
+    let _guard = ENV_GUARD.lock().unwrap();
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-ygtc-degraded.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    let node = lower_ygtc_mcp_node(
+        json!({
+            "server": "github",
+            "tool": "get_issue",
+            "arguments": { "id": "1" },
+            "output": "issue"
+        }),
+        json!([{ "out": true }]),
+    )?;
+    assert_eq!(node.component, "mcp");
+    build_ygtc_mcp_pack(&pack_path, &node)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+
+    // No admin env configured -> MCP source is None -> graceful node error.
+    unsafe {
+        std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+        std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+        std::env::remove_var("GREENTIC_AW_MCP");
+    }
+
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config))?;
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, json!({})))
+        .context("mcp ygtc degraded flow run")?;
+
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => anyhow::bail!("flow paused unexpectedly: {:?}", wait.reason),
+    }
+
+    let bound = find_key(&execution.output, "issue")
+        .with_context(|| format!("output key `issue` missing, got {:?}", execution.output))?;
+    let err = bound
+        .get("error")
+        .and_then(Value::as_str)
+        .with_context(|| format!("expected an `error` string under `issue`, got {bound:?}"))?;
+    assert!(
+        err.contains("MCP is not configured"),
+        "unexpected error message: {err}"
+    );
+    Ok(())
+}
 
 #[test]
 fn mcp_node_calls_tool_and_binds_output() -> Result<()> {
