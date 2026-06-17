@@ -3931,6 +3931,8 @@ mod tests {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
 
         let ctx = FlowContext {
@@ -4204,6 +4206,287 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "next"),
             other => panic!("expected Next(\"next\"), got {other:?}"),
         }
+    }
+
+    /// Live end-to-end test: `dw.agent` NATS dispatch path.
+    ///
+    /// Requires a real NATS server (JetStream not needed for this test — core
+    /// NATS pub/sub is sufficient) and an `aw-serve` consumer (or the in-process
+    /// fake bridge below acts as one).
+    ///
+    /// # Run recipe
+    ///
+    /// ```text
+    /// # Terminal 1 – NATS server (JetStream-enabled for prod parity, but core works too)
+    /// nats-server -js
+    ///
+    /// # Terminal 2 – aw-serve test-mock (replies "pong" for any agent)
+    /// AW_SERVE_AGENT_ID=greeter AW_SERVE_REPLY=pong \
+    ///   GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 \
+    ///   GREENTIC_AW_JETSTREAM=off \
+    ///   cargo run -p greentic-aw-runtime --features serve,test-mock --bin aw-serve
+    ///
+    /// # Terminal 3 – run this ignored test
+    /// GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 \
+    ///   cargo test -p greentic-runner-host --lib \
+    ///   tests::dw_agent_scale_to_zero_nats_e2e \
+    ///   -- --nocapture --ignored
+    /// ```
+    ///
+    /// When `GREENTIC_EVENTS_NATS_URL` is unset the test skips immediately.
+    /// The test wires its own in-process fake bridge so the `aw-serve` binary is
+    /// optional; running with the real `aw-serve` exercises the full out-of-process
+    /// path. Both variants must produce a resumed reply of `"pong"`.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    #[ignore = "requires live NATS; run with --ignored after `nats-server -js`"]
+    async fn dw_agent_scale_to_zero_nats_e2e() {
+        use crate::runner::agent_node::DwAgentDispatch;
+        use crate::runner::dispatch_listener::{SessionResumer, run_response_listener};
+        use crate::runner::remote_dispatch::NatsDispatcher;
+        use futures::StreamExt as _;
+        use greentic_types::{RuntimeDispatchResponse, TenantCtx as DispatchTenantCtx, request_topic, response_topic};
+        use tokio::sync::Notify;
+
+        let nats_url = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping dw_agent_scale_to_zero_nats_e2e: GREENTIC_EVENTS_NATS_URL not set");
+                return;
+            }
+        };
+
+        // ── 1. Build a two-node flow: dw.agent → emit.log (resume target) ──
+        // The agent node must have Routing::Next so the engine knows the resume
+        // target (same requirement as agentic.call / sorla.call in production).
+        let resume_id = NodeId::from_str("after-agent").unwrap();
+        let agent_node_id = NodeId::from_str("agent-e2e").unwrap();
+        let agent_node = Node {
+            id: agent_node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "ping" }),
+            },
+            output: OutputMapping { mapping: Value::Null },
+            err_map: None,
+            routing: Routing::Next { node_id: resume_id.clone() },
+            telemetry: TelemetryHints::default(),
+        };
+        let resume_node = Node {
+            id: resume_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "resumed" }),
+            },
+            output: OutputMapping { mapping: Value::Null },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(agent_node_id.clone(), agent_node);
+        nodes.insert(resume_id.clone(), resume_node);
+        let flow = greentic_types::Flow {
+            schema_version: "1.0".into(),
+            id: greentic_types::FlowId::from_str("e2e-agent.flow").unwrap(),
+            kind: greentic_types::FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(agent_node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        // ── 2. Connect NATS clients ──
+        let dispatcher_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: dispatcher client");
+        let bridge_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: fake bridge client");
+        let listener_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: response listener client");
+
+        // ── 3. Fake bridge: subscribe to agentic request subject, reply "pong" ──
+        let agentic_request_subject = request_topic("agentic");
+        let agentic_response_subject = response_topic("agentic");
+        let mut req_sub = bridge_client
+            .subscribe(agentic_request_subject.clone())
+            .await
+            .expect("fake bridge: subscribe to agentic request subject");
+        let bridge_reply_client = bridge_client.clone();
+        let reply_subject = agentic_response_subject.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = req_sub.next().await {
+                let headers = msg.headers.as_ref();
+                let get_hdr = |name: &str| {
+                    headers
+                        .and_then(|h| h.get(name))
+                        .map(|v| v.as_str().to_owned())
+                        .unwrap_or_default()
+                };
+                let correlation_id = get_hdr("Greentic-Correlation-Id");
+                let tenant = get_hdr("Greentic-Tenant");
+                let env = get_hdr("Greentic-Env");
+
+                let response_payload = RuntimeDispatchResponse {
+                    ok: true,
+                    output: json!({
+                        "reply": "pong",
+                        "trail": [],
+                        "terminated_by": "final_reply"
+                    }),
+                    events: vec![],
+                    error: None,
+                };
+                let body = serde_json::to_vec(&response_payload)
+                    .expect("serialize fake bridge response");
+
+                let mut resp_headers = async_nats::HeaderMap::new();
+                resp_headers.insert("Greentic-Correlation-Id", correlation_id.as_str());
+                resp_headers.insert("Greentic-Tenant", tenant.as_str());
+                resp_headers.insert("Greentic-Env", env.as_str());
+
+                bridge_reply_client
+                    .publish_with_headers(reply_subject.clone(), resp_headers, body.into())
+                    .await
+                    .expect("fake bridge: publish response");
+            }
+        });
+
+        // ── 4. Recording resumer + run_response_listener ──
+        struct RecordingResumer {
+            calls: std::sync::Mutex<Vec<(String, Value)>>,
+            notify: Notify,
+        }
+
+        impl RecordingResumer {
+            fn new() -> Self {
+                Self {
+                    calls: std::sync::Mutex::new(vec![]),
+                    notify: Notify::new(),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SessionResumer for RecordingResumer {
+            async fn resume(
+                &self,
+                _tenant: DispatchTenantCtx,
+                correlation_id: &str,
+                output: Value,
+            ) -> anyhow::Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((correlation_id.to_string(), output));
+                self.notify.notify_one();
+                Ok(())
+            }
+        }
+
+        let resumer = Arc::new(RecordingResumer::new());
+        let resumer_for_listener = resumer.clone();
+        tokio::spawn(async move {
+            run_response_listener(listener_client, "agentic".to_owned(), resumer_for_listener)
+                .await
+                .expect("response listener exited unexpectedly");
+        });
+
+        // Give subscriptions a moment to register.
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        // ── 5. Build FlowEngine with NatsDispatcher + DwAgentDispatch::Nats ──
+        let nats_engine_dispatcher = Arc::new(NatsDispatcher::new(dispatcher_client));
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "e2e-pack".to_string(),
+                    flow_id: "e2e-agent.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: crate::validate::ValidationConfig {
+                mode: crate::validate::ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(nats_engine_dispatcher as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
+            dw_agent_dispatch: DwAgentDispatch::Nats,
+            agent_node_handler: None,
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        };
+
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "e2e-pack",
+            flow_id: "e2e-agent.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("e2e-sess-1"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig { max_attempts: 1, base_delay_ms: 1 },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        // ── 6. Execute: the dw.agent NATS path must PAUSE the flow ──
+        let result = engine
+            .execute(ctx, json!({ "user_text": "ping" }))
+            .await
+            .expect("engine.execute succeeded");
+
+        assert!(
+            matches!(result.status, FlowStatus::Waiting(_)),
+            "expected FlowStatus::Waiting from dw.agent Nats path, got: {:?}",
+            result.status
+        );
+        eprintln!("dw.agent: flow paused (Waiting) — dispatch published to NATS");
+
+        // ── 7. Wait for the fake bridge reply to reach the resumer (up to 5 s) ──
+        let wait = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            resumer.notify.notified(),
+        )
+        .await;
+
+        assert!(
+            wait.is_ok(),
+            "timed out waiting for fake bridge reply — is NATS running? ({nats_url})"
+        );
+
+        // ── 8. Assert the resumed reply == "pong" ──
+        let calls = resumer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "resumer should have been called exactly once");
+        let (ref _corr, ref output) = calls[0];
+        assert_eq!(
+            output["output"]["reply"],
+            json!("pong"),
+            "resumed reply must match the aw-serve canned reply"
+        );
+        eprintln!(
+            "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
+            output["output"]["reply"]
+        );
     }
 }
 
