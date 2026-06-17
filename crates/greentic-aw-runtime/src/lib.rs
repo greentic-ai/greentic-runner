@@ -61,7 +61,10 @@ pub use long_term::{
     RecalledFact,
 };
 pub use manifest_provider::ManifestToolOverlayProvider;
-pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
+pub use mcp_source::{
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpRoute, McpToolCatalog, McpToolEntry,
+    McpToolSource, dispatch_route,
+};
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;

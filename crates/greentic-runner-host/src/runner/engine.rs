@@ -60,6 +60,12 @@ pub struct FlowEngine {
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
     #[cfg(feature = "agentic-worker")]
     graph_node_handler: Option<Arc<dyn crate::runner::graph_node::GraphNodeHandler>>,
+    /// Per-tenant MCP tool source for `component == "mcp"` flow nodes
+    /// (role `flow_editor`). Built once from env so the TTL catalog cache is
+    /// shared across nodes/flows. `None` when MCP is unconfigured/opted-out,
+    /// in which case MCP nodes fail gracefully with a clear node error.
+    #[cfg(feature = "agentic-worker")]
+    mcp_tool_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -168,6 +174,19 @@ enum NodeKind {
     /// completely separate and untouched.
     AgenticCall {
         target: String,
+    },
+    /// Flow-execution MCP node (LOCKED ENCODING v2): `component == "mcp"` with
+    /// `server`/`tool` carried in the node payload/config. Invokes the named
+    /// MCP tool through the tenant's `flow_editor` MCP catalog (reusing
+    /// `greentic-aw-runtime`'s `McpToolSource`). Completely separate from the
+    /// agent-loop MCP path (role `agentic_worker`).
+    ///
+    /// `server_id`/`tool` here are the values resolved at flow-load time;
+    /// `execute_mcp` re-reads them from the rendered payload (source of truth)
+    /// and only uses these as a fallback for the legacy `operation` encoding.
+    Mcp {
+        server_id: String,
+        tool: String,
     },
 }
 
@@ -319,6 +338,8 @@ impl FlowEngine {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: crate::runner::mcp_node::source_from_env(),
         })
     }
 
@@ -796,6 +817,10 @@ impl FlowEngine {
             NodeKind::AgenticCall { target } => {
                 self.execute_agentic_call(ctx, target, payload).await
             }
+            NodeKind::Mcp { server_id, tool } => self
+                .execute_mcp(ctx, server_id, tool, payload)
+                .await
+                .map(DispatchOutcome::complete),
         }
     }
 
@@ -890,6 +915,83 @@ impl FlowEngine {
     ) -> Result<DispatchOutcome> {
         self.execute_remote_dispatch(ctx, "agentic", target, payload)
             .await
+    }
+
+    /// Execute a `component == "mcp"` flow node (LOCKED ENCODING v2).
+    ///
+    /// `payload` is the already-rendered node input mapping (the engine
+    /// templates `{{ }}` against flow state before dispatch), shaped
+    /// `{ "server": <id>, "tool": <name>, "arguments": <object>,
+    ///    "output": <optional string state key> }`.
+    ///
+    /// `server`/`tool` are sourced from this payload (the source of truth);
+    /// the `server_id`/`tool` parsed at flow-load time are passed in only as a
+    /// fallback for the legacy `operation = "<server>/<tool>"` encoding. The MCP
+    /// tool is invoked through the tenant's `flow_editor` catalog (reusing
+    /// `greentic-aw-runtime`'s `McpToolSource`); the result value is bound under
+    /// `output` when present, else returned as the node payload.
+    ///
+    /// Graceful by contract: MCP being unconfigured or the tool being
+    /// unreachable yields a structured `{"error": ...}` value — never a panic,
+    /// never an aborted runtime.
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_mcp(
+        &self,
+        ctx: &FlowContext<'_>,
+        server_id: &str,
+        tool: &str,
+        payload: Value,
+    ) -> Result<NodeOutput> {
+        // Payload is the source of truth: prefer the rendered `server`/`tool`
+        // from config, falling back to the values resolved at flow-load time
+        // (legacy `operation`/`mcp:` encoding).
+        let payload_server = crate::runner::mcp_node::str_field(&payload, "server");
+        let payload_tool = crate::runner::mcp_node::str_field(&payload, "tool");
+        let server_id = payload_server.as_deref().unwrap_or(server_id);
+        let tool = payload_tool.as_deref().unwrap_or(tool);
+
+        // `arguments` defaults to `{}` so a no-arg tool needs no config.
+        let arguments = payload
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(JsonMap::new()));
+
+        let result = crate::runner::mcp_node::invoke(
+            self.mcp_tool_source.as_ref(),
+            ctx.tenant,
+            &self.default_env,
+            server_id,
+            tool,
+            &arguments,
+        )
+        .await;
+
+        // Bind the result under the optional `output` state key. When absent,
+        // the raw tool result becomes the node payload (still addressable via
+        // the standard `node.<id>.payload` mechanism).
+        let bound = match payload.get("output").and_then(Value::as_str) {
+            Some(key) if !key.is_empty() => json!({ key: result }),
+            _ => result,
+        };
+        Ok(NodeOutput::new(bound))
+    }
+
+    /// Compile-time stub for the MCP flow node when the agentic-worker feature
+    /// (which carries the MCP runtime deps) is disabled. The node degrades to a
+    /// clear error value rather than failing the build or the run.
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_mcp(
+        &self,
+        _ctx: &FlowContext<'_>,
+        server_id: &str,
+        tool: &str,
+        _payload: Value,
+    ) -> Result<NodeOutput> {
+        Ok(NodeOutput::new(json!({
+            "error": format!(
+                "mcp node '{server_id}/{tool}' requires the agentic-worker feature (MCP runtime not compiled in)"
+            )
+        })))
     }
 
     /// Shared body for all native remote-dispatch flow nodes (`sorla.call`,
@@ -2107,7 +2209,10 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("dw.")
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
-            || full_ref.starts_with("agentic.");
+            || full_ref.starts_with("agentic.")
+            // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
+            // into a `component.operation` pair.
+            || full_ref.starts_with("mcp:");
         let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
             (full_ref, node.component.operation.clone())
         } else if let Some(dot) = full_ref.rfind('.') {
@@ -2178,6 +2283,21 @@ impl From<Node> for HostNode {
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
+                // LOCKED ENCODING v2 (shared with greentic-flow + designer):
+                // `component == "mcp"` (a valid `ComponentId`) with `server` and
+                // `tool` carried in the node PAYLOAD/config:
+                //   payload = { server, tool, arguments, output? }.
+                // The payload is the source of truth. A legacy
+                // `operation = "<server>/<tool>"` (or an `mcp:<server>/<tool>`
+                // component ref) is honored only as a defensive fallback when the
+                // payload lacks the fields, so older packs keep loading.
+                "mcp" => mcp_node_kind(&node.input.mapping, raw_operation.as_deref()),
+                // `mcp:<server>/<tool>` carried verbatim in `component.id`.
+                // `greentic_types::ComponentId` rejects `:`/`/`, so this form
+                // only survives when the node-type string bypasses ComponentId
+                // validation; it is still recognized as a fallback for older
+                // packs.
+                comp if comp.starts_with("mcp:") => mcp_node_kind(&node.input.mapping, Some(comp)),
                 other => NodeKind::PackComponent {
                     component_ref: other.to_string(),
                 },
@@ -2197,6 +2317,7 @@ impl From<Node> for HostNode {
             NodeKind::SorlaCall { .. } => "sorla.call".to_string(),
             NodeKind::OperalaCall { .. } => "operala.call".to_string(),
             NodeKind::AgenticCall { .. } => "agentic.call".to_string(),
+            NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -2221,6 +2342,42 @@ impl From<Node> for HostNode {
             routing: node.routing,
         }
     }
+}
+
+/// Classify a `component == "mcp"` node into [`NodeKind::Mcp`].
+///
+/// LOCKED ENCODING v2: `server` and `tool` are read from the node
+/// `payload`/config object (the source of truth). When the payload omits them,
+/// a legacy `operation = "<server>/<tool>"` string (or an
+/// `mcp:<server>/<tool>` component ref) is parsed as a defensive fallback for
+/// older packs.
+///
+/// When neither source yields a usable `(server, tool)` pair the node falls
+/// back to an ordinary [`NodeKind::PackComponent`], so a malformed MCP node
+/// surfaces as a normal unknown-component error at run time rather than
+/// panicking at load. Flow loading stays total.
+fn mcp_node_kind(payload: &Value, legacy_ref: Option<&str>) -> NodeKind {
+    if let Some((server_id, tool)) = crate::runner::mcp_node::server_tool_from_payload(payload) {
+        return NodeKind::Mcp { server_id, tool };
+    }
+    if let Some((server_id, tool)) = legacy_ref.and_then(parse_legacy_mcp_ref) {
+        return NodeKind::Mcp { server_id, tool };
+    }
+    NodeKind::PackComponent {
+        component_ref: "mcp".to_string(),
+    }
+}
+
+/// Parse a legacy MCP server/tool reference, accepting either the bare
+/// `"<server>/<tool>"` operation form or the prefixed `mcp:<server>/<tool>`
+/// component-ref form. Returns `None` when either part is missing or empty.
+fn parse_legacy_mcp_ref(reference: &str) -> Option<(String, String)> {
+    let rest = reference.strip_prefix("mcp:").unwrap_or(reference);
+    let (server, tool) = rest.split_once('/')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server.to_string(), tool.to_string()))
 }
 
 fn extract_target_component(payload: &Value) -> Option<String> {
@@ -2842,6 +2999,8 @@ mod tests {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         }
     }
 
@@ -3269,6 +3428,8 @@ mod tests {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -3417,6 +3578,8 @@ mod tests {
             agent_node_handler: Some(handler),
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3553,6 +3716,8 @@ mod tests {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: Some(handler_dyn),
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3664,6 +3829,8 @@ mod tests {
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         }
     }
 

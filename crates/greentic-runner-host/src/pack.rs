@@ -82,7 +82,7 @@ use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsVi
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
-use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow};
+use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
@@ -2854,7 +2854,13 @@ fn normalize_flow_doc(mut doc: FlowDoc) -> FlowDoc {
         else {
             continue;
         };
-        if component_ref.starts_with("emit.") {
+        // Runner-native op-keys (`emit.*`, `mcp`, `dw.agent`, `sorla.call`, …)
+        // are dispatched by the engine directly off the `component` string, so
+        // they must survive verbatim — wrapping them in a `component.exec` node
+        // would misclassify them as `NodeKind::Exec`. The runtime-flow load
+        // path (`flow_doc_to_ir`) already preserves them; mirror that here for
+        // the legacy flow-JSON path using the shared op-key predicate.
+        if is_native_op_key(&component_ref) {
             node.operation = Some(component_ref);
             node.payload = payload;
             node.raw.clear();
@@ -4370,6 +4376,101 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    /// Build a single-node `FlowDoc` whose only node carries the raw-YGTC
+    /// op-key `op_key` with `payload`, mirroring the legacy flow-JSON shape the
+    /// loader feeds into `normalize_flow_doc` -> `flow_doc_to_ir`.
+    fn single_node_doc(op_key: &str, payload: Value) -> FlowDoc {
+        let mut raw = IndexMap::new();
+        raw.insert(op_key.to_string(), payload);
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node".into(),
+            NodeDoc {
+                raw,
+                routing: json!([{ "out": true }]),
+                ..Default::default()
+            },
+        );
+        FlowDoc {
+            id: "legacy".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("node".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema: None,
+            nodes,
+        }
+    }
+
+    /// REGRESSION: the legacy flow-JSON load path (`normalize_flow_doc` ->
+    /// `flow_doc_to_ir`) must preserve a raw-YGTC `{ mcp: { ... }, routing }`
+    /// node VERBATIM as `component == "mcp"` with its payload intact, exactly
+    /// like the runtime-flow (packc) path. Before the fix `normalize_flow_doc`
+    /// rewrote every non-`emit.*` op-key into a `component.exec` node, so the
+    /// engine saw `NodeKind::Exec` instead of the MCP dispatch arm.
+    #[test]
+    fn normalize_preserves_mcp_op_key_through_legacy_path() {
+        let doc = single_node_doc(
+            "mcp",
+            json!({
+                "server": "github",
+                "tool": "get_issue",
+                "arguments": { "id": "{{ entry.issue_id }}" },
+                "output": "issue"
+            }),
+        );
+
+        let normalized = normalize_flow_doc(doc);
+        let node = normalized.nodes.get("node").expect("node exists");
+        // NOT rewritten into a `component.exec` wrapper.
+        assert_eq!(
+            node.operation.as_deref(),
+            Some("mcp"),
+            "the `mcp` op-key must survive normalization verbatim, not become component.exec"
+        );
+        assert!(node.raw.is_empty(), "raw op-key should be lowered");
+
+        // Lowering through the real adapter yields `component == "mcp"` with
+        // the LOCKED ENCODING v2 payload (server/tool/arguments/output) intact.
+        let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+        let lowered = ir.nodes.get("node").expect("lowered node exists");
+        assert_eq!(lowered.component, "mcp");
+        assert_eq!(lowered.payload_expr["server"], json!("github"));
+        assert_eq!(lowered.payload_expr["tool"], json!("get_issue"));
+        assert_eq!(
+            lowered.payload_expr["arguments"]["id"],
+            json!("{{ entry.issue_id }}")
+        );
+        assert_eq!(lowered.payload_expr["output"], json!("issue"));
+    }
+
+    /// No regression to the passthrough set: the other native op-keys-with-
+    /// payload (`dw.agent`, `sorla.call`) must also survive `normalize_flow_doc`
+    /// verbatim rather than being wrapped in `component.exec`.
+    #[test]
+    fn normalize_preserves_dw_agent_and_sorla_call_op_keys() {
+        for op_key in ["dw.agent", "sorla.call"] {
+            let doc = single_node_doc(op_key, json!({ "input": { "x": 1 } }));
+            let normalized = normalize_flow_doc(doc);
+            let node = normalized.nodes.get("node").expect("node exists");
+            assert_eq!(
+                node.operation.as_deref(),
+                Some(op_key),
+                "`{op_key}` must survive normalization verbatim, not become component.exec"
+            );
+            assert!(node.raw.is_empty());
+
+            let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+            let lowered = ir.nodes.get("node").expect("lowered node exists");
+            assert_eq!(lowered.component, op_key);
+        }
     }
 }
 
