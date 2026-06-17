@@ -42,8 +42,15 @@ const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 /// Per-server budget for the full connect → initialize → list/call sequence.
 const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Role a server must carry to be exposed to agentic workers.
-const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
+/// Role a server must carry to be exposed to agentic workers (the agent-loop
+/// MCP path).
+pub const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
+
+/// Role a server must carry to be exposed to the flow-execution MCP path
+/// (`mcp:<server>/<tool>` flow nodes). Distinct from
+/// [`MCP_ROLE_AGENTIC_WORKER`] so the operator can authorize a server for one
+/// surface without the other.
+pub const MCP_ROLE_FLOW_EDITOR: &str = "flow_editor";
 
 /// Wire row from `/api/v1/designer/tenant/me/mcp-servers`.
 #[derive(Deserialize)]
@@ -216,21 +223,41 @@ impl McpToolSource {
         }
     }
 
-    /// Stable per-tenant cache key. `TenantContext` exposes no single opaque
-    /// id, so the `(tenant_id, env_id)` pair is joined — the same pair
-    /// `TenantContext::key_prefix` is built from.
-    fn cache_key(tenant: &TenantContext) -> String {
-        format!("{}:{}", tenant.tenant_id, tenant.env_id)
+    /// Stable per-tenant, per-role cache key. `TenantContext` exposes no single
+    /// opaque id, so the `(tenant_id, env_id)` pair is joined — the same pair
+    /// `TenantContext::key_prefix` is built from. The `role` is appended so the
+    /// agentic-worker and flow-editor catalogs for the same tenant do not
+    /// collide in the shared cache.
+    fn cache_key(tenant: &TenantContext, role: &str) -> String {
+        format!("{}:{}:{}", tenant.tenant_id, tenant.env_id, role)
     }
 
-    /// Return the tenant's MCP tool catalog, rebuilding when stale or absent.
+    /// Return the tenant's agentic-worker MCP tool catalog (filtered to the
+    /// [`MCP_ROLE_AGENTIC_WORKER`] role), rebuilding when stale or absent.
+    ///
+    /// Convenience wrapper over [`catalog_for_role`] preserving the agent-loop
+    /// call site. See [`catalog_for_role`] for the resilience contract.
+    ///
+    /// [`catalog_for_role`]: McpToolSource::catalog_for_role
+    pub async fn catalog(&self, tenant: &TenantContext) -> Arc<McpToolCatalog> {
+        self.catalog_for_role(tenant, MCP_ROLE_AGENTIC_WORKER).await
+    }
+
+    /// Return the tenant's MCP tool catalog filtered to servers carrying
+    /// `role`, rebuilding when stale or absent. Use [`MCP_ROLE_FLOW_EDITOR`]
+    /// for the flow-execution path and [`MCP_ROLE_AGENTIC_WORKER`] for the
+    /// agent loop.
     ///
     /// Infallible by contract: any admin network or non-200 response degrades
     /// to an empty (cached) catalog with a `warn`, and a dead/slow MCP server
     /// is skipped with a `warn` while the catalog still returns the servers
     /// that worked.
-    pub async fn catalog(&self, tenant: &TenantContext) -> Arc<McpToolCatalog> {
-        let key = Self::cache_key(tenant);
+    pub async fn catalog_for_role(
+        &self,
+        tenant: &TenantContext,
+        role: &str,
+    ) -> Arc<McpToolCatalog> {
+        let key = Self::cache_key(tenant, role);
 
         if let Some(entry) = self.cache.get(&key) {
             let snap = entry.value();
@@ -239,14 +266,14 @@ impl McpToolSource {
             }
         }
 
-        let built = Arc::new(self.build_catalog(&key).await);
+        let built = Arc::new(self.build_catalog(&key, role).await);
         self.cache.insert(key, built.clone());
         built
     }
 
-    /// Fetch the admin rows and probe each agentic-worker server. Always
+    /// Fetch the admin rows and probe each server carrying `role`. Always
     /// returns a catalog (possibly empty); never errors.
-    async fn build_catalog(&self, tenant_key: &str) -> McpToolCatalog {
+    async fn build_catalog(&self, tenant_key: &str, role: &str) -> McpToolCatalog {
         let servers = match self.fetch_servers().await {
             Ok(s) => s,
             Err(e) => {
@@ -261,7 +288,7 @@ impl McpToolSource {
 
         let mut catalog = McpToolCatalog::empty();
         for server in &servers {
-            if !server.roles.iter().any(|r| r == MCP_ROLE_AGENTIC_WORKER) {
+            if !server.roles.iter().any(|r| r == role) {
                 continue;
             }
             self.probe_server(&mut catalog, server, tenant_key).await;
@@ -574,6 +601,73 @@ mod tests {
         assert!(catalog.tool_entry("worker", "search_code").is_some());
         // The flow_editor server is never probed/ingested.
         assert!(catalog.tool_entry("editor", "get_issue").is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_for_role_filters_flow_editor() {
+        // One flow_editor server (→ fake MCP) and one agentic_worker server.
+        let mcp = fake_mcp_server(two_tools(), json!({})).await;
+        let admin = MockServer::start().await;
+        let body = json!({
+            "servers": [
+                {
+                    "id": "editor", "name": "Editor", "transport_url": mcp.uri(),
+                    "auth_header_name": null, "auth_token": null,
+                    "allowed_tools": null, "roles": ["flow_editor"]
+                },
+                {
+                    "id": "worker", "name": "Worker", "transport_url": "http://127.0.0.1:1/",
+                    "auth_header_name": null, "auth_token": null,
+                    "allowed_tools": null, "roles": ["agentic_worker"]
+                }
+            ]
+        });
+        mount_admin(&admin, body).await;
+
+        let source = McpToolSource::new(admin.uri(), "gtc_live_x");
+        let catalog = source
+            .catalog_for_role(&tenant(), MCP_ROLE_FLOW_EDITOR)
+            .await;
+
+        // Only the flow_editor server's two tools land.
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog.tool_entry("editor", "get_issue").is_some());
+        assert!(catalog.tool_entry("editor", "search_code").is_some());
+        // The agentic_worker server is never probed/ingested for this role.
+        assert!(catalog.tool_entry("worker", "get_issue").is_none());
+    }
+
+    #[tokio::test]
+    async fn role_catalogs_are_cached_independently() {
+        // Same admin exposes one server per role at distinct fake MCP servers;
+        // the per-role cache keys must not collide.
+        let editor_mcp = fake_mcp_server(two_tools(), json!({})).await;
+        let admin = MockServer::start().await;
+        let body = json!({
+            "servers": [
+                {
+                    "id": "editor", "name": "Editor", "transport_url": editor_mcp.uri(),
+                    "auth_header_name": null, "auth_token": null,
+                    "allowed_tools": null, "roles": ["flow_editor"]
+                },
+                {
+                    "id": "worker", "name": "Worker", "transport_url": "http://127.0.0.1:1/",
+                    "auth_header_name": null, "auth_token": null,
+                    "allowed_tools": null, "roles": ["agentic_worker"]
+                }
+            ]
+        });
+        mount_admin(&admin, body).await;
+
+        let source = McpToolSource::new(admin.uri(), "gtc_live_x");
+        let t = tenant();
+        let editor = source.catalog_for_role(&t, MCP_ROLE_FLOW_EDITOR).await;
+        let worker = source.catalog_for_role(&t, MCP_ROLE_AGENTIC_WORKER).await;
+        // Distinct cache entries: flow-editor has tools, agentic-worker's dead
+        // server yields none — proving the keys did not alias.
+        assert_eq!(editor.len(), 2);
+        assert_eq!(worker.len(), 0);
+        assert!(!Arc::ptr_eq(&editor, &worker));
     }
 
     #[tokio::test]

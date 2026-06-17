@@ -9,6 +9,7 @@ pub mod flow_adapter;
 pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
+pub mod mcp_node;
 pub mod mocks;
 pub mod operator;
 pub mod remote_dispatch;
