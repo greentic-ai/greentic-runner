@@ -193,6 +193,35 @@ pub fn use_jetstream(get_env: impl Fn(&str) -> Option<String>) -> bool {
     }
 }
 
+/// Parse the comma-separated warm-pack list from the environment. Trims blanks;
+/// empty/unset → no targets. Pure over `get_env` for testability.
+#[must_use]
+pub fn warm_targets(get_env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    get_env("GREENTIC_AW_WARM_PACKS")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Best-effort cold-start warm hook. Today it logs the intended warm targets so
+/// operators can confirm the env is set; the actual cwasm/pack pre-load is baked
+/// into the aw-serve image (see the infra runbook). Non-fatal: a warm failure
+/// must never block serving. This is a seam — extend to trigger the pack cache
+/// load once that API is exposed to this crate.
+pub fn warm_on_start(get_env: impl Fn(&str) -> Option<String>) {
+    let targets = warm_targets(get_env);
+    if targets.is_empty() {
+        tracing::debug!("aw serve: no warm targets (GREENTIC_AW_WARM_PACKS unset)");
+    } else {
+        tracing::info!(count = targets.len(), ?targets, "aw serve: warm targets configured");
+    }
+}
+
 /// Connect to NATS at `nats_url` and serve agentic dispatch requests forever.
 ///
 /// Uses JetStream durable consumer by default; set `GREENTIC_AW_JETSTREAM=0`
@@ -201,6 +230,7 @@ pub fn use_jetstream(get_env: impl Fn(&str) -> Option<String>) -> bool {
 /// Blocks until the subscription stream ends or the process is signalled. The
 /// caller supplies the constructed [`AgentRuntime`] (production or test-mock).
 pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
+    warm_on_start(|k| std::env::var(k).ok());
     let client = async_nats::connect(nats_url)
         .await
         .with_context(|| format!("connecting to NATS at {nats_url}"))?;
@@ -296,6 +326,24 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         ledger,
         None,
     ))
+}
+
+#[cfg(test)]
+mod warm_targets_tests {
+    use super::warm_targets;
+
+    #[test]
+    fn warm_targets_parses_csv_and_empty() {
+        assert_eq!(warm_targets(|_| None), Vec::<String>::new());
+        assert_eq!(
+            warm_targets(|k| (k == "GREENTIC_AW_WARM_PACKS").then(|| "a, b ,c".to_string())),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            warm_targets(|k| (k == "GREENTIC_AW_WARM_PACKS").then(|| "".to_string())),
+            Vec::<String>::new()
+        );
+    }
 }
 
 #[cfg(test)]
