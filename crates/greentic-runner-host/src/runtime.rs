@@ -311,6 +311,30 @@ impl TenantRuntime {
             Err(_) => None,
         };
 
+        // Resolve how `dw.agent` nodes dispatch. When `GREENTIC_AW_DISPATCH=nats`
+        // is set, the node is rerouted over the durable agentic NATS path instead
+        // of the in-process handler. Must be wired while `engine` is still owned.
+        #[cfg(feature = "agentic-worker")]
+        {
+            let dw_dispatch =
+                crate::runner::agent_node::dw_agent_dispatch_mode(|k| std::env::var(k).ok());
+            engine.set_dw_agent_dispatch(dw_dispatch);
+            if matches!(
+                dw_dispatch,
+                crate::runner::agent_node::DwAgentDispatch::Nats
+            ) && std::env::var("GREENTIC_EVENTS_NATS_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                tracing::warn!(
+                    "GREENTIC_AW_DISPATCH=nats but GREENTIC_EVENTS_NATS_URL is unset; \
+                     dw.agent nodes will fail (no remote dispatch handler). \
+                     Set the NATS URL or unset the flag."
+                );
+            }
+        }
+
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(

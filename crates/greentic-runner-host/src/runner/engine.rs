@@ -56,6 +56,10 @@ pub struct FlowEngine {
     /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
     /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
     remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
+    /// Controls whether `dw.agent` nodes run in-process (default) or are
+    /// rerouted over the durable agentic NATS path (`GREENTIC_AW_DISPATCH=nats`).
+    #[cfg(feature = "agentic-worker")]
+    dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch,
     #[cfg(feature = "agentic-worker")]
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
     #[cfg(feature = "agentic-worker")]
@@ -316,6 +320,8 @@ impl FlowEngine {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
@@ -359,6 +365,23 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::graph_node::GraphNodeHandler>,
     ) {
         self.graph_node_handler = Some(handler);
+    }
+
+    /// Set the dispatch mode for `dw.agent` nodes.
+    ///
+    /// - [`DwAgentDispatch::InProcess`] (default): runs the agent in-process via
+    ///   [`AgentNodeHandler`]. Zero configuration overhead; today's behaviour.
+    /// - [`DwAgentDispatch::Nats`]: reroutes the node over the durable agentic
+    ///   NATS path (`greentic.agentic.request.v1`), identical to an `agentic.call`
+    ///   node. Requires [`set_remote_dispatch_handler`] to also be set.
+    ///
+    /// Called by `runtime.rs` when `GREENTIC_AW_DISPATCH=nats`.
+    ///
+    /// [`AgentNodeHandler`]: crate::runner::agent_node::AgentNodeHandler
+    /// [`set_remote_dispatch_handler`]: FlowEngine::set_remote_dispatch_handler
+    #[cfg(feature = "agentic-worker")]
+    pub fn set_dw_agent_dispatch(&mut self, mode: crate::runner::agent_node::DwAgentDispatch) {
+        self.dw_agent_dispatch = mode;
     }
 
     async fn get_or_load_flow(&self, pack_id: &str, flow_id: &str) -> Result<HostFlow> {
@@ -781,10 +804,29 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
-            NodeKind::DwAgent { agent_id } => self
-                .execute_dw_agent(ctx, agent_id, payload)
-                .await
-                .map(DispatchOutcome::complete),
+            NodeKind::DwAgent { agent_id } => {
+                #[cfg(feature = "agentic-worker")]
+                match self.dw_agent_dispatch {
+                    crate::runner::agent_node::DwAgentDispatch::Nats => {
+                        // Reroute to the durable out-of-process agentic path.
+                        // Wrap the raw node payload as the dispatch `input` (the
+                        // serve invoker reads `input.user_text`); `await=true` →
+                        // pause+resume, identical to `agentic.call`.
+                        let remote_payload =
+                            serde_json::json!({ "await": true, "input": payload });
+                        self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
+                            .await
+                    }
+                    crate::runner::agent_node::DwAgentDispatch::InProcess => self
+                        .execute_dw_agent(ctx, agent_id, payload)
+                        .await
+                        .map(DispatchOutcome::complete),
+                }
+                #[cfg(not(feature = "agentic-worker"))]
+                self.execute_dw_agent(ctx, agent_id, payload)
+                    .await
+                    .map(DispatchOutcome::complete)
+            }
             NodeKind::DwAgentGraph { graph_id } => self
                 .execute_dw_agent_graph(ctx, graph_id, payload)
                 .await
@@ -2839,6 +2881,8 @@ mod tests {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
@@ -3266,6 +3310,8 @@ mod tests {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
@@ -3414,6 +3460,8 @@ mod tests {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: Some(handler),
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
@@ -3550,6 +3598,8 @@ mod tests {
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: Some(handler_dyn),
@@ -3597,6 +3647,168 @@ mod tests {
         assert!(
             output_str.contains("graph-pong"),
             "expected graph reply in flow output, got: {output_str}"
+        );
+    }
+
+    /// When `GREENTIC_AW_DISPATCH=nats` is set, a `dw.agent` node must be
+    /// rerouted through the remote-dispatch path (`"agentic"` runtime) rather
+    /// than calling the in-process `AgentNodeHandler`. The node payload is
+    /// wrapped as `input`, `await=true` is injected, and the engine pauses
+    /// (returns a wait outcome, not a complete one).
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn dw_agent_nats_mode_dispatches_remote() {
+        use std::sync::Mutex;
+
+        use crate::runner::agent_node::DwAgentDispatch;
+        use crate::runner::remote_dispatch::{RemoteDispatch, RemoteDispatchAction, RemoteDispatchHandler};
+
+        /// Recording stub: captures the last dispatch and returns
+        /// `AwaitingResponse` so the engine pauses.
+        struct RecordingDispatcher {
+            seen: Mutex<Option<RemoteDispatch>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteDispatchHandler for RecordingDispatcher {
+            async fn dispatch(&self, request: RemoteDispatch) -> anyhow::Result<RemoteDispatchAction> {
+                let corr = request.correlation_id.clone();
+                *self.seen.lock().unwrap() = Some(request);
+                Ok(RemoteDispatchAction::AwaitingResponse {
+                    correlation_id: corr,
+                })
+            }
+        }
+
+        let dispatcher = Arc::new(RecordingDispatcher {
+            seen: Mutex::new(None),
+        });
+
+        // --- two-node flow: dw.agent → emit (resume target) ---
+        // The agent node must have Routing::Next so the engine knows where to
+        // resume once the async response arrives (same requirement as sorla.call /
+        // agentic.call nodes in production).
+        let resume_id = NodeId::from_str("after-agent").unwrap();
+        let node_id = NodeId::from_str("agent-nats").unwrap();
+        let agent_node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: resume_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+        let resume_node = Node {
+            id: resume_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "done" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), agent_node);
+        nodes.insert(resume_id.clone(), resume_node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("nats-agent.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "nats-agent.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(dispatcher.clone() as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: DwAgentDispatch::Nats,
+            #[cfg(feature = "agentic-worker")]
+            // No in-process handler wired — Nats path must NOT call it.
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+        };
+
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "nats-agent.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-nats"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(ctx, json!({ "user_text": "hi" })))
+            .unwrap();
+
+        // The Nats path pauses the flow (await=true → DispatchOutcome::wait).
+        assert!(
+            matches!(result.status, FlowStatus::Waiting(_)),
+            "expected Waiting outcome from dw.agent Nats mode, got: {:?}",
+            result.status
+        );
+
+        // The dispatcher must have been called with runtime="agentic" and
+        // target=<agent_id>, and the node payload wrapped as `input`.
+        let seen = dispatcher.seen.lock().unwrap();
+        let dispatch = seen.as_ref().expect("dispatcher was not called");
+        assert_eq!(dispatch.runtime, "agentic", "runtime name must be 'agentic'");
+        assert_eq!(dispatch.target, "greeter", "target must be the agent_id");
+        assert_eq!(
+            dispatch.input,
+            json!({ "user_text": "hi" }),
+            "node payload must be forwarded as dispatch input"
         );
     }
 
@@ -3660,6 +3872,8 @@ mod tests {
             },
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
