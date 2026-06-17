@@ -1154,7 +1154,7 @@ mod aw {
 #[allow(clippy::items_after_test_module)] // helper fn + re-exports follow
 #[cfg(test)]
 mod gating_tests {
-    use super::should_serve_agentic_inproc;
+    use super::{DwAgentDispatch, dw_agent_dispatch_mode, should_serve_agentic_inproc};
     use std::collections::HashMap;
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
@@ -1207,6 +1207,25 @@ mod gating_tests {
             assert!(!should_serve_agentic_inproc(env), "{falsey} should skip");
         }
     }
+
+    #[test]
+    fn dw_agent_dispatch_mode_defaults_inproc_and_parses_nats() {
+        assert_eq!(dw_agent_dispatch_mode(|_| None), DwAgentDispatch::InProcess);
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| (k == "GREENTIC_AW_DISPATCH").then(|| "nats".to_string())),
+            DwAgentDispatch::Nats
+        );
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| {
+                (k == "GREENTIC_AW_DISPATCH").then(|| "inproc".to_string())
+            }),
+            DwAgentDispatch::InProcess
+        );
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| (k == "GREENTIC_AW_DISPATCH").then(|| "NATS".to_string())),
+            DwAgentDispatch::Nats
+        );
+    }
 }
 
 /// Decide whether the runner process should host the agentic-worker NATS
@@ -1235,6 +1254,29 @@ pub fn should_serve_agentic_inproc(get_env: impl Fn(&str) -> Option<String>) -> 
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false);
     opt_in && nats_set
+}
+
+/// How a `dw.agent` flow node executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by Task 2.2 (engine.rs)
+pub enum DwAgentDispatch {
+    /// Run the agentic step in-process (default; today's behaviour).
+    InProcess,
+    /// Publish to the durable agentic NATS path (scale-to-zero compute).
+    Nats,
+}
+
+/// Resolve how `dw.agent` nodes execute. `GREENTIC_AW_DISPATCH=nats` routes them
+/// over the out-of-process agentic NATS path; anything else (incl. unset) keeps
+/// the in-process path — zero regression by default. Pure over `get_env` for
+/// testability (mirrors `should_serve_agentic_inproc`).
+#[must_use]
+#[allow(dead_code)] // consumed by Task 2.2 (engine.rs)
+pub fn dw_agent_dispatch_mode(get_env: impl Fn(&str) -> Option<String>) -> DwAgentDispatch {
+    match get_env("GREENTIC_AW_DISPATCH") {
+        Some(v) if v.trim().eq_ignore_ascii_case("nats") => DwAgentDispatch::Nats,
+        _ => DwAgentDispatch::InProcess,
+    }
 }
 
 #[cfg(feature = "agentic-worker")]
