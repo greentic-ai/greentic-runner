@@ -9,6 +9,8 @@ pub mod flow_adapter;
 pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
+#[cfg(feature = "knowledge-chronicle")]
+pub mod knowledge_mount;
 #[cfg(feature = "long-term-chronicle")]
 pub mod long_term_memory;
 pub mod mcp_node;
