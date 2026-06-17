@@ -265,6 +265,34 @@ mod aw {
         )))
     }
 
+    /// Build the component tool source from the operator's loaded packs, gated
+    /// by `GREENTIC_AW_COMPONENT_TOOLS` (set to "0" to disable). Returns `None`
+    /// when disabled or when no packs are loaded, so `component:` tool refs then
+    /// resolve to nothing. Mirrors [`mcp_source_from_env`] but discovers tools
+    /// from in-pack components rather than a remote admin.
+    fn component_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+    ) -> Option<Arc<greentic_aw_runtime::ComponentToolSource>> {
+        if std::env::var("GREENTIC_AW_COMPONENT_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_COMPONENT_TOOLS=0; component tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+        let invoker = Arc::new(
+            crate::runner::component_invoker::PackRuntimeComponentInvoker::new(
+                packs.to_vec(),
+                tenant.to_string(),
+            ),
+        );
+        tracing::info!(tenant = %tenant, packs = packs.len(), "component tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::ComponentToolSource::new(
+            invoker,
+        )))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -433,6 +461,7 @@ mod aw {
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
@@ -523,16 +552,19 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(AgentRuntime::new(
-            config_provider,
-            state_store,
-            ext_runtime,
-            llm,
-            telemetry,
-            token_meter,
-            ledger,
-            mcp_source_from_env(),
-        ));
+        let runtime = Arc::new(
+            AgentRuntime::new(
+                config_provider,
+                state_store,
+                ext_runtime,
+                llm,
+                telemetry,
+                token_meter,
+                ledger,
+                mcp_source_from_env(),
+            )
+            .with_component_source(component_source_from_packs(&packs, &tenant)),
+        );
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed (per-tenant creds)");
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
