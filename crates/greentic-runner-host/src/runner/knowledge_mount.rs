@@ -21,6 +21,8 @@
 use std::sync::Arc;
 
 use chronicle_core::driver::GraphDriver;
+use chronicle_driver_falkor::FalkorDriver;
+use chronicle_driver_neo4j::Neo4jDriver;
 use chronicle_driver_surreal::SurrealDriver;
 use greentic_aw_runtime::AgentRuntime;
 use greentic_aw_runtime::knowledge::{
@@ -45,6 +47,17 @@ const DEFAULT_BACKEND: &str = "surreal-embedded";
 /// Default on-disk location for the embedded SurrealDB knowledge store. Distinct
 /// from the long-term-memory default so the two tiers never open the same store.
 const DEFAULT_SURREAL_PATH: &str = "/var/lib/greentic/knowledge";
+// Neo4j (backend=neo4j) — may point at the same server long-term memory uses; the
+// `knowledge:<tenant>` group_id keeps corpora isolated from memory graph entities.
+const ENV_NEO4J_URI: &str = "GREENTIC_KNOWLEDGE_NEO4J_URI";
+const ENV_NEO4J_USER: &str = "GREENTIC_KNOWLEDGE_NEO4J_USER";
+const ENV_NEO4J_PASSWORD: &str = "GREENTIC_KNOWLEDGE_NEO4J_PASSWORD";
+const ENV_NEO4J_DATABASE: &str = "GREENTIC_KNOWLEDGE_NEO4J_DATABASE";
+const DEFAULT_NEO4J_DATABASE: &str = "neo4j";
+// FalkorDB (backend=falkor).
+const ENV_FALKOR_URL: &str = "GREENTIC_KNOWLEDGE_FALKOR_URL";
+const ENV_FALKOR_GRAPH: &str = "GREENTIC_KNOWLEDGE_FALKOR_GRAPH";
+const DEFAULT_FALKOR_GRAPH: &str = "chronicle";
 // Embeddings (vector recall) — any OpenAI-compatible endpoint.
 const ENV_EMBED_BASE_URL: &str = "GREENTIC_KNOWLEDGE_EMBED_BASE_URL";
 const ENV_EMBED_API_KEY: &str = "GREENTIC_KNOWLEDGE_EMBED_API_KEY";
@@ -104,16 +117,91 @@ fn build_config() -> Option<KnowledgeConfig> {
     Some(config)
 }
 
-/// Resolve and connect the graph-store driver from the environment. Defaults to
-/// embedded SurrealDB. Returns `None` — with a logged reason — when the selector
-/// value is unknown, the backend isn't compiled into this build, or the
-/// connection fails. `embedding_dim` sizes the vector index.
-async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
+/// The graph-store backend resolved from the environment, before any connection
+/// is attempted. Selection is kept separate from connection so it is unit-testable
+/// without a live database.
+#[derive(Debug, PartialEq)]
+enum BackendChoice {
+    SurrealEmbedded {
+        path: String,
+    },
+    SurrealMemory,
+    Neo4j {
+        uri: String,
+        user: String,
+        password: String,
+        database: String,
+    },
+    Falkor {
+        connection: String,
+        graph: String,
+    },
+}
+
+/// Resolve the graph-store backend from `GREENTIC_KNOWLEDGE_BACKEND` (defaulting to
+/// embedded SurrealDB). Returns `None` — with a logged reason — when the selector
+/// value is unknown or an explicitly-chosen backend is missing its required
+/// connection env. Mirrors the long-term-memory selector but in its own env
+/// namespace and store.
+fn resolve_backend() -> Option<BackendChoice> {
     let kind = std::env::var(ENV_BACKEND).unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
     match kind.as_str() {
         "surreal-embedded" => {
             let path = std::env::var(ENV_SURREAL_PATH)
                 .unwrap_or_else(|_| DEFAULT_SURREAL_PATH.to_string());
+            Some(BackendChoice::SurrealEmbedded { path })
+        }
+        "surreal-memory" => Some(BackendChoice::SurrealMemory),
+        "neo4j" => {
+            let (Ok(uri), Ok(user), Ok(password)) = (
+                std::env::var(ENV_NEO4J_URI),
+                std::env::var(ENV_NEO4J_USER),
+                std::env::var(ENV_NEO4J_PASSWORD),
+            ) else {
+                tracing::warn!(
+                    "knowledge: backend=neo4j but GREENTIC_KNOWLEDGE_NEO4J_URI/USER/PASSWORD \
+                     incomplete; knowledge disabled"
+                );
+                return None;
+            };
+            let database = std::env::var(ENV_NEO4J_DATABASE)
+                .unwrap_or_else(|_| DEFAULT_NEO4J_DATABASE.to_string());
+            Some(BackendChoice::Neo4j {
+                uri,
+                user,
+                password,
+                database,
+            })
+        }
+        "falkor" => {
+            let Ok(connection) = std::env::var(ENV_FALKOR_URL) else {
+                tracing::warn!(
+                    "knowledge: backend=falkor but GREENTIC_KNOWLEDGE_FALKOR_URL unset; \
+                     knowledge disabled"
+                );
+                return None;
+            };
+            let graph = std::env::var(ENV_FALKOR_GRAPH)
+                .unwrap_or_else(|_| DEFAULT_FALKOR_GRAPH.to_string());
+            Some(BackendChoice::Falkor { connection, graph })
+        }
+        other => {
+            tracing::warn!(
+                backend = %other,
+                "knowledge: GREENTIC_KNOWLEDGE_BACKEND='{other}' is unknown (supported: \
+                 surreal-embedded|surreal-memory|neo4j|falkor); knowledge disabled",
+            );
+            None
+        }
+    }
+}
+
+/// Resolve and connect the graph-store driver. Returns `None` (with a logged
+/// reason) when selection fails or the connection errors. `embedding_dim` sizes
+/// the vector index on the backends that build one.
+async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
+    match resolve_backend()? {
+        BackendChoice::SurrealEmbedded { path } => {
             match SurrealDriver::connect_embedded(&path, embedding_dim).await {
                 Ok(driver) => Some(Arc::new(driver)),
                 Err(err) => {
@@ -122,7 +210,7 @@ async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
                 }
             }
         }
-        "surreal-memory" => {
+        BackendChoice::SurrealMemory => {
             tracing::warn!(
                 "knowledge: backend=surreal-memory is EPHEMERAL — the ingested corpus is lost on \
                  restart and must be re-ingested"
@@ -135,13 +223,26 @@ async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
                 }
             }
         }
-        other => {
-            tracing::warn!(
-                backend = %other,
-                "knowledge: GREENTIC_KNOWLEDGE_BACKEND='{other}' is unknown or not compiled into \
-                 this build (supported: surreal-embedded|surreal-memory); knowledge disabled",
-            );
-            None
+        BackendChoice::Neo4j {
+            uri,
+            user,
+            password,
+            database,
+        } => match Neo4jDriver::connect(&uri, &user, &password, database).await {
+            Ok(driver) => Some(Arc::new(driver)),
+            Err(err) => {
+                tracing::warn!(error = %err, "knowledge: Neo4j connect failed; knowledge disabled");
+                None
+            }
+        },
+        BackendChoice::Falkor { connection, graph } => {
+            match FalkorDriver::connect(&connection, &graph, embedding_dim).await {
+                Ok(driver) => Some(Arc::new(driver)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "knowledge: FalkorDB connect failed; knowledge disabled");
+                    None
+                }
+            }
         }
     }
 }
@@ -295,6 +396,114 @@ mod tests {
         set(ENV_EMBED_BASE_URL, "https://api.example/v1");
         set(ENV_EMBED_API_KEY, "sk-test");
         set(ENV_EMBED_MODEL, "text-embedding-3-small");
+    }
+
+    fn clear_backend_env() {
+        for key in [
+            ENV_BACKEND,
+            ENV_SURREAL_PATH,
+            ENV_NEO4J_URI,
+            ENV_NEO4J_USER,
+            ENV_NEO4J_PASSWORD,
+            ENV_NEO4J_DATABASE,
+            ENV_FALKOR_URL,
+            ENV_FALKOR_GRAPH,
+        ] {
+            unset(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_defaults_to_embedded_surreal() {
+        clear_backend_env();
+        assert_eq!(
+            resolve_backend(),
+            Some(BackendChoice::SurrealEmbedded {
+                path: DEFAULT_SURREAL_PATH.to_string()
+            })
+        );
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_surreal_embedded_honours_path() {
+        clear_backend_env();
+        set(ENV_BACKEND, "surreal-embedded");
+        set(ENV_SURREAL_PATH, "/data/knowledge");
+        assert_eq!(
+            resolve_backend(),
+            Some(BackendChoice::SurrealEmbedded {
+                path: "/data/knowledge".to_string()
+            })
+        );
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_neo4j_full_and_default_database() {
+        clear_backend_env();
+        set(ENV_BACKEND, "neo4j");
+        set(ENV_NEO4J_URI, "bolt://db:7687");
+        set(ENV_NEO4J_USER, "neo");
+        set(ENV_NEO4J_PASSWORD, "secret");
+        assert_eq!(
+            resolve_backend(),
+            Some(BackendChoice::Neo4j {
+                uri: "bolt://db:7687".to_string(),
+                user: "neo".to_string(),
+                password: "secret".to_string(),
+                database: DEFAULT_NEO4J_DATABASE.to_string(),
+            })
+        );
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_neo4j_missing_credentials_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "neo4j");
+        set(ENV_NEO4J_URI, "bolt://db:7687");
+        // user + password deliberately absent.
+        assert_eq!(resolve_backend(), None);
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_falkor_full_and_default_graph() {
+        clear_backend_env();
+        set(ENV_BACKEND, "falkor");
+        set(ENV_FALKOR_URL, "redis://falkor:6379");
+        assert_eq!(
+            resolve_backend(),
+            Some(BackendChoice::Falkor {
+                connection: "redis://falkor:6379".to_string(),
+                graph: DEFAULT_FALKOR_GRAPH.to_string(),
+            })
+        );
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_falkor_missing_url_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "falkor");
+        assert_eq!(resolve_backend(), None);
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_backend_unknown_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "cassandra");
+        assert_eq!(resolve_backend(), None);
+        clear_backend_env();
     }
 
     #[test]
