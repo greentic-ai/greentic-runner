@@ -12,6 +12,10 @@
 
 pub mod jetstream;
 
+// Re-export so callers can use `aw_event_bridge::run_bridge_jetstream` without
+// naming the submodule explicitly.
+pub use jetstream::run_bridge_jetstream;
+
 use std::sync::Arc;
 
 use anyhow::Result;
