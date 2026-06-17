@@ -73,6 +73,34 @@ pub(crate) fn augment_system_prompt(base: &str, facts: &[RecalledFact]) -> Strin
     out
 }
 
+/// Reserved extension id for the host-provided built-in tools (distinct from
+/// any WASM extension id).
+pub(crate) const RECALL_MEMORY_EXTENSION_ID: &str = "host";
+/// Reserved tool name for the host built-in long-term recall tool.
+pub(crate) const RECALL_MEMORY_TOOL: &str = "recall_memory";
+/// Max facts returned by an agentic `recall_memory` tool call.
+pub(crate) const TOOL_LIMIT: usize = 10;
+
+/// LLM-facing schema for the host built-in `recall_memory` tool. Advertised
+/// only when the long-term tier is active.
+pub(crate) fn recall_memory_tool_schema() -> crate::llm::LlmToolSchema {
+    crate::llm::LlmToolSchema {
+        extension_id: RECALL_MEMORY_EXTENSION_ID.to_string(),
+        tool_name: RECALL_MEMORY_TOOL.to_string(),
+        description: "Search the agent's long-term memory for facts relevant to a query. \
+             Use when you need to recall something from earlier interactions."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Natural-language search query." },
+                "limit": { "type": "integer", "description": "Max facts to return (default 10)." }
+            },
+            "required": ["query"]
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -221,5 +249,14 @@ mod tests {
         });
         assert!(long_term_active(true, &cfg));
         assert!(!long_term_active(false, &cfg));
+    }
+
+    #[test]
+    fn recall_memory_schema_shape() {
+        let s = recall_memory_tool_schema();
+        assert_eq!(s.tool_name, RECALL_MEMORY_TOOL);
+        assert_eq!(s.extension_id, RECALL_MEMORY_EXTENSION_ID);
+        assert_eq!(s.parameters["required"][0], "query");
+        assert!(s.parameters["properties"]["query"].is_object());
     }
 }

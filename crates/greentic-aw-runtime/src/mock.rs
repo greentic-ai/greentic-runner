@@ -29,6 +29,8 @@ mod inner {
     pub struct MockLlmBackend {
         pub responses: Mutex<Vec<Result<LlmResponse, LlmError>>>,
         pub seen_system_prompts: Mutex<Vec<String>>,
+        /// Tool names advertised in each request the backend saw.
+        pub seen_tool_names: Mutex<Vec<Vec<String>>>,
     }
 
     impl MockLlmBackend {
@@ -36,6 +38,7 @@ mod inner {
             Self {
                 responses: Mutex::new(responses),
                 seen_system_prompts: Mutex::new(Vec::new()),
+                seen_tool_names: Mutex::new(Vec::new()),
             }
         }
     }
@@ -49,6 +52,10 @@ mod inner {
                 .lock()
                 .expect("mock llm prompt lock poisoned")
                 .push(req.system_prompt.clone());
+            self.seen_tool_names
+                .lock()
+                .expect("mock llm tools lock poisoned")
+                .push(req.tools.iter().map(|t| t.tool_name.clone()).collect());
             // Eagerly extract the next scripted response so the future is Send + 'a.
             let next = {
                 let mut queue = self.responses.lock().expect("mock LLM mutex poisoned");
