@@ -3555,6 +3555,8 @@ dependencies = [
  "blake3",
  "bytes",
  "chronicle-core",
+ "chronicle-driver-falkor",
+ "chronicle-driver-neo4j",
  "chronicle-driver-surreal",
  "chrono",
  "criterion",

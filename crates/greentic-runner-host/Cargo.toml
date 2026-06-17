@@ -53,6 +53,8 @@ knowledge-chronicle = [
     "dep:greentic-dw-knowledge",
     "dep:chronicle-core",
     "dep:chronicle-driver-surreal",
+    "dep:chronicle-driver-neo4j",
+    "dep:chronicle-driver-falkor",
     # Same greentic-types `agents` skew as long-term-chronicle (the knowledge
     # crates transitively pull greentic-dw-providers-common).
     "dep:greentic-dw-providers-common",
@@ -85,6 +87,8 @@ greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greenti
 greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 chronicle-core = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 chronicle-driver-surreal = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
+chronicle-driver-neo4j = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
+chronicle-driver-falkor = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.24-research", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
