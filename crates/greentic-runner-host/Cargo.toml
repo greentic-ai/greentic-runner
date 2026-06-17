@@ -21,6 +21,24 @@ component-v0-6-introspection = []
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
+# memory backend into the agentic worker. Heavy (pulls the Chronicle graph
+# engine); off by default. The operator supplies Neo4j + the LLM and embedding
+# endpoints via GREENTIC_CHRONICLE_* env vars; chronicle is driven through the
+# provider-neutral DW LLM/embedding families (any OpenAI-compatible endpoint —
+# no single-provider lock). Absent the env, long-term stays disabled.
+long-term-chronicle = [
+    "agentic-worker",
+    "dep:greentic-dw-memory-chronicle",
+    "dep:greentic-dw-llm",
+    "dep:greentic-dw-llm-openai-compatible",
+    "dep:greentic-dw-embedding",
+    "dep:greentic-dw-embedding-openai-compatible",
+    # Turns on greentic-dw-providers-common's `pack-manifest-agents` feature so it
+    # emits PackManifest.agents against the greentic-types rev we pin (where that
+    # field is required). Without it the transitive common copy fails to compile.
+    "dep:greentic-dw-providers-common",
+]
 
 [dependencies]
 async-nats = "0.46"
@@ -32,6 +50,15 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.2.0-research", features = ["serve"], optional = true }
+greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-embedding = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+greentic-dw-embedding-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
+# Pulled only to enable its `pack-manifest-agents` feature (see the
+# long-term-chronicle feature). The crate is otherwise a transitive dep of the
+# openai-compatible providers above.
+greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true, features = ["pack-manifest-agents"] }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.24-research", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true

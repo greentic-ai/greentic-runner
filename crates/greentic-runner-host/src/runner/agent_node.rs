@@ -610,7 +610,7 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(AgentRuntime::new(
+        let base = AgentRuntime::new(
             config_provider,
             state_store,
             ext_runtime,
@@ -619,7 +619,13 @@ mod aw {
             token_meter,
             ledger,
             mcp_source_from_env(),
-        ));
+        );
+        // Optionally attach an operator-configured native long-term memory
+        // backend. With the `long-term-chronicle` feature off (default) this is
+        // a no-op and `base` is wrapped unchanged.
+        #[cfg(feature = "long-term-chronicle")]
+        let base = crate::runner::long_term_memory::attach(base).await;
+        let runtime = Arc::new(base);
 
         tracing::info!(agent_count, "AW runtime constructed");
         Some(runtime)
