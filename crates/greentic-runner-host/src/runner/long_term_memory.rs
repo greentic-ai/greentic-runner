@@ -230,3 +230,182 @@ fn operator_tenant() -> TenantCtx {
         .expect("the literal tenant id \"chronicle\" is always valid");
     TenantCtx::new(env, tenant)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    // The crate denies unsafe, but `std::env::set_var`/`remove_var` are `unsafe`
+    // under edition 2024. These helpers are confined to tests, which run under
+    // `#[serial]`, so no other thread observes the environment mid-mutation.
+    #[allow(unsafe_code)]
+    fn set(key: &str, val: &str) {
+        // SAFETY: tests touching the environment are serialized via `#[serial]`.
+        unsafe { std::env::set_var(key, val) };
+    }
+
+    #[allow(unsafe_code)]
+    fn unset(key: &str) {
+        // SAFETY: tests touching the environment are serialized via `#[serial]`.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    /// Clear every backend-selection variable so a test starts from a known,
+    /// empty environment regardless of the host or sibling tests.
+    fn clear_backend_env() {
+        for key in [
+            ENV_BACKEND,
+            ENV_NEO4J_URI,
+            ENV_NEO4J_USER,
+            ENV_NEO4J_PASSWORD,
+            ENV_NEO4J_DATABASE,
+            ENV_FALKOR_URL,
+            ENV_FALKOR_GRAPH,
+            ENV_SURREAL_PATH,
+        ] {
+            unset(key);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_to_embedded_surreal_on_disk() {
+        clear_backend_env();
+        match select_backend() {
+            Some(ChronicleBackend::SurrealEmbedded { path }) => {
+                assert_eq!(path, DEFAULT_SURREAL_PATH);
+            }
+            other => panic!("expected default SurrealEmbedded, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn surreal_embedded_honours_custom_path() {
+        clear_backend_env();
+        set(ENV_BACKEND, "surreal-embedded");
+        set(ENV_SURREAL_PATH, "/data/chronicle");
+        match select_backend() {
+            Some(ChronicleBackend::SurrealEmbedded { path }) => {
+                assert_eq!(path, "/data/chronicle");
+            }
+            other => panic!("expected SurrealEmbedded, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn surreal_memory_selected() {
+        clear_backend_env();
+        set(ENV_BACKEND, "surreal-memory");
+        assert_eq!(select_backend().map(|b| b.kind()), Some("surreal-memory"));
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn neo4j_reads_all_connection_fields() {
+        clear_backend_env();
+        set(ENV_BACKEND, "neo4j");
+        set(ENV_NEO4J_URI, "bolt://db:7687");
+        set(ENV_NEO4J_USER, "neo");
+        set(ENV_NEO4J_PASSWORD, "secret");
+        set(ENV_NEO4J_DATABASE, "graph-db");
+        match select_backend() {
+            Some(ChronicleBackend::Neo4j {
+                uri,
+                user,
+                password,
+                database,
+            }) => {
+                assert_eq!(uri, "bolt://db:7687");
+                assert_eq!(user, "neo");
+                assert_eq!(password, "secret");
+                assert_eq!(database, "graph-db");
+            }
+            other => panic!("expected Neo4j, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn neo4j_defaults_database_when_unset() {
+        clear_backend_env();
+        set(ENV_BACKEND, "neo4j");
+        set(ENV_NEO4J_URI, "bolt://db:7687");
+        set(ENV_NEO4J_USER, "neo");
+        set(ENV_NEO4J_PASSWORD, "secret");
+        match select_backend() {
+            Some(ChronicleBackend::Neo4j { database, .. }) => {
+                assert_eq!(database, DEFAULT_NEO4J_DATABASE);
+            }
+            other => panic!("expected Neo4j, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn neo4j_missing_credentials_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "neo4j");
+        set(ENV_NEO4J_URI, "bolt://db:7687");
+        // user + password deliberately absent.
+        assert!(select_backend().is_none());
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn falkor_reads_connection_and_graph() {
+        clear_backend_env();
+        set(ENV_BACKEND, "falkor");
+        set(ENV_FALKOR_URL, "redis://falkor:6379");
+        set(ENV_FALKOR_GRAPH, "episodes");
+        match select_backend() {
+            Some(ChronicleBackend::Falkor { connection, graph }) => {
+                assert_eq!(connection, "redis://falkor:6379");
+                assert_eq!(graph, "episodes");
+            }
+            other => panic!("expected Falkor, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn falkor_defaults_graph_when_unset() {
+        clear_backend_env();
+        set(ENV_BACKEND, "falkor");
+        set(ENV_FALKOR_URL, "redis://falkor:6379");
+        match select_backend() {
+            Some(ChronicleBackend::Falkor { graph, .. }) => {
+                assert_eq!(graph, DEFAULT_FALKOR_GRAPH);
+            }
+            other => panic!("expected Falkor, got {other:?}"),
+        }
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn falkor_missing_url_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "falkor");
+        assert!(select_backend().is_none());
+        clear_backend_env();
+    }
+
+    #[test]
+    #[serial]
+    fn unknown_backend_disables() {
+        clear_backend_env();
+        set(ENV_BACKEND, "cassandra");
+        assert!(select_backend().is_none());
+        clear_backend_env();
+    }
+}
