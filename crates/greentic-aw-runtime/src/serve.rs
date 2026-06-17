@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge};
+use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge, run_bridge_jetstream};
 use serde_json::{Value, json};
 
 use crate::tenant::TenantContext;
@@ -114,7 +114,25 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
     }
 }
 
+/// Whether the agentic serve consumer uses JetStream (durable) vs core-NATS.
+///
+/// Default ON; set `GREENTIC_AW_JETSTREAM=0|false|no|off` to force the legacy
+/// core-NATS path.
+#[must_use]
+pub fn use_jetstream(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    match get_env("GREENTIC_AW_JETSTREAM") {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
+    }
+}
+
 /// Connect to NATS at `nats_url` and serve agentic dispatch requests forever.
+///
+/// Uses JetStream durable consumer by default; set `GREENTIC_AW_JETSTREAM=0`
+/// (or `off`/`false`/`no`) to fall back to the legacy core-NATS consumer.
 ///
 /// Blocks until the subscription stream ends or the process is signalled. The
 /// caller supplies the constructed [`AgentRuntime`] (production or test-mock).
@@ -128,7 +146,13 @@ pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
         "aw event bridge connected; serving agentic dispatch"
     );
     let invoker = Arc::new(RuntimeAgentDispatchInvoker::new(runtime));
-    run_bridge(client, invoker).await
+    if use_jetstream(|k| std::env::var(k).ok()) {
+        tracing::info!(nats_url, "aw serve: JetStream durable consumer");
+        run_bridge_jetstream(client, invoker).await
+    } else {
+        tracing::info!(nats_url, "aw serve: core-NATS consumer (legacy)");
+        run_bridge(client, invoker).await
+    }
 }
 
 /// Build a credit-free, broker-free [`AgentRuntime`] that returns a canned reply
@@ -208,6 +232,19 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         ledger,
         None,
     ))
+}
+
+#[cfg(test)]
+mod env_gate_tests {
+    use super::use_jetstream;
+
+    #[test]
+    fn jetstream_default_on_unless_disabled() {
+        assert!(use_jetstream(|_| None)); // default ON
+        assert!(!use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "0".to_string())));
+        assert!(!use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "off".to_string())));
+        assert!(use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "on".to_string())));
+    }
 }
 
 #[cfg(all(test, feature = "test-mock"))]
