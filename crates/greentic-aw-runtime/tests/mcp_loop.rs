@@ -90,6 +90,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
             ..AgentLimits::default()
         },
         memory: None,
+        knowledge: None,
     }
 }
 

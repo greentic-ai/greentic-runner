@@ -20,6 +20,7 @@ pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
 pub mod http_provider;
+pub mod knowledge;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
@@ -135,6 +136,10 @@ pub struct AgentRuntime {
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
     pub(crate) long_term_memory: Option<Arc<dyn long_term::LongTermMemory>>,
+    /// Knowledge / RAG (document-corpus) backend (e.g. Chronicle doc-RAG).
+    /// `None` disables the knowledge tier. Set via [`AgentRuntime::with_knowledge`];
+    /// the concrete backend is injected at the runner-host edge, never compiled in.
+    pub(crate) knowledge: Option<Arc<dyn knowledge::Knowledge>>,
 }
 
 impl AgentRuntime {
@@ -162,6 +167,7 @@ impl AgentRuntime {
             ledger,
             mcp,
             long_term_memory: None,
+            knowledge: None,
         }
     }
 
@@ -200,6 +206,29 @@ impl AgentRuntime {
         })?;
         let ctx = long_term::to_types_tenant(tenant)?;
         memory.recall(&ctx, query).await
+    }
+
+    /// Wire the knowledge / RAG backend (e.g. Chronicle doc-RAG). Coexists with
+    /// the memory tiers (distinct `cap://dw.knowledge` capability); defaults off.
+    #[must_use]
+    pub fn with_knowledge(mut self, knowledge: Arc<dyn knowledge::Knowledge>) -> Self {
+        self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Hybrid retrieval over the agent's knowledge corpus. Returns
+    /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
+    pub async fn search_knowledge(
+        &self,
+        tenant: &TenantContext,
+        query: knowledge::KnowledgeQuery,
+    ) -> knowledge::KnowledgeResult<Vec<knowledge::RetrievedChunk>> {
+        let kb = self
+            .knowledge
+            .as_ref()
+            .ok_or(knowledge::KnowledgeError::NotConfigured)?;
+        let ctx = knowledge::to_types_tenant(tenant)?;
+        kb.search(&ctx, query).await
     }
 
     /// Execute one agentic step against the given session.

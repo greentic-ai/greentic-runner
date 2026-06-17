@@ -146,6 +146,7 @@ mod tests {
                 ..AgentLimits::default()
             },
             memory: None,
+            knowledge: None,
         }
     }
 

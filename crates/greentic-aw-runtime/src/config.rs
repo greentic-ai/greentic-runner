@@ -53,6 +53,37 @@ pub struct MemorySettings {
     pub long_term: Option<MemoryProviderRef>,
 }
 
+/// Default number of knowledge chunks auto-retrieved per turn.
+pub(crate) const fn default_knowledge_top_k() -> usize {
+    5
+}
+
+/// Knowledge / RAG binding for an agent (`cap://dw.knowledge`). Distinct from
+/// [`MemorySettings`] (D4): a read-mostly document corpus with auto pre-retrieval,
+/// not evolving conversational memory. `knowledge` is the retrieval provider;
+/// `embedding` is the embedding provider used to build the Chronicle index at the
+/// runner-host edge; `top_k` caps the chunks injected per turn.
+// `Eq` omitted: provider refs carry non-`Eq` `serde_json::Value` params.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<MemoryProviderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<MemoryProviderRef>,
+    #[serde(default = "default_knowledge_top_k")]
+    pub top_k: usize,
+}
+
+impl Default for KnowledgeSettings {
+    fn default() -> Self {
+        Self {
+            knowledge: None,
+            embedding: None,
+            top_k: default_knowledge_top_k(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub agent_id: String,
@@ -63,6 +94,8 @@ pub struct AgentConfig {
     pub limits: AgentLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemorySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<KnowledgeSettings>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,6 +254,7 @@ mod tests {
             },
             limits: AgentLimits::default(),
             memory: None,
+            knowledge: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();

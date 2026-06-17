@@ -3551,7 +3551,7 @@ mod tests {
                 },
                 limits: AgentLimits::default(),
                 memory: None,
-            },
+                knowledge: None,            },
         );
         let config_provider = Arc::new(config_provider);
         let token_meter = Arc::new(MockTokenMeter::new(0));

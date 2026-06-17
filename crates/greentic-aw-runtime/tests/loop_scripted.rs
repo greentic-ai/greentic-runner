@@ -38,6 +38,7 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
             ..AgentLimits::default()
         },
         memory: None,
+        knowledge: None,
     }
 }
 
