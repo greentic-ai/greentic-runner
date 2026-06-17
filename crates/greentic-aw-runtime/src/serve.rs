@@ -222,14 +222,22 @@ pub fn warm_on_start(get_env: impl Fn(&str) -> Option<String>) {
     }
 }
 
-/// Connect to NATS at `nats_url` and serve agentic dispatch requests forever.
+/// Connect to NATS at `nats_url` and serve agentic dispatch requests forever
+/// using an explicit dispatch ledger.
 ///
-/// Uses JetStream durable consumer by default; set `GREENTIC_AW_JETSTREAM=0`
-/// (or `off`/`false`/`no`) to fall back to the legacy core-NATS consumer.
+/// This is the production entry-point: the runner host supplies a
+/// [`crate::dispatch_ledger::RedisDispatchLedger`] so that JetStream
+/// at-least-once redeliveries are short-circuited without re-running the LLM
+/// step. Callers that do not need Redis-backed idempotency (e.g. the
+/// `aw-serve` test binary) can call [`serve`], which injects a
+/// [`NoopDispatchLedger`] and is otherwise identical.
 ///
-/// Blocks until the subscription stream ends or the process is signalled. The
-/// caller supplies the constructed [`AgentRuntime`] (production or test-mock).
-pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
+/// Blocks until the subscription stream ends or the process is signalled.
+pub async fn serve_with_ledger(
+    nats_url: &str,
+    runtime: Arc<AgentRuntime>,
+    ledger: Arc<dyn DispatchLedger>,
+) -> Result<()> {
     warm_on_start(|k| std::env::var(k).ok());
     let client = async_nats::connect(nats_url)
         .await
@@ -239,7 +247,7 @@ pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
         subject = aw_event_bridge::request_topic(aw_event_bridge::RUNTIME_NAME),
         "aw event bridge connected; serving agentic dispatch"
     );
-    let invoker = Arc::new(RuntimeAgentDispatchInvoker::new(runtime));
+    let invoker = Arc::new(RuntimeAgentDispatchInvoker::with_ledger(runtime, ledger));
     if use_jetstream(|k| std::env::var(k).ok()) {
         tracing::info!(nats_url, "aw serve: JetStream durable consumer");
         run_bridge_jetstream(client, invoker).await
@@ -247,6 +255,27 @@ pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
         tracing::info!(nats_url, "aw serve: core-NATS consumer (legacy)");
         run_bridge(client, invoker).await
     }
+}
+
+/// Connect to NATS at `nats_url` and serve agentic dispatch requests forever.
+///
+/// Uses [`NoopDispatchLedger`]: idempotency is disabled; JetStream
+/// redeliveries will re-run the LLM step. This is the behaviour preserved
+/// for the `aw-serve` test binary and any caller that does not have a Redis
+/// instance available.
+///
+/// For production serving with Redis-backed idempotency, use
+/// [`serve_with_ledger`] directly (the runner host does this when
+/// `GREENTIC_AW_REDIS_URL` is set).
+///
+/// Blocks until the subscription stream ends or the process is signalled.
+pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
+    serve_with_ledger(
+        nats_url,
+        runtime,
+        Arc::new(NoopDispatchLedger),
+    )
+    .await
 }
 
 /// Build a credit-free, broker-free [`AgentRuntime`] that returns a canned reply
