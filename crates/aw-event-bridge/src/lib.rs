@@ -10,6 +10,8 @@
 //! pins the same `greentic-types` lineage as the runner, so the wire contract is
 //! SHARED from [`greentic_types::runtime_dispatch`] rather than mirrored by hand.
 
+pub mod jetstream;
+
 use std::sync::Arc;
 
 use anyhow::Result;
