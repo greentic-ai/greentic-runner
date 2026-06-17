@@ -747,7 +747,7 @@ mod aw {
                 },
                 limits: AgentLimits::default(),
                 memory: None,
-            }
+                knowledge: None,            }
         }
 
         #[tokio::test]
@@ -777,7 +777,7 @@ mod aw {
                     },
                     limits: AgentLimits::default(),
                     memory: None,
-                },
+                    knowledge: None,                },
             );
             let config_provider = Arc::new(config_provider);
 

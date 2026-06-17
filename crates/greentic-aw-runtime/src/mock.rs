@@ -13,6 +13,10 @@ mod inner {
     use crate::config::AgentConfig;
     use crate::config_provider::ConfigProvider;
     use crate::error::{ConfigError, LlmError, StateError, TerminationReason};
+    use crate::knowledge::{
+        IngestOutcome as KnowledgeIngestOutcome, Knowledge, KnowledgeChunk, KnowledgeQuery,
+        KnowledgeResult, RetrievedChunk,
+    };
     use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
     use crate::long_term::{
         EpisodeIngest, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
@@ -142,6 +146,62 @@ mod inner {
             _query: RecallQuery,
         ) -> Result<Vec<RecalledFact>, LongTermMemoryError> {
             Ok(self.scripted_facts.clone())
+        }
+    }
+
+    /// Knowledge (doc-RAG) mock: returns a scripted set of chunks from `search`
+    /// (bounded by `query.limit`) and records every ingested batch so tests can
+    /// assert on first-boot ingestion.
+    pub struct MockKnowledge {
+        scripted_chunks: Vec<RetrievedChunk>,
+        ingested: Mutex<Vec<KnowledgeChunk>>,
+    }
+
+    impl MockKnowledge {
+        pub fn new(scripted_chunks: Vec<RetrievedChunk>) -> Self {
+            Self {
+                scripted_chunks,
+                ingested: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Snapshot of the chunks ingested so far.
+        pub fn ingested(&self) -> Vec<KnowledgeChunk> {
+            self.ingested
+                .lock()
+                .expect("mock knowledge ingest lock poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Knowledge for MockKnowledge {
+        async fn ingest(
+            &self,
+            _tenant: &TenantCtx,
+            chunks: Vec<KnowledgeChunk>,
+        ) -> KnowledgeResult<KnowledgeIngestOutcome> {
+            let ids = chunks
+                .iter()
+                .map(|c| format!("{}#{}", c.doc_id, c.chunk_index))
+                .collect();
+            self.ingested
+                .lock()
+                .expect("mock knowledge ingest lock poisoned")
+                .extend(chunks);
+            Ok(KnowledgeIngestOutcome { chunk_ids: ids })
+        }
+
+        async fn search(
+            &self,
+            _tenant: &TenantCtx,
+            query: KnowledgeQuery,
+        ) -> KnowledgeResult<Vec<RetrievedChunk>> {
+            let mut hits = self.scripted_chunks.clone();
+            if let Some(limit) = query.limit {
+                hits.truncate(limit);
+            }
+            Ok(hits)
         }
     }
 
@@ -329,6 +389,6 @@ mod inner {
 }
 
 pub use inner::{
-    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockLongTermMemory, MockTelemetry,
-    NoopToolLedger, assert_terminated_by,
+    MockAgentStateStore, MockConfigProvider, MockKnowledge, MockLlmBackend, MockLongTermMemory,
+    MockTelemetry, NoopToolLedger, assert_terminated_by,
 };
