@@ -442,8 +442,8 @@ mod aw {
         use greentic_aw_runtime::cost::RedisTokenMeter;
         use greentic_aw_runtime::tools::RedisToolLedger;
         use greentic_aw_runtime::{
-            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry,
-            RedisAgentStateStore, RetryingLlmBackend,
+            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore,
+            RetryingLlmBackend,
         };
 
         if merged_agents.is_empty() {
