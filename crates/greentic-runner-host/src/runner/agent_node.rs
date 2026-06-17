@@ -632,16 +632,53 @@ mod aw {
     /// forever via the shared `aw-event-bridge`. This is the out-of-process
     /// (`agentic.call`) counterpart to the in-process `dw.agent` node.
     ///
+    /// When `GREENTIC_AW_REDIS_URL` is set and reachable the serve path wires
+    /// a [`greentic_aw_runtime::RedisDispatchLedger`] so JetStream at-least-once
+    /// redeliveries are short-circuited without re-running the LLM step. If the
+    /// Redis connect fails the ledger falls back to [`greentic_aw_runtime::NoopDispatchLedger`]
+    /// (idempotency disabled, warning logged) so serving is never blocked.
+    ///
     /// Returns `Ok(())` immediately (a no-op) when the runtime cannot be built
     /// (e.g. no agents, no Redis) so the host can call this unconditionally.
     pub async fn serve_agentic(
         nats_url: &str,
         merged_agents: HashMap<String, AgentConfig>,
     ) -> anyhow::Result<()> {
+        use greentic_aw_runtime::dispatch_ledger::RedisDispatchLedger;
+        use greentic_aw_runtime::{DispatchLedger, NoopDispatchLedger, RedisAgentStateStore};
+
         match build_agent_runtime(merged_agents).await {
             Some(runtime) => {
-                tracing::info!(nats_url, "agentic serve mode starting");
-                greentic_aw_runtime::serve::serve(nats_url, runtime).await
+                // Activate dispatch idempotency when Redis is reachable for the
+                // ledger. Best-effort: a connect failure disables idempotency
+                // but never blocks serving.
+                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) =
+                    match std::env::var("GREENTIC_AW_REDIS_URL") {
+                        Ok(url) if !url.is_empty() => {
+                            match RedisAgentStateStore::connect(&url).await {
+                                Ok(store) => (
+                                    Arc::new(RedisDispatchLedger::new(store.manager())),
+                                    true,
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "dispatch ledger Redis connect failed; \
+                                         idempotency disabled"
+                                    );
+                                    (Arc::new(NoopDispatchLedger), false)
+                                }
+                            }
+                        }
+                        _ => (Arc::new(NoopDispatchLedger), false),
+                    };
+
+                tracing::info!(
+                    nats_url,
+                    dispatch_ledger_active = ledger_active,
+                    "agentic serve mode starting"
+                );
+                greentic_aw_runtime::serve::serve_with_ledger(nats_url, runtime, ledger).await
             }
             None => {
                 tracing::info!(
