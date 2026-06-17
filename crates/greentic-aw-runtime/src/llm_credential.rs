@@ -24,10 +24,7 @@ impl SecretsBackedCredentialResolver {
 
     pub async fn resolve(&self, pr: &LlmProviderRef) -> Result<BridgeCredential, LlmError> {
         let cref = pr.credential_ref.as_deref().ok_or_else(|| {
-            LlmError::BadRequest(format!(
-                "no credential_ref for provider `{}`",
-                pr.provider
-            ))
+            LlmError::BadRequest(format!("no credential_ref for provider `{}`", pr.provider))
         })?;
         let uri = format!("secrets://default/{}/_/llm/{}", self.tenant, cref);
         let bytes = self

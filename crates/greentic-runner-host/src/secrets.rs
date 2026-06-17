@@ -21,7 +21,10 @@ pub enum SecretsBackend {
     /// HTTP secrets broker (greentic-secrets-broker). The `endpoint` is the
     /// base URL (e.g. `http://secrets-broker:8080`) and `token` is the Bearer
     /// auth token (may be empty for unauthenticated local deployments).
-    Broker { endpoint: String, token: String },
+    Broker {
+        endpoint: String,
+        token: String,
+    },
 }
 
 impl SecretsBackend {
@@ -94,11 +97,9 @@ impl SecretsBackend {
                 ensure_env_secrets_allowed()?;
                 Arc::new(EnvSecretsManager)
             }
-            SecretsBackend::Broker { endpoint, token } => {
-                Arc::new(crate::secrets_broker::BrokerSecretsManager::new(
-                    endpoint, token,
-                ))
-            }
+            SecretsBackend::Broker { endpoint, token } => Arc::new(
+                crate::secrets_broker::BrokerSecretsManager::new(endpoint, token),
+            ),
         };
         Ok(CachingSecretsManager::wrap(inner))
     }
@@ -377,12 +378,7 @@ mod tests {
     fn from_env_parses_broker() {
         // Test purely via the internal helper — avoids unsafe env mutation
         // (crate uses #![deny(unsafe_code)]).
-        let b = SecretsBackend::broker_from_strings(
-            "broker",
-            "http://localhost:9",
-            "",
-        )
-        .unwrap();
+        let b = SecretsBackend::broker_from_strings("broker", "http://localhost:9", "").unwrap();
         assert!(matches!(b, SecretsBackend::Broker { .. }));
     }
 

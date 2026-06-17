@@ -402,3 +402,70 @@ async fn no_ingest_when_long_term_disabled() {
     tokio::task::yield_now().await;
     assert!(mem.ingested().is_empty());
 }
+
+#[tokio::test]
+async fn recall_memory_tool_advertised_when_active() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(tools[0].iter().any(|n| n == "recall_memory"));
+}
+
+#[tokio::test]
+async fn recall_memory_tool_absent_when_disabled() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem,
+    );
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(!tools[0].iter().any(|n| n == "recall_memory"));
+}
+
+#[tokio::test]
+async fn recall_memory_call_is_handled_host_side() {
+    // First response: a recall_memory tool call (host built-in). Second: reply.
+    let mem = Arc::new(MockLongTermMemory::new(vec![fact(
+        "Alice prefers dark mode",
+    )]));
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![
+            Ok(tool_call("c1", "host", "recall_memory")),
+            Ok(final_reply("you prefer dark mode")),
+        ],
+        cfg_with_long_term(8),
+        mem,
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "what do I like?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "you prefer dark mode");
+    // The recall was handled host-side (not dispatched to the ext runtime, which
+    // would have produced a NotFound error), so the tool result carries the fact.
+    let result = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall { name, result, .. } if name == "recall_memory" => {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .expect("recall_memory tool call recorded in trail");
+    assert!(result.to_string().contains("Alice prefers dark mode"));
+}

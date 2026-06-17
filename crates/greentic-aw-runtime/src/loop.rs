@@ -58,23 +58,27 @@ pub async fn run_step(
         content: message.text,
     });
 
+    // Whether long-term memory is active for this turn (provider wired + the
+    // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
+    // and background ingest below.
+    let lt_active = crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config);
+
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
-    let system_prompt =
-        if crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config) {
-            let facts = runtime
-                .recall_long_term(
-                    &tenant,
-                    crate::long_term::RecallQuery {
-                        query: user_message.clone(),
-                        limit: Some(crate::long_term::AUTO_INJECT_K),
-                    },
-                )
-                .await
-                .unwrap_or_default();
-            crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
-        } else {
-            config.system_prompt.clone()
-        };
+    let system_prompt = if lt_active {
+        let facts = runtime
+            .recall_long_term(
+                &tenant,
+                crate::long_term::RecallQuery {
+                    query: user_message.clone(),
+                    limit: Some(crate::long_term::AUTO_INJECT_K),
+                },
+            )
+            .await
+            .unwrap_or_default();
+        crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
+    } else {
+        config.system_prompt.clone()
+    };
 
     // Resolve the per-tenant agentic-worker MCP catalog once per step. The
     // source is infallible (degrades to an empty catalog on any admin/server
@@ -105,8 +109,11 @@ pub async fn run_step(
             break;
         }
 
-        let tools_schema =
+        let mut tools_schema =
             list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
+        if lt_active {
+            tools_schema.push(crate::long_term::recall_memory_tool_schema());
+        }
         let request = LlmRequest {
             system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
@@ -160,6 +167,24 @@ pub async fn run_step(
                 tool_calls: response.tool_calls.clone(),
             });
             for call in response.tool_calls {
+                // --- Host built-in: `recall_memory` (long-term lookup) ---
+                // Intercepted before the allow-list + WASM dispatch; routed to
+                // the runtime's long-term backend instead of an extension.
+                if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
+                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    let result = host_recall_memory(runtime, &tenant, &call).await;
+                    observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: result.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id,
+                        result,
+                    });
+                    continue;
+                }
                 if !is_tool_allowed(&call, &config.tools) {
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -268,7 +293,7 @@ pub async fn run_step(
 
     // --- Long-term ingest: persist this turn as an episode (fire-and-forget) ---
     if !reply.is_empty()
-        && crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config)
+        && lt_active
         && let Some(memory) = runtime.long_term_memory.clone()
     {
         match crate::long_term::to_types_tenant(&tenant) {
@@ -308,6 +333,41 @@ pub async fn run_step(
         trail,
         terminated_by,
     })
+}
+
+/// Handle a host built-in `recall_memory` tool call: parse `query`/`limit` from
+/// the call args, query long-term memory, and return the facts as JSON (or an
+/// error object the LLM can observe and react to).
+async fn host_recall_memory(
+    runtime: &AgentRuntime,
+    tenant: &TenantContext,
+    call: &crate::state::ToolCallRecord,
+) -> serde_json::Value {
+    let query = call
+        .args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let limit = call
+        .args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(crate::long_term::TOOL_LIMIT);
+    match runtime
+        .recall_long_term(
+            tenant,
+            crate::long_term::RecallQuery {
+                query,
+                limit: Some(limit),
+            },
+        )
+        .await
+    {
+        Ok(facts) => serde_json::json!({ "facts": facts }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
 }
 
 #[cfg(all(test, feature = "test-mock"))]
