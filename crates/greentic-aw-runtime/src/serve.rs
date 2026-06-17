@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use aw_event_bridge::{AgentDispatchInvoker, InvokeOutcome, run_bridge, run_bridge_jetstream};
 use serde_json::{Value, json};
 
+use crate::dispatch_ledger::{DispatchLedger, NoopDispatchLedger};
 use crate::tenant::TenantContext;
 use crate::{AgentInput, AgentRuntime};
 
@@ -33,15 +34,46 @@ use crate::{AgentInput, AgentRuntime};
 /// shape so downstream flow nodes see an identical payload regardless of path.
 ///
 /// [`AgentOutput`]: crate::AgentOutput
+///
+/// # Dispatch-level idempotency (Task 2.3)
+///
+/// When `idempotency_key` is `Some(key)`, [`invoke`] checks the
+/// [`DispatchLedger`] first. A cache hit returns the stored output without
+/// calling `runtime.step`, so JetStream at-least-once redelivery never
+/// re-runs the LLM step.
+///
+/// PR2 defaults to [`NoopDispatchLedger`] (no caching). The **production**
+/// Redis-backed ledger should be wired in
+/// `greentic-runner-host::agent_node::build_agent_runtime`, where a Redis
+/// `ConnectionManager` is already available: construct a
+/// [`crate::RedisDispatchLedger`] there and pass it via
+/// `RuntimeAgentDispatchInvoker::with_ledger`. This is the designated
+/// follow-up after PR2 lands.
 pub struct RuntimeAgentDispatchInvoker {
     runtime: Arc<AgentRuntime>,
+    ledger: Arc<dyn DispatchLedger>,
 }
 
 impl RuntimeAgentDispatchInvoker {
     /// Wrap a shared [`AgentRuntime`] in a dispatch invoker.
+    ///
+    /// Uses [`NoopDispatchLedger`] (no cross-redelivery caching). See
+    /// [`RuntimeAgentDispatchInvoker::with_ledger`] to supply a real ledger.
     #[must_use]
     pub fn new(runtime: Arc<AgentRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            ledger: Arc::new(NoopDispatchLedger),
+        }
+    }
+
+    /// Wrap a shared [`AgentRuntime`] with an explicit dispatch ledger.
+    ///
+    /// Use this to inject a [`crate::RedisDispatchLedger`] in production or
+    /// an [`crate::dispatch_ledger::InMemoryDispatchLedger`] in tests.
+    #[must_use]
+    pub fn with_ledger(runtime: Arc<AgentRuntime>, ledger: Arc<dyn DispatchLedger>) -> Self {
+        Self { runtime, ledger }
     }
 }
 
@@ -87,6 +119,28 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         input: Value,
         idempotency_key: Option<&str>,
     ) -> Result<InvokeOutcome> {
+        // --- dispatch-level idempotency (Task 2.3) ---
+        // If we have a key, check the ledger first. A hit means this is a
+        // JetStream redelivery: return the cached output without re-running
+        // the (expensive + side-effectful) LLM step.
+        if let Some(key) = idempotency_key {
+            match self.ledger.get(key).await {
+                Ok(Some(cached)) => {
+                    tracing::debug!(key, "dispatch ledger hit; returning cached output");
+                    return Ok(InvokeOutcome {
+                        ok: true,
+                        output: cached,
+                        events: vec![],
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Best-effort: a ledger read error does not abort the step.
+                    tracing::warn!(key, error = %e, "dispatch ledger get failed; proceeding without cache");
+                }
+            }
+        }
+
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
         let tenant_ctx = TenantContext::new(tenant, env);
@@ -102,13 +156,23 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
             .await
             .with_context(|| format!("agentic step failed for agent '{target}'"))?;
 
+        let outcome_output = json!({
+            "reply": output.reply,
+            "trail": output.trail,
+            "terminated_by": output.terminated_by,
+        });
+
+        // Record the result for future redeliveries (best-effort: a ledger
+        // write error is logged but does NOT fail the dispatch).
+        if let Some(key) = idempotency_key
+            && let Err(e) = self.ledger.record(key, outcome_output.clone()).await
+        {
+            tracing::warn!(key, error = %e, "dispatch ledger record failed; redelivery will re-run step");
+        }
+
         Ok(InvokeOutcome {
             ok: true,
-            output: json!({
-                "reply": output.reply,
-                "trail": output.trail,
-                "terminated_by": output.terminated_by,
-            }),
+            output: outcome_output,
             events: vec![],
         })
     }
@@ -291,5 +355,104 @@ mod tests {
         assert!(outcome.ok);
         assert_eq!(outcome.output["reply"], json!("pong"));
         assert_eq!(outcome.output["terminated_by"], json!("final_reply"));
+    }
+
+    // --- Task 2.3: dispatch-level idempotency tests ---
+
+    /// Redelivery scenario: ledger pre-seeded with a sentinel value for "k1".
+    /// The invoker MUST return the sentinel without calling `runtime.step`.
+    /// We prove step was skipped because the mock runtime returns "pong" for any
+    /// step call — if it were called, the output would be "pong", not "CACHED".
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn redelivery_returns_cached_without_rerunning_step() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::with(
+            "k1",
+            json!({"reply": "CACHED", "trail": [], "terminated_by": "final_reply"}),
+        ));
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger,
+        );
+
+        let out = invoker
+            .invoke(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                Some("k1"),
+            )
+            .await
+            .expect("cached invoke succeeds");
+
+        assert!(out.ok);
+        // Sentinel value from the ledger, NOT "pong" from the mock step.
+        assert_eq!(
+            out.output["reply"],
+            json!("CACHED"),
+            "expected cached sentinel, got runtime reply"
+        );
+    }
+
+    /// Cache-miss scenario: ledger is empty, step runs, result is recorded.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn miss_runs_step_and_records() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::default());
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger.clone(),
+        );
+
+        let out = invoker
+            .invoke(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                Some("k2"),
+            )
+            .await
+            .expect("fresh invoke succeeds");
+
+        assert!(out.ok);
+        assert_eq!(out.output["reply"], json!("pong"), "step ran and replied");
+        let stored = ledger.stored("k2");
+        assert!(stored.is_some(), "result was recorded in the ledger");
+        assert_eq!(
+            stored.expect("stored entry present")["reply"],
+            json!("pong"),
+            "recorded value matches step output"
+        );
+    }
+
+    /// No key → no ledger interaction; step runs normally.
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn no_idempotency_key_runs_step_without_ledger() {
+        use crate::dispatch_ledger::InMemoryDispatchLedger;
+
+        let ledger = Arc::new(InMemoryDispatchLedger::default());
+        let invoker = RuntimeAgentDispatchInvoker::with_ledger(
+            build_test_mock_runtime("greeter", "pong"),
+            ledger.clone(),
+        );
+
+        let out = invoker
+            .invoke("acme", "prod", "greeter", "", json!({"user_text": "hi"}), None)
+            .await
+            .expect("no-key invoke succeeds");
+
+        assert!(out.ok);
+        assert_eq!(out.output["reply"], json!("pong"));
+        // No key → nothing recorded.
+        assert!(ledger.stored("k-absent").is_none());
     }
 }

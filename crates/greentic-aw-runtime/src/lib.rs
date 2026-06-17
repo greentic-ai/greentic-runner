@@ -16,6 +16,7 @@
 pub mod config;
 pub mod config_provider;
 pub mod cost;
+pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
 pub mod http_provider;
@@ -70,6 +71,7 @@ pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
+pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
