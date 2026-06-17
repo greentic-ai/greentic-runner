@@ -249,6 +249,7 @@ impl TenantRuntime {
                 merged_agents,
                 config.tenant.clone(),
                 Arc::clone(&secrets_manager),
+                pack_runtimes.clone(),
             )
             .await
             {

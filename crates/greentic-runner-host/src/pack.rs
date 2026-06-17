@@ -2222,6 +2222,15 @@ impl PackRuntime {
         self.component_manifests.get(component_ref)
     }
 
+    /// Iterate every `(component_ref, manifest)` this pack holds. Used by the
+    /// agentic-worker component tool source to enumerate the operations a
+    /// worker may call as tools without exposing the internal manifest map.
+    pub fn component_manifest_entries(&self) -> impl Iterator<Item = (&str, &ComponentManifest)> {
+        self.component_manifests
+            .iter()
+            .map(|(component_ref, manifest)| (component_ref.as_str(), manifest))
+    }
+
     /// Returns the raw agent config blobs embedded in this pack's manifest.
     ///
     /// Only present on the New (`greentic_types::PackManifest`) path; Legacy
