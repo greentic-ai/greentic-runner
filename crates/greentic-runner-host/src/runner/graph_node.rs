@@ -1050,9 +1050,10 @@ mod aw {
             args: json!({}),
         };
 
-        // Graph Tool nodes never carry mcp: ids (they use 'extension_id/tool'
-        // syntax over the WASM runtime), so no MCP catalog is threaded here.
-        dispatch_tool_call(ext_runtime, None, call)
+        // Graph Tool nodes never carry mcp: or component: ids (they use
+        // 'extension_id/tool' syntax over the WASM runtime), so neither the MCP
+        // nor the component catalog is threaded here.
+        dispatch_tool_call(ext_runtime, None, None, call)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }

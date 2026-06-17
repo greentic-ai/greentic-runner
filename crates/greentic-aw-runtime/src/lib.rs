@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod component_source;
 pub mod config;
 pub mod config_provider;
 pub mod cost;
@@ -44,11 +45,16 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
+pub use component_source::{
+    ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
+    ComponentToolSource,
+};
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
+pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
@@ -72,7 +78,6 @@ pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
-pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
@@ -132,6 +137,12 @@ pub struct AgentRuntime {
     /// per-operator wiring lives in the runner host; tests and non-MCP callers
     /// pass `None`.
     pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
+    /// Per-tenant agentic-worker component tool source. `None` disables
+    /// component tools entirely (`component:`-prefixed tool refs then resolve to
+    /// nothing). Set via [`AgentRuntime::with_component_source`]; the concrete
+    /// invoker (over the runner-host `PackRuntime` component host) is injected
+    /// at the runner-host edge, never compiled in.
+    pub(crate) components: Option<Arc<crate::component_source::ComponentToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -166,9 +177,22 @@ impl AgentRuntime {
             token_meter,
             ledger,
             mcp,
+            components: None,
             long_term_memory: None,
             knowledge: None,
         }
+    }
+
+    /// Wire the component tool source so `component:`-prefixed tool refs resolve
+    /// to greentic `.gtpack` components invoked over the host component runtime.
+    /// Coexists with the MCP/extension tool surfaces; defaults off when not set.
+    #[must_use]
+    pub fn with_component_source(
+        mut self,
+        components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    ) -> Self {
+        self.components = components;
+        self
     }
 
     /// Wire the episodic long-term memory backend (e.g. Chronicle). Coexists

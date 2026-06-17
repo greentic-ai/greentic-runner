@@ -110,6 +110,14 @@ pub async fn run_step(
         None => None,
     };
 
+    // Resolve the per-tenant component tool catalog once per step (mirrors the
+    // MCP catalog above). Infallible + TTL-cached; `None` source → no
+    // `component:` tools at all.
+    let component_catalog = match runtime.components.as_ref() {
+        Some(src) => Some(src.catalog(&tenant).await),
+        None => None,
+    };
+
     let mut total_tokens: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
     let mut terminated_by = TerminationReason::MaxIterations;
@@ -130,8 +138,12 @@ pub async fn run_step(
             break;
         }
 
-        let mut tools_schema =
-            list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
+        let mut tools_schema = list_tools_for_llm(
+            &runtime.ext_runtime,
+            mcp_catalog.as_deref(),
+            component_catalog.as_deref(),
+            &config.tools,
+        );
         if lt_active {
             tools_schema.push(crate::long_term::recall_memory_tool_schema());
         }
@@ -246,6 +258,7 @@ pub async fn run_step(
                 let result = match dispatch_tool_call(
                     runtime.ext_runtime.clone(),
                     mcp_catalog.clone(),
+                    component_catalog.clone(),
                     call.clone(),
                 )
                 .await
