@@ -5,9 +5,11 @@
 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, consumer, stream};
+use futures_util::StreamExt;
 use greentic_types::request_topic;
+use std::sync::Arc;
 
-use crate::RUNTIME_NAME;
+use crate::{AgentDispatchInvoker, RUNTIME_NAME};
 
 pub const STREAM_NAME: &str = "greentic-agentic";
 pub const DURABLE_CONSUMER: &str = "agentic-workers";
@@ -42,7 +44,6 @@ pub fn agentic_consumer_config() -> consumer::pull::Config {
 ///
 /// Idempotent: uses `get_or_create_stream` / `get_or_create_consumer`, so
 /// calling this on every process start is safe.
-#[allow(dead_code)] // used by the next task (aw-serve JetStream integration)
 pub async fn ensure_consumer(
     client: &async_nats::Client,
 ) -> Result<consumer::Consumer<consumer::pull::Config>> {
@@ -58,9 +59,64 @@ pub async fn ensure_consumer(
     Ok(consumer)
 }
 
+/// Whether a handled message should be acked.  Errors are left un-acked so
+/// JetStream redelivers (the invoker is idempotent — PR2).
+#[must_use]
+pub fn should_ack(handle_result: &Result<()>) -> bool {
+    handle_result.is_ok()
+}
+
+/// Pull messages from the `agentic-workers` durable consumer, dispatch each
+/// via [`crate::handle_message`], and ack on success.
+///
+/// Un-acked messages are redelivered up to `max_deliver` times (5) before
+/// JetStream marks them as dead-lettered.  Each message is processed in its
+/// own `tokio::spawn` so one slow agent does not stall the pull loop.
+pub async fn run_bridge_jetstream(
+    client: async_nats::Client,
+    invoker: Arc<dyn AgentDispatchInvoker>,
+) -> Result<()> {
+    let consumer = ensure_consumer(&client).await?;
+    let mut messages = consumer
+        .messages()
+        .await
+        .context("open jetstream messages stream")?;
+
+    while let Some(item) = messages.next().await {
+        let js_msg = item.context("jetstream message error")?;
+        let client = client.clone();
+        let invoker = invoker.clone();
+        tokio::spawn(async move {
+            // jetstream::Message has a `.message: async_nats::Message` field and
+            // also implements Deref<Target = async_nats::Message>.  We extract the
+            // inner core message via the public `.message` field so that
+            // handle_message receives the owned async_nats::Message it expects.
+            let core = js_msg.message.clone();
+            let result = crate::handle_message(&client, invoker, core).await;
+            if should_ack(&result) {
+                if let Err(ack_err) = js_msg.ack().await {
+                    tracing::error!(error = %ack_err, "jetstream ack failed");
+                }
+            } else if let Err(handle_err) = result {
+                tracing::error!(
+                    error = %handle_err,
+                    "agentic handler failed; leaving unacked for redelivery"
+                );
+            }
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_only_on_success() {
+        assert!(should_ack(&Ok(())));
+        assert!(!should_ack(&Err(anyhow::anyhow!("boom"))));
+    }
 
     #[test]
     fn stream_config_binds_agentic_request_subject() {
