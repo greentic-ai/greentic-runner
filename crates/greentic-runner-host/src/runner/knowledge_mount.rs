@@ -156,15 +156,7 @@ struct KnowledgeBridge(KnowledgeChronicle);
 #[async_trait::async_trait]
 impl AwKnowledge for KnowledgeBridge {
     async fn ingest(&self, tenant: &TenantCtx, chunks: Vec<AwChunk>) -> AwResult<AwIngestOutcome> {
-        let dw_chunks: Vec<DwChunk> = chunks
-            .into_iter()
-            .map(|c| DwChunk {
-                doc_id: c.doc_id,
-                chunk_index: c.chunk_index,
-                text: c.text,
-                metadata: c.metadata,
-            })
-            .collect();
+        let dw_chunks: Vec<DwChunk> = chunks.into_iter().map(to_dw_chunk).collect();
         let DwIngestOutcome { chunk_ids } =
             self.0.ingest(tenant, dw_chunks).await.map_err(to_aw_err)?;
         Ok(AwIngestOutcome { chunk_ids })
@@ -208,6 +200,65 @@ impl AwKnowledge for KnowledgeBridge {
 /// the runtime seam only needs the message for its fail-degrade logging.
 fn to_aw_err(err: greentic_dw_knowledge::KnowledgeError) -> AwKnowledgeError {
     AwKnowledgeError::Backend(err.to_string())
+}
+
+/// Convert a runtime knowledge chunk to the provider-stack DTO (field-for-field).
+fn to_dw_chunk(c: AwChunk) -> DwChunk {
+    DwChunk {
+        doc_id: c.doc_id,
+        chunk_index: c.chunk_index,
+        text: c.text,
+        metadata: c.metadata,
+    }
+}
+
+/// First-boot ingest of a pack-baked knowledge corpus (W4 4c). Opens a temporary
+/// knowledge connection, ingests `chunks` for `tenant`, then drops it — releasing
+/// the embedded-store lock before the serving mount ([`attach`]) opens its own
+/// connection (embedded SurrealDB allows only one handle per store directory, so
+/// the two must not overlap). Idempotent: Chronicle keys chunks by content hash,
+/// so re-ingesting an unchanged corpus on every boot is a no-op. Fail-open: any
+/// error is logged and skipped, never blocking startup.
+pub(crate) async fn ingest_corpus(tenant: &TenantCtx, chunks: Vec<AwChunk>) {
+    if chunks.is_empty() {
+        return;
+    }
+    let Some(config) = build_config() else {
+        tracing::debug!("knowledge: embedding env unset; skipping baked-corpus ingest");
+        return;
+    };
+    // surreal-memory's ingest connection is a SEPARATE in-memory DB from the
+    // serving mount's, so ingested chunks would be invisible at query time. Skip
+    // with a clear note — durable RAG needs a persistent backend.
+    if std::env::var(ENV_BACKEND).as_deref() == Ok("surreal-memory") {
+        tracing::warn!(
+            "knowledge: backend=surreal-memory does not retain a baked corpus across the \
+             ingest/serve connection boundary; skipping corpus ingest (use surreal-embedded)"
+        );
+        return;
+    }
+    let Some(driver) = build_driver(config.embedding_dim).await else {
+        return;
+    };
+    let knowledge = match KnowledgeChronicle::from_config(&config, driver).await {
+        Ok(knowledge) => knowledge,
+        Err(err) => {
+            tracing::warn!(error = %err, "knowledge: baked-corpus ingest connect failed; skipping");
+            return;
+        }
+    };
+    let count = chunks.len();
+    let dw_chunks: Vec<DwChunk> = chunks.into_iter().map(to_dw_chunk).collect();
+    match knowledge.ingest(tenant, dw_chunks).await {
+        Ok(outcome) => tracing::info!(
+            chunks = count,
+            stored = outcome.chunk_ids.len(),
+            "knowledge: baked corpus ingested"
+        ),
+        Err(err) => tracing::warn!(error = %err, "knowledge: baked-corpus ingest failed"),
+    }
+    // `knowledge` (and its embedded-store handle) drops here, before the serving
+    // mount opens its own connection.
 }
 
 #[cfg(test)]

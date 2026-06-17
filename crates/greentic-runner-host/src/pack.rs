@@ -2247,11 +2247,18 @@ impl PackRuntime {
     ///
     /// [`load_schema_json`]: PackRuntime::load_schema_json
     pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
-        const SIDECAR_NAME: &str = "agent-graph.json";
+        self.read_pack_file("agent-graph.json")
+    }
 
-        // Materialized pack directory (root holds manifest.cbor + sidecar).
+    /// Read a single named file from the pack by its archive-relative path,
+    /// trying the materialized pack directory first and the `.gtpack` archive as
+    /// a fallback. Returns `None` when the file is absent (or on a read error,
+    /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
+    /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
+    pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
+        // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
-            let candidate = self.path.join(SIDECAR_NAME);
+            let candidate = self.path.join(name);
             if candidate.exists() {
                 match std::fs::read(&candidate) {
                     Ok(bytes) => return Some(bytes),
@@ -2259,7 +2266,7 @@ impl PackRuntime {
                         tracing::warn!(
                             path = %candidate.display(),
                             error = %error,
-                            "failed to read agent-graph.json from pack directory"
+                            "failed to read {name} from pack directory"
                         );
                         return None;
                     }
@@ -2278,7 +2285,7 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "failed to open pack archive while reading agent-graph.json"
+                    "failed to open pack archive while reading {name}"
                 );
                 return None;
             }
@@ -2289,19 +2296,19 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "failed to read pack archive while reading agent-graph.json"
+                    "failed to read pack archive while reading {name}"
                 );
                 return None;
             }
         };
-        match archive.by_name(SIDECAR_NAME) {
+        match archive.by_name(name) {
             Ok(mut entry) => {
                 let mut bytes = Vec::new();
                 if let Err(error) = entry.read_to_end(&mut bytes) {
                     tracing::warn!(
                         path = %archive_path.display(),
                         error = %error,
-                        "failed to extract agent-graph.json from pack archive"
+                        "failed to extract {name} from pack archive"
                     );
                     return None;
                 }
@@ -2312,7 +2319,7 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "error reading agent-graph.json from pack archive"
+                    "error reading {name} from pack archive"
                 );
                 None
             }
