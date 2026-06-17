@@ -625,6 +625,11 @@ mod aw {
         // a no-op and `base` is wrapped unchanged.
         #[cfg(feature = "long-term-chronicle")]
         let base = crate::runner::long_term_memory::attach(base).await;
+        // Optionally attach an operator-configured Chronicle knowledge (document
+        // RAG) backend for auto pre-retrieval. No-op with the `knowledge-chronicle`
+        // feature off (default).
+        #[cfg(feature = "knowledge-chronicle")]
+        let base = crate::runner::knowledge_mount::attach(base).await;
         let runtime = Arc::new(base);
 
         tracing::info!(agent_count, "AW runtime constructed");
