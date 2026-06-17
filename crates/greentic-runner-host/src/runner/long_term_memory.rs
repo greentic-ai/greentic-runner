@@ -1,17 +1,21 @@
 //! Operator-configured long-term (episodic) memory wiring for the agentic
 //! worker. Compiled only with the `long-term-chronicle` feature.
 //!
-//! A single native Chronicle backend (graphiti over Neo4j) is built once from
-//! operator environment variables and shared across every agent on the runtime;
-//! per-agent/tenant data isolation is handled inside the runtime by scoping each
-//! call to the agent's tenant (Chronicle `group_id`).
+//! A single native Chronicle backend is built once from operator environment
+//! variables and shared across every agent on the runtime; per-agent/tenant data
+//! isolation is handled inside the runtime by scoping each call to the agent's
+//! tenant (Chronicle `group_id`).
 //!
+//! The graph store is operator-selectable via `GREENTIC_CHRONICLE_BACKEND`
+//! (`neo4j` | `falkor` | `surreal-embedded` | `surreal-memory`), defaulting to
+//! **embedded SurrealDB on disk** so no external graph server is required.
 //! Chronicle is driven **entirely through the provider-neutral DW LLM and
 //! embedding families** — both wired to whatever OpenAI-compatible endpoint the
 //! operator points at (`GREENTIC_CHRONICLE_{LLM,EMBED}_BASE_URL`). There is no
-//! hard dependency on a single provider. When the required environment is unset
-//! — or a provider config / Neo4j connection fails — the long-term tier simply
-//! stays disabled; a missing backend never fails construction.
+//! hard dependency on a single provider. When the required LLM/embedding
+//! environment is unset — or a provider config / backend connection fails — the
+//! long-term tier simply stays disabled; a missing backend never fails
+//! construction.
 
 use std::sync::Arc;
 
@@ -22,14 +26,29 @@ use greentic_dw_embedding_openai_compatible::{
 };
 use greentic_dw_llm::LlmProvider;
 use greentic_dw_llm_openai_compatible::{OpenAiCompatibleConfig, OpenAiCompatibleProvider};
-use greentic_dw_memory_chronicle::{ChronicleLongTermMemory, ChronicleMemoryConfig};
+use greentic_dw_memory_chronicle::{
+    ChronicleBackend, ChronicleLongTermMemory, ChronicleMemoryConfig, DEFAULT_FALKOR_GRAPH,
+    DEFAULT_NEO4J_DATABASE,
+};
 use greentic_types::{EnvId, TenantCtx, TenantId};
 
-// Neo4j connection.
+// Graph-store backend selector + per-backend connection.
+const ENV_BACKEND: &str = "GREENTIC_CHRONICLE_BACKEND";
+// Neo4j (backend=neo4j).
 const ENV_NEO4J_URI: &str = "GREENTIC_CHRONICLE_NEO4J_URI";
 const ENV_NEO4J_USER: &str = "GREENTIC_CHRONICLE_NEO4J_USER";
 const ENV_NEO4J_PASSWORD: &str = "GREENTIC_CHRONICLE_NEO4J_PASSWORD";
 const ENV_NEO4J_DATABASE: &str = "GREENTIC_CHRONICLE_NEO4J_DATABASE";
+// FalkorDB (backend=falkor).
+const ENV_FALKOR_URL: &str = "GREENTIC_CHRONICLE_FALKOR_URL";
+const ENV_FALKOR_GRAPH: &str = "GREENTIC_CHRONICLE_FALKOR_GRAPH";
+// Embedded SurrealDB (backend=surreal-embedded).
+const ENV_SURREAL_PATH: &str = "GREENTIC_CHRONICLE_SURREAL_PATH";
+/// Graph store used when `GREENTIC_CHRONICLE_BACKEND` is unset: embedded
+/// SurrealDB on disk — no external graph server required.
+const DEFAULT_BACKEND: &str = "surreal-embedded";
+/// Default on-disk location for the embedded SurrealDB store.
+const DEFAULT_SURREAL_PATH: &str = "/var/lib/greentic/chronicle";
 // LLM (entity/edge extraction) — any OpenAI-compatible endpoint.
 const ENV_LLM_BASE_URL: &str = "GREENTIC_CHRONICLE_LLM_BASE_URL";
 const ENV_LLM_API_KEY: &str = "GREENTIC_CHRONICLE_LLM_API_KEY";
@@ -44,13 +63,12 @@ const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_EMBEDDING_DIM: usize = 1024;
 
 /// Attach an operator-configured, provider-neutral Chronicle long-term backend
-/// to `runtime` when Neo4j + the LLM and embedding endpoints are all present and
-/// the connection succeeds. Returns the runtime unchanged otherwise.
+/// to `runtime`. The LLM and embedding endpoints are the opt-in signal (Chronicle
+/// needs both regardless of graph store); the graph backend is selected by
+/// `GREENTIC_CHRONICLE_BACKEND`, defaulting to embedded SurrealDB so no external
+/// graph server is required. Returns the runtime unchanged when the environment
+/// is incomplete or the connection fails.
 pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
-    let Some(mut config) = neo4j_config() else {
-        tracing::debug!("long-term memory: Neo4j env unset; long-term disabled");
-        return runtime;
-    };
     let Some(llm) = build_llm() else {
         tracing::debug!("long-term memory: LLM endpoint env unset/invalid; long-term disabled");
         return runtime;
@@ -61,8 +79,15 @@ pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
         );
         return runtime;
     };
+    let Some(backend) = select_backend() else {
+        // select_backend logs the specific reason (unknown kind / missing conn env).
+        return runtime;
+    };
+
+    let mut config = ChronicleMemoryConfig::with_backend(backend);
     // Chronicle's graph vector index dimension must match the embedder's output.
     config.embedding_dim = Some(embedding_dim);
+    let backend_kind = config.backend.kind();
 
     match ChronicleLongTermMemory::connect_with_dw_providers(
         config,
@@ -74,12 +99,14 @@ pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
     {
         Ok(memory) => {
             tracing::info!(
+                backend = %backend_kind,
                 "long-term memory: Chronicle attached (provider-neutral DW LLM + embeddings)"
             );
             runtime.with_long_term_memory(Arc::new(memory) as Arc<dyn LongTermMemory>)
         }
         Err(err) => {
             tracing::warn!(
+                backend = %backend_kind,
                 error = %err,
                 "long-term memory: Chronicle connect failed; long-term disabled"
             );
@@ -88,17 +115,67 @@ pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
     }
 }
 
-/// Read the Neo4j connection from the environment. Returns `None` when any of
-/// the three required vars is absent.
-fn neo4j_config() -> Option<ChronicleMemoryConfig> {
-    let uri = std::env::var(ENV_NEO4J_URI).ok()?;
-    let user = std::env::var(ENV_NEO4J_USER).ok()?;
-    let password = std::env::var(ENV_NEO4J_PASSWORD).ok()?;
-    let mut config = ChronicleMemoryConfig::new(uri, user, password);
-    if let Ok(database) = std::env::var(ENV_NEO4J_DATABASE) {
-        config.neo4j_database = database;
+/// Resolve the graph-store backend from the environment. Defaults to embedded
+/// SurrealDB. Returns `None` — with a logged reason — when an explicitly-chosen
+/// backend is missing its required connection env, or the selector value is
+/// unknown.
+fn select_backend() -> Option<ChronicleBackend> {
+    let kind = std::env::var(ENV_BACKEND).unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
+    match kind.as_str() {
+        "neo4j" => {
+            let (Ok(uri), Ok(user), Ok(password)) = (
+                std::env::var(ENV_NEO4J_URI),
+                std::env::var(ENV_NEO4J_USER),
+                std::env::var(ENV_NEO4J_PASSWORD),
+            ) else {
+                tracing::warn!(
+                    "long-term memory: backend=neo4j but GREENTIC_CHRONICLE_NEO4J_URI/USER/PASSWORD \
+                     incomplete; long-term disabled"
+                );
+                return None;
+            };
+            let database = std::env::var(ENV_NEO4J_DATABASE)
+                .unwrap_or_else(|_| DEFAULT_NEO4J_DATABASE.to_string());
+            Some(ChronicleBackend::Neo4j {
+                uri,
+                user,
+                password,
+                database,
+            })
+        }
+        "falkor" => {
+            let Ok(connection) = std::env::var(ENV_FALKOR_URL) else {
+                tracing::warn!(
+                    "long-term memory: backend=falkor but GREENTIC_CHRONICLE_FALKOR_URL unset; \
+                     long-term disabled"
+                );
+                return None;
+            };
+            let graph = std::env::var(ENV_FALKOR_GRAPH)
+                .unwrap_or_else(|_| DEFAULT_FALKOR_GRAPH.to_string());
+            Some(ChronicleBackend::Falkor { connection, graph })
+        }
+        "surreal-embedded" => {
+            let path = std::env::var(ENV_SURREAL_PATH)
+                .unwrap_or_else(|_| DEFAULT_SURREAL_PATH.to_string());
+            Some(ChronicleBackend::surreal_embedded(path))
+        }
+        "surreal-memory" => {
+            tracing::warn!(
+                "long-term memory: backend=surreal-memory is EPHEMERAL — recalled facts are lost \
+                 on restart"
+            );
+            Some(ChronicleBackend::surreal_memory())
+        }
+        other => {
+            tracing::warn!(
+                backend = %other,
+                "long-term memory: unknown GREENTIC_CHRONICLE_BACKEND \
+                 (expected neo4j|falkor|surreal-embedded|surreal-memory); long-term disabled"
+            );
+            None
+        }
     }
-    Some(config)
 }
 
 /// Build the provider-neutral DW LLM backend (any OpenAI-compatible endpoint).
