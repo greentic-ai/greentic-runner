@@ -105,6 +105,7 @@ fn build_pack_with_runtime_extension(runtime_extension: Value, pack_path: &Path)
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runtime.flow.config".parse()?,
         name: None,

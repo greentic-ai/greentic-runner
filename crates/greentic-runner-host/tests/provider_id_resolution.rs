@@ -49,6 +49,7 @@ fn manifest_with(providers: Vec<ProviderDecl>) -> Result<PackManifest> {
         },
     );
     Ok(PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: PackId::new("vendor.providers")?,
         name: None,
