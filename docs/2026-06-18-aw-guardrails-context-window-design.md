@@ -92,12 +92,24 @@ A `NoopGuardrail` returning `Allow` is the global default, so the feature is zer
 
 ### 4.2 Decorator `GuardrailingLlmBackend`
 
-Wraps `Arc<dyn LlmBackend>` + `Arc<dyn Guardrail>`. The decorator covers three of the four checkpoints purely at the LLM seam (`loop.rs` unchanged except wiring); the **tool-result** checkpoint cannot be reached from the `LlmBackend` seam and needs one small hook in `loop.rs` (see below).
+**Checkpoint placement (resolved during planning).** The four checkpoints split across two seams, and the split is forced by the *persist-masked* decision below:
 
-- **INPUT check:** before `inner.complete()`, scan the last `User` message in `request.history`. On `Block`, short-circuit and return a synthetic `LlmResponse` whose content is the safe message and whose `tool_calls` is empty, so the loop terminates cleanly. On `Mask`, replace the user text passed downstream with the masked text.
+| Checkpoint | Seam | Why |
+| --- | --- | --- |
+| OUTPUT | `GuardrailingLlmBackend` decorator (LLM seam) | The model reply is the decorator's natural subject; nothing needs to be persisted before the LLM call. |
+| INPUT | `loop.rs` (before the request is built) | Masked input must be written to `state.messages` so PII does not re-enter context; the decorator runs behind the `LlmBackend` trait and cannot reach `state.messages`. A Block must short-circuit the whole step. |
+| Tool-result | `loop.rs` (before the result is appended) | Same persistence reason; the tool result enters as `ChatMessage::Tool` and is never visible at the LLM seam anyway. |
+| Tool-call args | OUTPUT, inside the decorator | Folded into the OUTPUT scan (a model could hide a payload in a tool argument). |
+
+Putting INPUT in the decorator *and* persisting masked would require a **second** guardrail round-trip in `loop.rs`, so INPUT/tool-result live in `loop.rs` (one call per stage). The decorator owns OUTPUT only.
+
+**Decorator (`GuardrailingLlmBackend`)** wraps `Arc<dyn LlmBackend>` + `Arc<dyn Guardrail>` and implements the OUTPUT check:
+
 - **OUTPUT check:** after `inner.complete()`, scan a serialization of **both** `response.content` **and** the `tool_calls` (call name + JSON args). Scanning the args closes the exfil-via-tool-argument vector: a model can place sensitive payload in a tool argument, and content-only scanning would miss it. On `Block`, replace `content` with the safe message and drop `tool_calls`. On `Mask`, apply Bedrock's redacted text to `content`.
 - **Compose order:** `GuardrailingLlmBackend( RetryingLlmBackend( <OpenAi|Extension> ) )` — guardrail sits outside retry so it evaluates the final text after retries settle.
-- **Streaming (`complete_streaming`):** input check is identical. Output is checked on the accumulated text once the stream finishes. **PoC default = stream-then-redact:** deltas stream to the client as they arrive and the OUTPUT verdict applies to the accumulated text at the end, so a blocked reply may already have partially streamed before the verdict is known. The stricter alternative (buffer-until-verdict, full enforcement at the cost of latency) is an open question (§8), not the demo default.
+- **Streaming (`complete_streaming`):** output is checked on the accumulated text once the stream finishes. **PoC default = stream-then-redact:** deltas stream to the client as they arrive and the OUTPUT verdict applies to the accumulated text at the end, so a blocked reply may already have partially streamed before the verdict is known. The stricter alternative (buffer-until-verdict, full enforcement at the cost of latency) is an open question (§8), not the demo default.
+
+**`loop.rs` INPUT check:** after the user message is appended to `state.messages` and before the `LlmRequest` is built, scan the last `User` entry. On `Block`, short-circuit the step and return the safe message as the reply (no LLM call). On `Mask`, write the masked text back into that `state.messages` entry so it is what gets persisted *and* sent.
 
 #### Persisting masked content (Mask + multi-turn correctness)
 
