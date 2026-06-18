@@ -46,7 +46,10 @@ pub struct GuardrailVerdict {
 impl GuardrailVerdict {
     /// An `Allow` verdict with empty assessments.
     pub fn allow() -> Self {
-        Self { action: GuardrailAction::Allow, assessments: serde_json::Value::Null }
+        Self {
+            action: GuardrailAction::Allow,
+            assessments: serde_json::Value::Null,
+        }
     }
 }
 
@@ -95,7 +98,9 @@ pub fn resolve_action(
         Err(err) => {
             tracing::warn!(error = %err, fail_closed, "guardrail check failed");
             if fail_closed {
-                GuardrailAction::Block { message: block_message.to_string() }
+                GuardrailAction::Block {
+                    message: block_message.to_string(),
+                }
             } else {
                 GuardrailAction::Allow
             }
@@ -140,19 +145,30 @@ pub fn map_apply_guardrail(
     assessments: serde_json::Value,
 ) -> GuardrailVerdict {
     if !intervened {
-        return GuardrailVerdict { action: GuardrailAction::Allow, assessments };
+        return GuardrailVerdict {
+            action: GuardrailAction::Allow,
+            assessments,
+        };
     }
     if only_pii_anonymized && pii_mode == PiiMode::Mask {
         if let Some(text) = output_text {
-            return GuardrailVerdict { action: GuardrailAction::Mask { text }, assessments };
+            return GuardrailVerdict {
+                action: GuardrailAction::Mask { text },
+                assessments,
+            };
         }
         return GuardrailVerdict {
-            action: GuardrailAction::Block { message: block_fallback.to_string() },
+            action: GuardrailAction::Block {
+                message: block_fallback.to_string(),
+            },
             assessments,
         };
     }
     let message = output_text.unwrap_or_else(|| block_fallback.to_string());
-    GuardrailVerdict { action: GuardrailAction::Block { message }, assessments }
+    GuardrailVerdict {
+        action: GuardrailAction::Block { message },
+        assessments,
+    }
 }
 
 /// Decision for untrusted text about to enter conversation history. Returned by
@@ -174,7 +190,11 @@ pub async fn guard_incoming(
     fail_closed: bool,
     block_fallback: &str,
 ) -> IncomingDecision {
-    match resolve_action(guardrail.check(stage, text).await, fail_closed, block_fallback) {
+    match resolve_action(
+        guardrail.check(stage, text).await,
+        fail_closed,
+        block_fallback,
+    ) {
         GuardrailAction::Allow => IncomingDecision::Allow,
         GuardrailAction::Block { message } => IncomingDecision::Block { message },
         GuardrailAction::Mask { text } => IncomingDecision::Mask { text },
@@ -216,7 +236,12 @@ impl GuardrailingLlmBackend {
         fail_closed: bool,
         block_message: String,
     ) -> Self {
-        Self { inner, guardrail, fail_closed, block_message }
+        Self {
+            inner,
+            guardrail,
+            fail_closed,
+            block_message,
+        }
     }
 
     /// Apply the OUTPUT verdict to a completed response.
@@ -235,7 +260,10 @@ impl GuardrailingLlmBackend {
                 tokens_in: response.tokens_in,
                 tokens_out: response.tokens_out,
             },
-            GuardrailAction::Mask { text } => LlmResponse { content: Some(text), ..response },
+            GuardrailAction::Mask { text } => LlmResponse {
+                content: Some(text),
+                ..response
+            },
         }
     }
 }
@@ -269,19 +297,36 @@ impl LlmBackend for GuardrailingLlmBackend {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
     use crate::config::LlmProviderRef;
+    use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
     use crate::state::ToolCallRecord;
 
     // A guardrail that blocks when the scanned text contains `needle`.
-    struct KeywordBlock { needle: String }
+    struct KeywordBlock {
+        needle: String,
+    }
     impl Guardrail for KeywordBlock {
-        fn check<'a>(&'a self, _s: GuardrailStage, text: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
+        fn check<'a>(
+            &'a self,
+            _s: GuardrailStage,
+            text: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             let hit = text.contains(&self.needle);
             Box::pin(async move {
                 Ok(GuardrailVerdict {
-                    action: if hit { GuardrailAction::Block { message: "blocked".into() } } else { GuardrailAction::Allow },
+                    action: if hit {
+                        GuardrailAction::Block {
+                            message: "blocked".into(),
+                        }
+                    } else {
+                        GuardrailAction::Allow
+                    },
                     assessments: serde_json::Value::Null,
                 })
             })
@@ -289,36 +334,89 @@ mod tests {
     }
     struct AlwaysMask;
     impl Guardrail for AlwaysMask {
-        fn check<'a>(&'a self, _s: GuardrailStage, _t: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
-            Box::pin(async { Ok(GuardrailVerdict { action: GuardrailAction::Mask { text: "MASKED".into() }, assessments: serde_json::Value::Null }) })
+        fn check<'a>(
+            &'a self,
+            _s: GuardrailStage,
+            _t: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(GuardrailVerdict {
+                    action: GuardrailAction::Mask {
+                        text: "MASKED".into(),
+                    },
+                    assessments: serde_json::Value::Null,
+                })
+            })
         }
     }
     struct AlwaysErr;
     impl Guardrail for AlwaysErr {
-        fn check<'a>(&'a self, _s: GuardrailStage, _t: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
+        fn check<'a>(
+            &'a self,
+            _s: GuardrailStage,
+            _t: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async { Err(GuardrailError::Backend("down".into())) })
         }
     }
     // An inner backend returning a fixed response.
-    struct Fixed { resp: LlmResponse }
+    struct Fixed {
+        resp: LlmResponse,
+    }
     impl LlmBackend for Fixed {
-        fn complete<'a>(&'a self, _r: LlmRequest)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LlmResponse, crate::error::LlmError>> + Send + 'a>> {
+        fn complete<'a>(
+            &'a self,
+            _r: LlmRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<LlmResponse, crate::error::LlmError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
             let r = self.resp.clone();
             Box::pin(async move { Ok(r) })
         }
     }
     fn req() -> LlmRequest {
-        LlmRequest { system_prompt: String::new(), history: vec![], tools: vec![],
-            provider: LlmProviderRef { provider: "openai".into(), model: "m".into(), credential_ref: None } }
+        LlmRequest {
+            system_prompt: String::new(),
+            history: vec![],
+            tools: vec![],
+            provider: LlmProviderRef {
+                provider: "openai".into(),
+                model: "m".into(),
+                credential_ref: None,
+            },
+        }
     }
 
     #[tokio::test]
     async fn guard_incoming_maps_actions() {
-        let block = KeywordBlock { needle: "PII".into() };
-        match guard_incoming(&block, GuardrailStage::Input, "contains PII here", false, "fb").await {
+        let block = KeywordBlock {
+            needle: "PII".into(),
+        };
+        match guard_incoming(
+            &block,
+            GuardrailStage::Input,
+            "contains PII here",
+            false,
+            "fb",
+        )
+        .await
+        {
             IncomingDecision::Block { message } => assert_eq!(message, "blocked"),
             other => panic!("expected Block, got {other:?}"),
         }
@@ -335,7 +433,15 @@ mod tests {
     #[tokio::test]
     async fn guard_incoming_fail_closed_blocks_on_backend_error() {
         // AlwaysErr + fail_closed=true must yield Block with the supplied fallback.
-        match guard_incoming(&AlwaysErr, GuardrailStage::Input, "any text", true, "error-fallback").await {
+        match guard_incoming(
+            &AlwaysErr,
+            GuardrailStage::Input,
+            "any text",
+            true,
+            "error-fallback",
+        )
+        .await
+        {
             IncomingDecision::Block { message } => assert_eq!(message, "error-fallback"),
             other => panic!("expected Block, got {other:?}"),
         }
@@ -343,9 +449,23 @@ mod tests {
 
     #[tokio::test]
     async fn output_block_replaces_content_and_drops_tool_calls() {
-        let call = ToolCallRecord { call_id: "c".into(), extension_id: "x".into(), tool_name: "t".into(), args: serde_json::json!({}) };
-        let inner = Arc::new(Fixed { resp: resp(Some("here is the BADWORD"), vec![call]) });
-        let g = GuardrailingLlmBackend::new(inner, Arc::new(KeywordBlock { needle: "BADWORD".into() }), false, "safe".into());
+        let call = ToolCallRecord {
+            call_id: "c".into(),
+            extension_id: "x".into(),
+            tool_name: "t".into(),
+            args: serde_json::json!({}),
+        };
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("here is the BADWORD"), vec![call]),
+        });
+        let g = GuardrailingLlmBackend::new(
+            inner,
+            Arc::new(KeywordBlock {
+                needle: "BADWORD".into(),
+            }),
+            false,
+            "safe".into(),
+        );
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("blocked"));
         assert!(out.tool_calls.is_empty());
@@ -353,9 +473,23 @@ mod tests {
 
     #[tokio::test]
     async fn output_block_detects_keyword_in_tool_args_only() {
-        let call = ToolCallRecord { call_id: "c".into(), extension_id: "x".into(), tool_name: "send".into(), args: serde_json::json!({ "body": "BADWORD" }) };
-        let inner = Arc::new(Fixed { resp: resp(Some("ok"), vec![call]) }); // clean content
-        let g = GuardrailingLlmBackend::new(inner, Arc::new(KeywordBlock { needle: "BADWORD".into() }), false, "safe".into());
+        let call = ToolCallRecord {
+            call_id: "c".into(),
+            extension_id: "x".into(),
+            tool_name: "send".into(),
+            args: serde_json::json!({ "body": "BADWORD" }),
+        };
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("ok"), vec![call]),
+        }); // clean content
+        let g = GuardrailingLlmBackend::new(
+            inner,
+            Arc::new(KeywordBlock {
+                needle: "BADWORD".into(),
+            }),
+            false,
+            "safe".into(),
+        );
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("blocked"));
         assert!(out.tool_calls.is_empty());
@@ -363,7 +497,9 @@ mod tests {
 
     #[tokio::test]
     async fn output_mask_replaces_content() {
-        let inner = Arc::new(Fixed { resp: resp(Some("my ssn is 123"), vec![]) });
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("my ssn is 123"), vec![]),
+        });
         let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysMask), false, "safe".into());
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("MASKED"));
@@ -371,7 +507,9 @@ mod tests {
 
     #[tokio::test]
     async fn output_allow_passes_through() {
-        let inner = Arc::new(Fixed { resp: resp(Some("totally fine"), vec![]) });
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("totally fine"), vec![]),
+        });
         let g = GuardrailingLlmBackend::new(inner, Arc::new(NoopGuardrail), false, "safe".into());
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("totally fine"));
@@ -379,16 +517,22 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_blocks_on_guardrail_error() {
-        let inner = Arc::new(Fixed { resp: resp(Some("fine"), vec![]) });
-        let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), true, "safe-fallback".into());
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("fine"), vec![]),
+        });
+        let g =
+            GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), true, "safe-fallback".into());
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("safe-fallback"));
     }
 
     #[tokio::test]
     async fn fail_open_passes_through_on_guardrail_error() {
-        let inner = Arc::new(Fixed { resp: resp(Some("fine"), vec![]) });
-        let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), false, "safe-fallback".into());
+        let inner = Arc::new(Fixed {
+            resp: resp(Some("fine"), vec![]),
+        });
+        let g =
+            GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), false, "safe-fallback".into());
         let out = g.complete(req()).await.unwrap();
         assert_eq!(out.content.as_deref(), Some("fine"));
     }
@@ -413,31 +557,77 @@ mod tests {
         let scanned = serialize_output_for_scan(&resp(Some("hello"), vec![call]));
         assert!(scanned.contains("hello"));
         assert!(scanned.contains("send"));
-        assert!(scanned.contains("SECRET"), "tool args must be in the scanned text");
+        assert!(
+            scanned.contains("SECRET"),
+            "tool args must be in the scanned text"
+        );
     }
 
     #[test]
     fn map_allow_when_not_intervened() {
-        let v = map_apply_guardrail(false, false, None, PiiMode::Mask, "fb", serde_json::Value::Null);
+        let v = map_apply_guardrail(
+            false,
+            false,
+            None,
+            PiiMode::Mask,
+            "fb",
+            serde_json::Value::Null,
+        );
         assert_eq!(v.action, GuardrailAction::Allow);
     }
 
     #[test]
     fn map_masks_pii_when_mode_mask() {
-        let v = map_apply_guardrail(true, true, Some("redacted".into()), PiiMode::Mask, "fb", serde_json::Value::Null);
-        assert_eq!(v.action, GuardrailAction::Mask { text: "redacted".into() });
+        let v = map_apply_guardrail(
+            true,
+            true,
+            Some("redacted".into()),
+            PiiMode::Mask,
+            "fb",
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            v.action,
+            GuardrailAction::Mask {
+                text: "redacted".into()
+            }
+        );
     }
 
     #[test]
     fn map_blocks_pii_when_mode_block() {
-        let v = map_apply_guardrail(true, true, Some("redacted".into()), PiiMode::Block, "fb", serde_json::Value::Null);
-        assert_eq!(v.action, GuardrailAction::Block { message: "redacted".into() });
+        let v = map_apply_guardrail(
+            true,
+            true,
+            Some("redacted".into()),
+            PiiMode::Block,
+            "fb",
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            v.action,
+            GuardrailAction::Block {
+                message: "redacted".into()
+            }
+        );
     }
 
     #[test]
     fn map_blocks_non_pii_intervention_with_fallback() {
-        let v = map_apply_guardrail(true, false, None, PiiMode::Mask, "fallback msg", serde_json::Value::Null);
-        assert_eq!(v.action, GuardrailAction::Block { message: "fallback msg".into() });
+        let v = map_apply_guardrail(
+            true,
+            false,
+            None,
+            PiiMode::Mask,
+            "fallback msg",
+            serde_json::Value::Null,
+        );
+        assert_eq!(
+            v.action,
+            GuardrailAction::Block {
+                message: "fallback msg".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -452,24 +642,41 @@ mod tests {
     #[test]
     fn resolve_passes_ok_action_through() {
         let v = GuardrailVerdict {
-            action: GuardrailAction::Block { message: "no".into() },
+            action: GuardrailAction::Block {
+                message: "no".into(),
+            },
             assessments: serde_json::Value::Null,
         };
         assert_eq!(
             resolve_action(Ok(v), false, "fallback"),
-            GuardrailAction::Block { message: "no".into() }
+            GuardrailAction::Block {
+                message: "no".into()
+            }
         );
     }
 
     #[test]
     fn resolve_fail_closed_blocks_on_error() {
-        let action = resolve_action(Err(GuardrailError::Backend("boom".into())), true, "fallback");
-        assert_eq!(action, GuardrailAction::Block { message: "fallback".into() });
+        let action = resolve_action(
+            Err(GuardrailError::Backend("boom".into())),
+            true,
+            "fallback",
+        );
+        assert_eq!(
+            action,
+            GuardrailAction::Block {
+                message: "fallback".into()
+            }
+        );
     }
 
     #[test]
     fn resolve_fail_open_allows_on_error() {
-        let action = resolve_action(Err(GuardrailError::Backend("boom".into())), false, "fallback");
+        let action = resolve_action(
+            Err(GuardrailError::Backend("boom".into())),
+            false,
+            "fallback",
+        );
         assert_eq!(action, GuardrailAction::Allow);
     }
 }

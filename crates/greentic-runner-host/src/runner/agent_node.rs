@@ -383,11 +383,12 @@ mod aw {
         std::sync::Arc<dyn greentic_aw_runtime::Guardrail>,
         greentic_aw_runtime::GuardrailRuntimeConfig,
     )> {
-        let choice =
-            guardrail_choice(std::env::var("GREENTIC_AW_GUARDRAIL").ok().as_deref());
+        let choice = guardrail_choice(std::env::var("GREENTIC_AW_GUARDRAIL").ok().as_deref());
         let guardrail = build_guardrail_impl(choice)?;
         let fail_closed_ingress = matches!(
-            std::env::var("GREENTIC_AW_GUARDRAIL_FAILMODE").ok().as_deref(),
+            std::env::var("GREENTIC_AW_GUARDRAIL_FAILMODE")
+                .ok()
+                .as_deref(),
             Some("closed")
         );
         let cfg = greentic_aw_runtime::GuardrailRuntimeConfig {
@@ -420,8 +421,8 @@ mod aw {
     #[cfg(feature = "guardrail-bedrock")]
     fn build_bedrock_guardrail() -> Option<std::sync::Arc<dyn greentic_aw_runtime::Guardrail>> {
         let id = std::env::var("GREENTIC_AW_GUARDRAIL_ID").unwrap_or_default();
-        let version = std::env::var("GREENTIC_AW_GUARDRAIL_VERSION")
-            .unwrap_or_else(|_| "DRAFT".into());
+        let version =
+            std::env::var("GREENTIC_AW_GUARDRAIL_VERSION").unwrap_or_else(|_| "DRAFT".into());
         if id.trim().is_empty() {
             tracing::warn!(
                 "GREENTIC_AW_GUARDRAIL=bedrock but \
@@ -434,12 +435,14 @@ mod aw {
             _ => greentic_aw_runtime::PiiMode::Mask,
         };
         tracing::info!(guardrail_id = %id, version = %version, "AW guardrail: AWS Bedrock");
-        Some(std::sync::Arc::new(greentic_aw_runtime::AwsBedrockGuardrail::new(
-            id,
-            version,
-            pii_mode,
-            DEFAULT_BLOCK_MESSAGE.to_string(),
-        )))
+        Some(std::sync::Arc::new(
+            greentic_aw_runtime::AwsBedrockGuardrail::new(
+                id,
+                version,
+                pii_mode,
+                DEFAULT_BLOCK_MESSAGE.to_string(),
+            ),
+        ))
     }
 
     /// When the feature is off and `GREENTIC_AW_GUARDRAIL=bedrock` was requested,
@@ -670,14 +673,13 @@ mod aw {
                 // OUTPUT seam: wrap the backend so model replies are inspected.
                 // OUTPUT stays fail-open per spec §4.1; INPUT/tool-result use
                 // fail_closed_ingress via runtime.with_guardrail below.
-                let wrapped: Arc<dyn LlmBackend> = Arc::new(
-                    greentic_aw_runtime::GuardrailingLlmBackend::new(
+                let wrapped: Arc<dyn LlmBackend> =
+                    Arc::new(greentic_aw_runtime::GuardrailingLlmBackend::new(
                         llm,
                         guardrail,
                         false,
                         cfg.block_message.clone(),
-                    ),
-                );
+                    ));
                 (wrapped, Some(cfg))
             }
             None => (llm, None),
@@ -857,10 +859,9 @@ mod aw {
                     match std::env::var("GREENTIC_AW_REDIS_URL") {
                         Ok(url) if !url.is_empty() => {
                             match RedisAgentStateStore::connect(&url).await {
-                                Ok(store) => (
-                                    Arc::new(RedisDispatchLedger::new(store.manager())),
-                                    true,
-                                ),
+                                Ok(store) => {
+                                    (Arc::new(RedisDispatchLedger::new(store.manager())), true)
+                                }
                                 Err(error) => {
                                     tracing::warn!(
                                         %error,
@@ -985,7 +986,8 @@ mod aw {
                 },
                 limits: AgentLimits::default(),
                 memory: None,
-                knowledge: None,            }
+                knowledge: None,
+            }
         }
 
         #[tokio::test]
@@ -1015,7 +1017,8 @@ mod aw {
                     },
                     limits: AgentLimits::default(),
                     memory: None,
-                    knowledge: None,                },
+                    knowledge: None,
+                },
             );
             let config_provider = Arc::new(config_provider);
 
@@ -1102,7 +1105,10 @@ mod aw {
         #[test]
         fn guardrail_choice_maps_env() {
             assert_eq!(guardrail_choice(Some("bedrock")), GuardrailChoice::Bedrock);
-            assert_eq!(guardrail_choice(Some("  bedrock  ")), GuardrailChoice::Bedrock);
+            assert_eq!(
+                guardrail_choice(Some("  bedrock  ")),
+                GuardrailChoice::Bedrock
+            );
             assert_eq!(guardrail_choice(Some("nope")), GuardrailChoice::Disabled);
             assert_eq!(guardrail_choice(None), GuardrailChoice::Disabled);
         }
@@ -1540,4 +1546,6 @@ pub use aw::{
 // Allow the guardrail helpers to be unused at crate level until consumed by callers
 // wired in subsequent tasks (graph_node, etc.).
 #[allow(unused_imports)]
-pub(crate) use aw::{GuardrailChoice, build_ext_runtime, build_guardrail, build_llm_backend, guardrail_choice};
+pub(crate) use aw::{
+    GuardrailChoice, build_ext_runtime, build_guardrail, build_llm_backend, guardrail_choice,
+};

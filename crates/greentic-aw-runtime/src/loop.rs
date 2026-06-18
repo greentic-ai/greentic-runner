@@ -755,11 +755,26 @@ mod tests {
 
     struct BlockAll;
     impl crate::guardrail::Guardrail for BlockAll {
-        fn check<'a>(&'a self, _s: crate::guardrail::GuardrailStage, _t: &'a str)
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::guardrail::GuardrailVerdict, crate::guardrail::GuardrailError>> + Send + 'a>> {
+        fn check<'a>(
+            &'a self,
+            _s: crate::guardrail::GuardrailStage,
+            _t: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::guardrail::GuardrailVerdict,
+                            crate::guardrail::GuardrailError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
             Box::pin(async {
                 Ok(crate::guardrail::GuardrailVerdict {
-                    action: crate::guardrail::GuardrailAction::Block { message: "policy says no".into() },
+                    action: crate::guardrail::GuardrailAction::Block {
+                        message: "policy says no".into(),
+                    },
                     assessments: serde_json::Value::Null,
                 })
             })
@@ -783,16 +798,32 @@ mod tests {
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
-        let runtime = AgentRuntime::new(cp, store, ext, llm.clone(), telemetry, token_meter, ledger, None)
-            .with_guardrail(crate::guardrail::GuardrailRuntimeConfig {
-                guardrail: Arc::new(BlockAll),
-                fail_closed_ingress: true,
-                block_message: "policy says no".into(),
-                tool_block_placeholder: "withheld".into(),
-            });
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm.clone(),
+            telemetry,
+            token_meter,
+            ledger,
+            None,
+        )
+        .with_guardrail(crate::guardrail::GuardrailRuntimeConfig {
+            guardrail: Arc::new(BlockAll),
+            fail_closed_ingress: true,
+            block_message: "policy says no".into(),
+            tool_block_placeholder: "withheld".into(),
+        });
 
         let out = runtime
-            .step(tc, "sess-block", "a", AgentInput { text: "leak my SSN 123-45-6789".into() })
+            .step(
+                tc,
+                "sess-block",
+                "a",
+                AgentInput {
+                    text: "leak my SSN 123-45-6789".into(),
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out.reply, "policy says no");

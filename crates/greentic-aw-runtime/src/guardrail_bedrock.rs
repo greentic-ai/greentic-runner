@@ -12,7 +12,7 @@ use aws_sdk_bedrockruntime::types::{
 use tokio::sync::OnceCell;
 
 use crate::guardrail::{
-    map_apply_guardrail, Guardrail, GuardrailError, GuardrailStage, GuardrailVerdict, PiiMode,
+    Guardrail, GuardrailError, GuardrailStage, GuardrailVerdict, PiiMode, map_apply_guardrail,
 };
 
 pub struct AwsBedrockGuardrail {
@@ -54,8 +54,9 @@ impl Guardrail for AwsBedrockGuardrail {
         &'a self,
         stage: GuardrailStage,
         text: &'a str,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>>
-    {
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let source = match stage {
                 GuardrailStage::Input => GuardrailContentSource::Input,
@@ -137,10 +138,12 @@ mod tests {
     #[ignore = "needs AWS credentials and a provisioned Bedrock guardrail"]
     async fn live_apply_guardrail_allows_benign_text() {
         let id = std::env::var("GREENTIC_AW_GUARDRAIL_ID").unwrap();
-        let ver =
-            std::env::var("GREENTIC_AW_GUARDRAIL_VERSION").unwrap_or_else(|_| "DRAFT".into());
+        let ver = std::env::var("GREENTIC_AW_GUARDRAIL_VERSION").unwrap_or_else(|_| "DRAFT".into());
         let g = AwsBedrockGuardrail::new(id, ver, PiiMode::Mask, "blocked".into());
-        let v = g.check(GuardrailStage::Input, "Hello, how are you?").await.unwrap();
+        let v = g
+            .check(GuardrailStage::Input, "Hello, how are you?")
+            .await
+            .unwrap();
         assert_eq!(v.action, crate::guardrail::GuardrailAction::Allow);
     }
 }
