@@ -53,10 +53,59 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
-    let user_message = message.text.clone();
+    let mut user_message = message.text.clone();
     state.messages.push(ChatMessage::User {
         content: message.text,
     });
+
+    // --- INPUT guardrail (spec §4.2): scan the user message before it reaches
+    // the LLM. Block short-circuits the step; Mask rewrites the persisted text
+    // so PII does not re-enter context next turn. `user_message` is updated so
+    // recall/ingest use the masked text too.
+    if let Some(g) = &runtime.guardrail {
+        match crate::guardrail::guard_incoming(
+            g.guardrail.as_ref(),
+            crate::guardrail::GuardrailStage::Input,
+            &user_message,
+            g.fail_closed_ingress,
+            &g.block_message,
+        )
+        .await
+        {
+            crate::guardrail::IncomingDecision::Allow => {}
+            crate::guardrail::IncomingDecision::Mask { text } => {
+                if let Some(ChatMessage::User { content }) = state.messages.last_mut() {
+                    *content = text.clone();
+                }
+                user_message = text;
+            }
+            crate::guardrail::IncomingDecision::Block { message } => {
+                state.messages.push(ChatMessage::Assistant {
+                    content: message.clone(),
+                    tool_calls: vec![],
+                });
+                state.truncate_history(config.limits.max_history_turns);
+                if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+                    warn!(error = %e, "state save failed after input block");
+                }
+                runtime.telemetry.record_step(&StepTelemetryCtx {
+                    tenant_id: tenant.tenant_id.clone(),
+                    env_id: tenant.env_id.clone(),
+                    session_id: session_id.to_string(),
+                    agent_id: agent_id.to_string(),
+                    terminated_by: TerminationReason::FinalReply,
+                    iterations: 0,
+                    total_tokens: 0,
+                    duration: started.elapsed(),
+                });
+                return Ok(AgentOutput {
+                    reply: message.clone(),
+                    trail: vec![AgentStep::Reply { text: message }],
+                    terminated_by: TerminationReason::FinalReply,
+                });
+            }
+        }
+    }
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
@@ -281,6 +330,32 @@ pub async fn run_step(
                         });
                         continue;
                     }
+                };
+
+                // --- Tool-result guardrail (spec §4.2): the external tool
+                // output is the top prompt-injection / PII vector. Guard it
+                // before it is observed, recorded, or appended to history.
+                let result = if let Some(g) = &runtime.guardrail {
+                    let text = result.to_string();
+                    match crate::guardrail::guard_incoming(
+                        g.guardrail.as_ref(),
+                        crate::guardrail::GuardrailStage::Input,
+                        &text,
+                        g.fail_closed_ingress,
+                        &g.tool_block_placeholder,
+                    )
+                    .await
+                    {
+                        crate::guardrail::IncomingDecision::Allow => result,
+                        crate::guardrail::IncomingDecision::Block { .. } => {
+                            serde_json::json!({ "error": "blocked by guardrail policy, result withheld" })
+                        }
+                        crate::guardrail::IncomingDecision::Mask { text } => {
+                            serde_json::Value::String(text)
+                        }
+                    }
+                } else {
+                    result
                 };
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
@@ -676,5 +751,84 @@ mod tests {
             0,
             "no deltas on the non-streaming path"
         );
+    }
+
+    struct BlockAll;
+    impl crate::guardrail::Guardrail for BlockAll {
+        fn check<'a>(
+            &'a self,
+            _s: crate::guardrail::GuardrailStage,
+            _t: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::guardrail::GuardrailVerdict,
+                            crate::guardrail::GuardrailError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok(crate::guardrail::GuardrailVerdict {
+                    action: crate::guardrail::GuardrailAction::Block {
+                        message: "policy says no".into(),
+                    },
+                    assessments: serde_json::Value::Null,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn input_block_short_circuits_step() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("should never be returned".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm.clone(),
+            telemetry,
+            token_meter,
+            ledger,
+            None,
+        )
+        .with_guardrail(crate::guardrail::GuardrailRuntimeConfig {
+            guardrail: Arc::new(BlockAll),
+            fail_closed_ingress: true,
+            block_message: "policy says no".into(),
+            tool_block_placeholder: "withheld".into(),
+        });
+
+        let out = runtime
+            .step(
+                tc,
+                "sess-block",
+                "a",
+                AgentInput {
+                    text: "leak my SSN 123-45-6789".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "policy says no");
+        // Verify LLM was never called: the seeded response must still be in the queue.
+        let remaining = llm.responses.lock().expect("mock llm lock poisoned").len();
+        assert_eq!(remaining, 1, "LLM must not be called when input is blocked");
     }
 }

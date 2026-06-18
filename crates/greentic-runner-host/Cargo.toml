@@ -21,6 +21,11 @@ component-v0-6-introspection = []
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# Passthrough: enables the AWS Bedrock guardrail implementation inside
+# greentic-aw-runtime. Implies agentic-worker (the optional greentic-aw-runtime
+# dep it configures) so a --no-default-features build still activates it.
+# Requires AWS credentials at runtime.
+guardrail-bedrock = ["agentic-worker", "greentic-aw-runtime/guardrail-bedrock"]
 # Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
 # memory backend into the agentic worker. Heavy (pulls the Chronicle graph
 # engine); off by default. The operator supplies Neo4j + the LLM and embedding

@@ -20,6 +20,7 @@ pub mod cost;
 pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
+pub mod guardrail;
 pub mod http_provider;
 pub mod knowledge;
 pub mod layered_provider;
@@ -45,6 +46,11 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
+#[cfg(feature = "guardrail-bedrock")]
+pub mod guardrail_bedrock;
+#[cfg(feature = "guardrail-bedrock")]
+pub use guardrail_bedrock::AwsBedrockGuardrail;
+
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
@@ -57,6 +63,11 @@ pub use cost::{RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
+pub use guardrail::{
+    Guardrail, GuardrailAction, GuardrailError, GuardrailRuntimeConfig, GuardrailStage,
+    GuardrailVerdict, GuardrailingLlmBackend, IncomingDecision, NoopGuardrail, PiiMode,
+    guard_incoming, map_apply_guardrail, serialize_output_for_scan,
+};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
@@ -151,6 +162,11 @@ pub struct AgentRuntime {
     /// `None` disables the knowledge tier. Set via [`AgentRuntime::with_knowledge`];
     /// the concrete backend is injected at the runner-host edge, never compiled in.
     pub(crate) knowledge: Option<Arc<dyn knowledge::Knowledge>>,
+    /// Guardrail configuration for the INPUT and tool-result checkpoints. `None`
+    /// disables guardrailing at these checkpoints (zero runtime cost). Set via
+    /// [`AgentRuntime::with_guardrail`]; the OUTPUT checkpoint is wired separately
+    /// by wrapping the `LlmBackend` with `GuardrailingLlmBackend`.
+    pub(crate) guardrail: Option<crate::guardrail::GuardrailRuntimeConfig>,
 }
 
 impl AgentRuntime {
@@ -180,6 +196,7 @@ impl AgentRuntime {
             components: None,
             long_term_memory: None,
             knowledge: None,
+            guardrail: None,
         }
     }
 
@@ -237,6 +254,15 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_knowledge(mut self, knowledge: Arc<dyn knowledge::Knowledge>) -> Self {
         self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Attach a guardrail for the INPUT and tool-result checkpoints. The OUTPUT
+    /// checkpoint is wired separately by wrapping the `LlmBackend` with
+    /// `GuardrailingLlmBackend`.
+    #[must_use]
+    pub fn with_guardrail(mut self, cfg: crate::guardrail::GuardrailRuntimeConfig) -> Self {
+        self.guardrail = Some(cfg);
         self
     }
 
