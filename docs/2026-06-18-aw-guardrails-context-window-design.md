@@ -43,9 +43,12 @@ The decorator pattern at the `LlmBackend` seam is the established, low-blast-rad
 | Decision | Choice |
 | --- | --- |
 | Architecture | Trait `Guardrail` in `aw-runtime` + decorator `GuardrailingLlmBackend`; native AWS Bedrock demo backend; WASM guardrail kind documented as the future production path. |
-| Checkpoints in PoC | **Input** (user → LLM) and **Output** (LLM → user). |
-| Action on violation | **Block + safe message.** |
+| Checkpoints in PoC | **Input** (user → LLM), **Output** (LLM → user), **Tool-result** (tool output before it re-enters history), and **Tool-call args** (folded into the Output check). See §4.2 for why tool-result is in scope despite the original "Input + Output" framing. |
+| Action on violation | **Block + safe message** for denied-topic / content-filter / word policies; **Mask-and-continue** for sensitive-information (PII) policies, reusing Bedrock's redacted `outputs[].text`. The action is derived from the Bedrock assessment, not hardcoded (§4.3). |
+| Fail mode | Default **fail-open** for the demo; **fail-closed recommended for the INPUT/tool-result stages in production** (see §4.1). |
 | Context-window | Discussion only in this doc; not in the PoC. |
+
+> **Decision-change note:** the original lock with Andy was "Input + Output, Block + safe message." Code review surfaced that (a) tool results bypass both checks and (b) Bedrock returns masked text for free. The scope above is the revised decision: tool-result + tool-call coverage added, and Mask wired alongside Block. Block remains the default for non-PII policies, so this is an extension of the original decision, not a reversal.
 
 ## 4. Guardrail design
 
@@ -58,8 +61,8 @@ pub enum GuardrailStage { Input, Output }
 
 pub enum GuardrailAction {
     Allow,
-    Block { message: String },   // used by the PoC
-    Mask  { text: String },      // defined now, unused by the PoC
+    Block { message: String },   // denied-topic / content-filter / word policies
+    Mask  { text: String },      // sensitive-info (PII) redaction — Bedrock outputs[].text
 }
 
 pub struct GuardrailVerdict {
@@ -82,25 +85,39 @@ pub trait Guardrail: Send + Sync {
 
 A `NoopGuardrail` returning `Allow` is the global default, so the feature is zero-impact when disabled.
 
-**Fail-open vs fail-closed:** on `GuardrailError` (network/auth failure), the PoC **fails open** (treat as `Allow`) and records the error to telemetry. Fail-closed is a one-line policy flip and is noted as a config option for production; defaulting open keeps a guardrail outage from taking the worker down during the demo.
+**Fail-open vs fail-closed:** on `GuardrailError` (network/auth failure), the PoC **fails open** (treat as `Allow`) and records the error to telemetry — a guardrail outage should not take the worker down during the demo. The fail mode is configurable per the env var in §4.4.
+
+**Production recommendation:** prefer **fail-closed for the INPUT and tool-result stages**. A guardrail outage frequently coincides with an attack window (an attacker may even be the cause), so failing open on the *ingress* side is exactly when it hurts. Failing open on the OUTPUT stage is the milder choice (worst case: an unfiltered model reply, no externally-injected payload). The PoC keeps the global default open for demo smoothness but documents the split so production can flip INPUT/tool-result to closed.
 
 ### 4.2 Decorator `GuardrailingLlmBackend`
 
-Wraps `Arc<dyn LlmBackend>` + `Arc<dyn Guardrail>`. All logic lives at the LLM seam; `loop.rs` is unchanged except wiring.
+Wraps `Arc<dyn LlmBackend>` + `Arc<dyn Guardrail>`. The decorator covers three of the four checkpoints purely at the LLM seam (`loop.rs` unchanged except wiring); the **tool-result** checkpoint cannot be reached from the `LlmBackend` seam and needs one small hook in `loop.rs` (see below).
 
-- **INPUT check:** before `inner.complete()`, only when the last history entry is a `User` message (i.e. the first LLM call of a turn — subsequent iterations end in a `Tool` result, so we do not re-scan the same user text). On `Block`, short-circuit and return a synthetic `LlmResponse` whose content is the safe message and whose `tool_calls` is empty, so the loop terminates cleanly.
-- **OUTPUT check:** after `inner.complete()`, scan `response.content`. On `Block`, replace `content` with the safe message and drop any `tool_calls`.
+- **INPUT check:** before `inner.complete()`, scan the last `User` message in `request.history`. On `Block`, short-circuit and return a synthetic `LlmResponse` whose content is the safe message and whose `tool_calls` is empty, so the loop terminates cleanly. On `Mask`, replace the user text passed downstream with the masked text.
+- **OUTPUT check:** after `inner.complete()`, scan a serialization of **both** `response.content` **and** the `tool_calls` (call name + JSON args). Scanning the args closes the exfil-via-tool-argument vector: a model can place sensitive payload in a tool argument, and content-only scanning would miss it. On `Block`, replace `content` with the safe message and drop `tool_calls`. On `Mask`, apply Bedrock's redacted text to `content`.
 - **Compose order:** `GuardrailingLlmBackend( RetryingLlmBackend( <OpenAi|Extension> ) )` — guardrail sits outside retry so it evaluates the final text after retries settle.
 - **Streaming (`complete_streaming`):** input check is identical. Output is checked on the accumulated text once the stream finishes. **Caveat (documented):** with streaming, a blocked reply may already have partially streamed to the client before the verdict is known; mitigations (buffer-until-verdict, or post-hoc redaction event) are listed as follow-ups and out of PoC scope.
+
+#### Tool-result checkpoint (the fourth checkpoint — needs a `loop.rs` hook)
+
+In the agentic loop, the highest-risk untrusted content is **tool output** (web fetch, MCP call, component result): it is both the primary prompt-injection vector and a PII-exfiltration vector. This content is invisible to the `LlmBackend` decorator because:
+
+- it enters as a `ChatMessage::Tool` appended to history after dispatch (`loop.rs:210-213, 297-300`), so on the next iteration `history.last()` is `Tool`, not `User`, and the INPUT gate skips it; and
+- the OUTPUT check only sees the *model's* reply, not the raw tool result that shaped it.
+
+So the PoC adds a minimal INPUT-stage guardrail call in `loop.rs` immediately after a tool result is produced and **before** it is appended to history. On `Block`, the tool result is replaced with a safe placeholder value (e.g. `{"error":"blocked by guardrail policy"}`) so the loop continues without the offending content. On `Mask`, the redacted text replaces the tool content. This is the one place the guardrail reaches into `loop.rs` rather than living purely at the LLM seam; it is intentional and small (a single call guarded by an `Option<Arc<dyn Guardrail>>` on the runtime, defaulting to `None`).
 
 ### 4.3 Demo backend `AwsBedrockGuardrail` (feature `guardrail-bedrock`)
 
 - Calls **`bedrock-runtime:ApplyGuardrail`** — `POST /guardrail/{guardrailIdentifier}/version/{guardrailVersion}/apply`, body `{ "source": "INPUT"|"OUTPUT", "content": [ { "text": { "text": "<payload>" } } ] }`, SigV4-signed.
 - Uses `aws-config` + `aws-sdk-bedrockruntime` for correct credential resolution and SigV4. **Feature-gated** (`guardrail-bedrock`) so default builds pull none of the AWS SDK weight.
-- Response mapping:
-  - `action == "GUARDRAIL_INTERVENED"` → `GuardrailAction::Block { message }` (message from the guardrail's configured `blockedMessaging`, or a static fallback).
+- Response mapping (a pure function `map_apply_guardrail` so it is unit-testable without AWS — the SDK call only produces its inputs):
   - `action == "NONE"` → `Allow`.
-  - `assessments` array → forwarded verbatim into `GuardrailVerdict.assessments`.
+  - `action == "GUARDRAIL_INTERVENED"`:
+    - If the **only** intervening assessment is a sensitive-information policy that *anonymized* (masked) content — i.e. Bedrock returned redacted text in `outputs[].text` rather than a hard block — → `Mask { text: outputs[0].text }`.
+    - Otherwise (denied topic, content filter, word policy, or a blocking sensitive-info action) → `Block { message }`, where `message` is `outputs[0].text` if present (Bedrock substitutes the configured blocked message there) else a static fallback.
+  - `assessments` → summarized into `GuardrailVerdict.assessments` (the SDK assessment types are not `Serialize`; the PoC records a compact JSON summary — intervening policy kinds + counts — sufficient for telemetry).
+- A config toggle `GREENTIC_AW_GUARDRAIL_PII=mask|block` (default `mask`) lets operators force PII findings to hard-block instead of redacting, for stricter environments.
 - No `unwrap()` / `panic!()`; errors via `thiserror` → `GuardrailError`.
 
 ### 4.4 Wiring & configuration (`agent_node.rs::build_llm_backend`)
@@ -112,7 +129,8 @@ Opt-in, default off. New environment variables:
 | `GREENTIC_AW_GUARDRAIL` | `bedrock` to enable the Bedrock backend; unset/`noop` → `NoopGuardrail`. |
 | `GREENTIC_AW_GUARDRAIL_ID` | Bedrock guardrail identifier. |
 | `GREENTIC_AW_GUARDRAIL_VERSION` | Guardrail version (`DRAFT` or a published number). |
-| `GREENTIC_AW_GUARDRAIL_FAILMODE` | `open` (default) or `closed`. |
+| `GREENTIC_AW_GUARDRAIL_FAILMODE` | `open` (default) or `closed`. Production should set `closed` (applies to INPUT + tool-result stages; OUTPUT stays open). |
+| `GREENTIC_AW_GUARDRAIL_PII` | `mask` (default) or `block` — whether PII findings redact-and-continue or hard-block. |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, … | Standard AWS credential chain. |
 
 When `GREENTIC_AW_GUARDRAIL` is set, `build_llm_backend` constructs the guardrail, then wraps the (already-retrying) backend in `GuardrailingLlmBackend`.
@@ -124,8 +142,11 @@ Guardrail verdicts (stage, action, assessment summary) are emitted through the e
 ### 4.6 Tests
 
 - `NoopGuardrail` passes input/output through unchanged.
-- `GuardrailingLlmBackend` with a mock guardrail that blocks on a keyword: asserts (a) input block short-circuits without calling the inner backend, and (b) output block replaces content and drops tool_calls.
-- `AwsBedrockGuardrail`: unit test for response parsing (intervened / none / masked); an integration test gated `#[ignore]` requiring real AWS credentials and a provisioned guardrail.
+- `GuardrailingLlmBackend` with a mock guardrail that blocks on a keyword: asserts (a) input block short-circuits without calling the inner backend, (b) output block replaces content and drops tool_calls, and (c) a keyword placed only in a **tool-call argument** (not in `content`) is still detected and blocks — proving args are scanned.
+- `GuardrailingLlmBackend` with a mock guardrail that masks: asserts the masked text replaces the user/assistant text and the turn continues (no short-circuit).
+- Tool-result hook (`loop.rs`): a mock guardrail that blocks on a keyword in a tool result asserts the offending tool content is replaced with the safe placeholder before it re-enters history.
+- `map_apply_guardrail` (pure): unit tests for `NONE → Allow`, denied-topic `INTERVENED → Block`, and PII-anonymized `INTERVENED → Mask` with the `GREENTIC_AW_GUARDRAIL_PII=block` override forcing `Block`.
+- `AwsBedrockGuardrail`: an integration test gated `#[ignore]` requiring real AWS credentials and a provisioned guardrail.
 
 ### 4.7 Demo script for Andy
 
@@ -137,7 +158,11 @@ export AWS_REGION=us-east-1   # + credentials
 # build with: cargo build -p greentic-runner-host --features guardrail-bedrock
 ```
 
-Send a prompt that trips the configured policy (e.g. a denied topic or PII). The worker returns the guardrail's safe message instead of the model's answer; the trace shows the Bedrock `GUARDRAIL_INTERVENED` assessment.
+Two demo paths against the configured policy:
+- **Denied topic / content filter** → the worker returns the guardrail's safe message instead of the model's answer (Block).
+- **PII in the reply** (with default `GREENTIC_AW_GUARDRAIL_PII=mask`) → the worker returns the answer with PII redacted (Mask-and-continue); set `=block` to demo a hard block instead.
+
+In both cases the trace shows the Bedrock `GUARDRAIL_INTERVENED` assessment.
 
 ### 4.8 Future production-native path (documented, NOT implemented)
 
@@ -154,33 +179,50 @@ The `Guardrail` trait introduced here then gains a second implementation — `Ex
 
 Ranked by ROI / risk, framed as phases. None is in the guardrail PoC.
 
-### Phase 1 — Token-aware sliding window (recommended first)
-- Add token counting (`tiktoken-rs` for OpenAI-family; an approximate counter for others) and a `model → context_limit` lookup.
-- Compute a budget: `context_limit − reserved_output − tokens(system_prompt) − tokens(tools_schema)`. Trim oldest non-system messages until the history fits, preserving recent turns.
-- Apply at the centralized seam `loop.rs:150` (before the request is built), as a `ContextStrategy` field on `AgentLimits` (`config.rs`). This augments/replaces today's after-the-fact turn-count truncation.
-- Low risk, single insertion point, biggest immediate payoff (prevents hard context-overflow errors).
+### Phase 1 — Token-aware budgeting: post-injection sizing + tool-result pruning + sliding window
+This phase has two co-equal levers, because in practice context overflow is driven *more* by a single fat tool output (a 40k-token web fetch) than by a long chat history. Turn-based windowing does nothing for the former, so tool-result pruning is in Phase 1, not "supporting."
+
+- **Token counting** with `tiktoken-rs` for OpenAI-family models; an approximate (chars/4) counter for others. A `model → context_limit` lookup is needed but is a maintenance/staleness hazard because the model is a free-form string (`config.rs:20-29`); **prefer reading the limit from provider metadata where the provider exposes it**, and treat the static table as a fallback with a conservative default for unknown models.
+- **Budget computed AFTER injection.** The system prompt is augmented with long-term memory and Knowledge/RAG at `loop.rs:67-102`, and that injection is variable-size — it is frequently the bloat source, not the history. So token counting must happen on the *assembled* request, and the budget is:
+  `budget_for_history = context_limit − reserved_output − tokens(augmented_system_prompt) − tokens(tools_schema)`.
+  - Trim oldest non-system history until it fits the remaining budget, preserving recent turns.
+  - **Fallback when the augmented system prompt alone blows the budget:** trimming history cannot help. In that case shrink the *injection* first — drop the lowest-scoring RAG chunks / oldest recalled memory facts — before trimming conversation history. This requires the strategy to run where the injected content is still separable from the base prompt (i.e. integrate with the augmentation step at `loop.rs:67-102`, not only at the request-assembly point `loop.rs:150`).
+- **Tool-result pruning (Phase 1, not supporting):** when a tool returns a large payload, store the full result out-of-band (or in long-term memory) and inject only a compact summary + a handle into history once it has been consumed. This is the highest-ROI single lever against real-world overflow.
+- Expose as a `ContextStrategy` field on `AgentLimits` (`config.rs`); augments/replaces today's after-the-fact turn-count truncation.
 
 ### Phase 2 — Rolling summarization / compaction
 - When the budget is exceeded, summarize the oldest N turns into one synthetic "conversation summary" message via a cheap model call, persist it in state, and replace those turns. Recursive as the conversation grows.
 - Costs one extra LLM call when triggered; cache the summary so it is computed once.
+- **Composes with guardrails:** the summarization call is itself an LLM call and should run through the same `GuardrailingLlmBackend`, so summarized history cannot launder content past the guardrail. Order: context strategy (incl. summarization) decides the history, then the guardrail decorator checks what is sent — these do not conflict (see §6 note).
 
 ### Phase 3 — Offload to existing memory/RAG
 - Greentic already injects long-term memory (`long_term.rs`) and Knowledge/RAG (`knowledge.rs`) into the system prompt. Strategy: keep the working window small and push older context to long-term memory, recalling on demand. The seams already exist; this is mostly a policy/config change.
 
 ### Supporting items
-- **Tool-result pruning:** large tool outputs are dropped or summarized after they have been consumed, keeping only a compact reference.
 - **Per-turn token budget + telemetry:** count tokens before sending, emit near-limit metrics, and surface warnings. Ties into `TokenMeter` (`cost.rs`), which today only tracks daily per-tenant billing.
 
-**Recommendation:** ship Phase 1, make Phase 2 opt-in, and lean on existing infrastructure for Phase 3.
+**Recommendation:** ship Phase 1 (post-injection budgeting **and** tool-result pruning together), make Phase 2 opt-in, and lean on existing infrastructure for Phase 3.
 
-## 6. Out of scope
+## 6. Composition & ordering
+
+When both features ship, the per-turn order is coherent and non-conflicting:
+
+1. **Context strategy** runs first (at `loop.rs:67-102` for injection sizing and `loop.rs:150` for history assembly) and decides *what* goes into the `LlmRequest`.
+2. **Guardrail decorator** runs second, at the `LlmBackend` seam, and checks *what was actually assembled* — so `GuardrailingLlmBackend( RetryingLlmBackend( <backend> ) )` evaluates the post-trim, post-summarization request. The guardrail sits outside retry so it judges the final text.
+3. **Tool-result guardrail** (the `loop.rs` hook) runs before tool output re-enters history, so context trimming never operates on un-checked tool content.
+
+A Phase-2 summarization call is itself routed through the guardrail decorator, so summarized history cannot launder content past the guardrail.
+
+## 7. Out of scope
 
 - Implementing Cisco AI Defense / Azure Content Safety backends (the trait makes them straightforward follow-ups).
 - The WASM `guardrail` extension kind (documented as the future path only).
 - Any context-window implementation (this doc only discusses options).
 
-## 7. Open questions
+## 8. Open questions
 
 - Which AWS account / region and guardrail policy will back the live demo? (Needs a provisioned Bedrock guardrail ID + credentials — devops.)
-- Production default for guardrail fail mode: open or closed?
-- Should the streaming output path buffer-until-verdict in production, accepting added latency, or stream-then-redact?
+- **Resolved by this revision:** tool-result and tool-call-arg scanning are now in PoC scope (§4.2); the recommended production fail mode is fail-closed on INPUT/tool-result, open on OUTPUT (§4.1).
+- Should the streaming OUTPUT path buffer-until-verdict in production (added latency, full enforcement) or stream-then-redact (lower latency, partial leakage)?
+- For PII findings, is `mask` (default) the right organization-wide default, or should regulated tenants force `block`?
+- Does the chosen LLM provider expose context-limit metadata we can read, or do we accept a static `model → context_limit` table with a conservative fallback?
