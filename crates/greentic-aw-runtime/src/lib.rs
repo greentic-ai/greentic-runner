@@ -80,8 +80,8 @@ pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
 pub use guardrail::{
-    Guardrail, GuardrailAction, GuardrailError, GuardrailStage, GuardrailVerdict, NoopGuardrail,
-    PiiMode, map_apply_guardrail, serialize_output_for_scan,
+    Guardrail, GuardrailAction, GuardrailError, GuardrailStage, GuardrailVerdict,
+    GuardrailingLlmBackend, NoopGuardrail, PiiMode, map_apply_guardrail, serialize_output_for_scan,
 };
 pub use tools::{RedisToolLedger, ToolLedger};
 

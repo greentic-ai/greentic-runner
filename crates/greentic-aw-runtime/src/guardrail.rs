@@ -9,10 +9,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::llm::LlmResponse;
+use crate::error::LlmError;
+use crate::llm::{LlmBackend, LlmRequest, LlmResponse, OnDelta};
 
 /// Which checkpoint a guardrail call covers. Maps to the Bedrock
 /// `ApplyGuardrail` `source` field (`Input` / `Output`). Tool results use
@@ -153,12 +155,175 @@ pub fn map_apply_guardrail(
     GuardrailVerdict { action: GuardrailAction::Block { message }, assessments }
 }
 
+/// OUTPUT-stage decorator: wraps any [`LlmBackend`] and runs the model reply
+/// (content + tool-call args) through a [`Guardrail`] before returning it.
+/// Compose as `GuardrailingLlmBackend( RetryingLlmBackend( <backend> ) )` so it
+/// judges the final text after retries settle. INPUT and tool-result
+/// checkpoints are enforced in `loop.rs`, not here.
+pub struct GuardrailingLlmBackend {
+    inner: Arc<dyn LlmBackend>,
+    guardrail: Arc<dyn Guardrail>,
+    fail_closed: bool,
+    block_message: String,
+}
+
+impl GuardrailingLlmBackend {
+    pub fn new(
+        inner: Arc<dyn LlmBackend>,
+        guardrail: Arc<dyn Guardrail>,
+        fail_closed: bool,
+        block_message: String,
+    ) -> Self {
+        Self { inner, guardrail, fail_closed, block_message }
+    }
+
+    /// Apply the OUTPUT verdict to a completed response.
+    async fn guard_output(&self, response: LlmResponse) -> LlmResponse {
+        let scanned = serialize_output_for_scan(&response);
+        let action = resolve_action(
+            self.guardrail.check(GuardrailStage::Output, &scanned).await,
+            self.fail_closed,
+            &self.block_message,
+        );
+        match action {
+            GuardrailAction::Allow => response,
+            GuardrailAction::Block { message } => LlmResponse {
+                content: Some(message),
+                tool_calls: vec![],
+                tokens_in: response.tokens_in,
+                tokens_out: response.tokens_out,
+            },
+            GuardrailAction::Mask { text } => LlmResponse { content: Some(text), ..response },
+        }
+    }
+}
+
+impl LlmBackend for GuardrailingLlmBackend {
+    fn complete<'a>(
+        &'a self,
+        request: LlmRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self.inner.complete(request).await?;
+            Ok(self.guard_output(response).await)
+        })
+    }
+
+    fn complete_streaming<'a>(
+        &'a self,
+        request: LlmRequest,
+        on_delta: OnDelta,
+    ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Stream-then-redact (PoC default): deltas already reached the
+            // consumer; the verdict applies to the accumulated reply.
+            let response = self.inner.complete_streaming(request, on_delta).await?;
+            Ok(self.guard_output(response).await)
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::llm::LlmResponse;
+    use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
+    use crate::config::LlmProviderRef;
     use crate::state::ToolCallRecord;
+
+    // A guardrail that blocks when the scanned text contains `needle`.
+    struct KeywordBlock { needle: String }
+    impl Guardrail for KeywordBlock {
+        fn check<'a>(&'a self, _s: GuardrailStage, text: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
+            let hit = text.contains(&self.needle);
+            Box::pin(async move {
+                Ok(GuardrailVerdict {
+                    action: if hit { GuardrailAction::Block { message: "blocked".into() } } else { GuardrailAction::Allow },
+                    assessments: serde_json::Value::Null,
+                })
+            })
+        }
+    }
+    struct AlwaysMask;
+    impl Guardrail for AlwaysMask {
+        fn check<'a>(&'a self, _s: GuardrailStage, _t: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
+            Box::pin(async { Ok(GuardrailVerdict { action: GuardrailAction::Mask { text: "MASKED".into() }, assessments: serde_json::Value::Null }) })
+        }
+    }
+    struct AlwaysErr;
+    impl Guardrail for AlwaysErr {
+        fn check<'a>(&'a self, _s: GuardrailStage, _t: &'a str)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardrailVerdict, GuardrailError>> + Send + 'a>> {
+            Box::pin(async { Err(GuardrailError::Backend("down".into())) })
+        }
+    }
+    // An inner backend returning a fixed response.
+    struct Fixed { resp: LlmResponse }
+    impl LlmBackend for Fixed {
+        fn complete<'a>(&'a self, _r: LlmRequest)
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LlmResponse, crate::error::LlmError>> + Send + 'a>> {
+            let r = self.resp.clone();
+            Box::pin(async move { Ok(r) })
+        }
+    }
+    fn req() -> LlmRequest {
+        LlmRequest { system_prompt: String::new(), history: vec![], tools: vec![],
+            provider: LlmProviderRef { provider: "openai".into(), model: "m".into(), credential_ref: None } }
+    }
+
+    #[tokio::test]
+    async fn output_block_replaces_content_and_drops_tool_calls() {
+        let call = ToolCallRecord { call_id: "c".into(), extension_id: "x".into(), tool_name: "t".into(), args: serde_json::json!({}) };
+        let inner = Arc::new(Fixed { resp: resp(Some("here is the BADWORD"), vec![call]) });
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(KeywordBlock { needle: "BADWORD".into() }), false, "safe".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("blocked"));
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_block_detects_keyword_in_tool_args_only() {
+        let call = ToolCallRecord { call_id: "c".into(), extension_id: "x".into(), tool_name: "send".into(), args: serde_json::json!({ "body": "BADWORD" }) };
+        let inner = Arc::new(Fixed { resp: resp(Some("ok"), vec![call]) }); // clean content
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(KeywordBlock { needle: "BADWORD".into() }), false, "safe".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("blocked"));
+        assert!(out.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn output_mask_replaces_content() {
+        let inner = Arc::new(Fixed { resp: resp(Some("my ssn is 123"), vec![]) });
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysMask), false, "safe".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("MASKED"));
+    }
+
+    #[tokio::test]
+    async fn output_allow_passes_through() {
+        let inner = Arc::new(Fixed { resp: resp(Some("totally fine"), vec![]) });
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(NoopGuardrail), false, "safe".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("totally fine"));
+    }
+
+    #[tokio::test]
+    async fn fail_closed_blocks_on_guardrail_error() {
+        let inner = Arc::new(Fixed { resp: resp(Some("fine"), vec![]) });
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), true, "safe-fallback".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("safe-fallback"));
+    }
+
+    #[tokio::test]
+    async fn fail_open_passes_through_on_guardrail_error() {
+        let inner = Arc::new(Fixed { resp: resp(Some("fine"), vec![]) });
+        let g = GuardrailingLlmBackend::new(inner, Arc::new(AlwaysErr), false, "safe-fallback".into());
+        let out = g.complete(req()).await.unwrap();
+        assert_eq!(out.content.as_deref(), Some("fine"));
+    }
 
     fn resp(content: Option<&str>, calls: Vec<ToolCallRecord>) -> LlmResponse {
         LlmResponse {
