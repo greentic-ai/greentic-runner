@@ -46,8 +46,8 @@ mod aw {
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
     use greentic_aw_runtime::{
-        AgentConfig, AgentInput, AgentLimits, AgentRuntime, LlmBackend, LlmProviderRef, Telemetry,
-        TenantContext, TokenMeter,
+        AgentConfig, AgentInput, AgentLimits, AgentRuntime, GuardrailRuntimeConfig, LlmBackend,
+        LlmProviderRef, Telemetry, TenantContext, TokenMeter,
     };
     use greentic_ext_runtime::ExtensionRuntime;
     use serde_json::{Value, json};
@@ -348,8 +348,29 @@ mod aw {
         let ledger = Arc::new(RedisToolLedger::new(manager));
 
         let ext_runtime = super::super::agent_node::build_ext_runtime()?;
-        let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
+        let raw_llm = super::super::agent_node::build_llm_backend(&ext_runtime);
         let telemetry = Arc::new(OtelTelemetry);
+
+        // Build the guardrail once and share the Arc across both seams (OUTPUT
+        // wrap + per-visit INPUT/tool-result config), mirroring the single-agent
+        // path in `agent_node::build_agent_node_handler`.
+        let (llm, guardrail_cfg) = match super::super::agent_node::build_guardrail() {
+            Some((guardrail, cfg)) => {
+                // OUTPUT seam: wrap the backend so model replies are
+                // inspected. OUTPUT stays fail-open per spec §4.1;
+                // INPUT/tool-result use fail_closed_ingress via
+                // AgentRuntime::with_guardrail inside the per-visit closures.
+                let wrapped: Arc<dyn LlmBackend> =
+                    Arc::new(greentic_aw_runtime::GuardrailingLlmBackend::new(
+                        raw_llm,
+                        guardrail,
+                        false,
+                        cfg.block_message.clone(),
+                    ));
+                (wrapped, Some(cfg))
+            }
+            None => (raw_llm, None),
+        };
 
         let graph_count = graphs.len();
         // Build the graph config source: HTTP registry (cached) primary →
@@ -381,6 +402,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
+            guardrail_cfg,
         );
 
         tracing::info!(graph_count, "AW graph runtime constructed");
@@ -430,6 +452,7 @@ mod aw {
             telemetry: Arc<dyn Telemetry>,
             token_meter: Arc<dyn TokenMeter>,
             ledger: Arc<dyn ToolLedger>,
+            guardrail_cfg: Option<GuardrailRuntimeConfig>,
         ) -> Self {
             let agent_turn = build_agent_turn(
                 state_store.clone(),
@@ -438,6 +461,7 @@ mod aw {
                 telemetry.clone(),
                 token_meter.clone(),
                 ledger.clone(),
+                guardrail_cfg.clone(),
             );
             let tool = build_tool(ext_runtime.clone());
             let supervisor = build_supervisor(
@@ -447,6 +471,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                guardrail_cfg,
             );
             Self {
                 graphs,
@@ -717,6 +742,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        guardrail_cfg: Option<GuardrailRuntimeConfig>,
     ) -> AgentTurnFn {
         Arc::new(move |req: AgentTurnRequest| {
             let state_store = state_store.clone();
@@ -725,6 +751,7 @@ mod aw {
             let telemetry = telemetry.clone();
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
+            let guardrail_cfg = guardrail_cfg.clone();
             Box::pin(async move {
                 run_one_agent_turn(
                     req,
@@ -734,6 +761,7 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    guardrail_cfg,
                 )
                 .await
             }) as BoxFut<'static, Result<AgentTurnResult, GraphExecError>>
@@ -752,6 +780,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        guardrail_cfg: Option<GuardrailRuntimeConfig>,
     ) -> Result<AgentTurnResult, GraphExecError> {
         // The request carries no tenant/graph/session — they live on the
         // GraphRunState's seeded session. The executor seeds the run state with
@@ -780,11 +809,12 @@ mod aw {
             },
             limits: AgentLimits::default(),
             memory: None,
-            knowledge: None,        };
+            knowledge: None,
+        };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
-        let runtime = AgentRuntime::new(
+        let base = AgentRuntime::new(
             Arc::new(provider),
             state_store,
             ext_runtime,
@@ -794,6 +824,12 @@ mod aw {
             ledger,
             None,
         );
+        // INPUT + tool-result seam: attach guardrail config when configured,
+        // mirroring the single-agent path in `agent_node`.
+        let runtime = match guardrail_cfg {
+            Some(cfg) => base.with_guardrail(cfg),
+            None => base,
+        };
 
         // The latest user turn is the most recent user message in the seeded log
         // (the executor pushes the initial user message and re-seeds it here);
@@ -833,6 +869,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        guardrail_cfg: Option<GuardrailRuntimeConfig>,
     ) -> SupervisorFn {
         Arc::new(move |req: SupervisorRequest| {
             let state_store = state_store.clone();
@@ -841,6 +878,7 @@ mod aw {
             let telemetry = telemetry.clone();
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
+            let guardrail_cfg = guardrail_cfg.clone();
             Box::pin(async move {
                 run_one_supervisor_turn(
                     req,
@@ -850,6 +888,7 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    guardrail_cfg,
                 )
                 .await
             }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
@@ -882,6 +921,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        guardrail_cfg: Option<GuardrailRuntimeConfig>,
     ) -> Result<SupervisorResult, GraphExecError> {
         let tenant = TenantContext::new("graph", "run");
         let session_id = format!("graph__{}_sup", req.node_id);
@@ -914,11 +954,12 @@ mod aw {
             },
             limits: AgentLimits::default(),
             memory: None,
-            knowledge: None,        };
+            knowledge: None,
+        };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
-        let runtime = AgentRuntime::new(
+        let base = AgentRuntime::new(
             Arc::new(provider),
             state_store,
             ext_runtime,
@@ -930,6 +971,12 @@ mod aw {
             // never offered on this path.
             None,
         );
+        // INPUT + tool-result seam: attach guardrail config when configured,
+        // mirroring the single-agent path in `agent_node`.
+        let runtime = match guardrail_cfg {
+            Some(cfg) => base.with_guardrail(cfg),
+            None => base,
+        };
 
         let input = AgentInput {
             text: String::new(),
