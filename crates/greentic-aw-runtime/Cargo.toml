@@ -13,6 +13,9 @@ test-mock = []
 # bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
 # credit-free canned-reply runtime.
 serve     = ["dep:aw-event-bridge", "dep:async-nats"]
+# AWS Bedrock Guardrails backend. Feature-gated so default builds pull no AWS
+# SDK — verified by `cargo tree | grep aws-sdk-bedrockruntime` printing 0.
+guardrail-bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime"]
 
 [[bin]]
 name = "aw-serve"
@@ -23,6 +26,8 @@ required-features = ["serve", "test-mock"]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 async-nats          = { version = "0.46", optional = true }
+aws-config          = { version = "1", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
 aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }

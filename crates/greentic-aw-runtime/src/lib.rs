@@ -46,6 +46,11 @@ pub mod mock;
 #[cfg(feature = "serve")]
 pub mod serve;
 
+#[cfg(feature = "guardrail-bedrock")]
+pub mod guardrail_bedrock;
+#[cfg(feature = "guardrail-bedrock")]
+pub use guardrail_bedrock::AwsBedrockGuardrail;
+
 pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
