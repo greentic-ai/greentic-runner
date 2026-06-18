@@ -156,6 +156,7 @@ mod tests {
             agent_id: "a-1".into(),
             system_prompt: "sys".into(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),

@@ -55,6 +55,7 @@ mod tests {
             agent_id: agent_id.into(),
             system_prompt: "s".into(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "m".into(),
