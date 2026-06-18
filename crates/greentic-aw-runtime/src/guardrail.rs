@@ -155,6 +155,46 @@ pub fn map_apply_guardrail(
     GuardrailVerdict { action: GuardrailAction::Block { message }, assessments }
 }
 
+/// Decision for untrusted text about to enter conversation history. Returned by
+/// the `loop.rs` INPUT and tool-result checkpoints, which apply it
+/// stage-specifically (input Block short-circuits the step; tool Block swaps in
+/// a withheld-result placeholder).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncomingDecision {
+    Allow,
+    Block { message: String },
+    Mask { text: String },
+}
+
+/// Guard untrusted text destined for `state.messages`.
+pub async fn guard_incoming(
+    guardrail: &dyn Guardrail,
+    stage: GuardrailStage,
+    text: &str,
+    fail_closed: bool,
+    block_fallback: &str,
+) -> IncomingDecision {
+    match resolve_action(guardrail.check(stage, text).await, fail_closed, block_fallback) {
+        GuardrailAction::Allow => IncomingDecision::Allow,
+        GuardrailAction::Block { message } => IncomingDecision::Block { message },
+        GuardrailAction::Mask { text } => IncomingDecision::Mask { text },
+    }
+}
+
+/// Guardrail configuration carried on `AgentRuntime` for the INPUT and
+/// tool-result checkpoints (the OUTPUT checkpoint lives in the decorator).
+#[derive(Clone)]
+pub struct GuardrailRuntimeConfig {
+    pub guardrail: Arc<dyn Guardrail>,
+    /// Fail-closed on the ingress stages (input + tool-result) when the
+    /// guardrail backend errors. Production should set this true.
+    pub fail_closed_ingress: bool,
+    /// Safe reply used when an input message is blocked.
+    pub block_message: String,
+    /// Placeholder JSON-string used when a tool result is blocked.
+    pub tool_block_placeholder: String,
+}
+
 /// OUTPUT-stage decorator: wraps any [`LlmBackend`] and runs the model reply
 /// (content + tool-call args) through a [`Guardrail`] before returning it.
 /// Compose as `GuardrailingLlmBackend( RetryingLlmBackend( <backend> ) )` so it
@@ -224,7 +264,7 @@ impl LlmBackend for GuardrailingLlmBackend {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::llm::{LlmBackend, LlmRequest, LlmResponse};
@@ -271,6 +311,23 @@ mod tests {
     fn req() -> LlmRequest {
         LlmRequest { system_prompt: String::new(), history: vec![], tools: vec![],
             provider: LlmProviderRef { provider: "openai".into(), model: "m".into(), credential_ref: None } }
+    }
+
+    #[tokio::test]
+    async fn guard_incoming_maps_actions() {
+        let block = KeywordBlock { needle: "PII".into() };
+        match guard_incoming(&block, GuardrailStage::Input, "contains PII here", false, "fb").await {
+            IncomingDecision::Block { message } => assert_eq!(message, "blocked"),
+            other => panic!("expected Block, got {other:?}"),
+        }
+        match guard_incoming(&block, GuardrailStage::Input, "clean text", false, "fb").await {
+            IncomingDecision::Allow => {}
+            other => panic!("expected Allow, got {other:?}"),
+        }
+        match guard_incoming(&AlwaysMask, GuardrailStage::Input, "x", false, "fb").await {
+            IncomingDecision::Mask { text } => assert_eq!(text, "MASKED"),
+            other => panic!("expected Mask, got {other:?}"),
+        }
     }
 
     #[tokio::test]

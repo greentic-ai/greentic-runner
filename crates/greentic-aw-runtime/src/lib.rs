@@ -80,8 +80,9 @@ pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
 pub use guardrail::{
-    Guardrail, GuardrailAction, GuardrailError, GuardrailStage, GuardrailVerdict,
-    GuardrailingLlmBackend, NoopGuardrail, PiiMode, map_apply_guardrail, serialize_output_for_scan,
+    Guardrail, GuardrailAction, GuardrailError, GuardrailRuntimeConfig, GuardrailStage,
+    GuardrailVerdict, GuardrailingLlmBackend, IncomingDecision, NoopGuardrail, PiiMode,
+    guard_incoming, map_apply_guardrail, serialize_output_for_scan,
 };
 pub use tools::{RedisToolLedger, ToolLedger};
 
@@ -156,6 +157,11 @@ pub struct AgentRuntime {
     /// `None` disables the knowledge tier. Set via [`AgentRuntime::with_knowledge`];
     /// the concrete backend is injected at the runner-host edge, never compiled in.
     pub(crate) knowledge: Option<Arc<dyn knowledge::Knowledge>>,
+    /// Guardrail configuration for the INPUT and tool-result checkpoints. `None`
+    /// disables guardrailing at these checkpoints (zero runtime cost). Set via
+    /// [`AgentRuntime::with_guardrail`]; the OUTPUT checkpoint is wired separately
+    /// by wrapping the `LlmBackend` with `GuardrailingLlmBackend`.
+    pub(crate) guardrail: Option<crate::guardrail::GuardrailRuntimeConfig>,
 }
 
 impl AgentRuntime {
@@ -185,6 +191,7 @@ impl AgentRuntime {
             components: None,
             long_term_memory: None,
             knowledge: None,
+            guardrail: None,
         }
     }
 
@@ -242,6 +249,15 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_knowledge(mut self, knowledge: Arc<dyn knowledge::Knowledge>) -> Self {
         self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Attach a guardrail for the INPUT and tool-result checkpoints. The OUTPUT
+    /// checkpoint is wired separately by wrapping the `LlmBackend` with
+    /// `GuardrailingLlmBackend`.
+    #[must_use]
+    pub fn with_guardrail(mut self, cfg: crate::guardrail::GuardrailRuntimeConfig) -> Self {
+        self.guardrail = Some(cfg);
         self
     }
 
