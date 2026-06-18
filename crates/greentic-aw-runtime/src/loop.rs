@@ -53,9 +53,55 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
-    state.messages.push(ChatMessage::User {
-        content: message.text,
-    });
+    // --- Assemble guardrail chain (once per step, before any message push) ---
+    // Mandatory refs from the platform policy are resolved first; if any
+    // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
+    let guardrail_chain = {
+        let registry = runtime.ext_runtime.capability_registry();
+        let mandatory = runtime.guardrail_policy.mandatory_guardrails(&tenant);
+        match crate::guardrail::assemble_chain(&registry, &mandatory, &config.guardrails) {
+            Ok(chain) => chain,
+            Err(unresolved) => {
+                return Err(AgentError::GuardrailDenied {
+                    direction: crate::guardrail::GuardrailDirection::Inbound,
+                    code: "internal".to_string(),
+                    message: "A required guardrail is unavailable.".to_string(),
+                    details: serde_json::to_string(
+                        &serde_json::json!({ "unresolved_mandatory": unresolved }),
+                    )
+                    .ok(),
+                });
+            }
+        }
+    };
+    let guardrail_ctx = crate::guardrail::GuardrailRunCtx {
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        tenant_id: tenant.tenant_id.clone(),
+        env_id: tenant.env_id.clone(),
+    };
+
+    // --- Inbound guardrail hook ---
+    let user_text = match crate::guardrail::run_chain(
+        &guardrail_chain,
+        crate::guardrail::GuardrailDirection::Inbound,
+        message.text,
+        &guardrail_ctx,
+        runtime.guardrail_evaluator.as_ref(),
+    ) {
+        crate::guardrail::ChainOutcome::Pass(text) => text,
+        crate::guardrail::ChainOutcome::Denied { info, direction } => {
+            return Err(AgentError::GuardrailDenied {
+                direction,
+                code: info.code,
+                message: info.message,
+                details: info.details,
+            });
+        }
+    };
+    state
+        .messages
+        .push(ChatMessage::User { content: user_text });
 
     // Resolve the per-tenant agentic-worker MCP catalog once per step. The
     // source is infallible (degrades to an empty catalog on any admin/server
@@ -231,6 +277,36 @@ pub async fn run_step(
 
         // --- No tool calls: final reply ---
         reply = response.content.unwrap_or_default();
+        // NOTE: the assistant ChatMessage push and trail push are deferred
+        // until AFTER the outbound guardrail chain so history reflects the
+        // guarded reply, not the raw LLM output.
+        terminated_by = TerminationReason::FinalReply;
+        break;
+    }
+
+    // --- Outbound guardrail hook ---
+    // Run on the candidate reply before it leaves the runtime. History is
+    // written only after this check so saved state reflects the guarded reply.
+    let reply = match crate::guardrail::run_chain(
+        &guardrail_chain,
+        crate::guardrail::GuardrailDirection::Outbound,
+        reply,
+        &guardrail_ctx,
+        runtime.guardrail_evaluator.as_ref(),
+    ) {
+        crate::guardrail::ChainOutcome::Pass(text) => text,
+        crate::guardrail::ChainOutcome::Denied { info, direction } => {
+            return Err(AgentError::GuardrailDenied {
+                direction,
+                code: info.code,
+                message: info.message,
+                details: info.details,
+            });
+        }
+    };
+    // Push the guarded reply into conversation history and the audit trail
+    // now that both inbound and outbound checks have passed.
+    if terminated_by == TerminationReason::FinalReply {
         state.messages.push(ChatMessage::Assistant {
             content: reply.clone(),
             tool_calls: vec![],
@@ -238,8 +314,6 @@ pub async fn run_step(
         trail.push(AgentStep::Reply {
             text: reply.clone(),
         });
-        terminated_by = TerminationReason::FinalReply;
-        break;
     }
 
     state.truncate_history(config.limits.max_history_turns);
@@ -281,6 +355,7 @@ mod tests {
             agent_id: "a".into(),
             system_prompt: "sys".into(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "m".into(),

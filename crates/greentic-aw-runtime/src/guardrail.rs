@@ -19,6 +19,12 @@ impl GuardrailDirection {
     }
 }
 
+impl std::fmt::Display for GuardrailDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GuardrailDenyInfo {
     pub code: String,
@@ -65,6 +71,24 @@ pub trait GuardrailEvaluator: Send + Sync {
 
 pub trait GuardrailPolicy: Send + Sync {
     fn mandatory_guardrails(&self, tenant: &TenantContext) -> Vec<GuardrailRef>;
+}
+
+/// A no-op [`GuardrailEvaluator`] that unconditionally accepts every input.
+///
+/// Used as the default evaluator in [`crate::AgentRuntime`] until a real
+/// WASM-backed evaluator (Task 7) is wired in. This lets the runtime compile
+/// and the inbound/outbound hooks exercise the chain logic without requiring
+/// a populated extension registry.
+pub struct AcceptAllEvaluator;
+
+impl GuardrailEvaluator for AcceptAllEvaluator {
+    fn evaluate(
+        &self,
+        _extension_id: &str,
+        _input: &GuardrailInput,
+    ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
+        Ok(GuardrailVerdict::Accept)
+    }
 }
 
 pub struct NoMandatoryGuardrails;

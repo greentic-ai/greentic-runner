@@ -116,6 +116,14 @@ pub struct AgentRuntime {
     /// per-operator wiring lives in the runner host; tests and non-MCP callers
     /// pass `None`.
     pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
+    /// Policy that supplies platform/tenant-wide mandatory guardrail refs.
+    /// Defaults to [`crate::guardrail::NoMandatoryGuardrails`] (no platform
+    /// enforcement). Replaced by a real policy during runner-host wiring.
+    pub(crate) guardrail_policy: Arc<dyn crate::guardrail::GuardrailPolicy>,
+    /// Evaluator that invokes guardrail WASM extensions.
+    /// Defaults to [`crate::guardrail::AcceptAllEvaluator`] until Task 7
+    /// wires in the real extension-backed evaluator.
+    pub(crate) guardrail_evaluator: Arc<dyn crate::guardrail::GuardrailEvaluator>,
 }
 
 impl AgentRuntime {
@@ -142,7 +150,25 @@ impl AgentRuntime {
             token_meter,
             ledger,
             mcp,
+            guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
+            guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
         }
+    }
+
+    /// Override the guardrail policy and evaluator after construction.
+    ///
+    /// Intended for tests that need to inject a scripted policy/evaluator.
+    /// Only available under the `test-mock` feature so it never ships in
+    /// production builds.
+    #[cfg(feature = "test-mock")]
+    pub fn with_guardrails(
+        mut self,
+        policy: Arc<dyn crate::guardrail::GuardrailPolicy>,
+        evaluator: Arc<dyn crate::guardrail::GuardrailEvaluator>,
+    ) -> Self {
+        self.guardrail_policy = policy;
+        self.guardrail_evaluator = evaluator;
+        self
     }
 
     /// Execute one agentic step against the given session.

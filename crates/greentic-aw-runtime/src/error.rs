@@ -40,6 +40,14 @@ pub enum AgentError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("guardrail denied ({direction}): {message}")]
+    GuardrailDenied {
+        direction: crate::guardrail::GuardrailDirection,
+        code: String,
+        message: String,
+        details: Option<String>,
+    },
 }
 
 impl AgentError {
