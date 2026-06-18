@@ -12,6 +12,7 @@ anyhow.workspace = true
 greentic-runner-host = { workspace = true }
 greentic_pack.workspace = true
 parking_lot.workspace = true
+runner-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_bw.workspace = true
@@ -20,7 +21,6 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 zip.workspace = true
-runner-core.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
