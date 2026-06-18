@@ -191,7 +191,9 @@ pub struct GuardrailRuntimeConfig {
     pub fail_closed_ingress: bool,
     /// Safe reply used when an input message is blocked.
     pub block_message: String,
-    /// Placeholder JSON-string used when a tool result is blocked.
+    /// Fail-closed fallback used when the guardrail backend errors on a tool-result check.
+    /// NOT the explicit-Block placeholder — that withheld-result JSON is hardcoded in the loop
+    /// per spec §4.2.
     pub tool_block_placeholder: String,
 }
 
@@ -327,6 +329,15 @@ mod tests {
         match guard_incoming(&AlwaysMask, GuardrailStage::Input, "x", false, "fb").await {
             IncomingDecision::Mask { text } => assert_eq!(text, "MASKED"),
             other => panic!("expected Mask, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_incoming_fail_closed_blocks_on_backend_error() {
+        // AlwaysErr + fail_closed=true must yield Block with the supplied fallback.
+        match guard_incoming(&AlwaysErr, GuardrailStage::Input, "any text", true, "error-fallback").await {
+            IncomingDecision::Block { message } => assert_eq!(message, "error-fallback"),
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 

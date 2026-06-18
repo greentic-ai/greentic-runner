@@ -783,7 +783,7 @@ mod tests {
         let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
-        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None)
+        let runtime = AgentRuntime::new(cp, store, ext, llm.clone(), telemetry, token_meter, ledger, None)
             .with_guardrail(crate::guardrail::GuardrailRuntimeConfig {
                 guardrail: Arc::new(BlockAll),
                 fail_closed_ingress: true,
@@ -796,5 +796,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.reply, "policy says no");
+        // Verify LLM was never called: the seeded response must still be in the queue.
+        let remaining = llm.responses.lock().expect("mock llm lock poisoned").len();
+        assert_eq!(remaining, 1, "LLM must not be called when input is blocked");
     }
 }
