@@ -49,6 +49,7 @@ hex.workspace = true
 humantime.workspace = true
 indexmap.workspace = true
 lru.workspace = true
+opentelemetry = "0.31"
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true

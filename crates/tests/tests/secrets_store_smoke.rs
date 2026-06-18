@@ -64,6 +64,7 @@ fn invoke_component(wasm: &Path, config: Arc<HostConfig>) -> Result<String> {
         None,
         false,
         None,
+        None,
     )?;
     let policy = Arc::new(RunnerWasiPolicy::default());
     let mut store = Store::new(&engine, ComponentState::new(host_state, policy)?);

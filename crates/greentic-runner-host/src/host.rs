@@ -926,7 +926,9 @@ fn apply_fast2flow_routing_enabled(
 
     match route.directive {
         Fast2FlowDirective::Continue => Ok(activity),
-        Fast2FlowDirective::Dispatch { target, .. } => apply_fast2flow_target(activity, &target),
+        Fast2FlowDirective::Dispatch {
+            target, entities, ..
+        } => apply_fast2flow_target(activity, &target, entities),
         Fast2FlowDirective::Respond { message } => Ok(Activity::custom(
             "response",
             serde_json::json!({ "messages": [{ "text": message }] }),
@@ -951,7 +953,11 @@ fn apply_fast2flow_routing_enabled(
 }
 
 #[cfg(feature = "greentic-x-provider")]
-fn apply_fast2flow_target(activity: Activity, target: &str) -> Result<Activity> {
+fn apply_fast2flow_target(
+    activity: Activity,
+    target: &str,
+    entities: Vec<greentic_x_runtime::Fast2FlowRoutingEntity>,
+) -> Result<Activity> {
     let target = target.trim();
     if target.is_empty() {
         bail!("fast2flow dispatch target is empty");
@@ -960,9 +966,31 @@ fn apply_fast2flow_target(activity: Activity, target: &str) -> Result<Activity> 
         if pack_id.trim().is_empty() || flow_id.trim().is_empty() {
             bail!("fast2flow dispatch target `{target}` must be `pack_id/flow_id` or `flow_id`");
         }
-        return Ok(activity.with_pack(pack_id.trim()).with_flow(flow_id.trim()));
+        return Ok(attach_fast2flow_entities(
+            activity.with_pack(pack_id.trim()).with_flow(flow_id.trim()),
+            entities,
+        ));
     }
-    Ok(activity.with_flow(target))
+    Ok(attach_fast2flow_entities(
+        activity.with_flow(target),
+        entities,
+    ))
+}
+
+#[cfg(feature = "greentic-x-provider")]
+fn attach_fast2flow_entities(
+    activity: Activity,
+    entities: Vec<greentic_x_runtime::Fast2FlowRoutingEntity>,
+) -> Activity {
+    if entities.is_empty() {
+        return activity;
+    }
+    activity.with_payload_field(
+        "fast2flow",
+        serde_json::json!({
+            "entities": entities,
+        }),
+    )
 }
 
 fn resolve_flow_id(runtime: &TenantRuntime, activity: &Activity) -> Result<(String, String)> {
@@ -1536,6 +1564,35 @@ mod identify_endpoints_tests {
         assert!(
             msg.contains(&revision.to_string()),
             "error chain should name the revision id, got: {msg}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "greentic-x-provider"))]
+mod fast2flow_tests {
+    use greentic_x_runtime::Fast2FlowRoutingEntity;
+
+    use super::*;
+
+    #[test]
+    fn dispatch_target_attaches_prefill_entities_to_payload() {
+        let activity = Activity::text("show traffic tomorrow");
+        let routed = apply_fast2flow_target(
+            activity,
+            "telco-x/prefix-traffic",
+            vec![Fast2FlowRoutingEntity::new("date", "20260611").with_format("iso", "2026-06-11")],
+        )
+        .expect("target should route");
+
+        assert_eq!(routed.pack_id(), Some("telco-x"));
+        assert_eq!(routed.flow_id(), Some("prefix-traffic"));
+        assert_eq!(
+            routed.payload()["fast2flow"]["entities"][0]["normalized"],
+            "20260611"
+        );
+        assert_eq!(
+            routed.payload()["fast2flow"]["entities"][0]["formats"]["iso"],
+            "2026-06-11"
         );
     }
 }
