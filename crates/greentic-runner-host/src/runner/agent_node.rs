@@ -346,6 +346,118 @@ mod aw {
         Some(Arc::new(runtime))
     }
 
+    // -----------------------------------------------------------------------
+    // Guardrail env helpers
+    // -----------------------------------------------------------------------
+
+    /// Which external guardrail provider is configured, or none.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum GuardrailChoice {
+        Disabled,
+        Bedrock,
+    }
+
+    /// Map `GREENTIC_AW_GUARDRAIL` to a choice. Pure (no env access) so it is
+    /// unit-testable.
+    pub(crate) fn guardrail_choice(var: Option<&str>) -> GuardrailChoice {
+        match var.map(str::trim) {
+            Some("bedrock") => GuardrailChoice::Bedrock,
+            _ => GuardrailChoice::Disabled,
+        }
+    }
+
+    /// Default message surfaced to the user when a guardrail blocks output.
+    const DEFAULT_BLOCK_MESSAGE: &str =
+        "I can't help with that — it was blocked by a safety policy.";
+
+    /// JSON placeholder inserted into conversation history when a tool result
+    /// is blocked by the guardrail.
+    const DEFAULT_TOOL_PLACEHOLDER: &str =
+        "{\"error\":\"blocked by guardrail policy, result withheld\"}";
+
+    /// Build the configured guardrail (shared `Arc`) + runtime config, or `None`
+    /// when no guardrail is configured. Reads `GREENTIC_AW_GUARDRAIL*` from the
+    /// process environment. Call once per runtime construction site and share the
+    /// returned `Arc` between the OUTPUT wrapper and `with_guardrail`.
+    pub(crate) fn build_guardrail() -> Option<(
+        std::sync::Arc<dyn greentic_aw_runtime::Guardrail>,
+        greentic_aw_runtime::GuardrailRuntimeConfig,
+    )> {
+        let choice =
+            guardrail_choice(std::env::var("GREENTIC_AW_GUARDRAIL").ok().as_deref());
+        let guardrail = build_guardrail_impl(choice)?;
+        let fail_closed_ingress = matches!(
+            std::env::var("GREENTIC_AW_GUARDRAIL_FAILMODE").ok().as_deref(),
+            Some("closed")
+        );
+        let cfg = greentic_aw_runtime::GuardrailRuntimeConfig {
+            guardrail: guardrail.clone(),
+            fail_closed_ingress,
+            block_message: DEFAULT_BLOCK_MESSAGE.to_string(),
+            tool_block_placeholder: DEFAULT_TOOL_PLACEHOLDER.to_string(),
+        };
+        Some((guardrail, cfg))
+    }
+
+    /// Inner: resolve the concrete [`Guardrail`] implementation (or `None`).
+    ///
+    /// Separated from [`build_guardrail`] so the cfg-gated Bedrock arm and the
+    /// feature-off fallback each live in their own, fully-typed block without
+    /// triggering unreachable-code or unused-variable warnings when the
+    /// `guardrail-bedrock` feature is absent.
+    fn build_guardrail_impl(
+        choice: GuardrailChoice,
+    ) -> Option<std::sync::Arc<dyn greentic_aw_runtime::Guardrail>> {
+        match choice {
+            GuardrailChoice::Disabled => None,
+            GuardrailChoice::Bedrock => build_bedrock_guardrail(),
+        }
+    }
+
+    /// Construct the AWS Bedrock guardrail, reading `GREENTIC_AW_GUARDRAIL_ID`,
+    /// `GREENTIC_AW_GUARDRAIL_VERSION`, and `GREENTIC_AW_GUARDRAIL_PII` from env.
+    /// Returns `None` when the feature is off or the guardrail id is empty.
+    #[cfg(feature = "guardrail-bedrock")]
+    fn build_bedrock_guardrail() -> Option<std::sync::Arc<dyn greentic_aw_runtime::Guardrail>> {
+        let id = std::env::var("GREENTIC_AW_GUARDRAIL_ID").unwrap_or_default();
+        let version = std::env::var("GREENTIC_AW_GUARDRAIL_VERSION")
+            .unwrap_or_else(|_| "DRAFT".into());
+        if id.trim().is_empty() {
+            tracing::warn!(
+                "GREENTIC_AW_GUARDRAIL=bedrock but \
+                 GREENTIC_AW_GUARDRAIL_ID is empty; guardrail disabled"
+            );
+            return None;
+        }
+        let pii_mode = match std::env::var("GREENTIC_AW_GUARDRAIL_PII").ok().as_deref() {
+            Some("block") => greentic_aw_runtime::PiiMode::Block,
+            _ => greentic_aw_runtime::PiiMode::Mask,
+        };
+        tracing::info!(guardrail_id = %id, version = %version, "AW guardrail: AWS Bedrock");
+        Some(std::sync::Arc::new(greentic_aw_runtime::AwsBedrockGuardrail::new(
+            id,
+            version,
+            pii_mode,
+            DEFAULT_BLOCK_MESSAGE.to_string(),
+        )))
+    }
+
+    /// When the feature is off and `GREENTIC_AW_GUARDRAIL=bedrock` was requested,
+    /// warn and return `None` so the runtime boots without a guardrail rather than
+    /// panicking.
+    #[cfg(not(feature = "guardrail-bedrock"))]
+    fn build_bedrock_guardrail() -> Option<std::sync::Arc<dyn greentic_aw_runtime::Guardrail>> {
+        tracing::warn!(
+            "GREENTIC_AW_GUARDRAIL=bedrock but built without the \
+             `guardrail-bedrock` feature; guardrail disabled"
+        );
+        None
+    }
+
+    // -----------------------------------------------------------------------
+    // LLM backend
+    // -----------------------------------------------------------------------
+
     /// Resolve the [`LlmBackend`] from the environment.
     ///
     /// Prefers the LLM bridge extension when `GREENTIC_AW_LLM_EXTENSION` is set
@@ -552,22 +664,45 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(
-            AgentRuntime::new(
-                config_provider,
-                state_store,
-                ext_runtime,
-                llm,
-                telemetry,
-                token_meter,
-                ledger,
-                mcp_source_from_env(),
-            )
-            .with_component_source(component_source_from_packs(&packs, &tenant)),
-        );
+        // Build the guardrail once and share the Arc across both seams.
+        let (llm, guardrail_cfg) = match build_guardrail() {
+            Some((guardrail, cfg)) => {
+                // OUTPUT seam: wrap the backend so model replies are inspected.
+                // OUTPUT stays fail-open per spec §4.1; INPUT/tool-result use
+                // fail_closed_ingress via runtime.with_guardrail below.
+                let wrapped: Arc<dyn LlmBackend> = Arc::new(
+                    greentic_aw_runtime::GuardrailingLlmBackend::new(
+                        llm,
+                        guardrail,
+                        false,
+                        cfg.block_message.clone(),
+                    ),
+                );
+                (wrapped, Some(cfg))
+            }
+            None => (llm, None),
+        };
+
+        let runtime = AgentRuntime::new(
+            config_provider,
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+            mcp_source_from_env(),
+        )
+        .with_component_source(component_source_from_packs(&packs, &tenant));
+
+        // INPUT + tool-result seam: attach guardrail config to the runtime loop.
+        let runtime = match guardrail_cfg {
+            Some(cfg) => runtime.with_guardrail(cfg),
+            None => runtime,
+        };
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed (per-tenant creds)");
-        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+        Some(Arc::new(RuntimeAgentNodeHandler::new(Arc::new(runtime))))
     }
 
     /// Construct the shared [`AgentRuntime`] from the environment.
@@ -642,6 +777,24 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
+        // Build the guardrail once and share the Arc across both seams.
+        let (llm, guardrail_cfg) = match build_guardrail() {
+            Some((guardrail, cfg)) => {
+                // OUTPUT seam: wrap the backend so model replies are inspected.
+                // OUTPUT stays fail-open per spec §4.1; INPUT/tool-result use
+                // fail_closed_ingress via runtime.with_guardrail below.
+                let wrapped: Arc<dyn greentic_aw_runtime::LlmBackend> =
+                    Arc::new(greentic_aw_runtime::GuardrailingLlmBackend::new(
+                        llm,
+                        guardrail,
+                        false,
+                        cfg.block_message.clone(),
+                    ));
+                (wrapped, Some(cfg))
+            }
+            None => (llm, None),
+        };
+
         let base = AgentRuntime::new(
             config_provider,
             state_store,
@@ -652,6 +805,11 @@ mod aw {
             ledger,
             mcp_source_from_env(),
         );
+        // INPUT + tool-result seam: attach guardrail config to the runtime loop.
+        let base = match guardrail_cfg {
+            Some(cfg) => base.with_guardrail(cfg),
+            None => base,
+        };
         // Optionally attach an operator-configured native long-term memory
         // backend. With the `long-term-chronicle` feature off (default) this is
         // a no-op and `base` is wrapped unchanged.
@@ -935,6 +1093,18 @@ mod aw {
                     tool_name: "web_search".into()
                 }]
             );
+        }
+
+        // -----------------------------------------------------------------------
+        // guardrail_choice tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn guardrail_choice_maps_env() {
+            assert_eq!(guardrail_choice(Some("bedrock")), GuardrailChoice::Bedrock);
+            assert_eq!(guardrail_choice(Some("  bedrock  ")), GuardrailChoice::Bedrock);
+            assert_eq!(guardrail_choice(Some("nope")), GuardrailChoice::Disabled);
+            assert_eq!(guardrail_choice(None), GuardrailChoice::Disabled);
         }
 
         #[test]
@@ -1367,4 +1537,7 @@ pub use aw::{
 };
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{build_ext_runtime, build_llm_backend};
+// Allow the guardrail helpers to be unused at crate level until consumed by callers
+// wired in subsequent tasks (graph_node, etc.).
+#[allow(unused_imports)]
+pub(crate) use aw::{GuardrailChoice, build_ext_runtime, build_guardrail, build_llm_backend, guardrail_choice};
