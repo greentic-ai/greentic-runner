@@ -217,6 +217,11 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |
+| `GREENTIC_AW_GUARDRAIL` | External guardrail backend: `bedrock` enables AWS Bedrock Guardrails (needs the `guardrail-bedrock` build feature); unset/other → disabled (NoopGuardrail) |
+| `GREENTIC_AW_GUARDRAIL_ID` | Bedrock guardrail identifier (required when `=bedrock`) |
+| `GREENTIC_AW_GUARDRAIL_VERSION` | Bedrock guardrail version (`DRAFT` or a published number; default `DRAFT`) |
+| `GREENTIC_AW_GUARDRAIL_PII` | `mask` (default, redact-and-continue) or `block` for sensitive-information findings |
+| `GREENTIC_AW_GUARDRAIL_FAILMODE` | `open` (default) or `closed`; applies to INPUT + tool-result stages (OUTPUT stays open). AWS creds via the standard chain (`AWS_REGION`, `AWS_ACCESS_KEY_ID`, …) |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 
@@ -227,6 +232,7 @@ Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERI
 - `fault-injection` — testing fault injection
 - `session-redis` — Redis session storage backend
 - `component-v0-6-introspection` — v0.6 component inspection
+- `guardrail-bedrock` — AWS Bedrock Guardrails backend for the agentic worker (implies `agentic-worker`; pulls the AWS SDK, so off by default). Configured via `GREENTIC_AW_GUARDRAIL*` env vars
 
 ## Git Conventions
 
