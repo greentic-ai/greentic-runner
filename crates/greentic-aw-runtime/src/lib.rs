@@ -14,6 +14,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 pub mod component_source;
+pub mod guardrail;
 pub mod config;
 pub mod config_provider;
 pub mod cost;
@@ -78,6 +79,9 @@ pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
+pub use guardrail::{
+    Guardrail, GuardrailAction, GuardrailError, GuardrailStage, GuardrailVerdict, NoopGuardrail,
+};
 pub use tools::{RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
