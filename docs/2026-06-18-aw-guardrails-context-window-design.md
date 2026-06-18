@@ -119,7 +119,9 @@ In the agentic loop, the highest-risk untrusted content is **tool output** (web 
 - it enters as a `ChatMessage::Tool` appended to history after dispatch (`loop.rs:210-213, 297-300`), so on the next iteration `history.last()` is `Tool`, not `User`, and the INPUT gate skips it; and
 - the OUTPUT check only sees the *model's* reply, not the raw tool result that shaped it.
 
-So the PoC adds a minimal INPUT-stage guardrail call in `loop.rs` immediately after a tool result is produced and **before** it is appended to history. On `Block`, the tool result is replaced with a safe placeholder value (e.g. `{"error":"blocked by guardrail policy"}`) so the loop continues without the offending content. On `Mask`, the redacted text replaces the tool content. This is the one place the guardrail reaches into `loop.rs` rather than living purely at the LLM seam; it is intentional and small (a single call guarded by an `Option<Arc<dyn Guardrail>>` on the runtime, defaulting to `None`).
+So the PoC adds a minimal INPUT-stage guardrail call in `loop.rs` immediately after a tool result is produced and **before** it is appended to history. On `Block`, the tool result is replaced with a safe placeholder value (e.g. `{"error":"blocked by guardrail policy, result withheld"}`) so the loop continues without the offending content. On `Mask`, the redacted text replaces the tool content. This is the one place the guardrail reaches into `loop.rs` rather than living purely at the LLM seam; it is intentional and small (a single call guarded by an `Option<Arc<dyn Guardrail>>` on the runtime, defaulting to `None`).
+
+**Loop-behavior caveat:** the model receives the placeholder as the result of a tool call it requested, so it may retry the same tool or hallucinate the withheld value. This is ordinary agent-loop behavior, not a guardrail defect — the placeholder is phrased to signal "withheld, do not retry" rather than "transient error" to nudge graceful give-up, and the existing `max_iter` cap bounds any retry loop. Whether the wording reliably stops retries is **acceptable-as-is for the PoC** and logged as an open question (§8).
 
 ### 4.3 Demo backend `AwsBedrockGuardrail` (feature `guardrail-bedrock`)
 
@@ -160,6 +162,7 @@ Guardrail verdicts (stage, action, assessment summary) are emitted through the e
 - `GuardrailingLlmBackend` with a mock guardrail that masks: asserts the masked text replaces the user/assistant text and the turn continues (no short-circuit).
 - Tool-result hook (`loop.rs`): a mock guardrail that blocks on a keyword in a tool result asserts the offending tool content is replaced with the safe placeholder before it re-enters history.
 - Mask persistence (`loop.rs`): a mock guardrail that masks asserts the **persisted** `state.messages` entry holds the masked text (not the original), for both an input user message and a tool result — proving PII does not re-enter context next turn.
+- **Fail-mode** (`GuardrailingLlmBackend` with a guardrail that returns `GuardrailError`): asserts `failmode=closed` blocks (safe message, inner backend untouched for INPUT) and `failmode=open` passes through. Locks the most security-sensitive behavior with a test, not just prose.
 - `map_apply_guardrail` (pure): unit tests for `NONE → Allow`, denied-topic `INTERVENED → Block`, and PII-anonymized `INTERVENED → Mask` with the `GREENTIC_AW_GUARDRAIL_PII=block` override forcing `Block`.
 - `AwsBedrockGuardrail`: an integration test gated `#[ignore]` requiring real AWS credentials and a provisioned guardrail.
 
@@ -232,6 +235,8 @@ When both features ship, the per-turn order is coherent and non-conflicting:
 
 A Phase-2 summarization call is itself routed through the guardrail decorator, so summarized history cannot launder content past the guardrail.
 
+**Message-identity caveat (input-mask write-back).** The INPUT check scans the last `User` message in `request.history`, but mask-persistence writes back to the last `User` entry in `state.messages` — two different structures once a context strategy is active (`request.history` is the assembled/trimmed view; `state.messages` is the persisted source). In the PoC there is no context strategy, so they are the same object and write-back is unambiguous. When Phase 1 trimming/summarization ships, the masked text must be mapped back to the *persisted* message by stable identity (e.g. a message id or index into `state.messages`), not by re-finding "the last User message" in the trimmed request — otherwise a trim could redirect the write-back to the wrong entry. This mapping is a Phase-1 integration requirement, called out here so it is not lost.
+
 ## 7. Out of scope
 
 - Implementing Cisco AI Defense / Azure Content Safety backends (the trait makes them straightforward follow-ups).
@@ -244,5 +249,6 @@ A Phase-2 summarization call is itself routed through the guardrail decorator, s
 - **Resolved by this revision:** tool-result and tool-call-arg scanning are in PoC scope (§4.2); production fail mode = closed on INPUT/tool-result, open on OUTPUT (§4.1); masked content is persisted (not the original) so PII does not re-enter context (§4.2).
 - **Latency is not yet measured.** Each checkpoint is a serial Bedrock round-trip on the critical path; a tool-using turn adds 3–4 (§4.2). The demo will report measured per-turn overhead; production mitigation (batching / parallel checks / trusted-tool exemption, §5) is a follow-up. How much added latency per turn is acceptable?
 - Should the streaming OUTPUT path buffer-until-verdict in production (added latency, full enforcement) or keep the PoC default stream-then-redact (lower latency, partial leakage)?
+- Does the blocked-tool-result placeholder wording reliably make the model give up gracefully, or does it trigger retry/hallucination? Acceptable-as-is for the PoC (`max_iter` bounds it); worth measuring before production (§4.2).
 - For PII findings, is `mask` (default) the right organization-wide default, or should regulated tenants force `block`?
 - Does the chosen LLM provider expose context-limit metadata we can read, or do we accept a static `model → context_limit` table with a conservative fallback?
