@@ -166,6 +166,97 @@ pub fn assemble_chain(
     Ok(chain)
 }
 
+/// Runtime context for executing a guardrail chain.
+#[derive(Clone, Debug)]
+pub struct GuardrailRunCtx {
+    pub agent_id: String,
+    pub session_id: String,
+    pub tenant_id: String,
+    pub env_id: String,
+}
+
+/// Outcome of running a guardrail chain over content.
+#[derive(Clone, Debug)]
+pub enum ChainOutcome {
+    Pass(String),
+    Denied {
+        info: GuardrailDenyInfo,
+        direction: GuardrailDirection,
+    },
+}
+
+/// Run a chain of guardrails over content in the specified direction.
+///
+/// # Behavior
+///
+/// - Each guardrail in the chain is evaluated in order against the current content.
+/// - If a guardrail returns `Update(new_content)`, the new content is threaded forward to the next guardrail.
+/// - If a guardrail returns `Accept`, execution continues with the content unchanged.
+/// - If a guardrail returns `Deny(info)`, execution stops and `ChainOutcome::Denied` is returned immediately (short-circuit).
+/// - If a guardrail's evaluator returns an error:
+///   - For **mandatory** guardrails: fails closed — returns `ChainOutcome::Denied` with code "internal".
+///   - For **agent-level** guardrails: fails open — logs a warning and continues with content unchanged.
+///
+/// # Parameters
+///
+/// - `chain`: the sequence of resolved guardrails to execute
+/// - `direction`: `Inbound` or `Outbound` (threaded into each GuardrailInput)
+/// - `content`: the initial content to validate/transform
+/// - `ctx`: execution context (agent_id, session_id, tenant_id, env_id)
+/// - `evaluator`: the trait object that invokes guardrail extensions
+///
+/// # Returns
+///
+/// - `ChainOutcome::Pass(final_content)` if all guardrails accept the content (possibly modified)
+/// - `ChainOutcome::Denied { info, direction }` if any guardrail denies or a mandatory guardrail fails
+pub fn run_chain(
+    chain: &[ResolvedGuardrail],
+    direction: GuardrailDirection,
+    content: String,
+    ctx: &GuardrailRunCtx,
+    evaluator: &dyn GuardrailEvaluator,
+) -> ChainOutcome {
+    let mut content = content;
+    for g in chain {
+        let context = if g.config.is_null() {
+            None
+        } else {
+            serde_json::to_string(&g.config).ok()
+        };
+        let input = GuardrailInput {
+            direction,
+            content: content.clone(),
+            agent_id: ctx.agent_id.clone(),
+            session_id: ctx.session_id.clone(),
+            tenant_id: ctx.tenant_id.clone(),
+            env_id: ctx.env_id.clone(),
+            context,
+        };
+        match evaluator.evaluate(&g.extension_id, &input) {
+            Ok(GuardrailVerdict::Accept) => {}
+            Ok(GuardrailVerdict::Update(new_content)) => content = new_content,
+            Ok(GuardrailVerdict::Deny(info)) => {
+                return ChainOutcome::Denied { info, direction };
+            }
+            Err(e) => {
+                if g.mandatory {
+                    tracing::error!(extension_id = %g.extension_id, error = %e.0, "mandatory guardrail failed; failing closed");
+                    return ChainOutcome::Denied {
+                        info: GuardrailDenyInfo {
+                            code: "internal".into(),
+                            message: "A required guardrail is unavailable.".into(),
+                            details: None,
+                        },
+                        direction,
+                    };
+                }
+                tracing::warn!(extension_id = %g.extension_id, error = %e.0, "optional guardrail failed; failing open");
+            }
+        }
+    }
+    ChainOutcome::Pass(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +389,132 @@ mod tests {
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].extension_id, "ext.pii");
         assert!(chain[0].mandatory);
+    }
+
+    /// Fake evaluator for testing run_chain logic.
+    struct ScriptedEvaluator {
+        // extension_id -> verdict (or Err to simulate a trap)
+        script: std::collections::HashMap<String, Result<GuardrailVerdict, ()>>,
+    }
+
+    impl GuardrailEvaluator for ScriptedEvaluator {
+        fn evaluate(
+            &self,
+            extension_id: &str,
+            _input: &GuardrailInput,
+        ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
+            match self.script.get(extension_id) {
+                Some(Ok(v)) => Ok(v.clone()),
+                Some(Err(())) => Err(GuardrailInvokeError("boom".into())),
+                None => Ok(GuardrailVerdict::Accept),
+            }
+        }
+    }
+
+    fn ctx() -> GuardrailRunCtx {
+        GuardrailRunCtx {
+            agent_id: "a1".into(),
+            session_id: "s1".into(),
+            tenant_id: "t1".into(),
+            env_id: "dev".into(),
+        }
+    }
+
+    fn g(ext: &str, mandatory: bool) -> ResolvedGuardrail {
+        ResolvedGuardrail {
+            extension_id: ext.into(),
+            cap_id: "greentic.cap.guardrail.v1".into(),
+            mandatory,
+            config: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn update_feeds_forward() {
+        let mut script = std::collections::HashMap::new();
+        script.insert("a".into(), Ok(GuardrailVerdict::Update("masked".into())));
+        script.insert("b".into(), Ok(GuardrailVerdict::Accept));
+        let eval = ScriptedEvaluator { script };
+        let chain = vec![g("a", false), g("b", false)];
+        let out = run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "raw".into(),
+            &ctx(),
+            &eval,
+        );
+        match out {
+            ChainOutcome::Pass(c) => assert_eq!(c, "masked"),
+            _ => panic!("expected pass"),
+        }
+    }
+
+    #[test]
+    fn deny_short_circuits() {
+        let mut script = std::collections::HashMap::new();
+        script.insert(
+            "a".into(),
+            Ok(GuardrailVerdict::Deny(GuardrailDenyInfo {
+                code: "permission_denied".into(),
+                message: "no".into(),
+                details: None,
+            })),
+        );
+        // "b" would update, but must never run.
+        script.insert(
+            "b".into(),
+            Ok(GuardrailVerdict::Update("should-not-happen".into())),
+        );
+        let eval = ScriptedEvaluator { script };
+        let chain = vec![g("a", false), g("b", false)];
+        let out = run_chain(
+            &chain,
+            GuardrailDirection::Outbound,
+            "raw".into(),
+            &ctx(),
+            &eval,
+        );
+        match out {
+            ChainOutcome::Denied { info, direction } => {
+                assert_eq!(info.code, "permission_denied");
+                assert_eq!(direction, GuardrailDirection::Outbound);
+            }
+            _ => panic!("expected denied"),
+        }
+    }
+
+    #[test]
+    fn mandatory_trap_fails_closed() {
+        let mut script = std::collections::HashMap::new();
+        script.insert("a".into(), Err(()));
+        let eval = ScriptedEvaluator { script };
+        let chain = vec![g("a", true)];
+        let out = run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "raw".into(),
+            &ctx(),
+            &eval,
+        );
+        assert!(matches!(out, ChainOutcome::Denied { .. }));
+    }
+
+    #[test]
+    fn optional_trap_fails_open() {
+        let mut script = std::collections::HashMap::new();
+        script.insert("a".into(), Err(()));
+        let eval = ScriptedEvaluator { script };
+        let chain = vec![g("a", false)];
+        let out = run_chain(
+            &chain,
+            GuardrailDirection::Inbound,
+            "raw".into(),
+            &ctx(),
+            &eval,
+        );
+        match out {
+            ChainOutcome::Pass(c) => assert_eq!(c, "raw"),
+            _ => panic!("expected pass (fail-open)"),
+        }
     }
 }
