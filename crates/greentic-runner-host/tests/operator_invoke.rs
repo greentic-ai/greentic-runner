@@ -638,6 +638,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "operator.component".parse()?,
         name: Some("operator.component".into()),
@@ -764,6 +765,7 @@ fn build_provider_pack_with_schemas(
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "operator.provider".parse()?,
         name: Some("operator.provider".into()),
