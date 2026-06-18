@@ -86,7 +86,10 @@ impl Guardrail for AwsBedrockGuardrail {
                 .and_then(|o| o.text())
                 .map(str::to_string);
             // PII-only when there is at least one sensitive-information
-            // assessment and no topic/content/word-policy intervention.
+            // assessment and no other-policy intervention (topic, content,
+            // word, contextual-grounding, or automated-reasoning).  Any
+            // non-sensitive-information policy firing forces a Block (the safe
+            // direction) rather than mask-and-continue.
             let mut has_pii = false;
             let mut has_other = false;
             for a in out.assessments() {
@@ -96,6 +99,8 @@ impl Guardrail for AwsBedrockGuardrail {
                 if a.topic_policy().is_some()
                     || a.content_policy().is_some()
                     || a.word_policy().is_some()
+                    || a.contextual_grounding_policy().is_some()
+                    || a.automated_reasoning_policy().is_some()
                 {
                     has_other = true;
                 }
