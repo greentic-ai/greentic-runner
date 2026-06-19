@@ -19,6 +19,7 @@ use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 
+use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
 use crate::llm::LlmToolSchema;
@@ -46,9 +47,16 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// LLM-facing `description`/`parameters`. An mcp ref with no matching catalog
 /// entry (or no catalog at all) is logged and dropped, mirroring the
 /// extension-runtime "tool not found" path.
+///
+/// Tools whose `extension_id` starts with `"component:"` are resolved the same
+/// way from the per-tenant [`ComponentToolCatalog`] (`components`): the suffix
+/// is the `component_ref` and `tool_name` the operation, and the catalog
+/// supplies the operation's `description`/`parameters`. A `component:` ref with
+/// no matching catalog entry (or no catalog) is likewise logged and dropped.
 pub fn list_tools_for_llm(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
+    components: Option<&ComponentToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<LlmToolSchema> {
     let mut out = Vec::with_capacity(allowed.len());
@@ -64,6 +72,21 @@ pub fn list_tools_for_llm(
                 None => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
                     "mcp tool not found in catalog; dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
+        if let Some(component_ref) = t.extension_id.strip_prefix("component:") {
+            match components.and_then(|c| c.tool_entry(component_ref, &t.tool_name)) {
+                Some(entry) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: entry.description.clone(),
+                    parameters: entry.parameters.clone(),
+                }),
+                None => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "component tool not found in catalog; dropping from LLM tool list"
                 ),
             }
             continue;
@@ -108,11 +131,18 @@ pub fn list_tools_for_llm(
 /// `server_id`, and dispatch goes over HTTP via
 /// [`crate::mcp_source::dispatch_route`]. An MCP call NEVER yields `Err` — a
 /// missing route or remote failure is surfaced as an `{"error": ...}` value so
-/// the LLM observes it as a normal tool result. Non-mcp ids keep the existing
-/// blocking WASM path.
+/// the LLM observes it as a normal tool result.
+///
+/// Calls whose `extension_id` starts with `"component:"` route through the
+/// per-tenant [`ComponentToolCatalog`] (`components`): the suffix is the
+/// `component_ref` and dispatch goes to the host component invoker via
+/// [`ComponentToolCatalog::dispatch`]. Like the mcp path it NEVER yields `Err`
+/// — an unknown operation or a missing catalog becomes an `{"error": ...}`
+/// value. Other ids keep the existing blocking WASM path.
 pub async fn dispatch_tool_call(
     ext_runtime: Arc<ExtensionRuntime>,
     mcp: Option<Arc<McpToolCatalog>>,
+    components: Option<Arc<ComponentToolCatalog>>,
     call: ToolCallRecord,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
@@ -132,6 +162,29 @@ pub async fn dispatch_tool_call(
                 );
                 serde_json::json!({
                     "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
+                })
+            }
+        };
+        return Ok(value);
+    }
+
+    if let Some(component_ref) = call.extension_id.strip_prefix("component:") {
+        let value = match components.as_deref() {
+            Some(cat) => {
+                let args = call.args.to_string();
+                cat.dispatch(component_ref, &call.tool_name, &args).await
+            }
+            None => {
+                tracing::warn!(
+                    component = %component_ref,
+                    tool = %call.tool_name,
+                    "component call has no catalog wired; returning error value"
+                );
+                serde_json::json!({
+                    "error": format!(
+                        "unknown component tool '{}/{}'",
+                        component_ref, call.tool_name
+                    )
                 })
             }
         };
@@ -302,7 +355,7 @@ mod tests {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
         }];
-        let schemas = list_tools_for_llm(&rt, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, &allowed);
         assert!(schemas.is_empty());
     }
 
@@ -408,7 +461,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "mcp:s1");
@@ -440,7 +493,7 @@ mod tests {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
         }];
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-mcp ref still goes through ext_runtime (unloaded → dropped)"
@@ -494,7 +547,7 @@ mod tests {
             tool_name: "get_issue".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), call)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, call)
             .await
             .expect("mcp dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "ok": 1 }), "got: {out}");
@@ -506,7 +559,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog), missing)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, missing)
             .await
             .expect("missing mcp route still returns Ok");
         assert_eq!(
@@ -522,10 +575,137 @@ mod tests {
             tool_name: "nope".into(),
             args: serde_json::json!({}),
         };
-        let res = dispatch_tool_call(rt, None, non_mcp).await;
+        let res = dispatch_tool_call(rt, None, None, non_mcp).await;
         assert!(
             res.is_err(),
             "non-mcp dispatch against an unloaded extension must error"
         );
+    }
+
+    use crate::component_source::ComponentToolCatalog;
+    use crate::component_source::test_support::{FakeInvoker, one_tool};
+
+    #[test]
+    fn component_ref_listed_from_catalog() {
+        // A catalog-backed component: ref is emitted as an LlmToolSchema with
+        // the catalog's description/parameters; ext_runtime is never consulted.
+        let rt = ExtensionRuntime::for_test();
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": { "order_id": { "type": "string" } }
+        });
+        let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
+        let catalog = ComponentToolCatalog::for_tests(
+            one_tool(
+                "greentic.refund",
+                "issue_refund",
+                "Issue a refund",
+                params.clone(),
+            ),
+            invoker,
+        );
+
+        let allowed = vec![
+            ToolRef {
+                extension_id: "component:greentic.refund".into(),
+                tool_name: "issue_refund".into(),
+            },
+            // Absent from the catalog → dropped (warn), not panicked.
+            ToolRef {
+                extension_id: "component:greentic.refund".into(),
+                tool_name: "missing".into(),
+            },
+        ];
+
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
+        let s = &schemas[0];
+        assert_eq!(s.extension_id, "component:greentic.refund");
+        assert_eq!(s.tool_name, "issue_refund");
+        assert_eq!(s.description, "Issue a refund");
+        assert_eq!(s.parameters, params);
+    }
+
+    #[test]
+    fn non_component_ref_unaffected_by_catalog() {
+        // A plain ext ref still routes through ext_runtime even when a
+        // component catalog is present. The decoy entry is keyed by the FULL
+        // non-prefixed id — if the component branch ever matched it, this entry
+        // would leak into the list and the empty assertion would catch it.
+        let rt = ExtensionRuntime::for_test();
+        let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
+        let catalog = ComponentToolCatalog::for_tests(
+            one_tool(
+                "greentic.tavily",
+                "search",
+                "decoy: must never be emitted for a non-component ref",
+                serde_json::json!({}),
+            ),
+            invoker,
+        );
+        let allowed = vec![ToolRef {
+            extension_id: "greentic.tavily".into(),
+            tool_name: "search".into(),
+        }];
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        assert!(
+            schemas.is_empty(),
+            "non-component ref still goes through ext_runtime (unloaded → dropped)"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_component_ref() {
+        // Catalog entry present → routes to the invoker and returns its value.
+        let invoker = Arc::new(FakeInvoker::new(
+            vec![],
+            Ok(serde_json::json!({ "refund_id": "r-1" })),
+        ));
+        let catalog = Arc::new(ComponentToolCatalog::for_tests(
+            one_tool(
+                "greentic.refund",
+                "issue_refund",
+                "Issue a refund",
+                serde_json::json!({}),
+            ),
+            invoker,
+        ));
+        let rt = Arc::new(ExtensionRuntime::for_test());
+
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "component:greentic.refund".into(),
+            tool_name: "issue_refund".into(),
+            args: serde_json::json!({}),
+        };
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), call)
+            .await
+            .expect("component dispatch never returns Err");
+        assert_eq!(out, serde_json::json!({ "refund_id": "r-1" }), "got: {out}");
+
+        // Unknown op → shaped error value, still Ok.
+        let missing = ToolCallRecord {
+            call_id: "c2".into(),
+            extension_id: "component:greentic.refund".into(),
+            tool_name: "no_such".into(),
+            args: serde_json::json!({}),
+        };
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), missing)
+            .await
+            .expect("missing component op still returns Ok");
+        assert!(out.to_string().contains("error"), "got: {out}");
+
+        // No component catalog wired → shaped error value, still Ok (mirrors
+        // the mcp branch's "no route" behaviour).
+        let no_cat = ToolCallRecord {
+            call_id: "c3".into(),
+            extension_id: "component:greentic.refund".into(),
+            tool_name: "issue_refund".into(),
+            args: serde_json::json!({}),
+        };
+        let out = dispatch_tool_call(rt, None, None, no_cat)
+            .await
+            .expect("component dispatch with no catalog still returns Ok");
+        assert!(out.to_string().contains("error"), "got: {out}");
     }
 }

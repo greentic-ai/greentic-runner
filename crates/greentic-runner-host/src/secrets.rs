@@ -18,6 +18,13 @@ pub type DynSecretsManager = Arc<dyn SecretsManager>;
 #[derive(Clone, Debug)]
 pub enum SecretsBackend {
     Env,
+    /// HTTP secrets broker (greentic-secrets-broker). The `endpoint` is the
+    /// base URL (e.g. `http://secrets-broker:8080`) and `token` is the Bearer
+    /// auth token (may be empty for unauthenticated local deployments).
+    Broker {
+        endpoint: String,
+        token: String,
+    },
 }
 
 impl SecretsBackend {
@@ -29,13 +36,57 @@ impl SecretsBackend {
             .as_str()
         {
             "" | "env" => Ok(SecretsBackend::Env),
+            "broker" => Self::broker_from_strings(
+                "broker",
+                std::env::var("SECRETS_BROKER_ENDPOINT")
+                    .unwrap_or_default()
+                    .as_str(),
+                std::env::var("SECRETS_BROKER_TOKEN")
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
             other => Err(anyhow!("unsupported SECRETS_BACKEND `{other}`")),
         }
+    }
+
+    /// Pure constructor used by both `from_env` and tests. Validates that
+    /// `endpoint` is non-empty; `token` may be empty for unauthenticated use.
+    /// `kind` is passed solely for error-message context.
+    pub(crate) fn broker_from_strings(kind: &str, endpoint: &str, token: &str) -> Result<Self> {
+        let endpoint = endpoint.trim().trim_end_matches('/');
+        if endpoint.is_empty() {
+            return Err(anyhow!(
+                "SECRETS_BACKEND={kind} requires SECRETS_BROKER_ENDPOINT to be set"
+            ));
+        }
+        Ok(SecretsBackend::Broker {
+            endpoint: endpoint.to_owned(),
+            token: token.to_owned(),
+        })
     }
 
     pub fn from_config(cfg: &greentic_config_types::SecretsBackendRefConfig) -> Result<Self> {
         match cfg.kind.trim().to_ascii_lowercase().as_str() {
             "" | "none" | "env" => Ok(SecretsBackend::Env),
+            // `SecretsBackendRefConfig` has no dedicated endpoint/token fields.
+            // When kind="broker", use `reference` as the endpoint (if set) and
+            // fall back to SECRETS_BROKER_ENDPOINT from the environment.
+            // Token always comes from SECRETS_BROKER_TOKEN env.
+            "broker" => {
+                let endpoint = cfg
+                    .reference
+                    .as_deref()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_end_matches('/');
+                let endpoint = if endpoint.is_empty() {
+                    std::env::var("SECRETS_BROKER_ENDPOINT").unwrap_or_default()
+                } else {
+                    endpoint.to_owned()
+                };
+                let token = std::env::var("SECRETS_BROKER_TOKEN").unwrap_or_default();
+                Self::broker_from_strings("broker", &endpoint, &token)
+            }
             other => Err(anyhow!("unsupported secrets backend `{other}`")),
         }
     }
@@ -46,6 +97,9 @@ impl SecretsBackend {
                 ensure_env_secrets_allowed()?;
                 Arc::new(EnvSecretsManager)
             }
+            SecretsBackend::Broker { endpoint, token } => Arc::new(
+                crate::secrets_broker::BrokerSecretsManager::new(endpoint, token),
+            ),
         };
         Ok(CachingSecretsManager::wrap(inner))
     }
@@ -318,6 +372,33 @@ mod tests {
             path,
             "secrets://dev/demo/_/ollama-runtime-repro/ollama_api_key"
         );
+    }
+
+    #[test]
+    fn from_env_parses_broker() {
+        // Test purely via the internal helper — avoids unsafe env mutation
+        // (crate uses #![deny(unsafe_code)]).
+        let b = SecretsBackend::broker_from_strings("broker", "http://localhost:9", "").unwrap();
+        assert!(matches!(b, SecretsBackend::Broker { .. }));
+    }
+
+    #[test]
+    fn from_env_broker_rejects_empty_endpoint() {
+        let err = SecretsBackend::broker_from_strings("broker", "", "").unwrap_err();
+        assert!(
+            err.to_string().contains("SECRETS_BROKER_ENDPOINT"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn from_config_parses_broker() {
+        let b = SecretsBackend::from_config(&SecretsBackendRefConfig {
+            kind: "broker".into(),
+            reference: Some("http://localhost:9".into()),
+        })
+        .unwrap();
+        assert!(matches!(b, SecretsBackend::Broker { .. }));
     }
 
     #[test]

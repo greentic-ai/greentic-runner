@@ -13,21 +13,27 @@
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod component_source;
 pub mod config;
 pub mod config_provider;
 pub mod cost;
+pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
 pub mod guardrail;
 pub mod http_provider;
+pub mod knowledge;
 pub mod layered_provider;
 pub mod llm;
+pub mod llm_credential;
 pub mod llm_extension;
 pub mod llm_openai;
+pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_source;
+pub mod memory;
 pub mod state;
 pub mod state_redis;
 pub mod telemetry;
@@ -37,12 +43,20 @@ pub mod tools;
 #[cfg(feature = "test-mock")]
 pub mod mock;
 
+#[cfg(feature = "serve")]
+pub mod serve;
+
+pub use component_source::{
+    ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
+    ComponentToolSource,
+};
 pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
-pub use error::{AgentError, ConfigError, LlmError, StateError, TerminationReason};
+pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
+pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
@@ -51,8 +65,16 @@ pub use llm_extension::{
     BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
 };
 pub use llm_openai::OpenAiLlmBackend;
+pub use long_term::{
+    EpisodeIngest, EpisodeSource, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
+    RecalledFact,
+};
 pub use manifest_provider::ManifestToolOverlayProvider;
-pub use mcp_source::{McpRoute, McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route};
+pub use mcp_source::{
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpRoute, McpToolCatalog, McpToolEntry,
+    McpToolSource, dispatch_route,
+};
+pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
@@ -124,6 +146,20 @@ pub struct AgentRuntime {
     /// Defaults to [`crate::guardrail::AcceptAllEvaluator`] until Task 7
     /// wires in the real extension-backed evaluator.
     pub(crate) guardrail_evaluator: Arc<dyn crate::guardrail::GuardrailEvaluator>,
+    /// Per-tenant agentic-worker component tool source. `None` disables
+    /// component tools entirely (`component:`-prefixed tool refs then resolve to
+    /// nothing). Set via [`AgentRuntime::with_component_source`]; the concrete
+    /// invoker (over the runner-host `PackRuntime` component host) is injected
+    /// at the runner-host edge, never compiled in.
+    pub(crate) components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
+    /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
+    /// concrete backend is injected at the runner-host edge, never compiled in.
+    pub(crate) long_term_memory: Option<Arc<dyn long_term::LongTermMemory>>,
+    /// Knowledge / RAG (document-corpus) backend (e.g. Chronicle doc-RAG).
+    /// `None` disables the knowledge tier. Set via [`AgentRuntime::with_knowledge`];
+    /// the concrete backend is injected at the runner-host edge, never compiled in.
+    pub(crate) knowledge: Option<Arc<dyn knowledge::Knowledge>>,
 }
 
 impl AgentRuntime {
@@ -152,6 +188,9 @@ impl AgentRuntime {
             mcp,
             guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
+            components: None,
+            long_term_memory: None,
+            knowledge: None,
         }
     }
 
@@ -169,6 +208,79 @@ impl AgentRuntime {
         self.guardrail_evaluator = evaluator;
         self
     }
+
+    /// Wire the component tool source so `component:`-prefixed tool refs resolve
+    /// to greentic `.gtpack` components invoked over the host component runtime.
+    /// Coexists with the MCP/extension tool surfaces; defaults off when not set.
+    #[must_use]
+    pub fn with_component_source(
+        mut self,
+        components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    ) -> Self {
+        self.components = components;
+        self
+    }
+
+    /// Wire the episodic long-term memory backend (e.g. Chronicle). Coexists
+    /// with the short-term/working memory; defaults off when not set.
+    #[must_use]
+    pub fn with_long_term_memory(mut self, memory: Arc<dyn long_term::LongTermMemory>) -> Self {
+        self.long_term_memory = Some(memory);
+        self
+    }
+
+    /// Ingest one episode (conversation turn, document, event) into long-term
+    /// memory. Returns [`LongTermMemoryError::NotConfigured`] when no long-term
+    /// backend is wired.
+    pub async fn remember_episode(
+        &self,
+        tenant: &TenantContext,
+        episode: long_term::EpisodeIngest,
+    ) -> Result<long_term::IngestOutcome, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.ingest_episode(&ctx, episode).await
+    }
+
+    /// Semantic recall over long-term memory. Returns
+    /// [`LongTermMemoryError::NotConfigured`] when no long-term backend is wired.
+    pub async fn recall_long_term(
+        &self,
+        tenant: &TenantContext,
+        query: long_term::RecallQuery,
+    ) -> Result<Vec<long_term::RecalledFact>, long_term::LongTermMemoryError> {
+        let memory = self.long_term_memory.as_ref().ok_or_else(|| {
+            long_term::LongTermMemoryError::NotConfigured("long-term memory not wired".into())
+        })?;
+        let ctx = long_term::to_types_tenant(tenant)?;
+        memory.recall(&ctx, query).await
+    }
+
+    /// Wire the knowledge / RAG backend (e.g. Chronicle doc-RAG). Coexists with
+    /// the memory tiers (distinct `cap://dw.knowledge` capability); defaults off.
+    #[must_use]
+    pub fn with_knowledge(mut self, knowledge: Arc<dyn knowledge::Knowledge>) -> Self {
+        self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// Hybrid retrieval over the agent's knowledge corpus. Returns
+    /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
+    pub async fn search_knowledge(
+        &self,
+        tenant: &TenantContext,
+        query: knowledge::KnowledgeQuery,
+    ) -> knowledge::KnowledgeResult<Vec<knowledge::RetrievedChunk>> {
+        let kb = self
+            .knowledge
+            .as_ref()
+            .ok_or(knowledge::KnowledgeError::NotConfigured)?;
+        let ctx = knowledge::to_types_tenant(tenant)?;
+        kb.search(&ctx, query).await
+    }
+
 
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].

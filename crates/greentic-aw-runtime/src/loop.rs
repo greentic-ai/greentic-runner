@@ -99,15 +99,68 @@ pub async fn run_step(
             });
         }
     };
+    // Keep user_message for long-term memory recall query below.
+    let user_message = user_text.clone();
     state
         .messages
         .push(ChatMessage::User { content: user_text });
+
+    // Whether long-term memory is active for this turn (provider wired + the
+    // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
+    // and background ingest below.
+    let lt_active = crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config);
+
+    // --- Long-term recall: inject relevant facts into this turn's prompt ---
+    let system_prompt = if lt_active {
+        let facts = runtime
+            .recall_long_term(
+                &tenant,
+                crate::long_term::RecallQuery {
+                    query: user_message.clone(),
+                    limit: Some(crate::long_term::AUTO_INJECT_K),
+                },
+            )
+            .await
+            .unwrap_or_default();
+        crate::long_term::augment_system_prompt(&config.system_prompt, &facts)
+    } else {
+        config.system_prompt.clone()
+    };
+
+    // --- Knowledge retrieval: inject relevant corpus chunks (RAG-as-context,
+    // D3). Distinct seam from long-term memory (`cap://dw.knowledge`); both may
+    // augment the same turn, the knowledge block appended after the LT facts.
+    // Retrieval failures degrade to no injection rather than failing the turn.
+    let kn_active = crate::knowledge::knowledge_active(runtime.knowledge.is_some(), &config);
+    let system_prompt = if kn_active {
+        let chunks = runtime
+            .search_knowledge(
+                &tenant,
+                crate::knowledge::KnowledgeQuery {
+                    query: user_message.clone(),
+                    limit: Some(crate::knowledge::auto_top_k(&config)),
+                },
+            )
+            .await
+            .unwrap_or_default();
+        crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+    } else {
+        system_prompt
+    };
 
     // Resolve the per-tenant agentic-worker MCP catalog once per step. The
     // source is infallible (degrades to an empty catalog on any admin/server
     // failure) and TTL-cached, so a stable config does not re-hit the network
     // across iterations. `None` source → no MCP tools at all.
     let mcp_catalog = match runtime.mcp.as_ref() {
+        Some(src) => Some(src.catalog(&tenant).await),
+        None => None,
+    };
+
+    // Resolve the per-tenant component tool catalog once per step (mirrors the
+    // MCP catalog above). Infallible + TTL-cached; `None` source → no
+    // `component:` tools at all.
+    let component_catalog = match runtime.components.as_ref() {
         Some(src) => Some(src.catalog(&tenant).await),
         None => None,
     };
@@ -132,10 +185,17 @@ pub async fn run_step(
             break;
         }
 
-        let tools_schema =
-            list_tools_for_llm(&runtime.ext_runtime, mcp_catalog.as_deref(), &config.tools);
+        let mut tools_schema = list_tools_for_llm(
+            &runtime.ext_runtime,
+            mcp_catalog.as_deref(),
+            component_catalog.as_deref(),
+            &config.tools,
+        );
+        if lt_active {
+            tools_schema.push(crate::long_term::recall_memory_tool_schema());
+        }
         let request = LlmRequest {
-            system_prompt: config.system_prompt.clone(),
+            system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
             tools: tools_schema,
             provider: config.llm.clone(),
@@ -187,6 +247,24 @@ pub async fn run_step(
                 tool_calls: response.tool_calls.clone(),
             });
             for call in response.tool_calls {
+                // --- Host built-in: `recall_memory` (long-term lookup) ---
+                // Intercepted before the allow-list + WASM dispatch; routed to
+                // the runtime's long-term backend instead of an extension.
+                if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
+                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    let result = host_recall_memory(runtime, &tenant, &call).await;
+                    observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: result.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id,
+                        result,
+                    });
+                    continue;
+                }
                 if !is_tool_allowed(&call, &config.tools) {
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -227,6 +305,7 @@ pub async fn run_step(
                 let result = match dispatch_tool_call(
                     runtime.ext_runtime.clone(),
                     mcp_catalog.clone(),
+                    component_catalog.clone(),
                     call.clone(),
                 )
                 .await
@@ -346,6 +425,32 @@ pub async fn run_step(
         warn!(error = %e, "state save failed at end of step");
     }
 
+    // --- Long-term ingest: persist this turn as an episode (fire-and-forget) ---
+    if !reply.is_empty()
+        && lt_active
+        && let Some(memory) = runtime.long_term_memory.clone()
+    {
+        match crate::long_term::to_types_tenant(&tenant) {
+            Ok(ctx) => {
+                let episode = crate::long_term::EpisodeIngest {
+                    name: format!("{session_id}:turn"),
+                    body: format!("{user_message}\n\n{reply}"),
+                    source: crate::long_term::EpisodeSource::Message,
+                    source_description: Some("agentic-worker turn".into()),
+                    reference_time: chrono::Utc::now(),
+                };
+                tokio::spawn(async move {
+                    if let Err(e) = memory.ingest_episode(&ctx, episode).await {
+                        warn!(error = %e, "background long-term ingest failed");
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
+            }
+        }
+    }
+
     runtime.telemetry.record_step(&StepTelemetryCtx {
         tenant_id: tenant.tenant_id.clone(),
         env_id: tenant.env_id.clone(),
@@ -362,6 +467,41 @@ pub async fn run_step(
         trail,
         terminated_by,
     })
+}
+
+/// Handle a host built-in `recall_memory` tool call: parse `query`/`limit` from
+/// the call args, query long-term memory, and return the facts as JSON (or an
+/// error object the LLM can observe and react to).
+async fn host_recall_memory(
+    runtime: &AgentRuntime,
+    tenant: &TenantContext,
+    call: &crate::state::ToolCallRecord,
+) -> serde_json::Value {
+    let query = call
+        .args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let limit = call
+        .args
+        .get("limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(crate::long_term::TOOL_LIMIT);
+    match runtime
+        .recall_long_term(
+            tenant,
+            crate::long_term::RecallQuery {
+                query,
+                limit: Some(limit),
+            },
+        )
+        .await
+    {
+        Ok(facts) => serde_json::json!({ "facts": facts }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
 }
 
 #[cfg(all(test, feature = "test-mock"))]
@@ -384,8 +524,11 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "m".into(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
+            memory: None,
+            knowledge: None,
         }
     }
 
@@ -432,6 +575,86 @@ mod tests {
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// 4b: when a knowledge backend is wired and the agent's binding is enabled,
+    /// retrieved chunks are injected into the system prompt the LLM sees.
+    #[tokio::test]
+    async fn knowledge_chunks_inject_into_system_prompt() {
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("ok".into()),
+            tool_calls: vec![],
+            tokens_in: 1,
+            tokens_out: 1,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+
+        // Config with an enabled knowledge binding (top_k = 3).
+        let mut c = cfg();
+        c.knowledge = Some(crate::config::KnowledgeSettings {
+            knowledge: Some(crate::config::MemoryProviderRef {
+                provider: "provider.knowledge.chronicle".into(),
+                capability: "cap://dw.knowledge".into(),
+                params: serde_json::Map::new(),
+                credential_ref: None,
+            }),
+            embedding: None,
+            top_k: 3,
+        });
+        cp.insert(&tc, "a", c);
+        let cp = Arc::new(cp);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let kb = Arc::new(crate::mock::MockKnowledge::new(vec![
+            crate::knowledge::RetrievedChunk {
+                text: "Refunds are processed within 5 business days.".into(),
+                score: 0.9,
+                doc_id: None,
+                chunk_index: None,
+                metadata: serde_json::Map::new(),
+            },
+        ]));
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm.clone(),
+            telemetry,
+            token_meter,
+            ledger,
+            None,
+        )
+        .with_knowledge(kb);
+
+        runtime
+            .step(
+                tc,
+                "sess-k",
+                "a",
+                AgentInput {
+                    text: "do I get refunds?".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let prompts = llm.seen_system_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains("<knowledge>"),
+            "knowledge block missing from system prompt: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[0].contains("Refunds are processed within 5 business days."),
+            "retrieved chunk missing from system prompt: {}",
+            prompts[0]
+        );
     }
 
     #[derive(Default)]

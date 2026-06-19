@@ -62,15 +62,23 @@ impl LlmExtensionInvoker for RuntimeInvoker {
     }
 }
 
+/// Credential source for [`ExtensionLlmBackend`]: either a frozen static
+/// credential (original behaviour) or a per-request resolver that derives the
+/// credential from `request.provider` at call time.
+enum CredentialSource {
+    Static(BridgeCredential),
+    Resolver(Arc<crate::llm_credential::SecretsBackedCredentialResolver>),
+}
+
 /// `LlmBackend` that delegates to an LLM-bridge extension.
 pub struct ExtensionLlmBackend {
     invoker: Arc<dyn LlmExtensionInvoker>,
     extension_id: String,
-    credential: BridgeCredential,
+    credential: CredentialSource,
 }
 
 impl ExtensionLlmBackend {
-    /// Build over a real `ExtensionRuntime`.
+    /// Build over a real `ExtensionRuntime` with a frozen credential.
     pub fn new(
         ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
         extension_id: impl Into<String>,
@@ -79,11 +87,11 @@ impl ExtensionLlmBackend {
         Self {
             invoker: Arc::new(RuntimeInvoker { ext_runtime }),
             extension_id: extension_id.into(),
-            credential,
+            credential: CredentialSource::Static(credential),
         }
     }
 
-    /// Build over an arbitrary invoker (tests).
+    /// Build over an arbitrary invoker with a frozen credential (tests).
     pub fn with_invoker(
         invoker: Arc<dyn LlmExtensionInvoker>,
         extension_id: impl Into<String>,
@@ -92,7 +100,34 @@ impl ExtensionLlmBackend {
         Self {
             invoker,
             extension_id: extension_id.into(),
-            credential,
+            credential: CredentialSource::Static(credential),
+        }
+    }
+
+    /// Build over an arbitrary invoker with a per-request resolver (tests).
+    pub fn with_resolver(
+        invoker: Arc<dyn LlmExtensionInvoker>,
+        extension_id: impl Into<String>,
+        resolver: Arc<crate::llm_credential::SecretsBackedCredentialResolver>,
+    ) -> Self {
+        Self {
+            invoker,
+            extension_id: extension_id.into(),
+            credential: CredentialSource::Resolver(resolver),
+        }
+    }
+
+    /// Build over a real `ExtensionRuntime` with a per-request resolver
+    /// (production path: mirrors `new()` but resolves credentials dynamically).
+    pub fn with_resolver_runtime(
+        ext_runtime: Arc<greentic_ext_runtime::ExtensionRuntime>,
+        extension_id: impl Into<String>,
+        resolver: Arc<crate::llm_credential::SecretsBackedCredentialResolver>,
+    ) -> Self {
+        Self {
+            invoker: Arc::new(RuntimeInvoker { ext_runtime }),
+            extension_id: extension_id.into(),
+            credential: CredentialSource::Resolver(resolver),
         }
     }
 }
@@ -104,8 +139,15 @@ impl LlmBackend for ExtensionLlmBackend {
     ) -> Pin<Box<dyn Future<Output = Result<LlmResponse, LlmError>> + Send + 'a>> {
         let invoker = self.invoker.clone();
         let ext_id = self.extension_id.clone();
-        let credential = self.credential.clone();
+        let credential_source = match &self.credential {
+            CredentialSource::Static(c) => CredentialSource::Static(c.clone()),
+            CredentialSource::Resolver(r) => CredentialSource::Resolver(r.clone()),
+        };
         Box::pin(async move {
+            let credential = match credential_source {
+                CredentialSource::Static(c) => c,
+                CredentialSource::Resolver(r) => r.resolve(&request.provider).await?,
+            };
             let payload = BridgeRequest {
                 system_prompt: &request.system_prompt,
                 history: &request.history,
@@ -161,6 +203,7 @@ mod tests {
             provider: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o".into(),
+                credential_ref: None,
             },
         }
     }
@@ -235,5 +278,52 @@ mod tests {
         let backend = ExtensionLlmBackend::with_invoker(inv, "llm-openai-bridge", cred());
         let err = backend.complete(req()).await.unwrap_err();
         assert!(matches!(err, LlmError::Decode(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn resolving_backend_uses_request_provider_credential() {
+        use crate::llm_credential::SecretsBackedCredentialResolver;
+        use async_trait::async_trait;
+
+        struct FakeSecrets;
+        #[async_trait]
+        impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                assert_eq!(path, "secrets://default/acme/_/llm/cred-uuid");
+                Ok(b"sk-live".to_vec())
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        let resolver = Arc::new(SecretsBackedCredentialResolver::new(
+            Arc::new(FakeSecrets),
+            "acme",
+        ));
+        let inv = Arc::new(ScriptInvoker {
+            seen: Mutex::new(None),
+            reply: Ok(serde_json::json!({
+                "content": "ok",
+                "tool_calls": [],
+                "tokens_in": 1,
+                "tokens_out": 1
+            })
+            .to_string()),
+        });
+        let backend = ExtensionLlmBackend::with_resolver(inv.clone(), "llm-bridge", resolver);
+        let mut r = req();
+        r.provider.provider = "anthropic".into();
+        r.provider.model = "claude-3-5-sonnet-latest".into();
+        r.provider.credential_ref = Some("cred-uuid".into());
+        backend.complete(r).await.unwrap();
+        let (_ext, _tool, args) = inv.seen.lock().unwrap().clone().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&args).unwrap();
+        assert_eq!(v["credential"]["provider"], "anthropic");
+        assert_eq!(v["credential"]["api_key"], "sk-live");
+        assert_eq!(v["credential"]["model"], "claude-3-5-sonnet-latest");
     }
 }

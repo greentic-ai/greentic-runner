@@ -233,8 +233,25 @@ impl TenantRuntime {
             // Operator config overrides pack-provided agents on collision.
             let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
 
-            if let Some(handler) =
-                crate::runner::agent_node::build_agent_node_handler(merged_agents).await
+            // First-boot ingest of any pack-baked knowledge corpus (W4 4c). Runs
+            // BEFORE the agent runtime mounts its serving knowledge connection:
+            // embedded SurrealDB allows one handle per store directory, so the
+            // temporary ingest connection must open and drop before the serving
+            // mount (inside build_agent_node_handler) opens its own. No-op without
+            // the `knowledge-chronicle` feature or when no pack carries a corpus.
+            #[cfg(feature = "knowledge-chronicle")]
+            {
+                let corpus = crate::runner::knowledge_corpus::collect(&pack_runtimes);
+                crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
+            }
+
+            if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(
+                merged_agents,
+                config.tenant.clone(),
+                Arc::clone(&secrets_manager),
+                pack_runtimes.clone(),
+            )
+            .await
             {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
@@ -278,6 +295,59 @@ impl TenantRuntime {
                 tracing::info!("DwAgentGraph runtime wired into FlowEngine");
             }
         }
+        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
+        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
+        // so the dispatcher must be attached while `engine` is still owned and
+        // mutable. The response listener (which needs the post-build ingress
+        // handle) is spawned further below, after the runtime is constructed.
+        //
+        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
+        // disabled and existing behaviour is unchanged. When set but NATS cannot
+        // be reached we log a warning and continue (the engine simply has no
+        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
+        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(nats_url) => match async_nats::connect(&nats_url).await {
+                Ok(client) => {
+                    engine.set_remote_dispatch_handler(Arc::new(
+                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
+                    ));
+                    Some(client)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        // Resolve how `dw.agent` nodes dispatch. When `GREENTIC_AW_DISPATCH=nats`
+        // is set, the node is rerouted over the durable agentic NATS path instead
+        // of the in-process handler. Must be wired while `engine` is still owned.
+        #[cfg(feature = "agentic-worker")]
+        {
+            let dw_dispatch =
+                crate::runner::agent_node::dw_agent_dispatch_mode(|k| std::env::var(k).ok());
+            engine.set_dw_agent_dispatch(dw_dispatch);
+            if matches!(
+                dw_dispatch,
+                crate::runner::agent_node::DwAgentDispatch::Nats
+            ) && std::env::var("GREENTIC_EVENTS_NATS_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                tracing::warn!(
+                    "GREENTIC_AW_DISPATCH=nats but GREENTIC_EVENTS_NATS_URL is unset; \
+                     dw.agent nodes will fail (no remote dispatch handler). \
+                     Set the NATS URL or unset the flag."
+                );
+            }
+        }
+
         let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
@@ -292,6 +362,33 @@ impl TenantRuntime {
             )
             .context("failed to initialise state machine runtime")?,
         );
+
+        // Spawn the response listeners now that the ingress handle
+        // (`state_machine`) exists. Each listener resumes paused flows by feeding
+        // a synthesized ingress envelope through `StateMachineRuntime::handle`
+        // (see `RuntimeSessionResumer`). The resumer is runtime-agnostic (it
+        // resumes by correlation id), so one shared resumer serves all runtimes;
+        // we run one listener per runtime so every `*.call` node's responses
+        // (`greentic.<runtime>.response.v1`) are consumed. Only started when the
+        // dispatcher above connected successfully.
+        if let Some(client) = dispatch_nats_client {
+            let resumer = Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
+                    &state_machine,
+                )),
+            );
+            for runtime_name in ["sorla", "operala", "agentic"] {
+                tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
+                    client.clone(),
+                    runtime_name.to_string(),
+                    Arc::clone(&resumer)
+                        as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                ));
+            }
+            tracing::info!(
+                "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call"
+            );
+        }
         let http_client = Client::builder().build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),

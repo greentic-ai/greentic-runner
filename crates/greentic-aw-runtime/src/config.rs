@@ -21,6 +21,67 @@ pub struct ToolRef {
 pub struct LlmProviderRef {
     pub provider: String, // "openai" | "anthropic" | ...
     pub model: String,    // "gpt-4o-mini" | "claude-3-haiku" | ...
+    /// Per-tenant credential identifier (admin provider UUID) used by the
+    /// runner to resolve `secrets://default/{tenant}/_/llm/{credential_ref}`.
+    /// `None` falls back to env-keyed credentials (legacy single-provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+/// Reference to a memory provider extension bound to one of an agent's memory
+/// tiers. Mirrors the composer `ProviderBinding` projected into runtime config.
+/// `capability` distinguishes the tier (`cap://memory/short-term` vs
+/// `cap://memory/long-term`).
+// `Eq` deliberately omitted: `params` holds `serde_json::Value`, which is not `Eq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryProviderRef {
+    pub provider: String,
+    pub capability: String,
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+/// Short-term and long-term memory bindings for an agent. Either tier may be
+/// absent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct MemorySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_term: Option<MemoryProviderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term: Option<MemoryProviderRef>,
+}
+
+/// Default number of knowledge chunks auto-retrieved per turn.
+pub(crate) const fn default_knowledge_top_k() -> usize {
+    5
+}
+
+/// Knowledge / RAG binding for an agent (`cap://dw.knowledge`). Distinct from
+/// [`MemorySettings`] (D4): a read-mostly document corpus with auto pre-retrieval,
+/// not evolving conversational memory. `knowledge` is the retrieval provider;
+/// `embedding` is the embedding provider used to build the Chronicle index at the
+/// runner-host edge; `top_k` caps the chunks injected per turn.
+// `Eq` omitted: provider refs carry non-`Eq` `serde_json::Value` params.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KnowledgeSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<MemoryProviderRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<MemoryProviderRef>,
+    #[serde(default = "default_knowledge_top_k")]
+    pub top_k: usize,
+}
+
+impl Default for KnowledgeSettings {
+    fn default() -> Self {
+        Self {
+            knowledge: None,
+            embedding: None,
+            top_k: default_knowledge_top_k(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -42,6 +103,10 @@ pub struct AgentConfig {
     pub llm: LlmProviderRef,
     #[serde(default)]
     pub limits: AgentLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemorySettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<KnowledgeSettings>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -160,9 +225,17 @@ mod limits_serde_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_provider_ref_defaults_credential_ref_to_none() {
+        let r: LlmProviderRef =
+            serde_json::from_str(r#"{ "provider":"anthropic","model":"claude-3" }"#).unwrap();
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.credential_ref, None);
+    }
 
     #[test]
     fn defaults_match_spec_5_2() {
@@ -189,8 +262,11 @@ mod tests {
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),
+                credential_ref: None,
             },
             limits: AgentLimits::default(),
+            memory: None,
+            knowledge: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -222,5 +298,49 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         let back: GuardrailRef = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn agent_config_memory_defaults_to_none_when_omitted() {
+        let json = r#"{
+            "agent_id": "greeter",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.memory.is_none());
+    }
+
+    #[test]
+    fn agent_config_memory_roundtrips_both_tiers() {
+        let json = r#"{
+            "agent_id": "greeter",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" },
+            "memory": {
+                "short_term": { "provider": "redis", "capability": "cap://memory/short-term" },
+                "long_term": {
+                    "provider": "chronicle",
+                    "capability": "cap://memory/long-term",
+                    "params": { "backend": "surrealdb" },
+                    "credential_ref": "vault://acme/surreal"
+                }
+            }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        let mem = cfg.memory.clone().expect("memory present");
+        let long = mem.long_term.expect("long_term present");
+        assert_eq!(long.provider, "chronicle");
+        assert_eq!(long.capability, "cap://memory/long-term");
+        assert_eq!(long.credential_ref.as_deref(), Some("vault://acme/surreal"));
+        assert_eq!(
+            mem.short_term.expect("short_term present").provider,
+            "redis"
+        );
+        let reser = serde_json::to_string(&cfg).unwrap();
+        let back: AgentConfig = serde_json::from_str(&reser).unwrap();
+        assert_eq!(back.memory, cfg.memory);
     }
 }

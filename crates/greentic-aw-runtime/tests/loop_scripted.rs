@@ -6,11 +6,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use greentic_aw_runtime::config::{MemoryProviderRef, MemorySettings};
 use greentic_aw_runtime::cost::MockTokenMeter;
 use greentic_aw_runtime::error::{AgentError, TerminationReason};
 use greentic_aw_runtime::llm::LlmResponse;
+use greentic_aw_runtime::long_term::RecalledFact;
 use greentic_aw_runtime::mock::{
-    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry, NoopToolLedger,
+    MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockLongTermMemory, MockTelemetry,
+    NoopToolLedger,
 };
 use greentic_aw_runtime::state::ToolCallRecord;
 use greentic_aw_runtime::tenant::TenantContext;
@@ -27,6 +30,7 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),
+            credential_ref: None,
         },
         limits: AgentLimits {
             max_iter,
@@ -34,6 +38,8 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
             daily_token_cap_per_tenant: cap,
             ..AgentLimits::default()
         },
+        memory: None,
+        knowledge: None,
     }
 }
 
@@ -264,4 +270,204 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::LlmProviderUnavailable));
+}
+
+fn fact(text: &str) -> RecalledFact {
+    RecalledFact {
+        fact: text.into(),
+        relation: "about".into(),
+        valid_at: None,
+        invalid_at: None,
+        source_episode_ids: vec![],
+    }
+}
+
+fn cfg_with_long_term(max_iter: u32) -> AgentConfig {
+    let mut c = cfg(max_iter, 60_000, vec![], None);
+    c.memory = Some(MemorySettings {
+        short_term: None,
+        long_term: Some(MemoryProviderRef {
+            provider: "provider.memory.chronicle".into(),
+            capability: "cap://memory/long-term".into(),
+            params: serde_json::Map::new(),
+            credential_ref: None,
+        }),
+    });
+    c
+}
+
+/// Build a runtime with a long-term backend attached, returning the captured
+/// LLM mock (for prompt assertions) and the tenant.
+fn build_lt_runtime(
+    llm_script: Vec<Result<LlmResponse, greentic_aw_runtime::error::LlmError>>,
+    cfg_inner: AgentConfig,
+    mem: Arc<MockLongTermMemory>,
+) -> (AgentRuntime, Arc<MockLlmBackend>, TenantContext) {
+    let llm = Arc::new(MockLlmBackend::new(llm_script));
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", cfg_inner);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+    .with_long_term_memory(mem);
+    (rt, llm, tc)
+}
+
+#[tokio::test]
+async fn long_term_facts_are_injected_into_system_prompt() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![fact(
+        "Alice prefers dark mode",
+    )]));
+    let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "what do I like?".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(prompts[0].contains("<long_term_memory>"));
+    assert!(prompts[0].contains("Alice prefers dark mode"));
+}
+
+#[tokio::test]
+async fn no_injection_when_long_term_disabled() {
+    // Provider attached but the agent has no long-term binding -> inactive.
+    let mem = Arc::new(MockLongTermMemory::new(vec![fact("should not appear")]));
+    let (rt, llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem,
+    );
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert_eq!(prompts[0], "sys");
+    assert!(!prompts[0].contains("<long_term_memory>"));
+}
+
+#[tokio::test]
+async fn turn_is_ingested_as_episode_in_background() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("you like dark mode"))],
+        cfg_with_long_term(8),
+        mem.clone(),
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "what do I like?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "you like dark mode");
+
+    // Ingest is fire-and-forget; await it deterministically.
+    mem.wait_for_ingests(1).await;
+    let episodes = mem.ingested();
+    assert_eq!(episodes.len(), 1);
+    assert!(episodes[0].body.contains("what do I like?"));
+    assert!(episodes[0].body.contains("you like dark mode"));
+}
+
+#[tokio::test]
+async fn no_ingest_when_long_term_disabled() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem.clone(),
+    );
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    // Give any erroneously-spawned task a chance to run, then assert none did.
+    tokio::task::yield_now().await;
+    assert!(mem.ingested().is_empty());
+}
+
+#[tokio::test]
+async fn recall_memory_tool_advertised_when_active() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(tools[0].iter().any(|n| n == "recall_memory"));
+}
+
+#[tokio::test]
+async fn recall_memory_tool_absent_when_disabled() {
+    let mem = Arc::new(MockLongTermMemory::new(vec![]));
+    let (rt, llm, tc) = build_lt_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None),
+        mem,
+    );
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(!tools[0].iter().any(|n| n == "recall_memory"));
+}
+
+#[tokio::test]
+async fn recall_memory_call_is_handled_host_side() {
+    // First response: a recall_memory tool call (host built-in). Second: reply.
+    let mem = Arc::new(MockLongTermMemory::new(vec![fact(
+        "Alice prefers dark mode",
+    )]));
+    let (rt, _llm, tc) = build_lt_runtime(
+        vec![
+            Ok(tool_call("c1", "host", "recall_memory")),
+            Ok(final_reply("you prefer dark mode")),
+        ],
+        cfg_with_long_term(8),
+        mem,
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "what do I like?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "you prefer dark mode");
+    // The recall was handled host-side (not dispatched to the ext runtime, which
+    // would have produced a NotFound error), so the tool result carries the fact.
+    let result = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall { name, result, .. } if name == "recall_memory" => {
+                Some(result.clone())
+            }
+            _ => None,
+        })
+        .expect("recall_memory tool call recorded in trail");
+    assert!(result.to_string().contains("Alice prefers dark mode"));
 }

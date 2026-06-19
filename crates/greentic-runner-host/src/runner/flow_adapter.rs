@@ -37,6 +37,43 @@ pub struct RouteIR {
 
 const FLOW_SCHEMA_VERSION: &str = "1.0";
 
+/// Runner-native flow op-keys that must reach the engine **verbatim** as the
+/// node `component` (NOT rewritten into a `component.exec` wrapper).
+///
+/// This is the single source of truth shared by the runtime-flow load path
+/// (`flow_doc_to_ir`, which already preserves these structurally) and the
+/// legacy flow-JSON load path (`normalize_flow_doc` in `pack.rs`, which would
+/// otherwise misclassify any non-`emit.*` op-key as `component.exec`). The
+/// engine's `From<Node>` dispatch (`runner::engine`) matches exactly these
+/// component strings — keep the two sets in lockstep when adding a node type.
+///
+/// `emit.*` prefixes and the self-contained `mcp:<server>/<tool>` ref form are
+/// handled separately by [`is_native_op_key`] because they are prefix-matched
+/// rather than exact.
+const NATIVE_OP_KEYS: &[&str] = &[
+    "flow.call",
+    "provider.invoke",
+    "session.wait",
+    "state.get",
+    "state.set",
+    "dw.agent",
+    "dw.agent_graph",
+    "sorla.call",
+    "operala.call",
+    "agentic.call",
+    "mcp",
+];
+
+/// Whether `key` is a runner-native flow op-key that the engine dispatches
+/// directly (so the loader must preserve it verbatim instead of wrapping it in
+/// a `component.exec` node).
+///
+/// Covers the exact [`NATIVE_OP_KEYS`] plus the `emit.*` builtin family and the
+/// self-contained `mcp:<server>/<tool>` ref form.
+pub(crate) fn is_native_op_key(key: &str) -> bool {
+    key.starts_with("emit.") || key.starts_with("mcp:") || NATIVE_OP_KEYS.contains(&key)
+}
+
 pub fn flow_doc_to_ir(doc: FlowDoc) -> Result<FlowIR> {
     let mut nodes: IndexMap<String, NodeIR> = IndexMap::new();
     for (id, node) in doc.nodes {

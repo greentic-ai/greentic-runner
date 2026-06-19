@@ -4,6 +4,7 @@ members = [
     "crates/greentic-runner-host",
     "crates/greentic-runner-desktop",
     "crates/greentic-aw-runtime",
+    "crates/aw-event-bridge",
     "crates/tests",
     "crates/runner-core",
     "tests/fixtures/packs/secrets_store_smoke/components",
@@ -244,11 +245,11 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.7-research" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.11-research" }
 # The published greentic-types 1.1.0-dev.27002562828 predates the
 # `PackManifest.agents` blob map (added on research, commit e808720) and is
 # resolved by the `<1.2.0-0` consumer cap. The `agents`-carrying build
 # (1.1.0-dev.26731975668) lives only on the research branch and is not yet
 # republished, so redirect the registry requirement onto that branch until a
 # dev build carrying `agents` lands on crates.io.
-greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "ce5ae20f6f68d28408fe7fa54a30cd94ebbd1a46" }
+greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "7f388ec1feb14c263555bba3d3e559bd924373a3" }

@@ -53,10 +53,23 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
+    /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
+    remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
+    /// Controls whether `dw.agent` nodes run in-process (default) or are
+    /// rerouted over the durable agentic NATS path (`GREENTIC_AW_DISPATCH=nats`).
+    #[cfg(feature = "agentic-worker")]
+    dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch,
     #[cfg(feature = "agentic-worker")]
     agent_node_handler: Option<Arc<dyn crate::runner::agent_node::AgentNodeHandler>>,
     #[cfg(feature = "agentic-worker")]
     graph_node_handler: Option<Arc<dyn crate::runner::graph_node::GraphNodeHandler>>,
+    /// Per-tenant MCP tool source for `component == "mcp"` flow nodes
+    /// (role `flow_editor`). Built once from env so the TTL catalog cache is
+    /// shared across nodes/flows. `None` when MCP is unconfigured/opted-out,
+    /// in which case MCP nodes fail gracefully with a clear node error.
+    #[cfg(feature = "agentic-worker")]
+    mcp_tool_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -128,16 +141,57 @@ impl HostNode {
 
 #[derive(Clone, Debug)]
 enum NodeKind {
-    Exec { target_component: String },
-    PackComponent { component_ref: String },
+    Exec {
+        target_component: String,
+    },
+    PackComponent {
+        component_ref: String,
+    },
     ProviderInvoke,
     FlowCall,
-    BuiltinEmit { kind: EmitKind },
+    BuiltinEmit {
+        kind: EmitKind,
+    },
     BuiltinStateGet,
     BuiltinStateSet,
     Wait,
-    DwAgent { agent_id: String },
-    DwAgentGraph { graph_id: String },
+    DwAgent {
+        agent_id: String,
+    },
+    DwAgentGraph {
+        graph_id: String,
+    },
+    /// Native runtime-dispatch node: publishes work to a separate runtime
+    /// (e.g. sorx) via the injected [`RemoteDispatchHandler`]. `target` is the
+    /// node operation (the logical runtime target).
+    SorlaCall {
+        target: String,
+    },
+    /// Native runtime-dispatch node for the Operala runtime. Mirrors
+    /// [`SorlaCall`] but routes to the `"operala"` runtime name.
+    OperalaCall {
+        target: String,
+    },
+    /// Native runtime-dispatch node for an out-of-process agentic runtime.
+    /// Mirrors [`SorlaCall`] but routes to the `"agentic"` runtime name.
+    /// This is an ADDITIONAL path: the in-process `dw.agent` node is
+    /// completely separate and untouched.
+    AgenticCall {
+        target: String,
+    },
+    /// Flow-execution MCP node (LOCKED ENCODING v2): `component == "mcp"` with
+    /// `server`/`tool` carried in the node payload/config. Invokes the named
+    /// MCP tool through the tenant's `flow_editor` MCP catalog (reusing
+    /// `greentic-aw-runtime`'s `McpToolSource`). Completely separate from the
+    /// agent-loop MCP path (role `agentic_worker`).
+    ///
+    /// `server_id`/`tool` here are the values resolved at flow-load time;
+    /// `execute_mcp` re-reads them from the rendered payload (source of truth)
+    /// and only uses these as a fallback for the legacy `operation` encoding.
+    Mcp {
+        server_id: String,
+        tool: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -283,10 +337,15 @@ impl FlowEngine {
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: crate::runner::mcp_node::source_from_env(),
         })
     }
 
@@ -294,6 +353,16 @@ impl FlowEngine {
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {
         self.cross_pack_resolver = Some(resolver);
+    }
+
+    /// Set the handler that bridges `sorla.call` flow nodes into a separate
+    /// runtime over pub/sub. Constructed by the runner binary when a transport
+    /// (e.g. NATS) is configured.
+    pub fn set_remote_dispatch_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) {
+        self.remote_dispatch_handler = Some(handler);
     }
 
     /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
@@ -317,6 +386,23 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::graph_node::GraphNodeHandler>,
     ) {
         self.graph_node_handler = Some(handler);
+    }
+
+    /// Set the dispatch mode for `dw.agent` nodes.
+    ///
+    /// - [`DwAgentDispatch::InProcess`] (default): runs the agent in-process via
+    ///   [`AgentNodeHandler`]. Zero configuration overhead; today's behaviour.
+    /// - [`DwAgentDispatch::Nats`]: reroutes the node over the durable agentic
+    ///   NATS path (`greentic.agentic.request.v1`), identical to an `agentic.call`
+    ///   node. Requires [`set_remote_dispatch_handler`] to also be set.
+    ///
+    /// Called by `runtime.rs` when `GREENTIC_AW_DISPATCH=nats`.
+    ///
+    /// [`AgentNodeHandler`]: crate::runner::agent_node::AgentNodeHandler
+    /// [`set_remote_dispatch_handler`]: FlowEngine::set_remote_dispatch_handler
+    #[cfg(feature = "agentic-worker")]
+    pub fn set_dw_agent_dispatch(&mut self, mode: crate::runner::agent_node::DwAgentDispatch) {
+        self.dw_agent_dispatch = mode;
     }
 
     async fn get_or_load_flow(&self, pack_id: &str, flow_id: &str) -> Result<HostFlow> {
@@ -489,6 +575,7 @@ impl FlowEngine {
                 action: ctx.action,
                 session_id: ctx.session_id,
                 provider_id: ctx.provider_id,
+                reply_scope: ctx.reply_scope,
                 retry_config: ctx.retry_config,
                 attempt: ctx.attempt,
                 observer: ctx.observer,
@@ -738,12 +825,42 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
-            NodeKind::DwAgent { agent_id } => self
-                .execute_dw_agent(ctx, agent_id, payload)
-                .await
-                .map(DispatchOutcome::complete),
+            NodeKind::DwAgent { agent_id } => {
+                #[cfg(feature = "agentic-worker")]
+                match self.dw_agent_dispatch {
+                    crate::runner::agent_node::DwAgentDispatch::Nats => {
+                        // Reroute to the durable out-of-process agentic path.
+                        // Wrap the raw node payload as the dispatch `input` (the
+                        // serve invoker reads `input.user_text`); `await=true` →
+                        // pause+resume, identical to `agentic.call`.
+                        let remote_payload =
+                            serde_json::json!({ "await": true, "input": payload });
+                        self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
+                            .await
+                    }
+                    crate::runner::agent_node::DwAgentDispatch::InProcess => self
+                        .execute_dw_agent(ctx, agent_id, payload)
+                        .await
+                        .map(DispatchOutcome::complete),
+                }
+                #[cfg(not(feature = "agentic-worker"))]
+                self.execute_dw_agent(ctx, agent_id, payload)
+                    .await
+                    .map(DispatchOutcome::complete)
+            }
             NodeKind::DwAgentGraph { graph_id } => self
                 .execute_dw_agent_graph(ctx, graph_id, payload)
+                .await
+                .map(DispatchOutcome::complete),
+            NodeKind::SorlaCall { target } => self.execute_sorla_call(ctx, target, payload).await,
+            NodeKind::OperalaCall { target } => {
+                self.execute_operala_call(ctx, target, payload).await
+            }
+            NodeKind::AgenticCall { target } => {
+                self.execute_agentic_call(ctx, target, payload).await
+            }
+            NodeKind::Mcp { server_id, tool } => self
+                .execute_mcp(ctx, server_id, tool, payload)
                 .await
                 .map(DispatchOutcome::complete),
         }
@@ -784,6 +901,252 @@ impl FlowEngine {
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
              `agentic-worker` feature. Rebuild with --features agentic-worker."
         )
+    }
+
+    /// Dispatch a `sorla.call` flow node to the configured
+    /// [`RemoteDispatchHandler`], publishing the work to a separate runtime.
+    ///
+    /// Input payload contract (JSON):
+    /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
+    ///    "input": any }`.
+    ///
+    /// The correlation id is the canonical session hint (`ctx.session_id`)
+    /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers. The bare hint
+    /// already encodes the conversation; the markers let the resume path
+    /// (`RuntimeSessionResumer`) route the response back to a registered
+    /// `(pack_id, flow_id)` and re-derive the store key. The markers are the
+    /// exact inverse of the resumer's parsing (`::flow=` then `::pack=`,
+    /// split off the trailing end).
+    ///
+    /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
+    /// - `await=false` -> publish + complete immediately with
+    ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    async fn execute_sorla_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "sorla", target, payload)
+            .await
+    }
+
+    /// Dispatch an `operala.call` flow node via the shared remote-dispatch seam.
+    /// Identical to [`execute_sorla_call`] except the runtime name is `"operala"`.
+    async fn execute_operala_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "operala", target, payload)
+            .await
+    }
+
+    /// Dispatch an `agentic.call` flow node via the shared remote-dispatch seam.
+    /// Identical to [`execute_sorla_call`] except the runtime name is `"agentic"`.
+    /// This is the out-of-process agentic path; the in-process `dw.agent` node
+    /// is completely separate and untouched.
+    async fn execute_agentic_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "agentic", target, payload)
+            .await
+    }
+
+    /// Execute a `component == "mcp"` flow node (LOCKED ENCODING v2).
+    ///
+    /// `payload` is the already-rendered node input mapping (the engine
+    /// templates `{{ }}` against flow state before dispatch), shaped
+    /// `{ "server": <id>, "tool": <name>, "arguments": <object>,
+    ///    "output": <optional string state key> }`.
+    ///
+    /// `server`/`tool` are sourced from this payload (the source of truth);
+    /// the `server_id`/`tool` parsed at flow-load time are passed in only as a
+    /// fallback for the legacy `operation = "<server>/<tool>"` encoding. The MCP
+    /// tool is invoked through the tenant's `flow_editor` catalog (reusing
+    /// `greentic-aw-runtime`'s `McpToolSource`); the result value is bound under
+    /// `output` when present, else returned as the node payload.
+    ///
+    /// Graceful by contract: MCP being unconfigured or the tool being
+    /// unreachable yields a structured `{"error": ...}` value — never a panic,
+    /// never an aborted runtime.
+    #[cfg(feature = "agentic-worker")]
+    async fn execute_mcp(
+        &self,
+        ctx: &FlowContext<'_>,
+        server_id: &str,
+        tool: &str,
+        payload: Value,
+    ) -> Result<NodeOutput> {
+        // Payload is the source of truth: prefer the rendered `server`/`tool`
+        // from config, falling back to the values resolved at flow-load time
+        // (legacy `operation`/`mcp:` encoding).
+        let payload_server = crate::runner::mcp_node::str_field(&payload, "server");
+        let payload_tool = crate::runner::mcp_node::str_field(&payload, "tool");
+        let server_id = payload_server.as_deref().unwrap_or(server_id);
+        let tool = payload_tool.as_deref().unwrap_or(tool);
+
+        // `arguments` defaults to `{}` so a no-arg tool needs no config.
+        let arguments = payload
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(JsonMap::new()));
+
+        let result = crate::runner::mcp_node::invoke(
+            self.mcp_tool_source.as_ref(),
+            ctx.tenant,
+            &self.default_env,
+            server_id,
+            tool,
+            &arguments,
+        )
+        .await;
+
+        // Bind the result under the optional `output` state key. When absent,
+        // the raw tool result becomes the node payload (still addressable via
+        // the standard `node.<id>.payload` mechanism).
+        let bound = match payload.get("output").and_then(Value::as_str) {
+            Some(key) if !key.is_empty() => json!({ key: result }),
+            _ => result,
+        };
+        Ok(NodeOutput::new(bound))
+    }
+
+    /// Compile-time stub for the MCP flow node when the agentic-worker feature
+    /// (which carries the MCP runtime deps) is disabled. The node degrades to a
+    /// clear error value rather than failing the build or the run.
+    #[cfg(not(feature = "agentic-worker"))]
+    async fn execute_mcp(
+        &self,
+        _ctx: &FlowContext<'_>,
+        server_id: &str,
+        tool: &str,
+        _payload: Value,
+    ) -> Result<NodeOutput> {
+        Ok(NodeOutput::new(json!({
+            "error": format!(
+                "mcp node '{server_id}/{tool}' requires the agentic-worker feature (MCP runtime not compiled in)"
+            )
+        })))
+    }
+
+    /// Shared body for all native remote-dispatch flow nodes (`sorla.call`,
+    /// `operala.call`, `agentic.call`). Routes through the injected
+    /// [`RemoteDispatchHandler`] with the given `runtime` name.
+    ///
+    /// Input payload contract (JSON):
+    /// `{ "await": bool (default true), "operation": str, "deadline_ms": u64?,
+    ///    "input": any }`.
+    ///
+    /// The correlation id is the canonical session hint (`ctx.session_id`)
+    /// suffixed with `::pack=<pack_id>::flow=<flow_id>` markers so the resume
+    /// path (`RuntimeSessionResumer`) can route the response back.
+    ///
+    /// - `await=true`  -> publish + PAUSE the flow ([`DispatchOutcome::wait`]).
+    /// - `await=false` -> publish + complete immediately with
+    ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
+    ///
+    /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
+    async fn execute_remote_dispatch(
+        &self,
+        ctx: &FlowContext<'_>,
+        runtime: &str,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
+            format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
+        })?;
+
+        let await_mode = payload
+            .get("await")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let operation = payload
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let deadline_ms = payload.get("deadline_ms").and_then(Value::as_u64);
+        let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
+
+        // The resume path (`RuntimeSessionResumer`) recovers `pack_id` and
+        // `flow_id` from `::pack=`/`::flow=` markers on the correlation id to
+        // route the synthesized resume envelope, then strips them to recover the
+        // bare canonical hint used as the store key. So the published
+        // correlation id MUST carry those markers and preserve the bare hint.
+        //
+        // Bare canonical hint = everything before the first `::` marker. This is
+        // robust whether `ctx.session_id` is already bare (the production case)
+        // or has accreted a marker.
+        let raw_hint = ctx.session_id.unwrap_or_default();
+        let bare_hint = raw_hint.split("::").next().unwrap_or_default();
+        // The store key (`FlowResumeStore::save`) hashes the inbound reply
+        // scope's `conversation`/`thread`/`reply_to`. The bare canonical hint
+        // only encodes `conversation`, so a wait saved against a non-empty
+        // `thread`/`reply_to` would be un-keyable on resume. Append OPAQUE
+        // `::thread=`/`::reply=` markers so `RuntimeSessionResumer` can rebuild
+        // the EXACT reply scope and recompute the same `scope_hash`. The remote
+        // bridge echoes the correlation verbatim, so this needs no bridge change.
+        // Markers are omitted when their value is empty (back-compat with the
+        // no-thread case).
+        let mut correlation_id =
+            format!("{}::pack={}::flow={}", bare_hint, ctx.pack_id, ctx.flow_id);
+        if let Some(scope) = ctx.reply_scope {
+            if let Some(thread) = scope.thread.as_deref().filter(|value| !value.is_empty()) {
+                correlation_id.push_str("::thread=");
+                correlation_id.push_str(thread);
+            }
+            if let Some(reply_to) = scope.reply_to.as_deref().filter(|value| !value.is_empty()) {
+                correlation_id.push_str("::reply=");
+                correlation_id.push_str(reply_to);
+            }
+        }
+        let mode = if await_mode {
+            greentic_types::DispatchMode::Await
+        } else {
+            greentic_types::DispatchMode::FireAndForget
+        };
+
+        let action = handler
+            .dispatch(crate::runner::remote_dispatch::RemoteDispatch {
+                tenant: ctx.tenant.to_string(),
+                env: self.default_env.clone(),
+                runtime: runtime.to_string(),
+                target: target.to_string(),
+                operation,
+                mode,
+                correlation_id: correlation_id.clone(),
+                input: inner_input,
+                deadline_ms,
+            })
+            .await?;
+
+        match action {
+            crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
+                correlation_id,
+            } => {
+                let reason = format!("await-runtime:{correlation_id}");
+                let output = NodeOutput::new(serde_json::json!({
+                    "pending": true,
+                    "correlation_id": correlation_id,
+                }));
+                Ok(DispatchOutcome::wait(output, Some(reason)))
+            }
+            crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched => {
+                let output = NodeOutput::new(serde_json::json!({
+                    "dispatched": true,
+                    "correlation_id": correlation_id,
+                }));
+                Ok(DispatchOutcome::complete(output))
+            }
+        }
     }
 
     /// Dispatch a `DwAgentGraph` flow node to the configured
@@ -987,6 +1350,7 @@ impl FlowEngine {
             action: Some(action),
             session_id: ctx.session_id,
             provider_id: ctx.provider_id,
+            reply_scope: ctx.reply_scope,
             retry_config: ctx.retry_config,
             attempt: ctx.attempt,
             observer: ctx.observer,
@@ -1884,7 +2248,13 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("emit.")
             || full_ref.starts_with("session.")
             || full_ref.starts_with("provider.")
-            || full_ref.starts_with("dw.");
+            || full_ref.starts_with("dw.")
+            || full_ref.starts_with("sorla.")
+            || full_ref.starts_with("operala.")
+            || full_ref.starts_with("agentic.")
+            // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
+            // into a `component.operation` pair.
+            || full_ref.starts_with("mcp:");
         let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
             (full_ref, node.component.operation.clone())
         } else if let Some(dot) = full_ref.rfind('.') {
@@ -1943,9 +2313,33 @@ impl From<Node> for HostNode {
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
                 },
+                "sorla.call" => NodeKind::SorlaCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
+                "operala.call" => NodeKind::OperalaCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
+                "agentic.call" => NodeKind::AgenticCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
+                // LOCKED ENCODING v2 (shared with greentic-flow + designer):
+                // `component == "mcp"` (a valid `ComponentId`) with `server` and
+                // `tool` carried in the node PAYLOAD/config:
+                //   payload = { server, tool, arguments, output? }.
+                // The payload is the source of truth. A legacy
+                // `operation = "<server>/<tool>"` (or an `mcp:<server>/<tool>`
+                // component ref) is honored only as a defensive fallback when the
+                // payload lacks the fields, so older packs keep loading.
+                "mcp" => mcp_node_kind(&node.input.mapping, raw_operation.as_deref()),
+                // `mcp:<server>/<tool>` carried verbatim in `component.id`.
+                // `greentic_types::ComponentId` rejects `:`/`/`, so this form
+                // only survives when the node-type string bypasses ComponentId
+                // validation; it is still recognized as a fallback for older
+                // packs.
+                comp if comp.starts_with("mcp:") => mcp_node_kind(&node.input.mapping, Some(comp)),
                 other => NodeKind::PackComponent {
                     component_ref: other.to_string(),
                 },
@@ -1962,6 +2356,10 @@ impl From<Node> for HostNode {
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
+            NodeKind::SorlaCall { .. } => "sorla.call".to_string(),
+            NodeKind::OperalaCall { .. } => "operala.call".to_string(),
+            NodeKind::AgenticCall { .. } => "agentic.call".to_string(),
+            NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
             None
@@ -1986,6 +2384,42 @@ impl From<Node> for HostNode {
             routing: node.routing,
         }
     }
+}
+
+/// Classify a `component == "mcp"` node into [`NodeKind::Mcp`].
+///
+/// LOCKED ENCODING v2: `server` and `tool` are read from the node
+/// `payload`/config object (the source of truth). When the payload omits them,
+/// a legacy `operation = "<server>/<tool>"` string (or an
+/// `mcp:<server>/<tool>` component ref) is parsed as a defensive fallback for
+/// older packs.
+///
+/// When neither source yields a usable `(server, tool)` pair the node falls
+/// back to an ordinary [`NodeKind::PackComponent`], so a malformed MCP node
+/// surfaces as a normal unknown-component error at run time rather than
+/// panicking at load. Flow loading stays total.
+fn mcp_node_kind(payload: &Value, legacy_ref: Option<&str>) -> NodeKind {
+    if let Some((server_id, tool)) = crate::runner::mcp_node::server_tool_from_payload(payload) {
+        return NodeKind::Mcp { server_id, tool };
+    }
+    if let Some((server_id, tool)) = legacy_ref.and_then(parse_legacy_mcp_ref) {
+        return NodeKind::Mcp { server_id, tool };
+    }
+    NodeKind::PackComponent {
+        component_ref: "mcp".to_string(),
+    }
+}
+
+/// Parse a legacy MCP server/tool reference, accepting either the bare
+/// `"<server>/<tool>"` operation form or the prefixed `mcp:<server>/<tool>`
+/// component-ref form. Returns `None` when either part is missing or empty.
+fn parse_legacy_mcp_ref(reference: &str) -> Option<(String, String)> {
+    let rest = reference.strip_prefix("mcp:").unwrap_or(reference);
+    let (server, tool) = rest.split_once('/')?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server.to_string(), tool.to_string()))
 }
 
 fn extract_target_component(payload: &Value) -> Option<String> {
@@ -2602,10 +3036,15 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         }
     }
 
@@ -2836,6 +3275,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -2901,6 +3341,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -3026,10 +3467,15 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -3041,6 +3487,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3101,9 +3548,11 @@ mod tests {
                 llm: LlmProviderRef {
                     provider: "mock".into(),
                     model: "m".into(),
+                    credential_ref: None,
                 },
                 limits: AgentLimits::default(),
-            },
+                memory: None,
+                knowledge: None,            },
         );
         let config_provider = Arc::new(config_provider);
         let token_meter = Arc::new(MockTokenMeter::new(0));
@@ -3171,10 +3620,15 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: Some(handler),
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3185,6 +3639,7 @@ mod tests {
             action: None,
             session_id: Some("sess-1"),
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3305,10 +3760,15 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: Some(handler_dyn),
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -3319,6 +3779,7 @@ mod tests {
             action: None,
             session_id: Some("sess-1"),
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3352,6 +3813,170 @@ mod tests {
         assert!(
             output_str.contains("graph-pong"),
             "expected graph reply in flow output, got: {output_str}"
+        );
+    }
+
+    /// When `GREENTIC_AW_DISPATCH=nats` is set, a `dw.agent` node must be
+    /// rerouted through the remote-dispatch path (`"agentic"` runtime) rather
+    /// than calling the in-process `AgentNodeHandler`. The node payload is
+    /// wrapped as `input`, `await=true` is injected, and the engine pauses
+    /// (returns a wait outcome, not a complete one).
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn dw_agent_nats_mode_dispatches_remote() {
+        use std::sync::Mutex;
+
+        use crate::runner::agent_node::DwAgentDispatch;
+        use crate::runner::remote_dispatch::{RemoteDispatch, RemoteDispatchAction, RemoteDispatchHandler};
+
+        /// Recording stub: captures the last dispatch and returns
+        /// `AwaitingResponse` so the engine pauses.
+        struct RecordingDispatcher {
+            seen: Mutex<Option<RemoteDispatch>>,
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteDispatchHandler for RecordingDispatcher {
+            async fn dispatch(&self, request: RemoteDispatch) -> anyhow::Result<RemoteDispatchAction> {
+                let corr = request.correlation_id.clone();
+                *self.seen.lock().unwrap() = Some(request);
+                Ok(RemoteDispatchAction::AwaitingResponse {
+                    correlation_id: corr,
+                })
+            }
+        }
+
+        let dispatcher = Arc::new(RecordingDispatcher {
+            seen: Mutex::new(None),
+        });
+
+        // --- two-node flow: dw.agent → emit (resume target) ---
+        // The agent node must have Routing::Next so the engine knows where to
+        // resume once the async response arrives (same requirement as sorla.call /
+        // agentic.call nodes in production).
+        let resume_id = NodeId::from_str("after-agent").unwrap();
+        let node_id = NodeId::from_str("agent-nats").unwrap();
+        let agent_node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: resume_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+        let resume_node = Node {
+            id: resume_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "done" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), agent_node);
+        nodes.insert(resume_id.clone(), resume_node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("nats-agent.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "nats-agent.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(dispatcher.clone() as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: DwAgentDispatch::Nats,
+            #[cfg(feature = "agentic-worker")]
+            // No in-process handler wired — Nats path must NOT call it.
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "nats-agent.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-nats"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(ctx, json!({ "user_text": "hi" })))
+            .unwrap();
+
+        // The Nats path pauses the flow (await=true → DispatchOutcome::wait).
+        assert!(
+            matches!(result.status, FlowStatus::Waiting(_)),
+            "expected Waiting outcome from dw.agent Nats mode, got: {:?}",
+            result.status
+        );
+
+        // The dispatcher must have been called with runtime="agentic" and
+        // target=<agent_id>, and the node payload wrapped as `input`.
+        let seen = dispatcher.seen.lock().unwrap();
+        let dispatch = seen.as_ref().expect("dispatcher was not called");
+        assert_eq!(dispatch.runtime, "agentic", "runtime name must be 'agentic'");
+        assert_eq!(dispatch.target, "greeter", "target must be the agent_id");
+        assert_eq!(
+            dispatch.input,
+            json!({ "user_text": "hi" }),
+            "node payload must be forwarded as dispatch input"
         );
     }
 
@@ -3414,10 +4039,15 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
             agent_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
         }
     }
 
@@ -3431,6 +4061,7 @@ mod tests {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config: RetryConfig {
                 max_attempts: 1,
                 base_delay_ms: 1,
@@ -3577,6 +4208,287 @@ mod tests {
             other => panic!("expected Next(\"next\"), got {other:?}"),
         }
     }
+
+    /// Live end-to-end test: `dw.agent` NATS dispatch path.
+    ///
+    /// Requires a real NATS server (JetStream not needed for this test — core
+    /// NATS pub/sub is sufficient) and an `aw-serve` consumer (or the in-process
+    /// fake bridge below acts as one).
+    ///
+    /// # Run recipe
+    ///
+    /// ```text
+    /// # Terminal 1 – NATS server (JetStream-enabled for prod parity, but core works too)
+    /// nats-server -js
+    ///
+    /// # Terminal 2 – aw-serve test-mock (replies "pong" for any agent)
+    /// AW_SERVE_AGENT_ID=greeter AW_SERVE_REPLY=pong \
+    ///   GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 \
+    ///   GREENTIC_AW_JETSTREAM=off \
+    ///   cargo run -p greentic-aw-runtime --features serve,test-mock --bin aw-serve
+    ///
+    /// # Terminal 3 – run this ignored test
+    /// GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 \
+    ///   cargo test -p greentic-runner-host --lib \
+    ///   tests::dw_agent_scale_to_zero_nats_e2e \
+    ///   -- --nocapture --ignored
+    /// ```
+    ///
+    /// When `GREENTIC_EVENTS_NATS_URL` is unset the test skips immediately.
+    /// The test wires its own in-process fake bridge so the `aw-serve` binary is
+    /// optional; running with the real `aw-serve` exercises the full out-of-process
+    /// path. Both variants must produce a resumed reply of `"pong"`.
+    #[cfg(feature = "agentic-worker")]
+    #[tokio::test]
+    #[ignore = "requires live NATS; run with --ignored after `nats-server -js`"]
+    async fn dw_agent_scale_to_zero_nats_e2e() {
+        use crate::runner::agent_node::DwAgentDispatch;
+        use crate::runner::dispatch_listener::{SessionResumer, run_response_listener};
+        use crate::runner::remote_dispatch::NatsDispatcher;
+        use futures::StreamExt as _;
+        use greentic_types::{RuntimeDispatchResponse, TenantCtx as DispatchTenantCtx, request_topic, response_topic};
+        use tokio::sync::Notify;
+
+        let nats_url = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping dw_agent_scale_to_zero_nats_e2e: GREENTIC_EVENTS_NATS_URL not set");
+                return;
+            }
+        };
+
+        // ── 1. Build a two-node flow: dw.agent → emit.log (resume target) ──
+        // The agent node must have Routing::Next so the engine knows the resume
+        // target (same requirement as agentic.call / sorla.call in production).
+        let resume_id = NodeId::from_str("after-agent").unwrap();
+        let agent_node_id = NodeId::from_str("agent-e2e").unwrap();
+        let agent_node = Node {
+            id: agent_node_id.clone(),
+            component: FlowComponentRef {
+                id: "dw.agent".parse().unwrap(),
+                pack_alias: None,
+                operation: Some("greeter".to_string()),
+            },
+            input: InputMapping {
+                mapping: json!({ "user_text": "ping" }),
+            },
+            output: OutputMapping { mapping: Value::Null },
+            err_map: None,
+            routing: Routing::Next { node_id: resume_id.clone() },
+            telemetry: TelemetryHints::default(),
+        };
+        let resume_node = Node {
+            id: resume_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "resumed" }),
+            },
+            output: OutputMapping { mapping: Value::Null },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(agent_node_id.clone(), agent_node);
+        nodes.insert(resume_id.clone(), resume_node);
+        let flow = greentic_types::Flow {
+            schema_version: "1.0".into(),
+            id: greentic_types::FlowId::from_str("e2e-agent.flow").unwrap(),
+            kind: greentic_types::FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(agent_node_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        // ── 2. Connect NATS clients ──
+        let dispatcher_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: dispatcher client");
+        let bridge_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: fake bridge client");
+        let listener_client = async_nats::connect(&nats_url)
+            .await
+            .expect("NATS: response listener client");
+
+        // ── 3. Fake bridge: subscribe to agentic request subject, reply "pong" ──
+        let agentic_request_subject = request_topic("agentic");
+        let agentic_response_subject = response_topic("agentic");
+        let mut req_sub = bridge_client
+            .subscribe(agentic_request_subject.clone())
+            .await
+            .expect("fake bridge: subscribe to agentic request subject");
+        let bridge_reply_client = bridge_client.clone();
+        let reply_subject = agentic_response_subject.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = req_sub.next().await {
+                let headers = msg.headers.as_ref();
+                let get_hdr = |name: &str| {
+                    headers
+                        .and_then(|h| h.get(name))
+                        .map(|v| v.as_str().to_owned())
+                        .unwrap_or_default()
+                };
+                let correlation_id = get_hdr("Greentic-Correlation-Id");
+                let tenant = get_hdr("Greentic-Tenant");
+                let env = get_hdr("Greentic-Env");
+
+                let response_payload = RuntimeDispatchResponse {
+                    ok: true,
+                    output: json!({
+                        "reply": "pong",
+                        "trail": [],
+                        "terminated_by": "final_reply"
+                    }),
+                    events: vec![],
+                    error: None,
+                };
+                let body = serde_json::to_vec(&response_payload)
+                    .expect("serialize fake bridge response");
+
+                let mut resp_headers = async_nats::HeaderMap::new();
+                resp_headers.insert("Greentic-Correlation-Id", correlation_id.as_str());
+                resp_headers.insert("Greentic-Tenant", tenant.as_str());
+                resp_headers.insert("Greentic-Env", env.as_str());
+
+                bridge_reply_client
+                    .publish_with_headers(reply_subject.clone(), resp_headers, body.into())
+                    .await
+                    .expect("fake bridge: publish response");
+            }
+        });
+
+        // ── 4. Recording resumer + run_response_listener ──
+        struct RecordingResumer {
+            calls: std::sync::Mutex<Vec<(String, Value)>>,
+            notify: Notify,
+        }
+
+        impl RecordingResumer {
+            fn new() -> Self {
+                Self {
+                    calls: std::sync::Mutex::new(vec![]),
+                    notify: Notify::new(),
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl SessionResumer for RecordingResumer {
+            async fn resume(
+                &self,
+                _tenant: DispatchTenantCtx,
+                correlation_id: &str,
+                output: Value,
+            ) -> anyhow::Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((correlation_id.to_string(), output));
+                self.notify.notify_one();
+                Ok(())
+            }
+        }
+
+        let resumer = Arc::new(RecordingResumer::new());
+        let resumer_for_listener = resumer.clone();
+        tokio::spawn(async move {
+            run_response_listener(listener_client, "agentic".to_owned(), resumer_for_listener)
+                .await
+                .expect("response listener exited unexpectedly");
+        });
+
+        // Give subscriptions a moment to register.
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        // ── 5. Build FlowEngine with NatsDispatcher + DwAgentDispatch::Nats ──
+        let nats_engine_dispatcher = Arc::new(NatsDispatcher::new(dispatcher_client));
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "e2e-pack".to_string(),
+                    flow_id: "e2e-agent.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: crate::validate::ValidationConfig {
+                mode: crate::validate::ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(nats_engine_dispatcher as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
+            dw_agent_dispatch: DwAgentDispatch::Nats,
+            agent_node_handler: None,
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        };
+
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "e2e-pack",
+            flow_id: "e2e-agent.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("e2e-sess-1"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig { max_attempts: 1, base_delay_ms: 1 },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        // ── 6. Execute: the dw.agent NATS path must PAUSE the flow ──
+        let result = engine
+            .execute(ctx, json!({ "user_text": "ping" }))
+            .await
+            .expect("engine.execute succeeded");
+
+        assert!(
+            matches!(result.status, FlowStatus::Waiting(_)),
+            "expected FlowStatus::Waiting from dw.agent Nats path, got: {:?}",
+            result.status
+        );
+        eprintln!("dw.agent: flow paused (Waiting) — dispatch published to NATS");
+
+        // ── 7. Wait for the fake bridge reply to reach the resumer (up to 5 s) ──
+        let wait = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            resumer.notify.notified(),
+        )
+        .await;
+
+        assert!(
+            wait.is_ok(),
+            "timed out waiting for fake bridge reply — is NATS running? ({nats_url})"
+        );
+
+        // ── 8. Assert the resumed reply == "pong" ──
+        let calls = resumer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "resumer should have been called exactly once");
+        let (ref _corr, ref output) = calls[0];
+        assert_eq!(
+            output["output"]["reply"],
+            json!("pong"),
+            "resumed reply must match the aw-serve canned reply"
+        );
+        eprintln!(
+            "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
+            output["output"]["reply"]
+        );
+    }
 }
 
 use tracing::Instrument;
@@ -3590,6 +4502,14 @@ pub struct FlowContext<'a> {
     pub action: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
+    /// Reply scope of the originating inbound activity, when known.
+    ///
+    /// Carried so async-dispatch nodes (`sorla.call await`) can encode the
+    /// inbound `thread`/`reply_to` into the published correlation id. Without
+    /// it, a wait saved against a threaded scope cannot be re-keyed on resume
+    /// (the resumer would synthesize an empty thread/reply_to and miss the
+    /// saved wait). See `execute_sorla_call` and `RuntimeSessionResumer`.
+    pub reply_scope: Option<&'a greentic_types::ReplyScope>,
     pub retry_config: RetryConfig,
     pub attempt: u32,
     pub observer: Option<&'a dyn ExecutionObserver>,

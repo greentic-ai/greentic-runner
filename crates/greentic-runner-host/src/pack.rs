@@ -82,7 +82,7 @@ use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsVi
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
-use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow};
+use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
@@ -1323,6 +1323,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
+            runtime_config: None,
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
@@ -1893,6 +1894,7 @@ impl PackRuntime {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -2220,6 +2222,15 @@ impl PackRuntime {
         self.component_manifests.get(component_ref)
     }
 
+    /// Iterate every `(component_ref, manifest)` this pack holds. Used by the
+    /// agentic-worker component tool source to enumerate the operations a
+    /// worker may call as tools without exposing the internal manifest map.
+    pub fn component_manifest_entries(&self) -> impl Iterator<Item = (&str, &ComponentManifest)> {
+        self.component_manifests
+            .iter()
+            .map(|(component_ref, manifest)| (component_ref.as_str(), manifest))
+    }
+
     /// Returns the raw agent config blobs embedded in this pack's manifest.
     ///
     /// Only present on the New (`greentic_types::PackManifest`) path; Legacy
@@ -2245,11 +2256,18 @@ impl PackRuntime {
     ///
     /// [`load_schema_json`]: PackRuntime::load_schema_json
     pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
-        const SIDECAR_NAME: &str = "agent-graph.json";
+        self.read_pack_file("agent-graph.json")
+    }
 
-        // Materialized pack directory (root holds manifest.cbor + sidecar).
+    /// Read a single named file from the pack by its archive-relative path,
+    /// trying the materialized pack directory first and the `.gtpack` archive as
+    /// a fallback. Returns `None` when the file is absent (or on a read error,
+    /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
+    /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
+    pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
+        // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
-            let candidate = self.path.join(SIDECAR_NAME);
+            let candidate = self.path.join(name);
             if candidate.exists() {
                 match std::fs::read(&candidate) {
                     Ok(bytes) => return Some(bytes),
@@ -2257,7 +2275,7 @@ impl PackRuntime {
                         tracing::warn!(
                             path = %candidate.display(),
                             error = %error,
-                            "failed to read agent-graph.json from pack directory"
+                            "failed to read {name} from pack directory"
                         );
                         return None;
                     }
@@ -2276,7 +2294,7 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "failed to open pack archive while reading agent-graph.json"
+                    "failed to open pack archive while reading {name}"
                 );
                 return None;
             }
@@ -2287,19 +2305,19 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "failed to read pack archive while reading agent-graph.json"
+                    "failed to read pack archive while reading {name}"
                 );
                 return None;
             }
         };
-        match archive.by_name(SIDECAR_NAME) {
+        match archive.by_name(name) {
             Ok(mut entry) => {
                 let mut bytes = Vec::new();
                 if let Err(error) = entry.read_to_end(&mut bytes) {
                     tracing::warn!(
                         path = %archive_path.display(),
                         error = %error,
-                        "failed to extract agent-graph.json from pack archive"
+                        "failed to extract {name} from pack archive"
                     );
                     return None;
                 }
@@ -2310,7 +2328,7 @@ impl PackRuntime {
                 tracing::warn!(
                     path = %archive_path.display(),
                     error = %error,
-                    "error reading agent-graph.json from pack archive"
+                    "error reading {name} from pack archive"
                 );
                 None
             }
@@ -2852,7 +2870,13 @@ fn normalize_flow_doc(mut doc: FlowDoc) -> FlowDoc {
         else {
             continue;
         };
-        if component_ref.starts_with("emit.") {
+        // Runner-native op-keys (`emit.*`, `mcp`, `dw.agent`, `sorla.call`, …)
+        // are dispatched by the engine directly off the `component` string, so
+        // they must survive verbatim — wrapping them in a `component.exec` node
+        // would misclassify them as `NodeKind::Exec`. The runtime-flow load
+        // path (`flow_doc_to_ir`) already preserves them; mirror that here for
+        // the legacy flow-JSON path using the shared op-key predicate.
+        if is_native_op_key(&component_ref) {
             node.operation = Some(component_ref);
             node.payload = payload;
             node.raw.clear();
@@ -4368,6 +4392,101 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    /// Build a single-node `FlowDoc` whose only node carries the raw-YGTC
+    /// op-key `op_key` with `payload`, mirroring the legacy flow-JSON shape the
+    /// loader feeds into `normalize_flow_doc` -> `flow_doc_to_ir`.
+    fn single_node_doc(op_key: &str, payload: Value) -> FlowDoc {
+        let mut raw = IndexMap::new();
+        raw.insert(op_key.to_string(), payload);
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node".into(),
+            NodeDoc {
+                raw,
+                routing: json!([{ "out": true }]),
+                ..Default::default()
+            },
+        );
+        FlowDoc {
+            id: "legacy".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("node".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema: None,
+            nodes,
+        }
+    }
+
+    /// REGRESSION: the legacy flow-JSON load path (`normalize_flow_doc` ->
+    /// `flow_doc_to_ir`) must preserve a raw-YGTC `{ mcp: { ... }, routing }`
+    /// node VERBATIM as `component == "mcp"` with its payload intact, exactly
+    /// like the runtime-flow (packc) path. Before the fix `normalize_flow_doc`
+    /// rewrote every non-`emit.*` op-key into a `component.exec` node, so the
+    /// engine saw `NodeKind::Exec` instead of the MCP dispatch arm.
+    #[test]
+    fn normalize_preserves_mcp_op_key_through_legacy_path() {
+        let doc = single_node_doc(
+            "mcp",
+            json!({
+                "server": "github",
+                "tool": "get_issue",
+                "arguments": { "id": "{{ entry.issue_id }}" },
+                "output": "issue"
+            }),
+        );
+
+        let normalized = normalize_flow_doc(doc);
+        let node = normalized.nodes.get("node").expect("node exists");
+        // NOT rewritten into a `component.exec` wrapper.
+        assert_eq!(
+            node.operation.as_deref(),
+            Some("mcp"),
+            "the `mcp` op-key must survive normalization verbatim, not become component.exec"
+        );
+        assert!(node.raw.is_empty(), "raw op-key should be lowered");
+
+        // Lowering through the real adapter yields `component == "mcp"` with
+        // the LOCKED ENCODING v2 payload (server/tool/arguments/output) intact.
+        let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+        let lowered = ir.nodes.get("node").expect("lowered node exists");
+        assert_eq!(lowered.component, "mcp");
+        assert_eq!(lowered.payload_expr["server"], json!("github"));
+        assert_eq!(lowered.payload_expr["tool"], json!("get_issue"));
+        assert_eq!(
+            lowered.payload_expr["arguments"]["id"],
+            json!("{{ entry.issue_id }}")
+        );
+        assert_eq!(lowered.payload_expr["output"], json!("issue"));
+    }
+
+    /// No regression to the passthrough set: the other native op-keys-with-
+    /// payload (`dw.agent`, `sorla.call`) must also survive `normalize_flow_doc`
+    /// verbatim rather than being wrapped in `component.exec`.
+    #[test]
+    fn normalize_preserves_dw_agent_and_sorla_call_op_keys() {
+        for op_key in ["dw.agent", "sorla.call"] {
+            let doc = single_node_doc(op_key, json!({ "input": { "x": 1 } }));
+            let normalized = normalize_flow_doc(doc);
+            let node = normalized.nodes.get("node").expect("node exists");
+            assert_eq!(
+                node.operation.as_deref(),
+                Some(op_key),
+                "`{op_key}` must survive normalization verbatim, not become component.exec"
+            );
+            assert!(node.raw.is_empty());
+
+            let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+            let lowered = ir.nodes.get("node").expect("lowered node exists");
+            assert_eq!(lowered.component, op_key);
+        }
     }
 }
 

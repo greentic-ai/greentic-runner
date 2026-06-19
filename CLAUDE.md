@@ -48,6 +48,10 @@ crates/
                              #   ingress adapters, session/state, admin API
   greentic-runner-desktop/   # Desktop CLI integration
   runner-core/               # Pack resolution, signing verification, cache helpers
+  greentic-aw-runtime/       # Agentic-worker runtime (Plan-Act-Observe loop) +
+                             #   `serve` mode (NATS) + `aw-serve` test-mock bin
+  aw-event-bridge/           # NATS bridge: consumes greentic.agentic.request.v1,
+                             #   dispatches to AgentDispatchInvoker (agentic.call side)
   greentic-i18n/             # Compile-time i18n (embedded locale bundles)
   tests/                     # Integration test harness
 ```
@@ -80,6 +84,63 @@ the OpenAI backend encodes tool function names as `<ext>_FN_<tool>` (OpenAI reje
 Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`).
 Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
+
+### Async runtime dispatch (`sorla.call` node)
+
+A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target)
+dispatches work to the separate `greentic-sorx` runtime over NATS pub/sub. Node input:
+`{ "await": true|false, "operation": "<op>", "deadline_ms": <u64?>, "input": {...} }`.
+`await: true` PAUSES the flow (reuses `FlowResumeStore`/ingress resume) and resumes when the
+runtime's response arrives; `await: false` continues immediately. Implemented natively
+(`runner/remote_dispatch.rs` `RemoteDispatchHandler`/`NatsDispatcher`, `runner/engine.rs`
+`execute_sorla_call`, `runner/dispatch_listener.rs` response-listener,
+`runner/runtime_session_resumer.rs`), wired in `runtime.rs` when `GREENTIC_EVENTS_NATS_URL`
+is set. Subjects: `greentic.sorla.request.v1` / `greentic.sorla.response.v1`; correlation id
+= `<bare session hint>::pack=<id>::flow=<id>`. Contract in `greentic-types::runtime_dispatch`;
+sorx side is the `sorx-event-bridge` crate. Same pattern is intended for `agentic.call` /
+`operala.call`. Waits from an inbound with a non-empty thread/reply_to ARE resumable: the
+node appends opaque `::thread=<t>::reply=<r>` markers to the correlation id (omitted when
+empty) and `RuntimeSessionResumer` parses them back into the synthesized `ReplyScope` so
+`FlowResumeStore::fetch` recomputes the same `scope_hash` as `save`. The sorx bridge echoes
+the correlation verbatim, so no sorx change is required.
+
+### Agentic dispatch serve mode (`agentic.call` runtime side)
+
+The `agentic.call` node uses runtime name `"agentic"` → subjects
+`greentic.agentic.request.v1` / `greentic.agentic.response.v1` (same contract,
+headers, and correlation-marker rules as `sorla.call`). The runtime-side consumer
+is the `aw-event-bridge` crate: it shares the `greentic-types::runtime_dispatch`
+contract directly (aw-runtime pins the same types lineage as the runner, so no
+mirroring) and exposes an `AgentDispatchInvoker` seam + `run_bridge`. The
+production invoker (`greentic_aw_runtime::serve::RuntimeAgentDispatchInvoker`)
+maps `target` → agent id, `input.user_text` → `AgentInput`, the correlation hint
+→ session id, and serialises `AgentOutput` to `{reply, trail, terminated_by}`
+(identical to the in-process `dw.agent` node output). Serve entries:
+`greentic_aw_runtime::serve::serve(nats_url, runtime)` and the host-level
+`agent_node::serve_agentic(nats_url, merged_agents)` (reuses the shared
+`build_agent_runtime` so in-process and serve paths build an identical runtime).
+For a credit-free live e2e there is an `aw-serve` bin (features `serve,test-mock`):
+`GREENTIC_EVENTS_NATS_URL=nats://127.0.0.1:4222 cargo run -p greentic-aw-runtime
+--features serve,test-mock --bin aw-serve` (env `AW_SERVE_AGENT_ID`,
+`AW_SERVE_REPLY`). `dw.agent` (in-process) stays untouched — `agentic.call` is the
+out-of-process path.
+
+**Opt-in in-process co-host (`GREENTIC_AGENTIC_SERVE_INPROC`)**: a single-node
+deployment can co-host the agentic-worker service inside the main runner process
+instead of running a separate `aw-serve`. **Default OFF** — distributed deploys
+run `aw-serve` standalone so the agentic service scales independently. When
+`GREENTIC_AGENTIC_SERVE_INPROC` is truthy (`1`/`true`/`yes`/`on`) AND
+`GREENTIC_EVENTS_NATS_URL` is set, `greentic_runner_host::run()` spawns
+`serve_agentic` exactly once per process (NOT per-tenant — a per-tenant spawn
+would put multiple competing subscribers on `greentic.agentic.request.v1`). The
+gate is the pure `agent_node::should_serve_agentic_inproc`; the spawn is
+`maybe_spawn_inproc_agentic_serve` in `lib.rs`, feature-gated behind
+`agentic-worker`. Process-level base agent configs come ONLY from
+`GREENTIC_AGENT_MANIFESTS_DIR` (`<agent_id>.json` full `AgentConfig` files, loaded
+by `agent_node::load_process_agent_configs`) — pack-embedded and per-tenant
+`HostConfig.agents` are not visible at process startup. Skips with a warning (and
+the runner continues normally) when no agents are configured, or when the runtime
+cannot be built (no `GREENTIC_AW_REDIS_URL` / no LLM key).
 
 ### WASM Component Model
 
@@ -152,6 +213,10 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `DEFAULT_TENANT` | Fallback tenant for routing |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
+| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`agentic.call` dispatch + in-proc agentic serve |
+| `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
+| `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
+| `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 

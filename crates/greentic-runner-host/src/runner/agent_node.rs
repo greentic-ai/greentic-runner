@@ -336,6 +336,34 @@ mod aw {
         )))
     }
 
+    /// Build the component tool source from the operator's loaded packs, gated
+    /// by `GREENTIC_AW_COMPONENT_TOOLS` (set to "0" to disable). Returns `None`
+    /// when disabled or when no packs are loaded, so `component:` tool refs then
+    /// resolve to nothing. Mirrors [`mcp_source_from_env`] but discovers tools
+    /// from in-pack components rather than a remote admin.
+    fn component_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+    ) -> Option<Arc<greentic_aw_runtime::ComponentToolSource>> {
+        if std::env::var("GREENTIC_AW_COMPONENT_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_COMPONENT_TOOLS=0; component tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+        let invoker = Arc::new(
+            crate::runner::component_invoker::PackRuntimeComponentInvoker::new(
+                packs.to_vec(),
+                tenant.to_string(),
+            ),
+        );
+        tracing::info!(tenant = %tenant, packs = packs.len(), "component tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::ComponentToolSource::new(
+            invoker,
+        )))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -493,9 +521,139 @@ mod aw {
     /// Redis is sourced from the environment because the runner uses an
     /// in-memory flow-state store by default and carries no Redis URL in
     /// [`HostConfig`]; this mirrors the existing env-config convention.
+    ///
+    /// The `tenant` and `secrets` arguments wire in per-tenant LLM credential
+    /// resolution when `GREENTIC_AW_LLM_EXTENSION` is set: requests resolve
+    /// credentials from the secrets broker for the calling tenant rather than
+    /// reading global env vars. Callers without per-tenant context (e.g.
+    /// `serve_agentic`) should use [`build_agent_runtime`] directly, which uses
+    /// the env-keyed backend and accepts no secrets context.
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
+        use std::time::Duration;
+
+        use greentic_aw_runtime::LayeredConfigProvider;
+        use greentic_aw_runtime::ManifestToolOverlayProvider;
+        use greentic_aw_runtime::config_provider::CachingConfigProvider;
+        use greentic_aw_runtime::cost::RedisTokenMeter;
+        use greentic_aw_runtime::tools::RedisToolLedger;
+        use greentic_aw_runtime::{
+            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore,
+            RetryingLlmBackend,
+        };
+
+        if merged_agents.is_empty() {
+            return None;
+        }
+
+        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
+            Ok(url) if !url.is_empty() => url,
+            _ => {
+                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let manager = state_store.manager();
+        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
+        let ledger = Arc::new(RedisToolLedger::new(manager));
+
+        let ext_runtime = build_ext_runtime()?;
+
+        // When the LLM bridge extension is configured, resolve credentials
+        // per-tenant from the secrets broker rather than from global env vars.
+        // The env-keyed OpenAI fallback is preserved for both branches.
+        let llm: Arc<dyn LlmBackend> = match std::env::var("GREENTIC_AW_LLM_EXTENSION")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(ext_id) => {
+                use greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver;
+                let resolver = Arc::new(SecretsBackedCredentialResolver::new(
+                    secrets.clone(),
+                    tenant.clone(),
+                ));
+                tracing::info!(
+                    extension = %ext_id,
+                    tenant = %tenant,
+                    "AW LLM via bridge (per-tenant creds)"
+                );
+                Arc::new(RetryingLlmBackend::new(
+                    ExtensionLlmBackend::with_resolver_runtime(
+                        ext_runtime.clone(),
+                        ext_id,
+                        resolver,
+                    ),
+                    3,
+                    Duration::from_millis(250),
+                ))
+            }
+            None => {
+                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+                Arc::new(RetryingLlmBackend::new(
+                    OpenAiLlmBackend::new(openai_key),
+                    3,
+                    Duration::from_millis(250),
+                ))
+            }
+        };
+
+        let agent_count = merged_agents.len();
+        let overlay = ManifestToolOverlayProvider::new(
+            HostConfigProvider::new(merged_agents),
+            manifests_discovery_dir(),
+        );
+        let config_provider: Arc<dyn ConfigProvider> = match registry_from_env() {
+            Some(http) => Arc::new(CachingConfigProvider::new(LayeredConfigProvider::new(
+                http, overlay,
+            ))),
+            None => Arc::new(CachingConfigProvider::new(overlay)),
+        };
+        let telemetry = Arc::new(OtelTelemetry);
+
+        let runtime = Arc::new(
+            AgentRuntime::new(
+                config_provider,
+                state_store,
+                ext_runtime,
+                llm,
+                telemetry,
+                token_meter,
+                ledger,
+                mcp_source_from_env(),
+            )
+            .with_component_source(component_source_from_packs(&packs, &tenant)),
+        );
+
+        tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed (per-tenant creds)");
+        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+    }
+
+    /// Construct the shared [`AgentRuntime`] from the environment.
+    ///
+    /// Factored out of [`build_agent_node_handler`] so both the in-process
+    /// `dw.agent`/`agentic.call` flow node and the out-of-process NATS serve
+    /// mode ([`serve_agentic`]) build an identical runtime (Redis state, env-
+    /// resolved LLM backend, design extensions, agent config providers, MCP).
+    ///
+    /// Returns `None` under the same graceful-degradation conditions as the node
+    /// handler: empty agent map, missing/unreachable `GREENTIC_AW_REDIS_URL`, or
+    /// extension-runtime init failure.
+    pub async fn build_agent_runtime(
+        merged_agents: HashMap<String, AgentConfig>,
+    ) -> Option<Arc<AgentRuntime>> {
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
@@ -533,6 +691,9 @@ mod aw {
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
+        // NOTE: this path has no per-tenant secrets context (it is used by
+        // `serve_agentic` and process-level in-proc serve). Per-tenant
+        // credential resolution is only available via `build_agent_node_handler`.
         let llm = build_llm_backend(&ext_runtime);
 
         let agent_count = merged_agents.len();
@@ -552,31 +713,171 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(
-            AgentRuntime::new(
-                config_provider,
-                state_store,
-                ext_runtime.clone(),
-                llm,
-                telemetry,
-                token_meter,
-                ledger,
-                mcp_source_from_env(),
-            )
-            .with_guardrails(
-                Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
-                    mandatory_guardrails_from_config(),
-                )),
-                Arc::new(
-                    greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
-                        ext_runtime: ext_runtime.clone(),
-                    },
-                ),
+        let base = AgentRuntime::new(
+            config_provider,
+            state_store,
+            ext_runtime.clone(),
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+            mcp_source_from_env(),
+        )
+        .with_guardrails(
+            Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                mandatory_guardrails_from_config(),
+            )),
+            Arc::new(
+                greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
+                    ext_runtime: ext_runtime.clone(),
+                },
             ),
         );
+        // Optionally attach an operator-configured native long-term memory
+        // backend. With the `long-term-chronicle` feature off (default) this is
+        // a no-op and `base` is wrapped unchanged.
+        #[cfg(feature = "long-term-chronicle")]
+        let base = crate::runner::long_term_memory::attach(base).await;
+        // Optionally attach an operator-configured Chronicle knowledge (document
+        // RAG) backend for auto pre-retrieval. No-op with the `knowledge-chronicle`
+        // feature off (default).
+        #[cfg(feature = "knowledge-chronicle")]
+        let base = crate::runner::knowledge_mount::attach(base).await;
+        let runtime = Arc::new(base);
 
         tracing::info!(agent_count, "AW runtime constructed");
-        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+        Some(runtime)
+    }
+
+    /// Run the agentic-worker runtime as a NATS-consuming service.
+    ///
+    /// Builds the production [`AgentRuntime`] via [`build_agent_runtime`] and,
+    /// when it could be constructed, serves `greentic.agentic.request.v1`
+    /// forever via the shared `aw-event-bridge`. This is the out-of-process
+    /// (`agentic.call`) counterpart to the in-process `dw.agent` node.
+    ///
+    /// When `GREENTIC_AW_REDIS_URL` is set and reachable the serve path wires
+    /// a [`greentic_aw_runtime::RedisDispatchLedger`] so JetStream at-least-once
+    /// redeliveries are short-circuited without re-running the LLM step. If the
+    /// Redis connect fails the ledger falls back to [`greentic_aw_runtime::NoopDispatchLedger`]
+    /// (idempotency disabled, warning logged) so serving is never blocked.
+    ///
+    /// Returns `Ok(())` immediately (a no-op) when the runtime cannot be built
+    /// (e.g. no agents, no Redis) so the host can call this unconditionally.
+    pub async fn serve_agentic(
+        nats_url: &str,
+        merged_agents: HashMap<String, AgentConfig>,
+    ) -> anyhow::Result<()> {
+        use greentic_aw_runtime::dispatch_ledger::RedisDispatchLedger;
+        use greentic_aw_runtime::{DispatchLedger, NoopDispatchLedger, RedisAgentStateStore};
+
+        match build_agent_runtime(merged_agents).await {
+            Some(runtime) => {
+                // Activate dispatch idempotency when Redis is reachable for the
+                // ledger. Best-effort: a connect failure disables idempotency
+                // but never blocks serving.
+                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) =
+                    match std::env::var("GREENTIC_AW_REDIS_URL") {
+                        Ok(url) if !url.is_empty() => {
+                            match RedisAgentStateStore::connect(&url).await {
+                                Ok(store) => (
+                                    Arc::new(RedisDispatchLedger::new(store.manager())),
+                                    true,
+                                ),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        "dispatch ledger Redis connect failed; \
+                                         idempotency disabled"
+                                    );
+                                    (Arc::new(NoopDispatchLedger), false)
+                                }
+                            }
+                        }
+                        _ => (Arc::new(NoopDispatchLedger), false),
+                    };
+
+                tracing::info!(
+                    nats_url,
+                    dispatch_ledger_active = ledger_active,
+                    "agentic serve mode starting"
+                );
+                greentic_aw_runtime::serve::serve_with_ledger(nats_url, runtime, ledger).await
+            }
+            None => {
+                tracing::info!(
+                    "agentic serve mode skipped: no agentic runtime could be constructed"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Load process-level base agent configs from the manifests directory.
+    ///
+    /// Reads every `<agent_id>.json` file in [`manifests_discovery_dir`] as a
+    /// full [`AgentConfig`] (NOT the tool-only Digital Worker manifest consumed
+    /// by [`ManifestToolOverlayProvider`]). This is the ONLY process-level base
+    /// agent source: pack-embedded agents and `HostConfig::agents` are both
+    /// per-tenant and only materialise inside `TenantRuntime::from_packs`, so an
+    /// in-process serve started at process startup cannot see them.
+    ///
+    /// Returns an empty map when the directory is absent or unreadable. Files
+    /// that fail to decode into an [`AgentConfig`], or whose `agent_id` does not
+    /// match the file stem, are logged and skipped so one malformed file never
+    /// aborts loading. The file stem is the authoritative key (the in-map id is
+    /// taken from the stem), mirroring the `<agent_id>.json` convention.
+    pub fn load_process_agent_configs() -> HashMap<String, AgentConfig> {
+        let dir = manifests_discovery_dir();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::debug!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "agent manifests dir not readable; no process-level agents loaded"
+                );
+                return HashMap::new();
+            }
+        };
+
+        let mut agents: HashMap<String, AgentConfig> = HashMap::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_json = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if !is_json {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "agent config read failed; skipping");
+                    continue;
+                }
+            };
+            match serde_json::from_slice::<AgentConfig>(&bytes) {
+                Ok(config) => {
+                    if config.agent_id != stem {
+                        tracing::warn!(
+                            file_stem = stem,
+                            agent_id = config.agent_id.as_str(),
+                            "agent config id does not match filename; keying by filename"
+                        );
+                    }
+                    agents.insert(stem.to_string(), config);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "agent config decode failed; skipping");
+                }
+            }
+        }
+        agents
     }
 
     #[cfg(test)]
@@ -604,9 +905,11 @@ mod aw {
                 llm: LlmProviderRef {
                     provider: "openai".into(),
                     model: "gpt-4o-mini".into(),
+                    credential_ref: None,
                 },
                 limits: AgentLimits::default(),
-            }
+                memory: None,
+                knowledge: None,            }
         }
 
         #[tokio::test]
@@ -633,9 +936,11 @@ mod aw {
                     llm: LlmProviderRef {
                         provider: "mock".into(),
                         model: "m".into(),
+                        credential_ref: None,
                     },
                     limits: AgentLimits::default(),
-                },
+                    memory: None,
+                    knowledge: None,                },
             );
             let config_provider = Arc::new(config_provider);
 
@@ -993,13 +1298,178 @@ mod aw {
             assert_eq!(v["terminated_by"], serde_json::json!("guardrail_denied"));
             assert_eq!(v["reply"], serde_json::json!("blocked"));
         }
+
+        #[test]
+        #[allow(unsafe_code)]
+        fn load_process_agent_configs_reads_full_configs_and_skips_bad_files() {
+            let dir = tempfile::tempdir().expect("tempdir");
+
+            // Valid full AgentConfig keyed by file stem.
+            let good = sample_agent_config("greeter");
+            std::fs::write(
+                dir.path().join("greeter.json"),
+                serde_json::to_vec(&good).expect("serialize"),
+            )
+            .expect("write good");
+
+            // Malformed JSON — skipped, must not abort the load.
+            std::fs::write(dir.path().join("broken.json"), b"{ not json").expect("write broken");
+
+            // Non-JSON file — ignored.
+            std::fs::write(dir.path().join("README.md"), b"ignore me").expect("write md");
+
+            let previous = std::env::var("GREENTIC_AGENT_MANIFESTS_DIR").ok();
+            unsafe {
+                std::env::set_var("GREENTIC_AGENT_MANIFESTS_DIR", dir.path());
+            }
+            let loaded = super::load_process_agent_configs();
+            unsafe {
+                match &previous {
+                    Some(value) => std::env::set_var("GREENTIC_AGENT_MANIFESTS_DIR", value),
+                    None => std::env::remove_var("GREENTIC_AGENT_MANIFESTS_DIR"),
+                }
+            }
+
+            assert_eq!(loaded.len(), 1, "only the valid config should load");
+            assert!(loaded.contains_key("greeter"));
+            assert_eq!(loaded["greeter"].agent_id, "greeter");
+        }
+    }
+}
+
+#[allow(clippy::items_after_test_module)] // helper fn + re-exports follow
+#[cfg(test)]
+mod gating_tests {
+    use super::{DwAgentDispatch, dw_agent_dispatch_mode, should_serve_agentic_inproc};
+    use std::collections::HashMap;
+
+    fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    #[test]
+    fn skips_when_opt_in_unset() {
+        let env = env_from(&[("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222")]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn skips_when_nats_url_unset() {
+        let env = env_from(&[("GREENTIC_AGENTIC_SERVE_INPROC", "1")]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn skips_when_nats_url_blank() {
+        let env = env_from(&[
+            ("GREENTIC_AGENTIC_SERVE_INPROC", "1"),
+            ("GREENTIC_EVENTS_NATS_URL", "   "),
+        ]);
+        assert!(!should_serve_agentic_inproc(env));
+    }
+
+    #[test]
+    fn serves_when_both_set() {
+        for truthy in ["1", "true", "TRUE", "yes", "on"] {
+            let env = env_from(&[
+                ("GREENTIC_AGENTIC_SERVE_INPROC", truthy),
+                ("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222"),
+            ]);
+            assert!(should_serve_agentic_inproc(env), "{truthy} should enable");
+        }
+    }
+
+    #[test]
+    fn skips_on_falsey_opt_in() {
+        for falsey in ["0", "false", "no", "off", "maybe"] {
+            let env = env_from(&[
+                ("GREENTIC_AGENTIC_SERVE_INPROC", falsey),
+                ("GREENTIC_EVENTS_NATS_URL", "nats://127.0.0.1:4222"),
+            ]);
+            assert!(!should_serve_agentic_inproc(env), "{falsey} should skip");
+        }
+    }
+
+    #[test]
+    fn dw_agent_dispatch_mode_defaults_inproc_and_parses_nats() {
+        assert_eq!(dw_agent_dispatch_mode(|_| None), DwAgentDispatch::InProcess);
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| (k == "GREENTIC_AW_DISPATCH").then(|| "nats".to_string())),
+            DwAgentDispatch::Nats
+        );
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| {
+                (k == "GREENTIC_AW_DISPATCH").then(|| "inproc".to_string())
+            }),
+            DwAgentDispatch::InProcess
+        );
+        assert_eq!(
+            dw_agent_dispatch_mode(|k| (k == "GREENTIC_AW_DISPATCH").then(|| "NATS".to_string())),
+            DwAgentDispatch::Nats
+        );
+    }
+}
+
+/// Decide whether the runner process should host the agentic-worker NATS
+/// service in-process (the opt-in co-host path).
+///
+/// Returns `true` only when BOTH gates are satisfied:
+/// - `GREENTIC_AGENTIC_SERVE_INPROC` is truthy (`1`/`true`/`yes`/`on`,
+///   case-insensitive) — opt-in, default OFF; and
+/// - `GREENTIC_EVENTS_NATS_URL` is set to a non-empty value (no NATS bus means
+///   nothing to serve on).
+///
+/// Pure over its `get_env` closure so it is unit-testable without touching the
+/// real process environment. Feature-independent (no `agentic-worker` gate) so
+/// the gating logic stays trivially testable; the actual spawn is gated at the
+/// call site.
+pub fn should_serve_agentic_inproc(get_env: impl Fn(&str) -> Option<String>) -> bool {
+    let opt_in = get_env("GREENTIC_AGENTIC_SERVE_INPROC")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false);
+    let nats_set = get_env("GREENTIC_EVENTS_NATS_URL")
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    opt_in && nats_set
+}
+
+/// How a `dw.agent` flow node executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // consumed by Task 2.2 (engine.rs)
+pub enum DwAgentDispatch {
+    /// Run the agentic step in-process (default; today's behaviour).
+    InProcess,
+    /// Publish to the durable agentic NATS path (scale-to-zero compute).
+    Nats,
+}
+
+/// Resolve how `dw.agent` nodes execute. `GREENTIC_AW_DISPATCH=nats` routes them
+/// over the out-of-process agentic NATS path; anything else (incl. unset) keeps
+/// the in-process path — zero regression by default. Pure over `get_env` for
+/// testability (mirrors `should_serve_agentic_inproc`).
+#[must_use]
+#[allow(dead_code)] // consumed by Task 2.2 (engine.rs)
+pub fn dw_agent_dispatch_mode(get_env: impl Fn(&str) -> Option<String>) -> DwAgentDispatch {
+    match get_env("GREENTIC_AW_DISPATCH") {
+        Some(v) if v.trim().eq_ignore_ascii_case("nats") => DwAgentDispatch::Nats,
+        _ => DwAgentDispatch::InProcess,
     }
 }
 
 #[cfg(feature = "agentic-worker")]
 pub use aw::{
     HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
-    build_agent_node_handler, merge_agent_sources,
+    build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
+    serve_agentic,
 };
 
 #[cfg(feature = "agentic-worker")]
