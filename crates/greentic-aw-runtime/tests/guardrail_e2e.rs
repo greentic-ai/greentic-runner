@@ -34,31 +34,19 @@
 //! unknown contributions key while keeping the `capabilities.offered` entry
 //! (`greentic:guardrail/pii`) that matters for registry resolution.
 //!
-//! ## Blocker (DONE_WITH_CONCERNS)
+//! ## Export name resolution (FIXED)
 //!
 //! `ExtensionRuntime::evaluate_guardrail` resolves the interface by calling
-//! `instance.get_export_index(None, "greentic:extension-design/guardrail@0.3.0")`.
-//! The built WASM binary (verified via `wasm-tools component wit`) does NOT
-//! export the interface under that name; instead it exports:
-//!   `greentic:guardrail-pii/guardrail@0.1.0`
-//! This is because `cargo component build` qualifies world exports under the
-//! component's own package namespace, not the upstream dependency namespace.
+//! `resolve_iface_versions` which looks for
+//! `greentic:extension-design/guardrail@0.3.0` in the component's exports.
 //!
-//! The WIT world of the component declares:
-//!   `export greentic:extension-design/guardrail@0.3.0;`
-//! …but the binary export name becomes `greentic:guardrail-pii/guardrail@0.1.0`.
+//! The previously committed dist WASM was stale and exported the interface
+//! under the old private namespace `greentic:guardrail-pii/guardrail@0.1.0`.
+//! The freshly-built binary (from `component-guardrail-pii` source) correctly
+//! exports `greentic:extension-design/guardrail@0.3.0` — the dist artifact
+//! has been updated to match (commit fix: sync dist wasm + describe sha).
 //!
-//! **Fix required in `component-guardrail-pii`**: restructure the WIT world so
-//! the interface is exported under `greentic:extension-design/guardrail@0.3.0`
-//! in the binary — for example by using an identity-world pattern that keeps the
-//! original package name in the export slot, or by rebuilding with an
-//! adapter that re-exports under the expected name.
-//!
-//! Until that fix lands, the full-stack e2e is `#[ignore]`-d.  Layered coverage
-//! from Tasks 4/5 (unit: run_chain, assemble_chain), Task 6 (integration:
-//! fail-closed/pass-through), and Task 9 (component: mask_pii proptest) already
-//! proves every individual piece; this e2e is the capstone, not the sole safety
-//! net.
+//! All three e2e tests are now active.
 
 #![cfg(feature = "test-mock")]
 
@@ -260,19 +248,11 @@ async fn pii_extension_registers_and_capability_appears_in_registry() {
 }
 
 // ─── Full-stack e2e: masked email and blocklist deny ─────────────────────────
-//
-// These two tests are #[ignore]-d because of a WIT export-name mismatch
-// between the component build and the ext-runtime's evaluate_guardrail
-// dispatcher.  See the module-level docs (## Blocker) for the exact root
-// cause and the required fix in component-guardrail-pii.
 
 /// Proves: with the PII guardrail wired as a mandatory policy, a prompt
 /// containing an email is masked before reaching the echoing LLM, so the
 /// final `AgentOutput.reply` does not contain the raw address.
 #[tokio::test]
-#[ignore = "WIT export-name mismatch: component exports 'greentic:guardrail-pii/guardrail@0.1.0' \
-            but evaluate_guardrail looks for 'greentic:extension-design/guardrail@0.3.0'; \
-            fix in component-guardrail-pii and re-enable"]
 async fn pii_guardrail_masks_inbound_email() {
     let Some(wasm_src) = pii_wasm_src() else {
         eprintln!("SKIP: component-guardrail-pii WASM not found");
@@ -313,9 +293,6 @@ async fn pii_guardrail_masks_inbound_email() {
 /// Proves: a blocklist match in the guardrail config causes `run_step` to
 /// return `AgentError::GuardrailDenied { direction: Inbound, code: "permission_denied" }`.
 #[tokio::test]
-#[ignore = "WIT export-name mismatch: component exports 'greentic:guardrail-pii/guardrail@0.1.0' \
-            but evaluate_guardrail looks for 'greentic:extension-design/guardrail@0.3.0'; \
-            fix in component-guardrail-pii and re-enable"]
 async fn pii_guardrail_denies_blocklist_match() {
     let Some(wasm_src) = pii_wasm_src() else {
         eprintln!("SKIP: component-guardrail-pii WASM not found");
