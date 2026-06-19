@@ -585,7 +585,13 @@ mod tests {
             &ctx(),
             &eval,
         );
-        assert!(matches!(out, ChainOutcome::Denied { .. }));
+        match out {
+            ChainOutcome::Denied { info, direction } => {
+                assert_eq!(info.code, "internal");
+                assert_eq!(direction, GuardrailDirection::Inbound);
+            }
+            _ => panic!("expected denied"),
+        }
     }
 
     #[test]

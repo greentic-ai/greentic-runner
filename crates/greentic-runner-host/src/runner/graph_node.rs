@@ -783,6 +783,7 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
+        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
@@ -916,6 +917,7 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
+        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
