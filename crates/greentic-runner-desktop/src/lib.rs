@@ -438,6 +438,35 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         engine.set_cross_pack_resolver(resolver);
     }
 
+    #[cfg(feature = "agentic-worker")]
+    {
+        use greentic_runner_host::runner::agent_node::{
+            agent_configs_from_manifest, build_agent_node_handler,
+            build_agent_node_handler_ephemeral, merge_agent_sources,
+        };
+
+        let blobs = pack.manifest_agent_blobs();
+        if !blobs.is_empty() {
+            let pack_agents = agent_configs_from_manifest(&pack.metadata().pack_id, &blobs);
+            let merged = merge_agent_sources(pack_agents, HashMap::new());
+            let tenant = resolved_profile.tenant_id.clone();
+            let sm = resolve_secrets_manager(&opts)?;
+            let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let handler = if redis_set {
+                build_agent_node_handler(merged, tenant, sm, vec![Arc::clone(&pack)]).await
+            } else {
+                build_agent_node_handler_ephemeral(merged, tenant, sm, vec![Arc::clone(&pack)])
+                    .await
+            };
+            if let Some(handler) = handler {
+                engine.set_agent_node_handler(handler);
+                tracing::info!("DwAgent runtime wired into desktop FlowEngine");
+            }
+        }
+    }
+
     let started_at = OffsetDateTime::now_utc();
     let tenant_str = host_config.tenant.clone();
     let session_id_owned = resolved_profile.session_id.clone();
