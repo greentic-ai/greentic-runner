@@ -36,7 +36,8 @@ mod aw {
     use anyhow::Result;
     use greentic_aw_runtime::config::AgentConfig;
     use greentic_aw_runtime::config_provider::ConfigProvider;
-    use greentic_aw_runtime::error::ConfigError;
+    use greentic_aw_runtime::error::{AgentError, ConfigError};
+    use greentic_aw_runtime::guardrail::GuardrailDirection;
     use greentic_aw_runtime::{AgentInput, AgentRuntime, AgentStep, TenantContext};
     use serde_json::{Value, json};
 
@@ -97,6 +98,53 @@ mod aw {
     /// flow output, so internal failure modes do not leak to end users.
     const SANITISED_ERROR_REPLY: &str = "Something went wrong. Please try again.";
 
+    /// Build the structured JSON output emitted by a `DwAgent` node when a
+    /// guardrail blocks the step.
+    ///
+    /// The returned value gives the downstream flow a machine-readable signal
+    /// it can branch on (`guardrail.blocked == true`, `terminated_by ==
+    /// "guardrail_denied"`) without leaking raw internal error details.
+    ///
+    /// - `direction` — inbound (user→agent) or outbound (agent→user)
+    /// - `code` — guardrail-defined denial code (e.g. `"permission_denied"`)
+    /// - `message` — human-readable denial reason surfaced to the user
+    /// - `details` — optional JSON string with additional context; parsed into a
+    ///   structured value when present, omitted (null) otherwise
+    pub(super) fn guardrail_denied_json(
+        direction: GuardrailDirection,
+        code: &str,
+        message: &str,
+        details: Option<&str>,
+    ) -> Value {
+        let details_val =
+            details.and_then(|detail_str| serde_json::from_str::<Value>(detail_str).ok());
+        json!({
+            "guardrail": {
+                "blocked": true,
+                "direction": direction.as_str(),
+                "code": code,
+                "message": message,
+                "details": details_val,
+            },
+            "reply": message,
+            "trail": Vec::<AgentStep>::new(),
+            "terminated_by": "guardrail_denied",
+        })
+    }
+
+    /// Return the static list of mandatory guardrails sourced from runner config.
+    ///
+    /// Returns an empty `Vec` in v1 — no config plumbing yet exposes a
+    /// guardrail list. The real policy store lives in the env→tenant→team
+    /// hierarchy.
+    ///
+    /// # TODO(guardrail)
+    /// Source from env→tenant→team policy store once the runner config
+    /// exposes a `guardrails.mandatory` list.
+    fn mandatory_guardrails_from_config() -> Vec<greentic_aw_runtime::config::GuardrailRef> {
+        Vec::new()
+    }
+
     /// Production [`AgentNodeHandler`] wrapping the agentic-worker runtime.
     ///
     /// Holds a shared [`AgentRuntime`] and translates a `DwAgent` flow node's
@@ -138,6 +186,29 @@ mod aw {
                     "trail": output.trail,
                     "terminated_by": output.terminated_by,
                 })),
+                Err(AgentError::GuardrailDenied {
+                    direction,
+                    code,
+                    message,
+                    details,
+                }) => {
+                    // Surface guardrail denials as a structured, machine-readable
+                    // node output so flows can branch on `guardrail.blocked`.
+                    // The denial code and message are intentionally visible to
+                    // the flow (they are governance messages, not internal detail).
+                    tracing::info!(
+                        agent_id,
+                        session_id,
+                        %code,
+                        "DwAgent blocked by guardrail"
+                    );
+                    Ok(guardrail_denied_json(
+                        direction,
+                        &code,
+                        &message,
+                        details.as_deref(),
+                    ))
+                }
                 Err(error) => {
                     // Never leak the internal AgentError to the flow output. Log
                     // the detail for operators; return a sanitised reply only.
@@ -481,16 +552,28 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(AgentRuntime::new(
-            config_provider,
-            state_store,
-            ext_runtime,
-            llm,
-            telemetry,
-            token_meter,
-            ledger,
-            mcp_source_from_env(),
-        ));
+        let runtime = Arc::new(
+            AgentRuntime::new(
+                config_provider,
+                state_store,
+                ext_runtime.clone(),
+                llm,
+                telemetry,
+                token_meter,
+                ledger,
+                mcp_source_from_env(),
+            )
+            .with_guardrails(
+                Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                    mandatory_guardrails_from_config(),
+                )),
+                Arc::new(
+                    greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
+                        ext_runtime: ext_runtime.clone(),
+                    },
+                ),
+            ),
+        );
 
         tracing::info!(agent_count, "AW runtime constructed");
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
@@ -517,6 +600,7 @@ mod aw {
                 agent_id: agent_id.into(),
                 system_prompt: "sys".into(),
                 tools: vec![],
+                guardrails: vec![],
                 llm: LlmProviderRef {
                     provider: "openai".into(),
                     model: "gpt-4o-mini".into(),
@@ -545,6 +629,7 @@ mod aw {
                     agent_id: "greeter".into(),
                     system_prompt: "sys".into(),
                     tools: vec![],
+                    guardrails: vec![],
                     llm: LlmProviderRef {
                         provider: "mock".into(),
                         model: "m".into(),
@@ -884,6 +969,29 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // guardrail_denied_json tests
+        // -----------------------------------------------------------------------
+
+        #[test]
+        fn guardrail_denied_maps_to_structured_output() {
+            use greentic_aw_runtime::guardrail::GuardrailDirection;
+            let v = super::guardrail_denied_json(
+                GuardrailDirection::Inbound,
+                "permission_denied",
+                "blocked",
+                None,
+            );
+            assert_eq!(v["guardrail"]["blocked"], serde_json::json!(true));
+            assert_eq!(v["guardrail"]["direction"], serde_json::json!("inbound"));
+            assert_eq!(
+                v["guardrail"]["code"],
+                serde_json::json!("permission_denied")
+            );
+            assert_eq!(v["terminated_by"], serde_json::json!("guardrail_denied"));
+            assert_eq!(v["reply"], serde_json::json!("blocked"));
         }
     }
 }

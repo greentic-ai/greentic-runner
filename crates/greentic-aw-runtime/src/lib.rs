@@ -157,10 +157,9 @@ impl AgentRuntime {
 
     /// Override the guardrail policy and evaluator after construction.
     ///
-    /// Intended for tests that need to inject a scripted policy/evaluator.
-    /// Only available under the `test-mock` feature so it never ships in
-    /// production builds.
-    #[cfg(feature = "test-mock")]
+    /// Available in all builds (including production runner-host) so the
+    /// runner can inject the real `ExtRuntimeGuardrailEvaluator` +
+    /// `StaticGuardrailPolicy` without requiring `test-mock`.
     pub fn with_guardrails(
         mut self,
         policy: Arc<dyn crate::guardrail::GuardrailPolicy>,

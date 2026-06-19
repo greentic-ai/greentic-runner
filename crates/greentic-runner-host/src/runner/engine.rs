@@ -3097,6 +3097,7 @@ mod tests {
                 agent_id: "greeter".into(),
                 system_prompt: "sys".into(),
                 tools: vec![],
+                guardrails: vec![],
                 llm: LlmProviderRef {
                     provider: "mock".into(),
                     model: "m".into(),

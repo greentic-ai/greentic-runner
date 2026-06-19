@@ -773,6 +773,7 @@ mod aw {
             agent_id: agent_id.clone(),
             system_prompt: req.system_prompt.clone(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
@@ -905,6 +906,7 @@ mod aw {
             agent_id: agent_id.clone(),
             system_prompt: routing_system_prompt,
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
