@@ -1721,6 +1721,29 @@ unsafe impl Send for ComponentState {}
 unsafe impl Sync for ComponentState {}
 
 impl PackRuntime {
+    /// Resolve a flow node's component reference to the key under which the
+    /// component is actually registered in this pack.
+    ///
+    /// greentic-pack resolves a component node to a bare component symbol
+    /// (e.g. `ai.greentic.component-templates`) and carries the operation
+    /// separately, so the full reference is the registration key. Older,
+    /// hand-authored flows instead pack the operation into the node id
+    /// (`qa.process`) while registering the component under the bare name
+    /// (`qa`); for those, fall back to the segment before the last dot when
+    /// the full reference isn't registered. Returns the reference unchanged
+    /// when neither form matches, so the caller's "not found" error names it.
+    fn resolve_component_key<'a>(&self, component_ref: &'a str) -> &'a str {
+        if self.components.contains_key(component_ref) {
+            return component_ref;
+        }
+        if let Some((prefix, _operation)) = component_ref.rsplit_once('.')
+            && self.components.contains_key(prefix)
+        {
+            return prefix;
+        }
+        component_ref
+    }
+
     fn allows_state_store(&self, component_ref: &str) -> bool {
         if self.state_store.is_none() {
             return false;
@@ -2183,6 +2206,7 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        let component_ref = self.resolve_component_key(component_ref);
         let pack_component = self
             .components
             .get(component_ref)
