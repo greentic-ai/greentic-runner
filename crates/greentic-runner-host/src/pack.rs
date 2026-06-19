@@ -3119,7 +3119,7 @@ mod resolve_component_key_tests {
     use std::collections::HashSet;
 
     fn registered(keys: &[&'static str]) -> impl Fn(&str) -> bool {
-        let set: HashSet<String> = keys.iter().map(|k| k.to_string()).collect();
+        let set: HashSet<&'static str> = keys.iter().copied().collect();
         move |key: &str| set.contains(key)
     }
 
