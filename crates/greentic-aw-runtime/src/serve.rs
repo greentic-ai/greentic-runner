@@ -319,6 +319,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         agent_id: agent_id.to_string(),
         system_prompt: "test-mock agent".to_string(),
         tools: vec![],
+        guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".to_string(),
             model: "mock".to_string(),
