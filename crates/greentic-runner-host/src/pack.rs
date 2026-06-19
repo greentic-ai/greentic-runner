@@ -2183,6 +2183,9 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        let component_ref = resolve_component_key(component_ref, operation, |key| {
+            self.components.contains_key(key)
+        });
         let pack_component = self
             .components
             .get(component_ref)
@@ -3073,6 +3076,86 @@ impl PackRuntime {
             runtime_config_non_secret: None,
             runtime_refs: None,
         })
+    }
+}
+
+/// Resolve a flow node's component reference to the key under which the
+/// component is actually registered, given the requested `operation` and a
+/// `is_registered` membership predicate over the pack's component keys.
+///
+/// greentic-pack resolves a component node to a bare component symbol
+/// (e.g. `ai.greentic.component-templates`) and carries the operation
+/// separately, so the full reference is the registration key. Older,
+/// hand-authored flows instead pack the operation into the node id
+/// (`qa.process`) while registering the component under the bare name
+/// (`qa`). For those, fall back to the segment before the last dot — but
+/// ONLY when that trailing segment IS the requested operation. Without the
+/// suffix check, a missing dotted component whose prefix happens to be a
+/// *different* registered component (`ai.greentic.component-templates` absent,
+/// `ai.greentic` present) would silently resolve to the wrong component and
+/// run it with the caller's tenant/session/state/secrets. Returns the
+/// reference unchanged when neither form matches, so the caller's
+/// "not found" error names the original reference.
+fn resolve_component_key<'a>(
+    component_ref: &'a str,
+    operation: &str,
+    is_registered: impl Fn(&str) -> bool,
+) -> &'a str {
+    if is_registered(component_ref) {
+        return component_ref;
+    }
+    if let Some((prefix, suffix)) = component_ref.rsplit_once('.')
+        && suffix == operation
+        && is_registered(prefix)
+    {
+        return prefix;
+    }
+    component_ref
+}
+
+#[cfg(test)]
+mod resolve_component_key_tests {
+    use super::resolve_component_key;
+    use std::collections::HashSet;
+
+    fn registered(keys: &[&'static str]) -> impl Fn(&str) -> bool {
+        let set: HashSet<&'static str> = keys.iter().copied().collect();
+        move |key: &str| set.contains(key)
+    }
+
+    #[test]
+    fn full_reference_is_used_when_registered() {
+        // greentic-pack's resolved symbol: full ref is the registration key.
+        let is_reg = registered(&["ai.greentic.component-templates", "ai.greentic"]);
+        assert_eq!(
+            resolve_component_key("ai.greentic.component-templates", "handle_message", is_reg),
+            "ai.greentic.component-templates"
+        );
+    }
+
+    #[test]
+    fn legacy_packed_id_falls_back_when_suffix_is_operation() {
+        // `qa.process` packs op into the id; component registered as `qa`.
+        let is_reg = registered(&["qa"]);
+        assert_eq!(resolve_component_key("qa.process", "process", is_reg), "qa");
+    }
+
+    #[test]
+    fn drifted_dotted_reference_does_not_fall_back_to_prefix() {
+        // Full symbol absent, a *different* prefix component present, and the
+        // trailing segment is NOT the requested operation -> must not silently
+        // resolve to the prefix; return the original so the caller errors out.
+        let is_reg = registered(&["ai.greentic"]);
+        assert_eq!(
+            resolve_component_key("ai.greentic.component-templates", "handle_message", is_reg),
+            "ai.greentic.component-templates"
+        );
+    }
+
+    #[test]
+    fn unregistered_reference_is_returned_unchanged() {
+        let is_reg = registered(&[]);
+        assert_eq!(resolve_component_key("foo", "bar", is_reg), "foo");
     }
 }
 

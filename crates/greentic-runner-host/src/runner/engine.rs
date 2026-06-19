@@ -1936,23 +1936,30 @@ impl From<Flow> for HostFlow {
 impl From<Node> for HostNode {
     fn from(node: Node) -> Self {
         let full_ref = node.component.id.as_str().to_string();
-        // When the pack compiler stores "component.operation" as a single ID
-        // without a separate operation field, split on the last dot.
+        let operation_in_mapping = extract_operation_from_mapping(&node.input.mapping);
+        // A dotted component id is only a packed "<component>.<operation>" string
+        // when the operation isn't carried structurally elsewhere. greentic-pack
+        // resolves a component node to a bare component symbol (e.g.
+        // `ai.greentic.component-templates`) and keeps the operation in the input
+        // mapping, so splitting on the last dot here would corrupt the reference
+        // (→ `ai.greentic`, "not found in pack"). Prefer the structured operation —
+        // from `component.operation` or the input mapping — and only fall back to
+        // the legacy single-ID split when neither is present.
         let is_builtin = full_ref.starts_with("component.exec")
             || full_ref.starts_with("flow.")
             || full_ref.starts_with("emit.")
             || full_ref.starts_with("session.")
             || full_ref.starts_with("provider.");
-        let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
-            (full_ref, node.component.operation.clone())
-        } else if let Some(dot) = full_ref.rfind('.') {
-            let comp = full_ref[..dot].to_string();
-            let op = full_ref[dot + 1..].to_string();
-            (comp, Some(op))
-        } else {
-            (full_ref, None)
-        };
-        let operation_in_mapping = extract_operation_from_mapping(&node.input.mapping);
+        let (component_ref, raw_operation) =
+            if node.component.operation.is_some() || is_builtin || operation_in_mapping.is_some() {
+                (full_ref, node.component.operation.clone())
+            } else if let Some(dot) = full_ref.rfind('.') {
+                let comp = full_ref[..dot].to_string();
+                let op = full_ref[dot + 1..].to_string();
+                (comp, Some(op))
+            } else {
+                (full_ref, None)
+            };
         let operation_is_component_exec = raw_operation.as_deref() == Some("component.exec");
         let operation_is_emit = raw_operation
             .as_deref()
@@ -3132,6 +3139,71 @@ mod tests {
         assert_eq!(starts.len(), 1);
         assert_eq!(ends.len(), 1);
         assert_eq!(ends[0], json!({ "message": "logged" }));
+    }
+
+    #[test]
+    fn dotted_component_id_with_mapping_operation_is_not_split() {
+        // greentic-pack resolves a component node to a bare component symbol and
+        // keeps the operation in the input mapping. The runtime must NOT split the
+        // dotted symbol on the last dot (which would yield `ai.greentic`, "not
+        // found in pack"); the structured mapping operation makes the id a
+        // complete reference.
+        let node = Node {
+            id: NodeId::from_str("render").unwrap(),
+            component: FlowComponentRef {
+                id: "ai.greentic.component-templates".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "operation": "handle_message", "input": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let host = HostNode::from(node);
+        assert!(
+            matches!(&host.kind, NodeKind::PackComponent { component_ref } if component_ref == "ai.greentic.component-templates"),
+            "dotted component id must stay intact, got kind {:?}",
+            host.kind
+        );
+        assert_eq!(host.component, "ai.greentic.component-templates");
+        assert_eq!(host.operation_in_mapping(), Some("handle_message"));
+    }
+
+    #[test]
+    fn packed_component_operation_id_still_splits_without_mapping_operation() {
+        // Legacy encoding: the operation is packed into the id as
+        // `<component>.<operation>` and absent from the mapping. The last-dot
+        // split must still recover it.
+        let node = Node {
+            id: NodeId::from_str("render").unwrap(),
+            component: FlowComponentRef {
+                id: "templating.handlebars".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "text": "hello" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let host = HostNode::from(node);
+        assert!(
+            matches!(&host.kind, NodeKind::PackComponent { component_ref } if component_ref == "templating"),
+            "packed <component>.<operation> id must split, got kind {:?}",
+            host.kind
+        );
+        assert_eq!(host.operation_name(), Some("handlebars"));
     }
 
     fn host_flow_for_test(
