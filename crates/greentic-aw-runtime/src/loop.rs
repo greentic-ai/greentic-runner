@@ -284,35 +284,60 @@ pub async fn run_step(
         break;
     }
 
-    // --- Outbound guardrail hook ---
-    // Run on the candidate reply before it leaves the runtime. History is
-    // written only after this check so saved state reflects the guarded reply.
-    let reply = match crate::guardrail::run_chain(
-        &guardrail_chain,
-        crate::guardrail::GuardrailDirection::Outbound,
-        reply,
-        &guardrail_ctx,
-        runtime.guardrail_evaluator.as_ref(),
-    ) {
-        crate::guardrail::ChainOutcome::Pass(text) => text,
-        crate::guardrail::ChainOutcome::Denied { info, direction } => {
-            return Err(AgentError::GuardrailDenied {
-                direction,
-                code: info.code,
-                message: info.message,
-                details: info.details,
-            });
-        }
-    };
-    // Push the guarded reply into conversation history and the audit trail
-    // now that both inbound and outbound checks have passed.
+    // --- Outbound guardrail hook (FinalReply only) ---
+    // The outbound chain is intentionally skipped when the loop terminated via
+    // Timeout or MaxIterations: in those cases `reply` is an empty string, and
+    // running an outbound guardrail against an empty string could trigger a
+    // policy deny that masks the true termination reason from the caller.
+    // Only a real final reply (where the LLM produced content) is subject to
+    // outbound policy; the assistant message and audit trail are written only
+    // after this check passes, so saved state reflects the guarded reply.
     if terminated_by == TerminationReason::FinalReply {
+        let reply = match crate::guardrail::run_chain(
+            &guardrail_chain,
+            crate::guardrail::GuardrailDirection::Outbound,
+            reply,
+            &guardrail_ctx,
+            runtime.guardrail_evaluator.as_ref(),
+        ) {
+            crate::guardrail::ChainOutcome::Pass(text) => text,
+            crate::guardrail::ChainOutcome::Denied { info, direction } => {
+                return Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                });
+            }
+        };
         state.messages.push(ChatMessage::Assistant {
             content: reply.clone(),
             tool_calls: vec![],
         });
         trail.push(AgentStep::Reply {
             text: reply.clone(),
+        });
+
+        state.truncate_history(config.limits.max_history_turns);
+        if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+            warn!(error = %e, "state save failed at end of step");
+        }
+
+        runtime.telemetry.record_step(&StepTelemetryCtx {
+            tenant_id: tenant.tenant_id.clone(),
+            env_id: tenant.env_id.clone(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            terminated_by: terminated_by.clone(),
+            iterations,
+            total_tokens,
+            duration: started.elapsed(),
+        });
+
+        return Ok(AgentOutput {
+            reply,
+            trail,
+            terminated_by,
         });
     }
 
