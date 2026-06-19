@@ -178,6 +178,11 @@ impl Activity {
         self
     }
 
+    /// Merge a namespaced field into the activity payload. The only caller is the
+    /// fast2flow dispatch path (feature `greentic-x-provider`), so gate the helper
+    /// to that feature — this keeps it (and its unit test) out of builds that
+    /// don't compile fast2flow, avoiding a dead-code warning there.
+    #[cfg(feature = "greentic-x-provider")]
     pub(crate) fn with_payload_field(mut self, key: impl Into<String>, value: Value) -> Self {
         match &mut self.payload {
             Value::Object(object) => {
@@ -336,6 +341,7 @@ mod tests {
         assert_eq!(activity.messaging_endpoint_id(), Some("teams-legal"));
     }
 
+    #[cfg(feature = "greentic-x-provider")]
     #[test]
     fn with_payload_field_adds_field_to_object_payload() {
         let activity = Activity::text("show traffic")
