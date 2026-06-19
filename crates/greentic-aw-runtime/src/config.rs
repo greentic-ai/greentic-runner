@@ -84,11 +84,22 @@ impl Default for KnowledgeSettings {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GuardrailRef {
+    pub cap_id: String,
+    #[serde(default)]
+    pub offer_id: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     pub agent_id: String,
     pub system_prompt: String,
     pub tools: Vec<ToolRef>,
+    #[serde(default)]
+    pub guardrails: Vec<GuardrailRef>,
     pub llm: LlmProviderRef,
     #[serde(default)]
     pub limits: AgentLimits,
@@ -247,6 +258,7 @@ mod tests {
                 extension_id: "http".into(),
                 tool_name: "fetch".into(),
             }],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4o-mini".into(),
@@ -262,6 +274,30 @@ mod tests {
         assert_eq!(round.limits.max_iter, 8);
         assert_eq!(round.limits.timeout, Duration::from_secs(60));
         assert_eq!(round.limits.llm_retry_backoff, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn agent_config_defaults_guardrails_to_empty() {
+        let json = r#"{
+            "agent_id": "a1",
+            "system_prompt": "hi",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "gpt-4o-mini" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.guardrails.is_empty());
+    }
+
+    #[test]
+    fn guardrail_ref_round_trips() {
+        let r = GuardrailRef {
+            cap_id: "greentic.cap.guardrail.v1".to_string(),
+            offer_id: Some("pii".to_string()),
+            config: serde_json::json!({ "mask": ["email"] }),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: GuardrailRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

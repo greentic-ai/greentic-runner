@@ -773,6 +773,7 @@ mod aw {
             agent_id: agent_id.clone(),
             system_prompt: req.system_prompt.clone(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
@@ -784,6 +785,7 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
+        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
@@ -907,6 +909,7 @@ mod aw {
             agent_id: agent_id.clone(),
             system_prompt: routing_system_prompt,
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: req.model.clone(),
@@ -918,6 +921,7 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
+        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,

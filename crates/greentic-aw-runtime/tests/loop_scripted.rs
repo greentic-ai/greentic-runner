@@ -26,6 +26,7 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
         agent_id: "a".into(),
         system_prompt: "sys".into(),
         tools,
+        guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),

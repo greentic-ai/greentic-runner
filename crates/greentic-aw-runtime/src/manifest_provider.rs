@@ -115,6 +115,7 @@ mod tests {
                     extension_id: "yaml.ext".into(),
                     tool_name: "yaml_tool".into(),
                 }],
+                guardrails: vec![],
                 llm: LlmProviderRef {
                     provider: "openai".into(),
                     model: "gpt-4o-mini".into(),

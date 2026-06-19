@@ -53,10 +53,57 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
-    let user_message = message.text.clone();
-    state.messages.push(ChatMessage::User {
-        content: message.text,
-    });
+    // --- Assemble guardrail chain (once per step, before any message push) ---
+    // Mandatory refs from the platform policy are resolved first; if any
+    // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
+    let guardrail_chain = {
+        let registry = runtime.ext_runtime.capability_registry();
+        let mandatory = runtime.guardrail_policy.mandatory_guardrails(&tenant);
+        match crate::guardrail::assemble_chain(&registry, &mandatory, &config.guardrails) {
+            Ok(chain) => chain,
+            Err(unresolved) => {
+                return Err(AgentError::GuardrailDenied {
+                    direction: crate::guardrail::GuardrailDirection::Inbound,
+                    code: "internal".to_string(),
+                    message: "A required guardrail is unavailable.".to_string(),
+                    details: serde_json::to_string(
+                        &serde_json::json!({ "unresolved_mandatory": unresolved }),
+                    )
+                    .ok(),
+                });
+            }
+        }
+    };
+    let guardrail_ctx = crate::guardrail::GuardrailRunCtx {
+        agent_id: agent_id.to_string(),
+        session_id: session_id.to_string(),
+        tenant_id: tenant.tenant_id.clone(),
+        env_id: tenant.env_id.clone(),
+    };
+
+    // --- Inbound guardrail hook ---
+    let user_text = match crate::guardrail::run_chain(
+        &guardrail_chain,
+        crate::guardrail::GuardrailDirection::Inbound,
+        message.text,
+        &guardrail_ctx,
+        runtime.guardrail_evaluator.as_ref(),
+    ) {
+        crate::guardrail::ChainOutcome::Pass(text) => text,
+        crate::guardrail::ChainOutcome::Denied { info, direction } => {
+            return Err(AgentError::GuardrailDenied {
+                direction,
+                code: info.code,
+                message: info.message,
+                details: info.details,
+            });
+        }
+    };
+    // Keep user_message for long-term memory recall query below.
+    let user_message = user_text.clone();
+    state
+        .messages
+        .push(ChatMessage::User { content: user_text });
 
     // Whether long-term memory is active for this turn (provider wired + the
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
@@ -309,6 +356,39 @@ pub async fn run_step(
 
         // --- No tool calls: final reply ---
         reply = response.content.unwrap_or_default();
+        // NOTE: the assistant ChatMessage push and trail push are deferred
+        // until AFTER the outbound guardrail chain so history reflects the
+        // guarded reply, not the raw LLM output.
+        terminated_by = TerminationReason::FinalReply;
+        break;
+    }
+
+    // --- Outbound guardrail hook (FinalReply only) ---
+    // The outbound chain is intentionally skipped when the loop terminated via
+    // Timeout or MaxIterations: in those cases `reply` is an empty string, and
+    // running an outbound guardrail against an empty string could trigger a
+    // policy deny that masks the true termination reason from the caller.
+    // Only a real final reply (where the LLM produced content) is subject to
+    // outbound policy; the assistant message and audit trail are written only
+    // after this check passes, so saved state reflects the guarded reply.
+    if terminated_by == TerminationReason::FinalReply {
+        let reply = match crate::guardrail::run_chain(
+            &guardrail_chain,
+            crate::guardrail::GuardrailDirection::Outbound,
+            reply,
+            &guardrail_ctx,
+            runtime.guardrail_evaluator.as_ref(),
+        ) {
+            crate::guardrail::ChainOutcome::Pass(text) => text,
+            crate::guardrail::ChainOutcome::Denied { info, direction } => {
+                return Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                });
+            }
+        };
         state.messages.push(ChatMessage::Assistant {
             content: reply.clone(),
             tool_calls: vec![],
@@ -316,8 +396,28 @@ pub async fn run_step(
         trail.push(AgentStep::Reply {
             text: reply.clone(),
         });
-        terminated_by = TerminationReason::FinalReply;
-        break;
+
+        state.truncate_history(config.limits.max_history_turns);
+        if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+            warn!(error = %e, "state save failed at end of step");
+        }
+
+        runtime.telemetry.record_step(&StepTelemetryCtx {
+            tenant_id: tenant.tenant_id.clone(),
+            env_id: tenant.env_id.clone(),
+            session_id: session_id.to_string(),
+            agent_id: agent_id.to_string(),
+            terminated_by: terminated_by.clone(),
+            iterations,
+            total_tokens,
+            duration: started.elapsed(),
+        });
+
+        return Ok(AgentOutput {
+            reply,
+            trail,
+            terminated_by,
+        });
     }
 
     state.truncate_history(config.limits.max_history_turns);
@@ -420,6 +520,7 @@ mod tests {
             agent_id: "a".into(),
             system_prompt: "sys".into(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "m".into(),

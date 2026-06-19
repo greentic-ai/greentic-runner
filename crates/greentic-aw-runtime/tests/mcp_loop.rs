@@ -79,6 +79,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         agent_id: "a".into(),
         system_prompt: "sys".into(),
         tools,
+        guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),

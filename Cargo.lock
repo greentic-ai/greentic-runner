@@ -2987,6 +2987,7 @@ dependencies = [
  "greentic-dw-manifest",
  "greentic-dw-memory-long-term",
  "greentic-ext-runtime",
+ "greentic-extension-sdk-contract",
  "greentic-mcp-client",
  "greentic-secrets-lib",
  "greentic-state",
@@ -2995,6 +2996,7 @@ dependencies = [
  "redis 1.2.3",
  "reqwest 0.12.28",
  "secrecy",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -3256,8 +3258,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-ext-runtime"
-version = "1.2.24-research"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.24-research#9d21a6727e9aef646a1cc944c74624e5c2f0a491"
+version = "1.2.25-research"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.25-research#bd6beaa2cbc7ef97badd772c3aea12f62c93ecb4"
 dependencies = [
  "anyhow",
  "arc-swap",

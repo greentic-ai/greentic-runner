@@ -40,6 +40,14 @@ pub enum AgentError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("guardrail denied ({direction}): {message}")]
+    GuardrailDenied {
+        direction: crate::guardrail::GuardrailDirection,
+        code: String,
+        message: String,
+        details: Option<String>,
+    },
 }
 
 impl AgentError {
@@ -136,6 +144,7 @@ mod tests {
             agent_id: "a".into(),
             system_prompt: "".into(),
             tools: vec![],
+            guardrails: vec![],
             llm: LlmProviderRef {
                 provider: "openai".into(),
                 model: "gpt-4".into(),

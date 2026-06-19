@@ -20,6 +20,7 @@ pub mod cost;
 pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
+pub mod guardrail;
 pub mod http_provider;
 pub mod knowledge;
 pub mod layered_provider;
@@ -137,6 +138,14 @@ pub struct AgentRuntime {
     /// per-operator wiring lives in the runner host; tests and non-MCP callers
     /// pass `None`.
     pub(crate) mcp: Option<Arc<crate::mcp_source::McpToolSource>>,
+    /// Policy that supplies platform/tenant-wide mandatory guardrail refs.
+    /// Defaults to [`crate::guardrail::NoMandatoryGuardrails`] (no platform
+    /// enforcement). Replaced by a real policy during runner-host wiring.
+    pub(crate) guardrail_policy: Arc<dyn crate::guardrail::GuardrailPolicy>,
+    /// Evaluator that invokes guardrail WASM extensions.
+    /// Defaults to [`crate::guardrail::AcceptAllEvaluator`] until Task 7
+    /// wires in the real extension-backed evaluator.
+    pub(crate) guardrail_evaluator: Arc<dyn crate::guardrail::GuardrailEvaluator>,
     /// Per-tenant agentic-worker component tool source. `None` disables
     /// component tools entirely (`component:`-prefixed tool refs then resolve to
     /// nothing). Set via [`AgentRuntime::with_component_source`]; the concrete
@@ -177,10 +186,27 @@ impl AgentRuntime {
             token_meter,
             ledger,
             mcp,
+            guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
+            guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
             long_term_memory: None,
             knowledge: None,
         }
+    }
+
+    /// Override the guardrail policy and evaluator after construction.
+    ///
+    /// Available in all builds (including production runner-host) so the
+    /// runner can inject the real `ExtRuntimeGuardrailEvaluator` +
+    /// `StaticGuardrailPolicy` without requiring `test-mock`.
+    pub fn with_guardrails(
+        mut self,
+        policy: Arc<dyn crate::guardrail::GuardrailPolicy>,
+        evaluator: Arc<dyn crate::guardrail::GuardrailEvaluator>,
+    ) -> Self {
+        self.guardrail_policy = policy;
+        self.guardrail_evaluator = evaluator;
+        self
     }
 
     /// Wire the component tool source so `component:`-prefixed tool refs resolve
@@ -254,6 +280,7 @@ impl AgentRuntime {
         let ctx = knowledge::to_types_tenant(tenant)?;
         kb.search(&ctx, query).await
     }
+
 
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].

@@ -32,7 +32,8 @@ greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", 
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
 greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.24-research" }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.25-research" }
+greentic-extension-sdk-contract = "=1.2.11-research"
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
@@ -51,6 +52,8 @@ url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+ed25519-dalek = { workspace = true }
+semver = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
 wiremock = "0.6"
