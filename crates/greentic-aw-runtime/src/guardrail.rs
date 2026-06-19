@@ -91,6 +91,71 @@ impl GuardrailEvaluator for AcceptAllEvaluator {
     }
 }
 
+/// A [`GuardrailEvaluator`] that delegates evaluation to a real WASM extension
+/// loaded by [`greentic_ext_runtime::ExtensionRuntime`].
+///
+/// This adapter bridges the agentic-worker's [`GuardrailEvaluator`] trait to the
+/// ext-runtime's `evaluate_guardrail` entry point:
+///
+/// 1. Serializes [`GuardrailInput`] to a flat JSON payload.
+/// 2. Calls `ext_runtime.evaluate_guardrail(extension_id, &payload)` which
+///    invokes the WASM component's `greentic:extension-design/guardrail#evaluate`
+///    export and returns the verdict as JSON.
+/// 3. Deserializes the returned JSON into [`greentic_ext_runtime::GuardrailVerdictWire`].
+/// 4. Maps the wire form to [`GuardrailVerdict`].
+///
+/// # Wiring
+///
+/// Construction (Task 8) will pass the `Arc<ExtensionRuntime>` that the
+/// `AgentRuntime` already holds for tool dispatch. No additional WASM runtime
+/// is needed.
+pub struct ExtRuntimeGuardrailEvaluator {
+    pub ext_runtime: std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>,
+}
+
+impl GuardrailEvaluator for ExtRuntimeGuardrailEvaluator {
+    fn evaluate(
+        &self,
+        extension_id: &str,
+        input: &GuardrailInput,
+    ) -> Result<GuardrailVerdict, GuardrailInvokeError> {
+        let payload = serde_json::json!({
+            "direction": input.direction.as_str(),
+            "content": input.content,
+            "agent_id": input.agent_id,
+            "session_id": input.session_id,
+            "tenant_id": input.tenant_id,
+            "env_id": input.env_id,
+            "context": input.context,
+        })
+        .to_string();
+
+        let verdict_json = self
+            .ext_runtime
+            .evaluate_guardrail(extension_id, &payload)
+            .map_err(|e| GuardrailInvokeError(e.to_string()))?;
+
+        let wire: greentic_ext_runtime::GuardrailVerdictWire =
+            serde_json::from_str(&verdict_json).map_err(|e| GuardrailInvokeError(e.to_string()))?;
+
+        Ok(match wire {
+            greentic_ext_runtime::GuardrailVerdictWire::Accept => GuardrailVerdict::Accept,
+            greentic_ext_runtime::GuardrailVerdictWire::Update { content } => {
+                GuardrailVerdict::Update(content)
+            }
+            greentic_ext_runtime::GuardrailVerdictWire::Deny {
+                code,
+                message,
+                details,
+            } => GuardrailVerdict::Deny(GuardrailDenyInfo {
+                code,
+                message,
+                details,
+            }),
+        })
+    }
+}
+
 pub struct NoMandatoryGuardrails;
 
 impl GuardrailPolicy for NoMandatoryGuardrails {
