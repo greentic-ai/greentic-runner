@@ -24,16 +24,6 @@ impl OAuthBrokerConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct OAuthBrokerHost;
-
-pub trait OAuthHostContext {
-    fn tenant_id(&self) -> &str;
-    fn env(&self) -> &str;
-    fn oauth_broker_host(&mut self) -> &mut OAuthBrokerHost;
-    fn oauth_config(&self) -> Option<&OAuthBrokerConfig>;
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ResourceTokenRequest {
     pub http_base_url: String,

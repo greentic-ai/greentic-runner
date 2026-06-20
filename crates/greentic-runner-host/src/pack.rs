@@ -10,7 +10,7 @@ use crate::cache::{ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProf
 use crate::component_api::{
     self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError,
 };
-use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
+use crate::oauth::{OAuthBrokerConfig, ResourceTokenRequest};
 use crate::provider::{ProviderBinding, ProviderRegistry};
 use crate::provider_core::{
     schema_core::SchemaCorePre as LegacySchemaCorePre,
@@ -26,6 +26,7 @@ use greentic_distributor_client::dist::{
 };
 use greentic_interfaces_wasmtime::host_helpers::v1::{
     self as host_v1, HostFns, add_all_v1_to_linker,
+    oauth_broker::OAuthBrokerHost as OAuthBrokerHostTrait,
     runner_host_http::RunnerHostHttp,
     runner_host_kv::RunnerHostKv,
     secrets_store::{SecretsError, SecretsErrorV1_1, SecretsStoreHost, SecretsStoreHostV1_1},
@@ -256,14 +257,12 @@ pub struct HostState {
     mocks: Option<Arc<MockLayer>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
-    oauth_host: OAuthBrokerHost,
     exec_ctx: Option<ComponentExecCtx>,
     component_ref: Option<String>,
     provider_core_component: bool,
 }
 
 impl HostState {
-    #[allow(clippy::default_constructed_unit_structs)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pack_id: String,
@@ -289,7 +288,6 @@ impl HostState {
             mocks,
             secrets,
             oauth_config,
-            oauth_host: OAuthBrokerHost::default(),
             exec_ctx,
             component_ref,
             provider_core_component,
@@ -1046,6 +1044,70 @@ impl RunnerHostKv for HostState {
     fn put(&mut self, _ns: String, _key: String, _val: String) {}
 }
 
+impl OAuthBrokerHostTrait for HostState {
+    /// Returns an access-token JSON string (`{"access_token":…,"expires_at":…}`) for the given
+    /// provider and scopes, or an empty string on error.
+    ///
+    /// `subject` is informational for MVP — tenant, env, and team are taken from the host context
+    /// (config + default_env + oauth_config.team), NOT derived from `subject`.
+    fn get_token(
+        &mut self,
+        provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        scopes: wasmtime::component::__internal::Vec<wasmtime::component::__internal::String>,
+    ) -> wasmtime::component::__internal::String {
+        let Some(cfg) = self.oauth_config.clone() else {
+            return String::new();
+        };
+        let req = ResourceTokenRequest {
+            http_base_url: cfg.http_base_url,
+            env: self.default_env.clone(),
+            tenant: self.config.tenant.clone(),
+            team: cfg.team.clone(),
+            resource_id: provider_id.to_string(),
+            scopes: scopes.into_iter().collect(),
+        };
+        match crate::oauth::request_resource_token_blocking(
+            &self.http_client,
+            &req,
+            cfg.shared_secret.as_deref(),
+        ) {
+            Ok(resp) => serde_json::to_string(&resp).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    error = %e,
+                    "oauth get-token proxy failed"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Operator-time only — OAuth consent URL generation happens in the admin UI, not at runtime.
+    fn get_consent_url(
+        &mut self,
+        _provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        _scopes: wasmtime::component::__internal::Vec<wasmtime::component::__internal::String>,
+        _redirect_path: wasmtime::component::__internal::String,
+        _extra_json: wasmtime::component::__internal::String,
+    ) -> wasmtime::component::__internal::String {
+        String::new()
+    }
+
+    /// Operator-time only — OAuth code exchange happens in the admin UI, not at runtime.
+    fn exchange_code(
+        &mut self,
+        _provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        _code: wasmtime::component::__internal::String,
+        _redirect_path: wasmtime::component::__internal::String,
+    ) -> wasmtime::component::__internal::String {
+        String::new()
+    }
+}
+
 enum ManifestLoad {
     New {
         manifest: Box<greentic_types::PackManifest>,
@@ -1316,7 +1378,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
         HostFns {
             http_client_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             http_client: Some(|state: &mut ComponentState| state.host_mut()),
-            oauth_broker: None,
+            oauth_broker: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_http: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_kv: Some(|state: &mut ComponentState| state.host_mut()),
             telemetry_logger: Some(|state: &mut ComponentState| state.host_mut()),
@@ -1433,24 +1495,6 @@ fn alias_error_from_host(
     http_client_client_alias::HostError {
         code: err.code,
         message: err.message,
-    }
-}
-
-impl OAuthHostContext for ComponentState {
-    fn tenant_id(&self) -> &str {
-        &self.host.config.tenant
-    }
-
-    fn env(&self) -> &str {
-        &self.host.default_env
-    }
-
-    fn oauth_broker_host(&mut self) -> &mut OAuthBrokerHost {
-        &mut self.host.oauth_host
-    }
-
-    fn oauth_config(&self) -> Option<&OAuthBrokerConfig> {
-        self.host.oauth_config.as_ref()
     }
 }
 

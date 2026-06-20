@@ -694,7 +694,11 @@ agents:
             team: Some("ops".into()),
             shared_secret: None,
         }));
-        let broker = cfg.oauth_broker_config().expect("missing broker config");
+        // Use `_with_env(None)` so the test is not perturbed by a set
+        // GREENTIC_OAUTH_BROKER_SHARED_SECRET environment variable.
+        let broker = cfg
+            .oauth_broker_config_with_env(None)
+            .expect("missing broker config");
         assert_eq!(broker.http_base_url, "https://oauth.example/");
         assert_eq!(broker.nats_url, "nats://broker:4222");
         assert_eq!(broker.default_provider.as_deref(), Some("demo"));
