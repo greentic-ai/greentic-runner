@@ -52,6 +52,16 @@ pub const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
 /// surface without the other.
 pub const MCP_ROLE_FLOW_EDITOR: &str = "flow_editor";
 
+/// Which transport backs an MCP server row. `http` is the default (existing
+/// remote behavior); `local-wasm` runs a `wasix:mcp` component in-process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    #[default]
+    Http,
+    LocalWasm,
+}
+
 /// Wire row from `/api/v1/designer/tenant/me/mcp-servers`.
 #[derive(Deserialize)]
 struct WireRow {
@@ -65,6 +75,14 @@ struct WireRow {
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     roles: Vec<String>,
+    /// Transport discriminator; defaults to [`Transport::Http`] when absent so
+    /// every existing row continues to work without changes.
+    #[serde(default)]
+    transport: Transport,
+    /// For `local-wasm` rows: the component reference (e.g. `weather.component`).
+    component_ref: Option<String>,
+    /// For `local-wasm` rows: optional pinned component version.
+    component_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +98,9 @@ struct ParsedServer {
     auth_token: Option<SecretString>,
     allowed_tools: Option<Vec<String>>,
     roles: Vec<String>,
+    transport: Transport,
+    component_ref: Option<String>,
+    component_version: Option<String>,
 }
 
 /// LLM-facing schema for one MCP tool: enough for Task 2 to build an
@@ -101,6 +122,9 @@ pub struct McpRoute {
     auth_header_name: Option<String>,
     auth_token: Option<SecretString>,
     raw_tool_name: String,
+    pub transport: Transport,
+    pub component_ref: Option<String>,
+    pub component_version: Option<String>,
 }
 
 impl std::fmt::Debug for McpRoute {
@@ -114,6 +138,7 @@ impl std::fmt::Debug for McpRoute {
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("raw_tool_name", &self.raw_tool_name)
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -189,6 +214,9 @@ pub(crate) fn route_for_tests(server_id: &str, tool: &str, transport_url: &str) 
         auth_header_name: None,
         auth_token: None,
         raw_tool_name: tool.to_string(),
+        transport: Transport::Http,
+        component_ref: None,
+        component_version: None,
     }
 }
 
@@ -360,6 +388,9 @@ fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, String> {
             auth_token: w.auth_token.map(SecretString::from),
             allowed_tools: w.allowed_tools,
             roles: w.roles,
+            transport: w.transport,
+            component_ref: w.component_ref,
+            component_version: w.component_version,
         })
         .collect())
 }
@@ -389,6 +420,9 @@ fn ingest_server_tools(catalog: &mut McpToolCatalog, server: &ParsedServer, defs
                 auth_header_name: server.auth_header_name.clone(),
                 auth_token: server.auth_token.clone(),
                 raw_tool_name: def.name.clone(),
+                transport: server.transport,
+                component_ref: server.component_ref.clone(),
+                component_version: server.component_version.clone(),
             },
         );
     }
@@ -806,9 +840,28 @@ mod tests {
             auth_header_name: None,
             auth_token: Some(SecretString::from("tok-secret".to_string())),
             raw_tool_name: "get_issue".to_string(),
+            transport: Transport::Http,
+            component_ref: None,
+            component_version: None,
         };
         let dbg = format!("{route:?}");
         assert!(!dbg.contains("tok-secret"), "got: {dbg}");
         assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
+    }
+
+    #[test]
+    fn parse_rows_defaults_transport_to_http_and_reads_local_wasm() {
+        let body = json!({"servers": [
+            { "id": "h", "name": "H", "transport_url": "https://x/", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"] },
+            { "id": "l", "name": "L", "transport_url": "", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"],
+              "transport": "local-wasm", "component_ref": "weather.component",
+              "component_version": "1.0.0" }
+        ]});
+        let rows = parse_rows(body).expect("parse");
+        assert!(matches!(rows[0].transport, Transport::Http));
+        assert!(matches!(rows[1].transport, Transport::LocalWasm));
+        assert_eq!(rows[1].component_ref.as_deref(), Some("weather.component"));
     }
 }
