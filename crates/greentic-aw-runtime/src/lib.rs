@@ -21,6 +21,7 @@ pub mod dispatch_ledger;
 pub mod error;
 pub mod graph;
 pub mod guardrail;
+pub mod guardrail_provider;
 pub mod http_provider;
 pub mod knowledge;
 pub mod layered_provider;
