@@ -132,17 +132,19 @@ mod aw {
         })
     }
 
-    /// Return the static list of mandatory guardrails sourced from runner config.
-    ///
-    /// Returns an empty `Vec` in v1 — no config plumbing yet exposes a
-    /// guardrail list. The real policy store lives in the env→tenant→team
-    /// hierarchy.
-    ///
-    /// # TODO(guardrail)
-    /// Source from env→tenant→team policy store once the runner config
-    /// exposes a `guardrails.mandatory` list.
-    fn mandatory_guardrails_from_config() -> Vec<greentic_aw_runtime::config::GuardrailRef> {
-        Vec::new()
+    /// Build an [`HttpGuardrailPolicy`] from `GREENTIC_AW_ADMIN_ENDPOINT` +
+    /// `GREENTIC_AW_ADMIN_TOKEN` (the same pair the agent registry uses).
+    /// Returns `None` when either is unset/empty, so a non-admin deploy
+    /// enforces no mandatory policy (today's behavior).
+    fn guardrail_policy_from_env()
+    -> Option<greentic_aw_runtime::guardrail_provider::HttpGuardrailPolicy> {
+        let endpoint = std::env::var("GREENTIC_AW_ADMIN_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let token = std::env::var("GREENTIC_AW_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        Some(greentic_aw_runtime::guardrail_provider::HttpGuardrailPolicy::new(endpoint, token))
     }
 
     /// Production [`AgentNodeHandler`] wrapping the agentic-worker runtime.
@@ -724,9 +726,16 @@ mod aw {
             mcp_source_from_env(),
         )
         .with_guardrails(
-            Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
-                mandatory_guardrails_from_config(),
-            )),
+            {
+                let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
+                    match guardrail_policy_from_env() {
+                        Some(http) => Arc::new(http),
+                        None => Arc::new(
+                            greentic_aw_runtime::guardrail::StaticGuardrailPolicy(Vec::new()),
+                        ),
+                    };
+                policy
+            },
             Arc::new(
                 greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
                     ext_runtime: ext_runtime.clone(),
@@ -1206,6 +1215,37 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
             }
             assert!(super::registry_from_env().is_some());
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn guardrail_policy_from_env_requires_both_vars() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+            assert!(super::guardrail_policy_from_env().is_none());
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "http://localhost:9999");
+            }
+            assert!(
+                super::guardrail_policy_from_env().is_none(),
+                "endpoint alone is not enough"
+            );
+
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+            }
+            assert!(super::guardrail_policy_from_env().is_some());
 
             unsafe {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");

@@ -109,6 +109,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         },
         memory: None,
         knowledge: None,
+        guardrails: vec![],
     }
 }
 

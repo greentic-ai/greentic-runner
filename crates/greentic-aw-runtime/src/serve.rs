@@ -327,6 +327,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         limits: AgentLimits::default(),
         memory: None,
         knowledge: None,
+        guardrails: vec![],
     };
     for (tenant, env) in [
         ("default", "default"),
