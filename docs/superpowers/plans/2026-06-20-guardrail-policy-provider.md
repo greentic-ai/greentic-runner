@@ -6,7 +6,7 @@
 
 **Architecture:** Make `GuardrailPolicy::mandatory_guardrails` async + fallible (`Result<Vec<GuardrailRef>, GuardrailPolicyError>`); the loop maps `Err` to the existing `GuardrailDenied` fail-closed UX. Add `HttpGuardrailPolicy` (mirrors `HttpConfigProvider`, with an internal TTL cache like `CachingGraphProvider`). Wire it at the runner-host build site from `GREENTIC_AW_ADMIN_ENDPOINT`/`_TOKEN`, falling back to an empty `StaticGuardrailPolicy` when unset.
 
-**Tech Stack:** Rust 1.95, `async_trait`, `reqwest`, `tokio`, `wiremock` (tests), `thiserror`.
+**Tech Stack:** Rust 1.95, `reqwest`, `tokio`, `wiremock` (tests), `thiserror`. **The `GuardrailPolicy` trait is object-safe (used as `Arc<dyn GuardrailPolicy>`), so its async method returns a manual `Pin<Box<dyn Future + Send>>` — mirroring the `ConfigProvider` trait in `http_provider.rs`. Do NOT use `#[async_trait]`: `crates/greentic-aw-runtime/Cargo.toml` explicitly forbids it on AW traits.**
 
 ## Global Constraints
 
@@ -37,7 +37,7 @@
 - Modify (compile-fix `.await`): `crates/greentic-aw-runtime/tests/guardrail_e2e.rs`, `crates/greentic-aw-runtime/tests/guardrail_loop.rs` only if they call `mandatory_guardrails` directly (they construct `StaticGuardrailPolicy` and pass to `with_guardrails`; the call happens inside the loop, so likely no change — verify by compiling).
 
 **Interfaces:**
-- Produces: `pub enum GuardrailPolicyError { Unavailable(String) }` (derives `Debug` + `thiserror::Error`); `#[async_trait::async_trait] trait GuardrailPolicy { async fn mandatory_guardrails(&self, tenant: &TenantContext) -> Result<Vec<GuardrailRef>, GuardrailPolicyError>; }`. `StaticGuardrailPolicy` and `NoMandatoryGuardrails` return `Ok(...)`.
+- Produces: `pub enum GuardrailPolicyError { Unavailable(String) }` (derives `Debug` + `thiserror::Error`); the trait method becomes `fn mandatory_guardrails<'a>(&'a self, tenant: &'a TenantContext) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>` (object-safe async, `Pin<Box<dyn Future>>` like `ConfigProvider`). `StaticGuardrailPolicy` and `NoMandatoryGuardrails` return `Box::pin(async move { Ok(...) })`.
 
 - [ ] **Step 1: Write/adapt the failing test**
 
@@ -89,45 +89,43 @@ pub enum GuardrailPolicyError {
 }
 ```
 
-Change the trait (keep `Send + Sync`):
+Change the trait to an object-safe async method (`Pin<Box<dyn Future>>`, NOT `#[async_trait]` — the crate's `Cargo.toml` forbids async-trait on AW traits; this mirrors the `ConfigProvider` trait in `http_provider.rs`). Add the imports `use std::future::Future;` and `use std::pin::Pin;` at the top of `guardrail.rs` if absent:
 
 ```rust
-#[async_trait::async_trait]
 pub trait GuardrailPolicy: Send + Sync {
     /// The platform-mandated guardrails for this tenant+env. `Err` means the
     /// policy could not be determined and the caller MUST fail closed.
-    async fn mandatory_guardrails(
-        &self,
-        tenant: &TenantContext,
-    ) -> Result<Vec<GuardrailRef>, GuardrailPolicyError>;
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>;
 }
 ```
 
 Update the two impls:
 
 ```rust
-#[async_trait::async_trait]
 impl GuardrailPolicy for NoMandatoryGuardrails {
-    async fn mandatory_guardrails(
-        &self,
-        _tenant: &TenantContext,
-    ) -> Result<Vec<GuardrailRef>, GuardrailPolicyError> {
-        Ok(Vec::new())
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 }
 
-#[async_trait::async_trait]
 impl GuardrailPolicy for StaticGuardrailPolicy {
-    async fn mandatory_guardrails(
-        &self,
-        _tenant: &TenantContext,
-    ) -> Result<Vec<GuardrailRef>, GuardrailPolicyError> {
-        Ok(self.0.clone())
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>> {
+        let refs = self.0.clone();
+        Box::pin(async move { Ok(refs) })
     }
 }
 ```
 
-Confirm `async_trait` and `thiserror` are already workspace deps of `greentic-aw-runtime` (they are used elsewhere, e.g. `knowledge.rs` uses `async_trait`; check `Cargo.toml` and add if missing).
+Confirm `thiserror` is a workspace dep of `greentic-aw-runtime` (it is — see `Cargo.toml:48`). Do NOT add/use `async-trait` here.
 
 - [ ] **Step 4: Update the consumer in `loop.rs:61`**
 
@@ -159,13 +157,19 @@ In `crates/greentic-aw-runtime/tests/guardrail_loop.rs` (or a new focused test m
 
 ```rust
 struct FailingPolicy;
-#[async_trait::async_trait]
 impl greentic_aw_runtime::guardrail::GuardrailPolicy for FailingPolicy {
-    async fn mandatory_guardrails(
-        &self,
-        _t: &greentic_aw_runtime::tenant::TenantContext,
-    ) -> Result<Vec<greentic_aw_runtime::config::GuardrailRef>, greentic_aw_runtime::guardrail::GuardrailPolicyError> {
-        Err(greentic_aw_runtime::guardrail::GuardrailPolicyError::Unavailable("admin down".into()))
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _t: &'a greentic_aw_runtime::tenant::TenantContext,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<
+        Output = Result<
+            Vec<greentic_aw_runtime::config::GuardrailRef>,
+            greentic_aw_runtime::guardrail::GuardrailPolicyError,
+        >,
+    > + Send + 'a>> {
+        Box::pin(async move {
+            Err(greentic_aw_runtime::guardrail::GuardrailPolicyError::Unavailable("admin down".into()))
+        })
     }
 }
 ```
@@ -316,10 +320,10 @@ In `crates/greentic-aw-runtime/src/guardrail_provider.rs` (above the test module
 //! (fail-safe); returns `Unavailable` only when there is no cached entry (cold).
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-use async_trait::async_trait;
 
 use crate::config::GuardrailRef;
 use crate::guardrail::{GuardrailPolicy, GuardrailPolicyError};
@@ -397,29 +401,30 @@ impl HttpGuardrailPolicy {
     }
 }
 
-#[async_trait]
 impl GuardrailPolicy for HttpGuardrailPolicy {
-    async fn mandatory_guardrails(
-        &self,
-        tenant: &TenantContext,
-    ) -> Result<Vec<GuardrailRef>, GuardrailPolicyError> {
-        let key = (tenant.tenant_id.clone(), tenant.env_id.clone());
-        if let Some(fresh) = self.cached_fresh(&key) {
-            return Ok(fresh);
-        }
-        match self.fetch(&key.1).await {
-            Ok(refs) => {
-                self.store(key, refs.clone());
-                Ok(refs)
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = (tenant.tenant_id.clone(), tenant.env_id.clone());
+            if let Some(fresh) = self.cached_fresh(&key) {
+                return Ok(fresh);
             }
-            Err(reason) => match self.cached_any(&key) {
-                Some(stale) => {
-                    tracing::warn!(error = %reason, "guardrail policy fetch failed; serving stale");
-                    Ok(stale)
+            match self.fetch(&key.1).await {
+                Ok(refs) => {
+                    self.store(key, refs.clone());
+                    Ok(refs)
                 }
-                None => Err(GuardrailPolicyError::Unavailable(reason)),
-            },
-        }
+                Err(reason) => match self.cached_any(&key) {
+                    Some(stale) => {
+                        tracing::warn!(error = %reason, "guardrail policy fetch failed; serving stale");
+                        Ok(stale)
+                    }
+                    None => Err(GuardrailPolicyError::Unavailable(reason)),
+                },
+            }
+        })
     }
 }
 ```
@@ -606,4 +611,4 @@ async fn malformed_body_cold_is_unavailable() {
 
 **Placeholder scan:** no TBD/TODO-as-spec; every code step has concrete code. The "confirm field names / deps already present" notes are real verification instructions, not placeholders.
 
-**Type consistency:** `GuardrailPolicyError::Unavailable(String)`, `async fn mandatory_guardrails(&self, &TenantContext) -> Result<Vec<GuardrailRef>, GuardrailPolicyError>`, `HttpGuardrailPolicy::{new, with_ttl}`, `guardrail_policy_from_env() -> Option<HttpGuardrailPolicy>` — consistent across Tasks 1-3. Response wrapper `PolicyResp { guardrails: Vec<GuardrailRef> }` matches the Slice 2a `{guardrails:[...]}` contract. `tenant.tenant_id`/`tenant.env_id` field access flagged for verification in Task 2 Step 3.
+**Type consistency:** `GuardrailPolicyError::Unavailable(String)`, the object-safe `fn mandatory_guardrails<'a>(&'a self, &'a TenantContext) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>` (NO `#[async_trait]` — crate convention), `HttpGuardrailPolicy::{new, with_ttl}`, `guardrail_policy_from_env() -> Option<HttpGuardrailPolicy>` — consistent across Tasks 1-3. Response wrapper `PolicyResp { guardrails: Vec<GuardrailRef> }` matches the Slice 2a `{guardrails:[...]}` contract. `tenant.tenant_id`/`tenant.env_id` field access flagged for verification in Task 2 Step 3.
