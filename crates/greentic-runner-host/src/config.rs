@@ -175,6 +175,8 @@ pub struct OAuthConfig {
     pub env: Option<String>,
     #[serde(default)]
     pub team: Option<String>,
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 impl HostConfig {
@@ -270,6 +272,14 @@ impl HostConfig {
     }
 
     pub fn oauth_broker_config(&self) -> Option<OAuthBrokerConfig> {
+        let env_secret = std::env::var("GREENTIC_OAUTH_BROKER_SHARED_SECRET").ok();
+        self.oauth_broker_config_with_env(env_secret.as_deref())
+    }
+
+    /// Internal builder that accepts the env-var value explicitly so that
+    /// tests can exercise the priority logic without mutating the process
+    /// environment (which is unsafe in Rust 2024).
+    fn oauth_broker_config_with_env(&self, env_secret: Option<&str>) -> Option<OAuthBrokerConfig> {
         let oauth = self.oauth.as_ref()?;
         let mut cfg = OAuthBrokerConfig::new(&oauth.http_base_url, &oauth.nats_url);
         if !oauth.provider.is_empty() {
@@ -280,6 +290,10 @@ impl HostConfig {
         {
             cfg.team = Some(team.clone());
         }
+        // Prefer env var; fall back to yaml field. Never log the value.
+        cfg.shared_secret = env_secret
+            .map(str::to_owned)
+            .or_else(|| oauth.shared_secret.clone());
         Some(cfg)
     }
 
@@ -678,12 +692,63 @@ agents:
             provider: "demo".into(),
             env: None,
             team: Some("ops".into()),
+            shared_secret: None,
         }));
         let broker = cfg.oauth_broker_config().expect("missing broker config");
         assert_eq!(broker.http_base_url, "https://oauth.example/");
         assert_eq!(broker.nats_url, "nats://broker:4222");
         assert_eq!(broker.default_provider.as_deref(), Some("demo"));
         assert_eq!(broker.team.as_deref(), Some("ops"));
+        assert!(broker.shared_secret.is_none());
+    }
+
+    #[test]
+    fn oauth_broker_config_maps_shared_secret_from_yaml() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        // Pass None as the env var to exercise the yaml-field fallback path.
+        let broker = cfg
+            .oauth_broker_config_with_env(None)
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("yaml-secret"));
+    }
+
+    #[test]
+    fn oauth_broker_config_env_overrides_yaml_shared_secret() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        let broker = cfg
+            .oauth_broker_config_with_env(Some("env-secret"))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("env-secret"));
+    }
+
+    #[test]
+    fn oauth_broker_config_env_provides_secret_when_yaml_absent() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: None,
+        }));
+        let broker = cfg
+            .oauth_broker_config_with_env(Some("env-only-secret"))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("env-only-secret"));
     }
 
     #[test]
