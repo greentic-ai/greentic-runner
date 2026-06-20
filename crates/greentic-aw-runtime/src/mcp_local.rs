@@ -80,7 +80,7 @@ pub async fn local_call_tool(component_ref: &str, tool: &str, args: &Value) -> V
     let action = tool.to_string();
     let cloned_args = args.clone();
     let req = ExecRequest {
-        component: component.clone(),
+        component,
         action,
         args: cloned_args,
         tenant: None,
@@ -100,10 +100,12 @@ mod tests {
 
     /// Resolve a built router_echo wasm if present; else return None (test self-skips).
     fn fixture_wasm() -> Option<std::path::PathBuf> {
-        let p = std::path::PathBuf::from(
-            "/Users/bimapangestu/Desktop/Works/personal/greentic/greentic-mcp\
-             /.worktrees/local-wasm-mcp/target/wasm32-wasip2/release/router_echo.wasm",
-        );
+        let p = std::env::var("GREENTIC_MCP_ROUTER_ECHO_WASM")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../greentic-mcp/target/wasm32-wasip2/release/router_echo.wasm")
+            });
         p.exists().then_some(p)
     }
 
