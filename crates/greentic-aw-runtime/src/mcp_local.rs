@@ -35,6 +35,12 @@ pub fn cache_dir() -> PathBuf {
 /// Phase 1 trusts the cache contents (`allow_unverified: true`); signature
 /// pinning is added when the store-pull path lands (later phase) and supplies
 /// `required_digests`/`trusted_signers`.
+///
+/// TODO(phase-2): flip `allow_unverified` to signature pinning BEFORE
+/// `local-wasm` rows become registerable through admin. This unverified posture
+/// is only safe today because Phase 1 ships no admin path to register a
+/// `local-wasm` server — the cache is operator-seeded — so untrusted code
+/// cannot reach this executor in production until verification lands.
 fn exec_config() -> ExecConfig {
     ExecConfig {
         store: ToolStore::LocalDir(cache_dir()),
@@ -44,6 +50,9 @@ fn exec_config() -> ExecConfig {
             trusted_signers: Vec::new(),
         },
         runtime: RuntimePolicy::default(),
+        // Router tools commonly wrap REST/HTTP APIs (e.g. the generated
+        // OpenAPI routers), so the component is granted outbound HTTP. "No HTTP
+        // hop" refers to the host<->MCP transport, not the tool's own egress.
         http_enabled: true,
         secrets_store: None,
     }
