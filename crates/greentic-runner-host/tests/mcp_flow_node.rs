@@ -732,3 +732,132 @@ fn mcp_node_degrades_gracefully_when_unconfigured() -> Result<()> {
     );
     Ok(())
 }
+
+/// Flow-side local-wasm transport proof: an admin row with
+/// `"transport": "local-wasm"`, `"component_ref": "router_echo"`, and
+/// `"roles": ["flow_editor"]` causes the flow MCP node to dispatch through
+/// `mcp_local::local_call_tool` in-process (no network MCP handshake) and
+/// bind the result under the configured `output` state key.
+///
+/// Self-skips when `router_echo.wasm` is not built, mirroring the agent-loop
+/// test in `mcp_local_loop.rs`. To run live:
+///   ```
+///   GREENTIC_MCP_ROUTER_ECHO_WASM=<path> cargo test -p greentic-runner-host mcp_node_local_wasm
+///   ```
+#[allow(unsafe_code)]
+#[test]
+fn mcp_node_local_wasm_calls_echo_tool_in_process() -> Result<()> {
+    let _guard = ENV_GUARD.lock().unwrap();
+
+    // Resolve the fixture wasm (self-skip when absent).
+    let fixture_path = std::env::var("GREENTIC_MCP_ROUTER_ECHO_WASM")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../greentic-mcp/target/wasm32-wasip2/release/router_echo.wasm")
+        });
+    if !fixture_path.exists() {
+        eprintln!("SKIP: router_echo.wasm not found; set GREENTIC_MCP_ROUTER_ECHO_WASM to run live");
+        return Ok(());
+    }
+
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("mcp-local-wasm.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    let cache_dir = temp.path().join("mcp-local-cache");
+    std::fs::create_dir_all(&cache_dir)?;
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    // Copy the fixture into the temp cache dir.
+    std::fs::copy(&fixture_path, cache_dir.join("router_echo.wasm"))?;
+
+    // Stand up a fake admin returning a `local-wasm` flow_editor server.
+    let admin_server = rt.block_on(MockServer::start());
+    rt.block_on(
+        Mock::given(method("GET"))
+            .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+            .and(header("authorization", "Bearer gtc_live_test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "servers": [
+                    {
+                        "id": "local_echo",
+                        "name": "LocalEcho",
+                        "transport_url": "",
+                        "auth_header_name": null,
+                        "auth_token": null,
+                        "allowed_tools": null,
+                        "roles": ["flow_editor"],
+                        "transport": "local-wasm",
+                        "component_ref": "router_echo",
+                        "component_version": "1.0.0"
+                    }
+                ]
+            })))
+            .mount(&admin_server),
+    );
+
+    // Build a pack with an MCP node calling the `echo` tool.
+    build_mcp_pack(
+        &pack_path,
+        json!({
+            "server": "local_echo",
+            "tool": "echo",
+            "arguments": { "message": "hi" },
+            "output": "echo_result"
+        }),
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+
+    // SAFETY: serialised by ENV_GUARD.
+    //
+    // `GREENTIC_AW_ADMIN_ENDPOINT`/`GREENTIC_AW_ADMIN_TOKEN` are read by
+    // `FlowEngine::new` to construct the `McpToolSource` and can be cleared
+    // after `build_engine`. `GREENTIC_MCP_LOCAL_CACHE_DIR` is read lazily
+    // inside `mcp_local::cache_dir()` at probe / call time (during `execute`),
+    // so it must remain set until after the engine runs.
+    unsafe {
+        std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", admin_server.uri());
+        std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_test");
+        std::env::remove_var("GREENTIC_AW_MCP");
+        std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", &cache_dir);
+    }
+
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config))?;
+
+    // Clear only the admin endpoint/token; keep GREENTIC_MCP_LOCAL_CACHE_DIR
+    // set until after execute (the cache_dir() call is lazy).
+    unsafe {
+        std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+        std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+    }
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, json!({})))
+        .context("mcp local-wasm flow run")?;
+
+    unsafe {
+        std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+    }
+
+    match execution.status {
+        FlowStatus::Completed => {}
+        FlowStatus::Waiting(wait) => anyhow::bail!("flow paused unexpectedly: {:?}", wait.reason),
+    }
+
+    // The echo result is bound under `echo_result` — no error key.
+    let echo_result = find_key(&execution.output, "echo_result")
+        .with_context(|| {
+            format!(
+                "output key `echo_result` missing, got {:?}",
+                execution.output
+            )
+        })?;
+    assert!(
+        !echo_result.to_string().contains("\"error\""),
+        "echo result must not contain an error; got: {echo_result}"
+    );
+    Ok(())
+}
