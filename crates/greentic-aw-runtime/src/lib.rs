@@ -32,6 +32,7 @@ pub mod long_term;
 pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
+pub mod mcp_local;
 pub mod mcp_source;
 pub mod memory;
 pub mod state;
@@ -280,7 +281,6 @@ impl AgentRuntime {
         let ctx = knowledge::to_types_tenant(tenant)?;
         kb.search(&ctx, query).await
     }
-
 
     /// Execute one agentic step against the given session.
     /// Implementation lives in [`r#loop::run_step`].

@@ -253,3 +253,4 @@ greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greenti
 # republished, so redirect the registry requirement onto that branch until a
 # dev build carrying `agents` lands on crates.io.
 greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "7f388ec1feb14c263555bba3d3e559bd924373a3" }
+greentic-mcp-exec = { path = "/Users/bimapangestu/Desktop/Works/personal/greentic/greentic-mcp/.worktrees/local-wasm-mcp/crates/mcp-exec" }
