@@ -236,6 +236,7 @@ mod tests {
             limits: crate::AgentLimits::default(),
             memory: None,
             knowledge: None,
+            guardrails: vec![],
         };
         assert!(!long_term_active(false, &cfg));
         assert!(!long_term_active(true, &cfg));

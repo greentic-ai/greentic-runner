@@ -58,7 +58,21 @@ pub async fn run_step(
     // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
     let guardrail_chain = {
         let registry = runtime.ext_runtime.capability_registry();
-        let mandatory = runtime.guardrail_policy.mandatory_guardrails(&tenant);
+        let mandatory = match runtime.guardrail_policy.mandatory_guardrails(&tenant).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "mandatory guardrail policy unavailable; failing closed");
+                return Err(AgentError::GuardrailDenied {
+                    direction: crate::guardrail::GuardrailDirection::Inbound,
+                    code: "internal".to_string(),
+                    message: "A required guardrail is unavailable.".to_string(),
+                    details: serde_json::to_string(
+                        &serde_json::json!({ "policy_unavailable": true }),
+                    )
+                    .ok(),
+                });
+            }
+        };
         match crate::guardrail::assemble_chain(&registry, &mandatory, &config.guardrails) {
             Ok(chain) => chain,
             Err(unresolved) => {

@@ -375,12 +375,15 @@ fn build_full_runtime(
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "echo".into(),
+            credential_ref: None,
         },
         limits: AgentLimits {
             max_iter: 2,
             timeout: Duration::from_secs(30),
             ..AgentLimits::default()
         },
+        memory: None,
+        knowledge: None,
     };
 
     let cp = MockConfigProvider::new();
