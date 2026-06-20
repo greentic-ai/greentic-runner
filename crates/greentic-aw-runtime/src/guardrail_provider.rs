@@ -20,13 +20,16 @@ struct PolicyResp {
     guardrails: Vec<GuardrailRef>,
 }
 
+/// Cache keyed by `(tenant_id, env_id)` → (fetched-at, resolved guardrails).
+type PolicyCache = HashMap<(String, String), (Instant, Vec<GuardrailRef>)>;
+
 /// Fetches mandatory guardrails from the admin, cached per `(tenant_id, env_id)`.
 pub struct HttpGuardrailPolicy {
     base_url: String,
     token: String,
     client: reqwest::Client,
     ttl: Duration,
-    cache: Mutex<HashMap<(String, String), (Instant, Vec<GuardrailRef>)>>,
+    cache: Mutex<PolicyCache>,
 }
 
 impl HttpGuardrailPolicy {
