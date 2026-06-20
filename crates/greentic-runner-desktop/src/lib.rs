@@ -441,9 +441,10 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     #[cfg(feature = "agentic-worker")]
     {
         use greentic_runner_host::runner::agent_node::{
-            agent_configs_from_manifest, build_agent_node_handler,
-            build_agent_node_handler_ephemeral, merge_agent_sources,
+            agent_configs_from_manifest, build_agent_node_handler, merge_agent_sources,
         };
+        #[cfg(feature = "desktop-agent-ephemeral")]
+        use greentic_runner_host::runner::agent_node::build_agent_node_handler_ephemeral;
 
         let blobs = pack.manifest_agent_blobs();
         if !blobs.is_empty() {
@@ -457,8 +458,25 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             let handler = if redis_set {
                 build_agent_node_handler(merged, tenant, sm, vec![Arc::clone(&pack)]).await
             } else {
-                build_agent_node_handler_ephemeral(merged, tenant, sm, vec![Arc::clone(&pack)])
+                #[cfg(feature = "desktop-agent-ephemeral")]
+                {
+                    build_agent_node_handler_ephemeral(
+                        merged,
+                        tenant,
+                        sm,
+                        vec![Arc::clone(&pack)],
+                    )
                     .await
+                }
+                #[cfg(not(feature = "desktop-agent-ephemeral"))]
+                {
+                    let _ = (merged, tenant, sm);
+                    tracing::info!(
+                        "GREENTIC_AW_REDIS_URL unset and desktop-agent-ephemeral feature \
+                         off; dw.agent nodes disabled"
+                    );
+                    None
+                }
             };
             if let Some(handler) = handler {
                 engine.set_agent_node_handler(handler);

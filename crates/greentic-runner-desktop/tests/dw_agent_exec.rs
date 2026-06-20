@@ -4,7 +4,7 @@
 // failure must be recorded AGAINST the `ask` node — proving the handler is wired
 // and the node dispatches — rather than failing as "unknown node kind".
 
-#[cfg(feature = "agentic-worker")]
+#[cfg(feature = "desktop-agent-ephemeral")]
 mod tests {
     use std::collections::BTreeMap;
     use std::fs::File;

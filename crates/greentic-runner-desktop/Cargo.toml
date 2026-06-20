@@ -11,7 +11,11 @@ repository = "https://github.com/greentic-ai/greentic-runner"
 default = ["agentic-worker"]
 # Propagates the agentic-worker feature to the host shim.
 # Keep out of published defaults when greentic-aw-runtime is not on crates.io.
-agentic-worker = ["greentic-runner-host/agentic-worker", "greentic-runner-host/desktop-agent-ephemeral"]
+agentic-worker = ["greentic-runner-host/agentic-worker"]
+# Enables the ephemeral (in-memory) agent state store for desktop/local runs.
+# Activates test-mock types from greentic-aw-runtime; must NOT be in `default`
+# so the server build (agentic-worker only) never compiles the mocks.
+desktop-agent-ephemeral = ["agentic-worker", "greentic-runner-host/desktop-agent-ephemeral"]
 
 [dependencies]
 anyhow.workspace = true
