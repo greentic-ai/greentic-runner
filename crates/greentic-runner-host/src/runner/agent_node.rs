@@ -93,6 +93,18 @@ mod aw {
         merged
     }
 
+    /// Fill `blobs` from a `dw-agents.json` `sidecar` map, inserting each entry only
+    /// when its agent_id is absent — so `manifest.agents` stays authoritative and the
+    /// sidecar only bridges packs whose manifest could not carry agents.
+    pub fn merge_sidecar_into(
+        blobs: &mut std::collections::BTreeMap<String, serde_json::Value>,
+        sidecar: std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        for (agent_id, blob) in sidecar {
+            blobs.entry(agent_id).or_insert(blob);
+        }
+    }
+
     /// Fixed, user-safe reply returned when an agentic step fails. The detailed
     /// [`greentic_aw_runtime::AgentError`] is logged but never surfaced to the
     /// flow output, so internal failure modes do not leak to end users.
@@ -1340,6 +1352,21 @@ mod aw {
             assert!(loaded.contains_key("greeter"));
             assert_eq!(loaded["greeter"].agent_id, "greeter");
         }
+
+        #[test]
+        fn merge_sidecar_fills_only_missing_keys() {
+            use std::collections::BTreeMap;
+            let mut blobs: BTreeMap<String, serde_json::Value> =
+                BTreeMap::from([("a".to_string(), serde_json::json!({"from": "manifest"}))]);
+            let sidecar: BTreeMap<String, serde_json::Value> = BTreeMap::from([
+                ("a".to_string(), serde_json::json!({"from": "sidecar"})), // must NOT override
+                ("b".to_string(), serde_json::json!({"from": "sidecar"})), // must be added
+            ]);
+            super::merge_sidecar_into(&mut blobs, sidecar);
+            assert_eq!(blobs["a"]["from"], "manifest"); // manifest wins
+            assert_eq!(blobs["b"]["from"], "sidecar"); // gap filled
+            assert_eq!(blobs.len(), 2);
+        }
     }
 }
 
@@ -1475,7 +1502,7 @@ pub fn dw_agent_dispatch_mode(get_env: impl Fn(&str) -> Option<String>) -> DwAge
 pub use aw::{
     HostConfigProvider, RuntimeAgentNodeHandler, agent_configs_from_manifest,
     build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
-    serve_agentic,
+    merge_sidecar_into, serve_agentic,
 };
 
 #[cfg(feature = "agentic-worker")]
