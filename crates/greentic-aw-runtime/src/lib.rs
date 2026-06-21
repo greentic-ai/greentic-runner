@@ -34,6 +34,7 @@ pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_local;
 pub mod mcp_source;
+pub mod mcp_store_pull;
 pub mod memory;
 pub mod state;
 pub mod state_redis;

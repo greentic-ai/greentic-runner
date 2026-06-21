@@ -24,6 +24,14 @@ anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 async-nats          = { version = "0.46", optional = true }
 aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
+# Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
+# signature on its describe.json, extract extension.wasm into the local cache.
+# Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
+# base64 0.22) so no second copy is resolved.
+base64              = { workspace = true }
+ed25519-dalek       = { workspace = true }
+sha2                = { workspace = true }
+zip                 = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
@@ -54,7 +62,6 @@ url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true }
 semver = "1"
 serial_test = { workspace = true }
 tempfile = "3"

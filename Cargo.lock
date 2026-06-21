@@ -3077,6 +3077,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "aw-event-bridge",
+ "base64 0.22.1",
  "chrono",
  "dashmap",
  "ed25519-dalek",
@@ -3098,6 +3099,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3105,6 +3107,7 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+ "zip 8.6.0",
 ]
 
 [[package]]
