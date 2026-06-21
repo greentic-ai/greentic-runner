@@ -161,6 +161,12 @@ pub struct AgentRuntime {
     /// `None` disables the knowledge tier. Set via [`AgentRuntime::with_knowledge`];
     /// the concrete backend is injected at the runner-host edge, never compiled in.
     pub(crate) knowledge: Option<Arc<dyn knowledge::Knowledge>>,
+    /// Short-term ("working") memory backend, scoped per `(tenant, session, key)`.
+    /// `None` disables the short-term tier. Set via
+    /// [`AgentRuntime::with_short_term_memory`]; the host attaches the always-
+    /// available in-memory provider, and the tools are gated by
+    /// `config.memory.short_term`.
+    pub(crate) short_term_memory: Option<Arc<dyn crate::memory::MemoryProvider>>,
 }
 
 impl AgentRuntime {
@@ -192,6 +198,7 @@ impl AgentRuntime {
             components: None,
             long_term_memory: None,
             knowledge: None,
+            short_term_memory: None,
         }
     }
 
@@ -227,6 +234,19 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_long_term_memory(mut self, memory: Arc<dyn long_term::LongTermMemory>) -> Self {
         self.long_term_memory = Some(memory);
+        self
+    }
+
+    /// Wire the short-term ("working") memory backend. Coexists with the
+    /// long-term tier; defaults off when not set. The MVP host attaches the
+    /// in-memory provider unconditionally; the `remember`/`recall` tools are
+    /// advertised only when `config.memory.short_term` is set.
+    #[must_use]
+    pub fn with_short_term_memory(
+        mut self,
+        memory: Arc<dyn crate::memory::MemoryProvider>,
+    ) -> Self {
+        self.short_term_memory = Some(memory);
         self
     }
 
