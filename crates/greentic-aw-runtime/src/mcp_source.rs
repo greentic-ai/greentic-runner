@@ -1200,18 +1200,18 @@ mod tests {
         use crate::mcp_store_pull::{
             STORE_TOKEN_ENV, STORE_URL_ENV, TRUSTED_SIGNERS_ENV,
             fixtures::{
-                build_gtxpack, fixture_wasm, pubkey_env_value, sample_describe,
-                sign_describe_like_store,
+                build_gtxpack, pubkey_env_value, sample_describe, sign_describe_like_store,
             },
         };
         use ed25519_dalek::SigningKey;
         use wiremock::matchers::{method, path as wm_path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let Some(wasm_src) = fixture_wasm() else {
-            return; // self-skip: fixture not built
-        };
-        let wasm_bytes = std::fs::read(&wasm_src).unwrap();
+        // The wrong-digest failure fires at the archive-integrity check (sha256
+        // of the downloaded bytes != pinned digest) BEFORE the wasm is ever
+        // unzipped/executed — so any non-empty bytes serve as the "wasm" entry
+        // and this test needs no built wasm fixture (always runs in CI).
+        let wasm_bytes = b"not-a-real-wasm-component".to_vec();
 
         // Build a valid signed archive but tell the route a WRONG digest.
         // The store-pull will download it, compute the real digest, compare
@@ -1272,7 +1272,7 @@ mod tests {
 
         // Must return a JSON object with an "error" key — never panics.
         assert!(
-            result.to_string().contains("error"),
+            result.to_string().contains("\"error\""),
             "dispatch_route with wrong digest must degrade to {{\"error\": ...}}; got: {result}"
         );
         // Nothing leaked into the cache.
