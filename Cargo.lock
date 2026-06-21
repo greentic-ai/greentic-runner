@@ -3531,6 +3531,7 @@ dependencies = [
 [[package]]
 name = "greentic-mcp-exec"
 version = "1.1.0-dev.0"
+source = "git+https://github.com/greenticai/greentic-mcp.git?rev=450df805c395624041951f217c833884beb81440#450df805c395624041951f217c833884beb81440"
 dependencies = [
  "anyhow",
  "async-trait",
