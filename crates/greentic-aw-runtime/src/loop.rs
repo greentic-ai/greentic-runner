@@ -569,6 +569,9 @@ async fn host_remember(
     if key.is_empty() {
         return serde_json::json!({ "error": "missing 'key'" });
     }
+    if value.is_empty() {
+        return serde_json::json!({ "error": "missing 'value'" });
+    }
     let record = crate::memory::MemoryRecord {
         key: key.to_string(),
         value: value.to_string(),
