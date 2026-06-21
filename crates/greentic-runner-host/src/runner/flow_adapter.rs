@@ -61,6 +61,7 @@ const NATIVE_OP_KEYS: &[&str] = &[
     "sorla.call",
     "operala.call",
     "agentic.call",
+    "telco-x.call",
     "mcp",
 ];
 
@@ -233,4 +234,20 @@ fn parse_routes(raw: Value) -> Result<Vec<RouteIR>> {
     serde_json::from_value::<Vec<RouteIR>>(raw.clone()).map_err(|err| {
         anyhow!("failed to parse routes from node routing: {err}; value was {raw:?}")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telco_x_call_is_a_recognized_native_op() {
+        // Wire-ready: the runner recognizes telco-x.call as a native
+        // remote-dispatch node (not an unknown component.exec), alongside the
+        // other dispatch runtimes. The runtime side is not deployed yet.
+        assert!(is_native_op_key("telco-x.call"));
+        assert!(is_native_op_key("operala.call"));
+        assert!(is_native_op_key("sorla.call"));
+        assert!(!is_native_op_key("nope.call"));
+    }
 }

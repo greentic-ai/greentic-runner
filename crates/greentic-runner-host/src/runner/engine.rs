@@ -179,6 +179,13 @@ enum NodeKind {
     AgenticCall {
         target: String,
     },
+    /// Native runtime-dispatch node for the Telco-X runtime. Mirrors
+    /// [`SorlaCall`] but routes to the `"telco-x"` runtime name. Wire-ready: the
+    /// runtime side (a telco-x NATS dispatch service) is not built yet, so an
+    /// `await: true` node pauses until that runtime exists.
+    TelcoXCall {
+        target: String,
+    },
     /// Flow-execution MCP node (LOCKED ENCODING v2): `component == "mcp"` with
     /// `server`/`tool` carried in the node payload/config. Invokes the named
     /// MCP tool through the tenant's `flow_editor` MCP catalog (reusing
@@ -833,8 +840,7 @@ impl FlowEngine {
                         // Wrap the raw node payload as the dispatch `input` (the
                         // serve invoker reads `input.user_text`); `await=true` →
                         // pause+resume, identical to `agentic.call`.
-                        let remote_payload =
-                            serde_json::json!({ "await": true, "input": payload });
+                        let remote_payload = serde_json::json!({ "await": true, "input": payload });
                         self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
                             .await
                     }
@@ -858,6 +864,9 @@ impl FlowEngine {
             }
             NodeKind::AgenticCall { target } => {
                 self.execute_agentic_call(ctx, target, payload).await
+            }
+            NodeKind::TelcoXCall { target } => {
+                self.execute_telco_x_call(ctx, target, payload).await
             }
             NodeKind::Mcp { server_id, tool } => self
                 .execute_mcp(ctx, server_id, tool, payload)
@@ -956,6 +965,19 @@ impl FlowEngine {
         payload: Value,
     ) -> Result<DispatchOutcome> {
         self.execute_remote_dispatch(ctx, "agentic", target, payload)
+            .await
+    }
+
+    /// Dispatch a `telco-x.call` flow node via the shared remote-dispatch seam.
+    /// Mirrors [`execute_operala_call`] with runtime name `"telco-x"`. Wire-ready:
+    /// no telco-x runtime is deployed yet, so an awaiting node pauses until one is.
+    async fn execute_telco_x_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        self.execute_remote_dispatch(ctx, "telco-x", target, payload)
             .await
     }
 
@@ -2322,6 +2344,9 @@ impl From<Node> for HostNode {
                 "agentic.call" => NodeKind::AgenticCall {
                     target: raw_operation.clone().unwrap_or_default(),
                 },
+                "telco-x.call" => NodeKind::TelcoXCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -2359,6 +2384,7 @@ impl From<Node> for HostNode {
             NodeKind::SorlaCall { .. } => "sorla.call".to_string(),
             NodeKind::OperalaCall { .. } => "operala.call".to_string(),
             NodeKind::AgenticCall { .. } => "agentic.call".to_string(),
+            NodeKind::TelcoXCall { .. } => "telco-x.call".to_string(),
             NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
@@ -3552,7 +3578,8 @@ mod tests {
                 },
                 limits: AgentLimits::default(),
                 memory: None,
-                knowledge: None,            },
+                knowledge: None,
+            },
         );
         let config_provider = Arc::new(config_provider);
         let token_meter = Arc::new(MockTokenMeter::new(0));
@@ -3827,7 +3854,9 @@ mod tests {
         use std::sync::Mutex;
 
         use crate::runner::agent_node::DwAgentDispatch;
-        use crate::runner::remote_dispatch::{RemoteDispatch, RemoteDispatchAction, RemoteDispatchHandler};
+        use crate::runner::remote_dispatch::{
+            RemoteDispatch, RemoteDispatchAction, RemoteDispatchHandler,
+        };
 
         /// Recording stub: captures the last dispatch and returns
         /// `AwaitingResponse` so the engine pauses.
@@ -3837,7 +3866,10 @@ mod tests {
 
         #[async_trait::async_trait]
         impl RemoteDispatchHandler for RecordingDispatcher {
-            async fn dispatch(&self, request: RemoteDispatch) -> anyhow::Result<RemoteDispatchAction> {
+            async fn dispatch(
+                &self,
+                request: RemoteDispatch,
+            ) -> anyhow::Result<RemoteDispatchAction> {
                 let corr = request.correlation_id.clone();
                 *self.seen.lock().unwrap() = Some(request);
                 Ok(RemoteDispatchAction::AwaitingResponse {
@@ -3971,7 +4003,10 @@ mod tests {
         // target=<agent_id>, and the node payload wrapped as `input`.
         let seen = dispatcher.seen.lock().unwrap();
         let dispatch = seen.as_ref().expect("dispatcher was not called");
-        assert_eq!(dispatch.runtime, "agentic", "runtime name must be 'agentic'");
+        assert_eq!(
+            dispatch.runtime, "agentic",
+            "runtime name must be 'agentic'"
+        );
         assert_eq!(dispatch.target, "greeter", "target must be the agent_id");
         assert_eq!(
             dispatch.input,
@@ -4246,13 +4281,17 @@ mod tests {
         use crate::runner::dispatch_listener::{SessionResumer, run_response_listener};
         use crate::runner::remote_dispatch::NatsDispatcher;
         use futures::StreamExt as _;
-        use greentic_types::{RuntimeDispatchResponse, TenantCtx as DispatchTenantCtx, request_topic, response_topic};
+        use greentic_types::{
+            RuntimeDispatchResponse, TenantCtx as DispatchTenantCtx, request_topic, response_topic,
+        };
         use tokio::sync::Notify;
 
         let nats_url = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
             Ok(url) => url,
             Err(_) => {
-                eprintln!("skipping dw_agent_scale_to_zero_nats_e2e: GREENTIC_EVENTS_NATS_URL not set");
+                eprintln!(
+                    "skipping dw_agent_scale_to_zero_nats_e2e: GREENTIC_EVENTS_NATS_URL not set"
+                );
                 return;
             }
         };
@@ -4272,9 +4311,13 @@ mod tests {
             input: InputMapping {
                 mapping: json!({ "user_text": "ping" }),
             },
-            output: OutputMapping { mapping: Value::Null },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
             err_map: None,
-            routing: Routing::Next { node_id: resume_id.clone() },
+            routing: Routing::Next {
+                node_id: resume_id.clone(),
+            },
             telemetry: TelemetryHints::default(),
         };
         let resume_node = Node {
@@ -4287,7 +4330,9 @@ mod tests {
             input: InputMapping {
                 mapping: json!({ "message": "resumed" }),
             },
-            output: OutputMapping { mapping: Value::Null },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
@@ -4351,8 +4396,8 @@ mod tests {
                     events: vec![],
                     error: None,
                 };
-                let body = serde_json::to_vec(&response_payload)
-                    .expect("serialize fake bridge response");
+                let body =
+                    serde_json::to_vec(&response_payload).expect("serialize fake bridge response");
 
                 let mut resp_headers = async_nats::HeaderMap::new();
                 resp_headers.insert("Greentic-Correlation-Id", correlation_id.as_str());
@@ -4427,7 +4472,10 @@ mod tests {
                 mode: crate::validate::ValidationMode::Off,
             },
             cross_pack_resolver: None,
-            remote_dispatch_handler: Some(nats_engine_dispatcher as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
+            remote_dispatch_handler: Some(
+                nats_engine_dispatcher
+                    as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+            ),
             dw_agent_dispatch: DwAgentDispatch::Nats,
             agent_node_handler: None,
             graph_node_handler: None,
@@ -4444,7 +4492,10 @@ mod tests {
             session_id: Some("e2e-sess-1"),
             provider_id: None,
             reply_scope: None,
-            retry_config: RetryConfig { max_attempts: 1, base_delay_ms: 1 },
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
             attempt: 1,
             observer: None,
             mocks: None,
@@ -4477,7 +4528,11 @@ mod tests {
 
         // ── 8. Assert the resumed reply == "pong" ──
         let calls = resumer.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "resumer should have been called exactly once");
+        assert_eq!(
+            calls.len(),
+            1,
+            "resumer should have been called exactly once"
+        );
         let (ref _corr, ref output) = calls[0];
         assert_eq!(
             output["output"]["reply"],
