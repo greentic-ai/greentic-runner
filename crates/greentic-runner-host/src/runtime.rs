@@ -391,6 +391,14 @@ impl TenantRuntime {
                         as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
                 ));
             }
+            // Eagerly pre-cache local-wasm MCP components when the admin publishes
+            // a warm event. Feature-gated behind `agentic-worker` because
+            // `mcp_store_pull` lives in `greentic-aw-runtime` which is only
+            // present when that feature is enabled.
+            #[cfg(feature = "agentic-worker")]
+            tokio::spawn(crate::runner::mcp_warm_listener::run_mcp_warm_listener(
+                client.clone(),
+            ));
             tracing::info!(
                 "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call"
             );
