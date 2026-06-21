@@ -383,7 +383,7 @@ impl TenantRuntime {
                     &state_machine,
                 )),
             );
-            for runtime_name in ["sorla", "operala", "agentic"] {
+            for runtime_name in ["sorla", "operala", "agentic", "telco-x"] {
                 tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
                     client.clone(),
                     runtime_name.to_string(),
@@ -400,7 +400,7 @@ impl TenantRuntime {
                 client.clone(),
             ));
             tracing::info!(
-                "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call"
+                "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
             );
         }
         let http_client = Client::builder().build()?;

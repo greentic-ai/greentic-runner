@@ -213,7 +213,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `DEFAULT_TENANT` | Fallback tenant for routing |
 | `TENANT_RESOLVER` | Routing mode: host/header/jwt/env |
 | `ADMIN_TOKEN` | Bearer token for `/admin` endpoints (loopback-only when unset) |
-| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`agentic.call` dispatch + in-proc agentic serve |
+| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`operala.call`/`agentic.call`/`telco-x.call` dispatch + in-proc agentic serve. The runner registers response listeners for `sorla`/`operala`/`agentic`/`telco-x`; `telco-x.call` is wired but **inert until a telco-x runtime serves `greentic.telco-x.request.v1`** (see `docs/superpowers/specs/2026-06-21-telco-x-runtime-dispatch-design.md` in the workspace root) |
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |

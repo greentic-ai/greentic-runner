@@ -239,6 +239,24 @@ mod tests {
     }
 
     #[test]
+    fn build_request_targets_telco_x_request_topic() {
+        // `telco-x.call` uses runtime name "telco-x" → subject
+        // `greentic.telco-x.request.v1` (the runner now also registers a
+        // matching response listener for this runtime).
+        let mut dispatch = sample(DispatchMode::Await);
+        dispatch.runtime = "telco-x".into();
+        let built = build_request(&dispatch).unwrap();
+        assert_eq!(built.subject, "greentic.telco-x.request.v1");
+    }
+
+    #[test]
+    fn build_timeout_response_message_telco_x_response_topic() {
+        let (subject, _headers, _body) =
+            build_timeout_response_message("telco-x", "corr-1", "t1", "default", 500);
+        assert_eq!(subject, "greentic.telco-x.response.v1");
+    }
+
+    #[test]
     fn build_timeout_response_message_uses_response_topic() {
         let (subject, _headers, _body) =
             build_timeout_response_message("sorla", "corr-1", "t1", "default", 500);
