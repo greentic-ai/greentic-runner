@@ -54,6 +54,10 @@ pub(crate) const STORE_TOKEN_ENV: &str = "GREENTIC_STORE_TOKEN";
 const DESCRIBE_ENTRY: &str = "describe.json";
 const WASM_ENTRY: &str = "extension.wasm";
 
+/// Maximum size of a `.gtxpack` artifact accepted from the store. Prevents a
+/// hostile or misconfigured store from OOM-ing the runner before the digest check.
+const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Typed, non-panicking failure modes for the store-pull path.
 #[derive(Debug, thiserror::Error)]
 pub enum StorePullError {
@@ -79,12 +83,13 @@ pub enum StorePullError {
 
 /// Ensure `<cache_dir>/<component_ref>.wasm` exists and is verified.
 ///
-/// A no-op (returns `Ok`) if the cached wasm is already present — the cache is
-/// the install record, so a present file means a prior verified pull. Otherwise
-/// the matching `.gtxpack` is downloaded, its sha256 is checked against
+/// Short-circuits only when BOTH `<ref>.wasm` AND its `<ref>.wasm.sha256` sidecar
+/// are present — a wasm-only entry without a sidecar means a prior unverified seed
+/// (or a stale partial pull) and must be re-pulled and re-verified. Otherwise the
+/// matching `.gtxpack` is downloaded, its sha256 is checked against
 /// `component_digest`, the embedded describe signature is verified against the
-/// trusted allowlist, and `extension.wasm` is extracted into the cache
-/// atomically.
+/// trusted allowlist, and `extension.wasm` is extracted into the cache atomically
+/// alongside a fresh sidecar.
 ///
 /// # Arguments
 /// * `component_ref` — the store extension name; also the cache file stem.
@@ -100,7 +105,7 @@ pub async fn ensure_cached(
     component_digest: &str,
 ) -> Result<(), StorePullError> {
     let dest = cache_dir().join(format!("{component_ref}.wasm"));
-    if dest.exists() {
+    if dest.exists() && sidecar_path(&dest).exists() {
         return Ok(());
     }
 
@@ -256,6 +261,10 @@ fn parse_trusted_signer(entry: &str) -> Option<VerifyingKey> {
 }
 
 /// GET the `.gtxpack` bytes, sending the optional `gts_` bearer token.
+///
+/// Rejects the response before buffering when `Content-Length` exceeds
+/// [`MAX_ARTIFACT_BYTES`], and also after buffering in case the header was absent
+/// or lied. This limits exposure to a hostile/misconfigured store.
 async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
     let mut request = reqwest::Client::new().get(url);
     if let Ok(token) = std::env::var(STORE_TOKEN_ENV)
@@ -273,11 +282,25 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
             "GET {url} returned HTTP {status}"
         )));
     }
-    response
+    // Pre-flight: reject oversized artifacts before buffering the body.
+    if let Some(content_length) = response.content_length()
+        && content_length > MAX_ARTIFACT_BYTES
+    {
+        return Err(StorePullError::Integrity(format!(
+            "artifact at {url} claims Content-Length {content_length} which exceeds the {MAX_ARTIFACT_BYTES}-byte cap"
+        )));
+    }
+    let bytes = response
         .bytes()
         .await
-        .map(|bytes| bytes.to_vec())
-        .map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))
+        .map_err(|e| StorePullError::Network(format!("read body from {url}: {e}")))?;
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(StorePullError::Integrity(format!(
+            "artifact at {url} is {} bytes which exceeds the {MAX_ARTIFACT_BYTES}-byte cap",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// Hex-lowercase SHA256 of `bytes`. Matches the store's `hex::encode` output.
@@ -718,5 +741,80 @@ mod tests {
             "got: {result:?}"
         );
         assert!(!leaked, "an untrusted signature must cache nothing");
+    }
+
+    // ---- Fix 1 regression tests (fixture-independent) ----
+
+    /// Pre-seed a sidecar-less `<ref>.wasm` and confirm that `ensure_cached`
+    /// performs a full re-pull + writes the sidecar, proving the fail-open gap is
+    /// closed: a wasm without its companion `.sha256` is not treated as verified.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn wasm_without_sidecar_triggers_repull() {
+        let signing = SigningKey::from_bytes(&[42u8; 32]);
+        // Use minimal fake wasm bytes — ensure_cached never executes them.
+        let fake_wasm = b"fake-wasm-bytes-for-sidecar-test";
+        let signed_describe = sign_describe_like_store(&sample_describe(), &signing);
+        let archive = build_gtxpack(&signed_describe, fake_wasm);
+        let digest = hex_sha256(&archive);
+
+        let cache = tempfile::tempdir().unwrap();
+        // Pre-seed the wasm WITHOUT its sidecar — simulates operator-seeded or
+        // stale entry from a previous ref that never completed verification.
+        let dest = cache.path().join("router_echo.wasm");
+        std::fs::write(&dest, b"stale-unverified-bytes").unwrap();
+        assert!(dest.exists(), "pre-condition: wasm exists");
+        assert!(!sidecar_path(&dest).exists(), "pre-condition: sidecar absent");
+
+        let server = mock_store(archive).await;
+        unsafe {
+            std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache.path());
+            std::env::set_var(STORE_URL_ENV, server.uri());
+            std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing));
+        }
+
+        let result = ensure_cached("router_echo", "1.0.0", &digest).await;
+
+        let sidecar_exists = sidecar_path(&dest).exists();
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(TRUSTED_SIGNERS_ENV);
+        }
+
+        result.expect("re-pull of sidecar-less wasm must succeed");
+        assert!(
+            sidecar_exists,
+            "sidecar must be written after verified re-pull"
+        );
+    }
+
+    /// When BOTH the wasm and its sidecar already exist, `ensure_cached` must
+    /// short-circuit without hitting the network. No mock server is set up, so
+    /// any network attempt would error, proving short-circuit actually happened.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn wasm_with_sidecar_short_circuits() {
+        let cache = tempfile::tempdir().unwrap();
+        let dest = cache.path().join("router_echo.wasm");
+        // Seed both the wasm and its sidecar.
+        std::fs::write(&dest, b"cached-wasm").unwrap();
+        std::fs::write(sidecar_path(&dest), b"somedigest").unwrap();
+
+        unsafe {
+            std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache.path());
+            // Intentionally set a bogus store URL — any network attempt would fail.
+            std::env::set_var(STORE_URL_ENV, "http://127.0.0.1:1");
+            std::env::remove_var(TRUSTED_SIGNERS_ENV);
+        }
+
+        let result = ensure_cached("router_echo", "1.0.0", "anydigest").await;
+
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var(STORE_URL_ENV);
+        }
+
+        result.expect("both wasm + sidecar present must short-circuit with Ok");
     }
 }
