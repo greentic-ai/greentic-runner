@@ -516,71 +516,34 @@ mod aw {
         })
     }
 
-    /// Build the production `DwAgent` handler if the environment is configured.
+    /// Shared store-agnostic tail: builds the extension runtime, LLM backend,
+    /// config providers, and [`AgentRuntime`] given the three already-constructed
+    /// store trait objects.
     ///
-    /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
-    /// these graceful-degradation conditions:
-    /// - `merged_agents` is empty (no agents from packs or operator config);
-    /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
-    /// - the AW Redis connection fails;
-    /// - the extension runtime fails to initialise.
+    /// Extracted so both the Redis path ([`build_agent_node_handler`]) and the
+    /// ephemeral desktop path ([`build_agent_node_handler_ephemeral`]) share
+    /// identical post-store construction logic; store differences are the only
+    /// divergence between the two callers.
     ///
-    /// `merged_agents` is the result of merging pack-embedded agents (base)
-    /// with operator-declared [`HostConfig::agents`] (operator wins on
-    /// collision). This merged map replaces the former direct read of
-    /// `config.agents` so pack-provided agents are included in the runtime.
-    ///
-    /// Redis is sourced from the environment because the runner uses an
-    /// in-memory flow-state store by default and carries no Redis URL in
-    /// [`HostConfig`]; this mirrors the existing env-config convention.
-    ///
-    /// The `tenant` and `secrets` arguments wire in per-tenant LLM credential
-    /// resolution when `GREENTIC_AW_LLM_EXTENSION` is set: requests resolve
-    /// credentials from the secrets broker for the calling tenant rather than
-    /// reading global env vars. Callers without per-tenant context (e.g.
-    /// `serve_agentic`) should use [`build_agent_runtime`] directly, which uses
-    /// the env-keyed backend and accepts no secrets context.
-    pub async fn build_agent_node_handler(
+    /// Returns `None` when the extension runtime fails to initialise (the only
+    /// failure mode at this layer — store errors are handled by callers).
+    async fn build_runtime_handler_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
+        state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
+        token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
+        ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::tools::RedisToolLedger;
         use greentic_aw_runtime::{
-            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RedisAgentStateStore,
-            RetryingLlmBackend,
+            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RetryingLlmBackend,
         };
-
-        if merged_agents.is_empty() {
-            return None;
-        }
-
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let manager = state_store.manager();
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
 
         let ext_runtime = build_ext_runtime()?;
 
@@ -649,8 +612,118 @@ mod aw {
             .with_component_source(component_source_from_packs(&packs, &tenant)),
         );
 
-        tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed (per-tenant creds)");
+        tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+    }
+
+    /// Build the production `DwAgent` handler if the environment is configured.
+    ///
+    /// Returns `None` (so `DwAgent` flow dispatch errors clearly) under any of
+    /// these graceful-degradation conditions:
+    /// - `merged_agents` is empty (no agents from packs or operator config);
+    /// - `GREENTIC_AW_REDIS_URL` is unset/empty;
+    /// - the AW Redis connection fails;
+    /// - the extension runtime fails to initialise.
+    ///
+    /// `merged_agents` is the result of merging pack-embedded agents (base)
+    /// with operator-declared [`HostConfig::agents`] (operator wins on
+    /// collision). This merged map replaces the former direct read of
+    /// `config.agents` so pack-provided agents are included in the runtime.
+    ///
+    /// Redis is sourced from the environment because the runner uses an
+    /// in-memory flow-state store by default and carries no Redis URL in
+    /// [`HostConfig`]; this mirrors the existing env-config convention.
+    ///
+    /// The `tenant` and `secrets` arguments wire in per-tenant LLM credential
+    /// resolution when `GREENTIC_AW_LLM_EXTENSION` is set: requests resolve
+    /// credentials from the secrets broker for the calling tenant rather than
+    /// reading global env vars. Callers without per-tenant context (e.g.
+    /// `serve_agentic`) should use [`build_agent_runtime`] directly, which uses
+    /// the env-keyed backend and accepts no secrets context.
+    pub async fn build_agent_node_handler(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+    ) -> Option<Arc<dyn AgentNodeHandler>> {
+        use greentic_aw_runtime::RedisAgentStateStore;
+        use greentic_aw_runtime::cost::RedisTokenMeter;
+        use greentic_aw_runtime::tools::RedisToolLedger;
+
+        if merged_agents.is_empty() {
+            return None;
+        }
+
+        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
+            Ok(url) if !url.is_empty() => url,
+            _ => {
+                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
+                return None;
+            }
+        };
+
+        let manager = state_store.manager();
+        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
+        let ledger = Arc::new(RedisToolLedger::new(manager));
+
+        build_runtime_handler_with_stores(
+            merged_agents,
+            tenant,
+            secrets,
+            packs,
+            state_store,
+            token_meter,
+            ledger,
+        )
+        .await
+    }
+
+    /// Desktop/local builder: in-memory state, token meter, and ledger so
+    /// `gtc start` runs agents with NO external infra. State is ephemeral
+    /// (lost on process exit) — never used by the server path.
+    ///
+    /// Returns `None` only when `merged_agents` is empty or the extension
+    /// runtime fails to initialise. Unlike [`build_agent_node_handler`] this
+    /// function never returns `None` due to a missing Redis URL, making it safe
+    /// for desktop environments where no Redis is available.
+    #[cfg(feature = "desktop-agent-ephemeral")]
+    pub async fn build_agent_node_handler_ephemeral(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+    ) -> Option<Arc<dyn AgentNodeHandler>> {
+        use greentic_aw_runtime::cost::MockTokenMeter;
+        use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+        if merged_agents.is_empty() {
+            return None;
+        }
+        tracing::warn!(
+            tenant = %tenant,
+            "AW desktop ephemeral state store (in-memory; sessions do not persist)"
+        );
+        let state_store = Arc::new(MockAgentStateStore::new());
+        let token_meter = Arc::new(MockTokenMeter::new(0));
+        let ledger = Arc::new(NoopToolLedger);
+        build_runtime_handler_with_stores(
+            merged_agents,
+            tenant,
+            secrets,
+            packs,
+            state_store,
+            token_meter,
+            ledger,
+        )
+        .await
     }
 
     /// Construct the shared [`AgentRuntime`] from the environment.
@@ -798,10 +871,9 @@ mod aw {
                     match std::env::var("GREENTIC_AW_REDIS_URL") {
                         Ok(url) if !url.is_empty() => {
                             match RedisAgentStateStore::connect(&url).await {
-                                Ok(store) => (
-                                    Arc::new(RedisDispatchLedger::new(store.manager())),
-                                    true,
-                                ),
+                                Ok(store) => {
+                                    (Arc::new(RedisDispatchLedger::new(store.manager())), true)
+                                }
                                 Err(error) => {
                                     tracing::warn!(
                                         %error,
@@ -927,7 +999,8 @@ mod aw {
                 },
                 limits: AgentLimits::default(),
                 memory: None,
-                knowledge: None,            }
+                knowledge: None,
+            }
         }
 
         #[tokio::test]
@@ -958,7 +1031,8 @@ mod aw {
                     },
                     limits: AgentLimits::default(),
                     memory: None,
-                    knowledge: None,                },
+                    knowledge: None,
+                },
             );
             let config_provider = Arc::new(config_provider);
 
@@ -1317,6 +1391,33 @@ mod aw {
             assert_eq!(v["reply"], serde_json::json!("blocked"));
         }
 
+        #[cfg(feature = "desktop-agent-ephemeral")]
+        #[tokio::test]
+        #[allow(unsafe_code)]
+        async fn ephemeral_builder_yields_handler_without_redis() {
+            // Remove Redis URL so we prove the ephemeral builder does not need it.
+            // SAFETY: single-threaded test; no concurrent env mutation.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_REDIS_URL");
+            }
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            // Build a minimal env-backed secrets manager (no broker configured in tests).
+            let secrets: crate::secrets::DynSecretsManager =
+                Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+            let handler = super::build_agent_node_handler_ephemeral(
+                agents,
+                "t1".to_string(),
+                secrets,
+                Vec::new(),
+            )
+            .await;
+            assert!(
+                handler.is_some(),
+                "ephemeral builder must not require Redis"
+            );
+        }
+
         #[test]
         #[allow(unsafe_code)]
         fn load_process_agent_configs_reads_full_configs_and_skips_bad_files() {
@@ -1504,6 +1605,9 @@ pub use aw::{
     build_agent_node_handler, build_agent_runtime, load_process_agent_configs, merge_agent_sources,
     merge_sidecar_into, serve_agentic,
 };
+
+#[cfg(feature = "desktop-agent-ephemeral")]
+pub use aw::build_agent_node_handler_ephemeral;
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{build_ext_runtime, build_llm_backend};
