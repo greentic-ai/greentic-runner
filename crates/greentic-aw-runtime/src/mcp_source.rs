@@ -83,6 +83,9 @@ struct WireRow {
     component_ref: Option<String>,
     /// For `local-wasm` rows: optional pinned component version.
     component_version: Option<String>,
+    /// For `local-wasm` rows: optional pinned component content digest (hex).
+    #[serde(default)]
+    component_digest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +104,7 @@ struct ParsedServer {
     transport: Transport,
     component_ref: Option<String>,
     component_version: Option<String>,
+    component_digest: Option<String>,
 }
 
 /// LLM-facing schema for one MCP tool: enough for Task 2 to build an
@@ -125,6 +129,7 @@ pub struct McpRoute {
     pub transport: Transport,
     pub component_ref: Option<String>,
     pub component_version: Option<String>,
+    pub component_digest: Option<String>,
 }
 
 impl std::fmt::Debug for McpRoute {
@@ -139,6 +144,9 @@ impl std::fmt::Debug for McpRoute {
             )
             .field("raw_tool_name", &self.raw_tool_name)
             .field("transport", &self.transport)
+            .field("component_ref", &self.component_ref)
+            .field("component_version", &self.component_version)
+            .field("component_digest", &self.component_digest)
             .finish()
     }
 }
@@ -217,6 +225,7 @@ pub(crate) fn route_for_tests(server_id: &str, tool: &str, transport_url: &str) 
         transport: Transport::Http,
         component_ref: None,
         component_version: None,
+        component_digest: None,
     }
 }
 
@@ -391,6 +400,7 @@ fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, String> {
             transport: w.transport,
             component_ref: w.component_ref,
             component_version: w.component_version,
+            component_digest: w.component_digest,
         })
         .collect())
 }
@@ -423,6 +433,7 @@ fn ingest_server_tools(catalog: &mut McpToolCatalog, server: &ParsedServer, defs
                 transport: server.transport,
                 component_ref: server.component_ref.clone(),
                 component_version: server.component_version.clone(),
+                component_digest: server.component_digest.clone(),
             },
         );
     }
@@ -882,6 +893,7 @@ mod tests {
             transport: Transport::Http,
             component_ref: None,
             component_version: None,
+            component_digest: None,
         };
         let dbg = format!("{route:?}");
         assert!(!dbg.contains("tok-secret"), "got: {dbg}");
@@ -902,6 +914,26 @@ mod tests {
         assert!(matches!(rows[0].transport, Transport::Http));
         assert!(matches!(rows[1].transport, Transport::LocalWasm));
         assert_eq!(rows[1].component_ref.as_deref(), Some("weather.component"));
+    }
+
+    #[test]
+    fn parse_rows_carries_component_version_and_digest() {
+        let body = json!({"servers": [
+            { "id": "h", "name": "H", "transport_url": "https://x/", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"] },
+            { "id": "l", "name": "L", "transport_url": "", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"],
+              "transport": "local-wasm", "component_ref": "weather.component",
+              "component_version": "1.0.0",
+              "component_digest": "abc123deadbeef" }
+        ]});
+        let rows = parse_rows(body).expect("parse");
+        // HTTP row: both fields absent
+        assert!(rows[0].component_version.is_none());
+        assert!(rows[0].component_digest.is_none());
+        // local-wasm row: both fields present
+        assert_eq!(rows[1].component_version.as_deref(), Some("1.0.0"));
+        assert_eq!(rows[1].component_digest.as_deref(), Some("abc123deadbeef"));
     }
 
     /// End-to-end local-wasm path: admin row with `transport: "local-wasm"` →
