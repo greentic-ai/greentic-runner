@@ -471,3 +471,200 @@ async fn recall_memory_call_is_handled_host_side() {
         .expect("recall_memory tool call recorded in trail");
     assert!(result.to_string().contains("Alice prefers dark mode"));
 }
+
+// ---------------------------------------------------------------------------
+// Short-term memory (working-memory) loop tests
+// ---------------------------------------------------------------------------
+
+/// Build a tool-call `LlmResponse` with explicit args (for `remember`/`recall`).
+fn tool_call_with_args(call_id: &str, ext: &str, tool: &str, args: serde_json::Value) -> LlmResponse {
+    LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCallRecord {
+            call_id: call_id.into(),
+            extension_id: ext.into(),
+            tool_name: tool.into(),
+            args,
+        }],
+        tokens_in: 5,
+        tokens_out: 5,
+    }
+}
+
+/// Return an `AgentConfig` with `memory.short_term` set so `short_term_active()` is true.
+fn cfg_with_short_term(max_iter: u32) -> AgentConfig {
+    let mut c = cfg(max_iter, 60_000, vec![], None);
+    c.memory = Some(MemorySettings {
+        short_term: Some(MemoryProviderRef {
+            provider: "in-memory".into(),
+            capability: "cap://memory/short-term".into(),
+            params: serde_json::Map::new(),
+            credential_ref: None,
+        }),
+        long_term: None,
+    });
+    c
+}
+
+/// Build a runtime with the in-memory short-term provider attached.
+fn build_st_runtime(
+    llm_script: Vec<Result<LlmResponse, greentic_aw_runtime::error::LlmError>>,
+    cfg_inner: AgentConfig,
+) -> (AgentRuntime, Arc<MockLlmBackend>, TenantContext) {
+    let llm = Arc::new(MockLlmBackend::new(llm_script));
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", cfg_inner);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    )
+    .with_short_term_memory(Arc::new(greentic_aw_runtime::memory::InMemoryMemoryProvider::new()));
+    (rt, llm, tc)
+}
+
+#[tokio::test]
+async fn remember_and_recall_tools_advertised_when_active() {
+    // Config has memory.short_term set and the provider is attached → the LLM
+    // request must include both "remember" and "recall" tool names.
+    let (rt, llm, tc) = build_st_runtime(vec![Ok(final_reply("hi"))], cfg_with_short_term(8));
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        tools[0].iter().any(|n| n == "remember"),
+        "expected 'remember' in tool list: {:?}",
+        tools[0]
+    );
+    assert!(
+        tools[0].iter().any(|n| n == "recall"),
+        "expected 'recall' in tool list: {:?}",
+        tools[0]
+    );
+}
+
+#[tokio::test]
+async fn short_term_tools_absent_when_disabled() {
+    // Provider attached but config has no memory.short_term binding → inactive;
+    // neither "remember" nor "recall" should be advertised.
+    let (rt, llm, tc) = build_st_runtime(
+        vec![Ok(final_reply("hi"))],
+        cfg(8, 60_000, vec![], None), // no memory binding
+    );
+    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        !tools[0].iter().any(|n| n == "remember"),
+        "unexpected 'remember' in tool list: {:?}",
+        tools[0]
+    );
+    assert!(
+        !tools[0].iter().any(|n| n == "recall"),
+        "unexpected 'recall' in tool list: {:?}",
+        tools[0]
+    );
+}
+
+#[tokio::test]
+async fn remember_then_recall_roundtrips_via_tools() {
+    // Turn 1: LLM emits `remember {key:"fav", value:"blue"}`.
+    // Turn 2: LLM emits `recall {key:"fav"}`.
+    // Turn 3: LLM gives a final reply.
+    // Assert the recall tool result message content is `{"value":"blue"}`.
+    let (rt, _llm, tc) = build_st_runtime(
+        vec![
+            Ok(tool_call_with_args(
+                "c1",
+                "host",
+                "remember",
+                serde_json::json!({ "key": "fav", "value": "blue" }),
+            )),
+            Ok(tool_call_with_args(
+                "c2",
+                "host",
+                "recall",
+                serde_json::json!({ "key": "fav" }),
+            )),
+            Ok(final_reply("your fav is blue")),
+        ],
+        cfg_with_short_term(8),
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "what is my fav color?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "your fav is blue");
+    // Find the recall result in the trail and confirm the stored value came back.
+    let recall_result = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall { name, result, .. } if name == "recall" => Some(result.clone()),
+            _ => None,
+        })
+        .expect("recall tool call recorded in trail");
+    assert_eq!(
+        recall_result.get("value").and_then(|v| v.as_str()),
+        Some("blue"),
+        "expected value 'blue' in recall result, got: {recall_result}"
+    );
+}
+
+#[tokio::test]
+async fn recall_missing_key_returns_null() {
+    // LLM emits `recall {key:"absent"}` for a key that was never stored.
+    // Expect the tool result to be `{"value": null}`.
+    let (rt, _llm, tc) = build_st_runtime(
+        vec![
+            Ok(tool_call_with_args(
+                "c1",
+                "host",
+                "recall",
+                serde_json::json!({ "key": "absent" }),
+            )),
+            Ok(final_reply("nothing stored")),
+        ],
+        cfg_with_short_term(8),
+    );
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "do you know my name?".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.reply, "nothing stored");
+    let recall_result = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall { name, result, .. } if name == "recall" => Some(result.clone()),
+            _ => None,
+        })
+        .expect("recall tool call recorded in trail");
+    assert!(
+        recall_result.get("value").is_some_and(|v| v.is_null()),
+        "expected null value for missing key, got: {recall_result}"
+    );
+}

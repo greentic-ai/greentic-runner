@@ -6,8 +6,6 @@
 //! [`crate::memory::MemoryProvider`] wired via
 //! [`crate::AgentRuntime::with_short_term_memory`].
 
-#![allow(dead_code)]
-
 use crate::config::AgentConfig;
 use crate::llm::LlmToolSchema;
 

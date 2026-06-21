@@ -109,6 +109,10 @@ pub async fn run_step(
     // agent's binding enabled). Drives recall-inject, the `recall_memory` tool,
     // and background ingest below.
     let lt_active = crate::long_term::long_term_active(runtime.long_term_memory.is_some(), &config);
+    // Whether short-term ("working") memory is active for this turn (provider
+    // wired + the agent's binding enabled). Drives `remember`/`recall` tools.
+    let st_active =
+        crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -194,6 +198,10 @@ pub async fn run_step(
         if lt_active {
             tools_schema.push(crate::long_term::recall_memory_tool_schema());
         }
+        if st_active {
+            tools_schema.push(crate::short_term::remember_tool_schema());
+            tools_schema.push(crate::short_term::recall_tool_schema());
+        }
         let request = LlmRequest {
             system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
@@ -253,6 +261,39 @@ pub async fn run_step(
                 if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
                     observer.on_tool_call(&call.tool_name, &call.call_id);
                     let result = host_recall_memory(runtime, &tenant, &call).await;
+                    observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: result.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id,
+                        result,
+                    });
+                    continue;
+                }
+                // --- Host built-in: short-term `remember` / `recall` ---
+                // Intercepted before the allow-list + WASM dispatch; routed to
+                // the runtime's short-term backend instead of an extension.
+                if st_active && call.tool_name == crate::short_term::REMEMBER_TOOL {
+                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    let result = host_remember(runtime, &tenant, session_id, &call).await;
+                    observer.on_tool_result(&call.tool_name, &call.call_id, &result);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: result.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id,
+                        result,
+                    });
+                    continue;
+                }
+                if st_active && call.tool_name == crate::short_term::RECALL_TOOL {
+                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    let result = host_recall(runtime, &tenant, session_id, &call).await;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -500,6 +541,69 @@ async fn host_recall_memory(
         .await
     {
         Ok(facts) => serde_json::json!({ "facts": facts }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
+}
+
+/// Handle a host built-in `remember` call: store `{key, value}` into short-term
+/// memory for this `(tenant, session)`. Returns `{"ok": true}` or `{"error": ...}`.
+async fn host_remember(
+    runtime: &AgentRuntime,
+    tenant: &TenantContext,
+    session_id: &str,
+    call: &crate::state::ToolCallRecord,
+) -> serde_json::Value {
+    let Some(provider) = runtime.short_term_memory.as_ref() else {
+        return serde_json::json!({ "error": "short-term memory not configured" });
+    };
+    let key = call
+        .args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let value = call
+        .args
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if key.is_empty() {
+        return serde_json::json!({ "error": "missing 'key'" });
+    }
+    let record = crate::memory::MemoryRecord {
+        key: key.to_string(),
+        value: value.to_string(),
+    };
+    match provider.remember(tenant, session_id, record).await {
+        Ok(()) => serde_json::json!({ "ok": true }),
+        Err(e) => serde_json::json!({ "error": e.to_string() }),
+    }
+}
+
+/// Handle a host built-in `recall` call: read a value back by `key`. Returns
+/// `{"value": <string|null>}` or `{"error": ...}`.
+async fn host_recall(
+    runtime: &AgentRuntime,
+    tenant: &TenantContext,
+    session_id: &str,
+    call: &crate::state::ToolCallRecord,
+) -> serde_json::Value {
+    let Some(provider) = runtime.short_term_memory.as_ref() else {
+        return serde_json::json!({ "error": "short-term memory not configured" });
+    };
+    let key = call
+        .args
+        .get("key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if key.is_empty() {
+        return serde_json::json!({ "error": "missing 'key'" });
+    }
+    let query = crate::memory::MemoryQuery {
+        key: key.to_string(),
+    };
+    match provider.recall(tenant, session_id, &query).await {
+        Ok(Some(record)) => serde_json::json!({ "value": record.value }),
+        Ok(None) => serde_json::json!({ "value": serde_json::Value::Null }),
         Err(e) => serde_json::json!({ "error": e.to_string() }),
     }
 }
