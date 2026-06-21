@@ -733,6 +733,12 @@ mod aw {
                 },
             ),
         );
+        // Short-term ("working") memory: in-memory provider is always available
+        // (no external deps); the remember/recall tools stay gated by
+        // config.memory.short_term in the loop.
+        let base = base.with_short_term_memory(Arc::new(
+            greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
+        ));
         // Optionally attach an operator-configured native long-term memory
         // backend. With the `long-term-chronicle` feature off (default) this is
         // a no-op and `base` is wrapped unchanged.
