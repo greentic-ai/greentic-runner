@@ -30,6 +30,7 @@ pub mod llm_extension;
 pub mod llm_openai;
 pub mod long_term;
 pub mod r#loop;
+pub mod short_term;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_local;
