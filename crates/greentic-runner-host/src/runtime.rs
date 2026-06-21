@@ -202,7 +202,9 @@ impl TenantRuntime {
             .context("failed to prime flow engine")?;
         #[cfg(feature = "agentic-worker")]
         {
-            use crate::runner::agent_node::{agent_configs_from_manifest, merge_agent_sources};
+            use crate::runner::agent_node::{
+                agent_configs_from_manifest, merge_agent_sources, merge_sidecar_into,
+            };
             use std::collections::HashMap;
 
             // Collect agent configs from all New-manifest packs. When the same
@@ -211,7 +213,11 @@ impl TenantRuntime {
             // so operators can audit cross-pack conflicts.
             let mut pack_agents: HashMap<String, greentic_aw_runtime::AgentConfig> = HashMap::new();
             for pack in &pack_runtimes {
-                let blobs = pack.manifest_agent_blobs();
+                let mut blobs = pack.manifest_agent_blobs();
+                // Bridge: designer-built packs cannot populate `manifest.agents`
+                // (old greentic-pack); they embed a `dw-agents.json` sidecar.
+                // Fill any agent_id the manifest lacked (manifest stays authoritative).
+                merge_sidecar_into(&mut blobs, pack.dw_agents_sidecar_blobs());
                 if blobs.is_empty() {
                     continue;
                 }

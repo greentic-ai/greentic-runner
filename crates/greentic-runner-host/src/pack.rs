@@ -2303,6 +2303,29 @@ impl PackRuntime {
         self.read_pack_file("agent-graph.json")
     }
 
+    /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
+    ///
+    /// Designer-built packs (old greentic-pack, which cannot populate
+    /// `manifest.agents`) embed their `AgentConfig` map here. Returns an empty
+    /// map when the sidecar is absent or unparseable (lenient, mirroring
+    /// [`PackRuntime::manifest_agent_blobs`]) so a damaged sidecar never aborts
+    /// pack loading. `manifest.agents` remains authoritative; callers fill only
+    /// the agent_ids the manifest did not carry.
+    pub fn dw_agents_sidecar_blobs(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let Some(bytes) = self.read_pack_file("dw-agents.json") else {
+            return std::collections::BTreeMap::new();
+        };
+        match serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(
+            &bytes,
+        ) {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring malformed dw-agents.json sidecar");
+                std::collections::BTreeMap::new()
+            }
+        }
+    }
+
     /// Read a single named file from the pack by its archive-relative path,
     /// trying the materialized pack directory first and the `.gtpack` archive as
     /// a fallback. Returns `None` when the file is absent (or on a read error,
@@ -4311,6 +4334,101 @@ mod tests {
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
     use serde_json::json;
+
+    /// Build a minimal `PackRuntime` rooted at `dir` so that `read_pack_file`
+    /// resolves files from that directory via `self.path.is_dir()`.
+    /// Mirrors the `for_component_test` constructor but sets `path` to the
+    /// caller-supplied directory instead of `PathBuf::new()`.
+    fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
+        let engine = Engine::default();
+        let engine_profile =
+            EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        let cache = CacheManager::new(CacheConfig::default(), engine_profile);
+        let config = Arc::new(crate::config::HostConfig {
+            tenant: "test-tenant".to_string(),
+            bindings_path: std::path::PathBuf::from("/tmp/bindings.yaml"),
+            flow_type_bindings: HashMap::new(),
+            rate_limits: crate::config::RateLimits::default(),
+            retry: crate::config::FlowRetryConfig::default(),
+            http_enabled: false,
+            secrets_policy: crate::config::SecretsPolicy::allow_all(),
+            state_store_policy: crate::config::StateStorePolicy::default(),
+            webhook_policy: crate::config::WebhookPolicy::default(),
+            timers: Vec::new(),
+            oauth: None,
+            mocks: None,
+            pack_bindings: Vec::new(),
+            env_passthrough: Vec::new(),
+            trace: crate::trace::TraceConfig::from_env(),
+            validation: crate::validate::ValidationConfig::from_env(),
+            operator_policy: crate::config::OperatorPolicy::allow_all(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
+        });
+        PackRuntime {
+            path: dir.to_path_buf(),
+            archive_path: None,
+            config,
+            engine,
+            metadata: PackMetadata {
+                pack_id: "test-pack".to_string(),
+                version: "0.0.0".to_string(),
+                entry_flows: Vec::new(),
+                secret_requirements: Vec::new(),
+            },
+            manifest: None,
+            legacy_manifest: None,
+            component_manifests: HashMap::new(),
+            mocks: None,
+            flows: None,
+            components: HashMap::new(),
+            http_client: Arc::clone(&HTTP_CLIENT),
+            pre_cache: Mutex::new(HashMap::new()),
+            session_store: None,
+            state_store: None,
+            wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
+            assets_tempdir: None,
+            provider_registry: RwLock::new(None),
+            secrets: crate::secrets::default_manager().expect("default secrets manager"),
+            oauth_config: None,
+            cache,
+        }
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_reads_map_from_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = serde_json::json!({
+            "greeter": { "agent_id": "greeter", "system_prompt": "hi", "tools": [],
+                         "llm": { "provider": "openai", "model": "gpt-4o-mini" } }
+        });
+        std::fs::write(
+            dir.path().join("dw-agents.json"),
+            serde_json::to_vec(&agents).unwrap(),
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let blobs = pack.dw_agents_sidecar_blobs();
+        assert!(blobs.contains_key("greeter"));
+        assert_eq!(blobs["greeter"]["agent_id"], "greeter");
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_absent_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.dw_agents_sidecar_blobs().is_empty());
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_malformed_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dw-agents.json"), b"not json").unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.dw_agents_sidecar_blobs().is_empty());
+    }
 
     #[test]
     fn normalizes_raw_component_to_component_exec() {
