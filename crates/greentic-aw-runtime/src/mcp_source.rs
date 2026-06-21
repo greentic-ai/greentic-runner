@@ -52,6 +52,16 @@ pub const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
 /// surface without the other.
 pub const MCP_ROLE_FLOW_EDITOR: &str = "flow_editor";
 
+/// Which transport backs an MCP server row. `http` is the default (existing
+/// remote behavior); `local-wasm` runs a `wasix:mcp` component in-process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    #[default]
+    Http,
+    LocalWasm,
+}
+
 /// Wire row from `/api/v1/designer/tenant/me/mcp-servers`.
 #[derive(Deserialize)]
 struct WireRow {
@@ -65,6 +75,14 @@ struct WireRow {
     allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     roles: Vec<String>,
+    /// Transport discriminator; defaults to [`Transport::Http`] when absent so
+    /// every existing row continues to work without changes.
+    #[serde(default)]
+    transport: Transport,
+    /// For `local-wasm` rows: the component reference (e.g. `weather.component`).
+    component_ref: Option<String>,
+    /// For `local-wasm` rows: optional pinned component version.
+    component_version: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +98,9 @@ struct ParsedServer {
     auth_token: Option<SecretString>,
     allowed_tools: Option<Vec<String>>,
     roles: Vec<String>,
+    transport: Transport,
+    component_ref: Option<String>,
+    component_version: Option<String>,
 }
 
 /// LLM-facing schema for one MCP tool: enough for Task 2 to build an
@@ -101,6 +122,9 @@ pub struct McpRoute {
     auth_header_name: Option<String>,
     auth_token: Option<SecretString>,
     raw_tool_name: String,
+    pub transport: Transport,
+    pub component_ref: Option<String>,
+    pub component_version: Option<String>,
 }
 
 impl std::fmt::Debug for McpRoute {
@@ -114,6 +138,7 @@ impl std::fmt::Debug for McpRoute {
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("raw_tool_name", &self.raw_tool_name)
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -189,6 +214,9 @@ pub(crate) fn route_for_tests(server_id: &str, tool: &str, transport_url: &str) 
         auth_header_name: None,
         auth_token: None,
         raw_tool_name: tool.to_string(),
+        transport: Transport::Http,
+        component_ref: None,
+        component_version: None,
     }
 }
 
@@ -360,6 +388,9 @@ fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, String> {
             auth_token: w.auth_token.map(SecretString::from),
             allowed_tools: w.allowed_tools,
             roles: w.roles,
+            transport: w.transport,
+            component_ref: w.component_ref,
+            component_version: w.component_version,
         })
         .collect())
 }
@@ -389,6 +420,9 @@ fn ingest_server_tools(catalog: &mut McpToolCatalog, server: &ParsedServer, defs
                 auth_header_name: server.auth_header_name.clone(),
                 auth_token: server.auth_token.clone(),
                 raw_tool_name: def.name.clone(),
+                transport: server.transport,
+                component_ref: server.component_ref.clone(),
+                component_version: server.component_version.clone(),
             },
         );
     }
@@ -431,10 +465,32 @@ fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
 }
 
 /// Connect, handshake, and list a server's tools. Errors are stringified.
+///
+/// Branches on [`Transport`]: `Http` uses the existing `greentic-mcp-client`
+/// path; `LocalWasm` runs the component in-process via [`crate::mcp_local`].
 async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, String> {
-    let mut client = connect(server)?;
-    client.initialize().await.map_err(|e| e.to_string())?;
-    client.list_tools().await.map_err(|e| e.to_string())
+    match server.transport {
+        Transport::Http => {
+            let mut client = connect(server)?;
+            client.initialize().await.map_err(|e| e.to_string())?;
+            client.list_tools().await.map_err(|e| e.to_string())
+        }
+        Transport::LocalWasm => {
+            let component = server
+                .component_ref
+                .as_deref()
+                .ok_or_else(|| "local-wasm server missing component_ref".to_string())?;
+            let tools = crate::mcp_local::local_list_tools(component).await;
+            Ok(tools
+                .into_iter()
+                .map(|tool_def| McpToolDef {
+                    name: tool_def.name,
+                    description: tool_def.description,
+                    input_schema: tool_def.input_schema,
+                })
+                .collect())
+        }
+    }
 }
 
 /// Invoke an MCP tool through its route. Always returns a JSON [`Value`],
@@ -455,17 +511,34 @@ pub async fn dispatch_route(route: &McpRoute, args: &str) -> serde_json::Value {
     }
 }
 
+/// Invoke an MCP tool through its route. Errors are stringified.
+///
+/// Branches on [`Transport`]: `Http` uses the existing `greentic-mcp-client`
+/// path; `LocalWasm` runs the component in-process via [`crate::mcp_local`].
+/// [`dispatch_route`] wraps this with the timeout + `{"error": ...}` contract,
+/// which now covers both transports.
 async fn call_route(
     route: &McpRoute,
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let mut client = connect_route(route)?;
-    client.initialize().await.map_err(|e| e.to_string())?;
-    let out = client
-        .call_tool(&route.raw_tool_name, args)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(out.to_value())
+    match route.transport {
+        Transport::Http => {
+            let mut client = connect_route(route)?;
+            client.initialize().await.map_err(|e| e.to_string())?;
+            let out = client
+                .call_tool(&route.raw_tool_name, args)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(out.to_value())
+        }
+        Transport::LocalWasm => {
+            let component = route
+                .component_ref
+                .as_deref()
+                .ok_or_else(|| "local-wasm route missing component_ref".to_string())?;
+            Ok(crate::mcp_local::local_call_tool(component, &route.raw_tool_name, args).await)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -806,9 +879,74 @@ mod tests {
             auth_header_name: None,
             auth_token: Some(SecretString::from("tok-secret".to_string())),
             raw_tool_name: "get_issue".to_string(),
+            transport: Transport::Http,
+            component_ref: None,
+            component_version: None,
         };
         let dbg = format!("{route:?}");
         assert!(!dbg.contains("tok-secret"), "got: {dbg}");
         assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
+    }
+
+    #[test]
+    fn parse_rows_defaults_transport_to_http_and_reads_local_wasm() {
+        let body = json!({"servers": [
+            { "id": "h", "name": "H", "transport_url": "https://x/", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"] },
+            { "id": "l", "name": "L", "transport_url": "", "auth_header_name": null,
+              "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"],
+              "transport": "local-wasm", "component_ref": "weather.component",
+              "component_version": "1.0.0" }
+        ]});
+        let rows = parse_rows(body).expect("parse");
+        assert!(matches!(rows[0].transport, Transport::Http));
+        assert!(matches!(rows[1].transport, Transport::LocalWasm));
+        assert_eq!(rows[1].component_ref.as_deref(), Some("weather.component"));
+    }
+
+    /// End-to-end local-wasm path: admin row with `transport: "local-wasm"` →
+    /// catalog probe via `mcp_local::local_list_tools` → dispatch via
+    /// `mcp_local::local_call_tool` — all in-process, no network.
+    ///
+    /// Self-skips when the router_echo fixture is absent so the test never
+    /// blocks CI that hasn't built the WASM target. To run live:
+    ///   `GREENTIC_MCP_ROUTER_ECHO_WASM=<path> cargo test -p greentic-aw-runtime mcp_source`
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_wasm_server_lists_and_dispatches_in_process() {
+        // Resolve the fixture using the same strategy as mcp_local::fixture_wasm.
+        let src = std::env::var("GREENTIC_MCP_ROUTER_ECHO_WASM")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../greentic-mcp/target/wasm32-wasip2/release/router_echo.wasm")
+            });
+        if !src.exists() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        // Safety: serial attribute ensures no concurrent env-var mutation with
+        // other tests that share GREENTIC_MCP_LOCAL_CACHE_DIR.
+        unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
+        std::fs::copy(&src, dir.path().join("router_echo.wasm")).unwrap();
+
+        let admin = MockServer::start().await;
+        let body = json!({ "servers": [{
+            "id": "local", "name": "Local", "transport_url": "",
+            "auth_header_name": null, "auth_token": null, "allowed_tools": null,
+            "roles": ["agentic_worker"], "transport": "local-wasm",
+            "component_ref": "router_echo", "component_version": "1.0.0"
+        }]});
+        mount_admin(&admin, body).await;
+
+        let source = McpToolSource::new(admin.uri(), "gtc_live_x");
+        let catalog = source.catalog(&tenant()).await;
+        assert!(catalog.tool_entry("local", "echo").is_some(), "echo tool must be listed");
+
+        let route = catalog.route("local", "echo").expect("route for echo must exist");
+        let out = dispatch_route(route, "{\"message\":\"hi\"}").await;
+        assert!(!out.to_string().contains("\"error\""), "dispatch must succeed; got: {out}");
     }
 }

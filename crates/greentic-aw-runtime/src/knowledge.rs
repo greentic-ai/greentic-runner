@@ -201,6 +201,7 @@ mod tests {
                 embedding: None,
                 top_k: top_k.unwrap_or_else(crate::config::default_knowledge_top_k),
             }),
+            guardrails: vec![],
         }
     }
 

@@ -253,3 +253,8 @@ greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greenti
 # republished, so redirect the registry requirement onto that branch until a
 # dev build carrying `agents` lands on crates.io.
 greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "7f388ec1feb14c263555bba3d3e559bd924373a3" }
+# greentic-mcp-exec's `list_tools` (used by the local-wasm MCP transport) is not
+# yet on a published dev build; redirect onto the greentic-mcp branch commit that
+# carries it until it is published to crates.io (mirrors the greentic-types patch
+# above). CI fetches greenticai git deps over https, so this is reproducible.
+greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "450df805c395624041951f217c833884beb81440" }

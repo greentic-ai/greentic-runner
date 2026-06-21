@@ -218,7 +218,11 @@ pub fn warm_on_start(get_env: impl Fn(&str) -> Option<String>) {
     if targets.is_empty() {
         tracing::debug!("aw serve: no warm targets (GREENTIC_AW_WARM_PACKS unset)");
     } else {
-        tracing::info!(count = targets.len(), ?targets, "aw serve: warm targets configured");
+        tracing::info!(
+            count = targets.len(),
+            ?targets,
+            "aw serve: warm targets configured"
+        );
     }
 }
 
@@ -270,12 +274,7 @@ pub async fn serve_with_ledger(
 ///
 /// Blocks until the subscription stream ends or the process is signalled.
 pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
-    serve_with_ledger(
-        nats_url,
-        runtime,
-        Arc::new(NoopDispatchLedger),
-    )
-    .await
+    serve_with_ledger(nats_url, runtime, Arc::new(NoopDispatchLedger)).await
 }
 
 /// Build a credit-free, broker-free [`AgentRuntime`] that returns a canned reply
@@ -319,6 +318,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         agent_id: agent_id.to_string(),
         system_prompt: "test-mock agent".to_string(),
         tools: vec![],
+        guardrails: vec![],
         llm: LlmProviderRef {
             provider: "mock".to_string(),
             model: "mock".to_string(),
@@ -383,9 +383,15 @@ mod env_gate_tests {
     #[test]
     fn jetstream_default_on_unless_disabled() {
         assert!(use_jetstream(|_| None)); // default ON
-        assert!(!use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "0".to_string())));
-        assert!(!use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "off".to_string())));
-        assert!(use_jetstream(|k| (k == "GREENTIC_AW_JETSTREAM").then(|| "on".to_string())));
+        assert!(!use_jetstream(
+            |k| (k == "GREENTIC_AW_JETSTREAM").then(|| "0".to_string())
+        ));
+        assert!(!use_jetstream(
+            |k| (k == "GREENTIC_AW_JETSTREAM").then(|| "off".to_string())
+        ));
+        assert!(use_jetstream(
+            |k| (k == "GREENTIC_AW_JETSTREAM").then(|| "on".to_string())
+        ));
     }
 }
 
@@ -524,7 +530,14 @@ mod tests {
         );
 
         let out = invoker
-            .invoke("acme", "prod", "greeter", "", json!({"user_text": "hi"}), None)
+            .invoke(
+                "acme",
+                "prod",
+                "greeter",
+                "",
+                json!({"user_text": "hi"}),
+                None,
+            )
             .await
             .expect("no-key invoke succeeds");
 
