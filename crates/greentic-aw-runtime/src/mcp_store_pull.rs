@@ -362,7 +362,7 @@ fn unique_temp_path(dest: &Path) -> PathBuf {
     parent.join(format!(".{stem}.{pid}.{nonce}.tmp"))
 }
 
-/// Shared test fixtures for cross-module integration tests (mcp_source tests
+/// Shared test fixtures for cross-module unit tests (e.g. `mcp_source` tests
 /// that need to build signed `.gtxpack` archives without re-duplicating the
 /// signing/archive logic).
 #[cfg(test)]
@@ -406,8 +406,7 @@ pub(crate) mod fixtures {
     ) -> Vec<u8> {
         let message = serde_json::to_vec(describe).unwrap();
         let signature = signing.sign(&message);
-        let signature_b64 =
-            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
         let public_b64 =
             base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
         let mut signed = describe.clone();
@@ -442,8 +441,7 @@ pub(crate) mod fixtures {
     pub(crate) fn pubkey_env_value(signing: &SigningKey) -> String {
         format!(
             "ed25519:{}",
-            base64::engine::general_purpose::STANDARD
-                .encode(signing.verifying_key().to_bytes())
+            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes())
         )
     }
 }

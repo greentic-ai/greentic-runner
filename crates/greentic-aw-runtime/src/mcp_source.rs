@@ -495,32 +495,21 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
             // listing tools. Requires both version and digest to be present on
             // the wire row; a missing field is treated as a pull failure so the
             // server is skipped rather than silently running an unverified wasm.
-            let version = server
-                .component_version
-                .as_deref()
-                .ok_or_else(|| {
-                    format!(
-                        "local-wasm server '{}' missing component_version; cannot pull",
-                        component
-                    )
-                })?;
-            let digest = server
-                .component_digest
-                .as_deref()
-                .ok_or_else(|| {
-                    format!(
-                        "local-wasm server '{}' missing component_digest; cannot pull",
-                        component
-                    )
-                })?;
+            let version = server.component_version.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm server '{}' missing component_version; cannot pull",
+                    component
+                )
+            })?;
+            let digest = server.component_digest.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm server '{}' missing component_digest; cannot pull",
+                    component
+                )
+            })?;
             crate::mcp_store_pull::ensure_cached(component, version, digest)
                 .await
-                .map_err(|e| {
-                    format!(
-                        "local-wasm store-pull failed for '{}': {e}",
-                        component
-                    )
-                })?;
+                .map_err(|e| format!("local-wasm store-pull failed for '{}': {e}", component))?;
             let tools = crate::mcp_local::local_list_tools(component).await;
             Ok(tools
                 .into_iter()
@@ -581,24 +570,18 @@ async fn call_route(
             // path. The catalog build would have already pulled for in-session
             // routes, but a route can also be constructed or replayed without a
             // prior catalog probe (e.g. from a persisted session snapshot).
-            let version = route
-                .component_version
-                .as_deref()
-                .ok_or_else(|| {
-                    format!(
-                        "local-wasm route '{}' missing component_version; cannot pull",
-                        component
-                    )
-                })?;
-            let digest = route
-                .component_digest
-                .as_deref()
-                .ok_or_else(|| {
-                    format!(
-                        "local-wasm route '{}' missing component_digest; cannot pull",
-                        component
-                    )
-                })?;
+            let version = route.component_version.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm route '{}' missing component_version; cannot pull",
+                    component
+                )
+            })?;
+            let digest = route.component_digest.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm route '{}' missing component_digest; cannot pull",
+                    component
+                )
+            })?;
             crate::mcp_store_pull::ensure_cached(component, version, digest)
                 .await
                 .map_err(|e| {
@@ -1042,11 +1025,19 @@ mod tests {
 
         let source = McpToolSource::new(admin.uri(), "gtc_live_x");
         let catalog = source.catalog(&tenant()).await;
-        assert!(catalog.tool_entry("local", "echo").is_some(), "echo tool must be listed");
+        assert!(
+            catalog.tool_entry("local", "echo").is_some(),
+            "echo tool must be listed"
+        );
 
-        let route = catalog.route("local", "echo").expect("route for echo must exist");
+        let route = catalog
+            .route("local", "echo")
+            .expect("route for echo must exist");
         let out = dispatch_route(route, "{\"message\":\"hi\"}").await;
-        assert!(!out.to_string().contains("\"error\""), "dispatch must succeed; got: {out}");
+        assert!(
+            !out.to_string().contains("\"error\""),
+            "dispatch must succeed; got: {out}"
+        );
     }
 
     /// Task 3 TDD test: admin row carries `component_version` + `component_digest`
@@ -1124,8 +1115,14 @@ mod tests {
         // After lazy pull: wasm must be cached, sidecar written, echo tool listed.
         let wasm_in_cache = cache_dir.path().join("router_echo.wasm");
         let sidecar_in_cache = cache_dir.path().join("router_echo.wasm.sha256");
-        assert!(wasm_in_cache.exists(), "wasm must be in cache after lazy pull");
-        assert!(sidecar_in_cache.exists(), "wasm digest sidecar must be written");
+        assert!(
+            wasm_in_cache.exists(),
+            "wasm must be in cache after lazy pull"
+        );
+        assert!(
+            sidecar_in_cache.exists(),
+            "wasm digest sidecar must be written"
+        );
         assert!(
             catalog.tool_entry("local", "echo").is_some(),
             "echo tool must be listed after lazy pull"
@@ -1182,5 +1179,106 @@ mod tests {
             std::env::remove_var(STORE_URL_ENV);
             std::env::remove_var(TRUSTED_SIGNERS_ENV);
         }
+    }
+
+    /// Dispatch-path degrade (Fix A from Task 4 review):
+    /// a `local-wasm` route whose store-pull fails at `call_route`/`dispatch_route`
+    /// time (wrong `component_digest`, empty cache) must return a JSON value
+    /// containing `"error"` and must NEVER panic. This complements the list-path
+    /// degrade already covered by `lazy_pull_on_catalog_miss_and_dispatch`.
+    ///
+    /// Builds a route directly (bypassing catalog build) so we can simulate
+    /// a persisted/replayed route with a mismatched digest — the same scenario
+    /// that can arise when a session snapshot is replayed after an artifact is
+    /// re-published with a new digest.
+    ///
+    /// Self-skips when the `router_echo` fixture wasm is absent.
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
+        use crate::mcp_store_pull::{
+            STORE_TOKEN_ENV, STORE_URL_ENV, TRUSTED_SIGNERS_ENV,
+            fixtures::{
+                build_gtxpack, fixture_wasm, pubkey_env_value, sample_describe,
+                sign_describe_like_store,
+            },
+        };
+        use ed25519_dalek::SigningKey;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(wasm_src) = fixture_wasm() else {
+            return; // self-skip: fixture not built
+        };
+        let wasm_bytes = std::fs::read(&wasm_src).unwrap();
+
+        // Build a valid signed archive but tell the route a WRONG digest.
+        // The store-pull will download it, compute the real digest, compare
+        // against the wrong pinned digest, and fail with Integrity error.
+        let signing_key = SigningKey::from_bytes(&[30u8; 32]);
+        let signed_describe = sign_describe_like_store(&sample_describe(), &signing_key);
+        let archive = build_gtxpack(&signed_describe, &wasm_bytes);
+        // deliberately wrong digest (not the real sha256 of archive)
+        let wrong_digest = "e".repeat(64);
+
+        // Stand up a mock store so the download itself succeeds (the integrity
+        // check fires after the body is received).
+        let store_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/v1/extensions/router_echo/1.0.0/artifact"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(archive),
+            )
+            .mount(&store_server)
+            .await;
+
+        // Empty cache dir so ensure_cached must actually attempt the pull.
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        // Safety: serial ensures exclusive env-var access.
+        unsafe {
+            std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache_dir.path());
+            std::env::set_var(STORE_URL_ENV, store_server.uri());
+            std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing_key));
+            std::env::remove_var(STORE_TOKEN_ENV);
+        }
+
+        // Build a `local-wasm` route directly with the wrong digest.
+        // This represents a persisted/replayed route whose digest pin has become
+        // stale — dispatch_route must degrade, not panic.
+        let route = McpRoute {
+            server_id: "local".to_string(),
+            transport_url: String::new(),
+            auth_header_name: None,
+            auth_token: None,
+            raw_tool_name: "echo".to_string(),
+            transport: Transport::LocalWasm,
+            component_ref: Some("router_echo".to_string()),
+            component_version: Some("1.0.0".to_string()),
+            component_digest: Some(wrong_digest),
+        };
+
+        let result = dispatch_route(&route, r#"{"message":"degrade-test"}"#).await;
+
+        // Clean up before asserting (to avoid leaking env state on failure).
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(TRUSTED_SIGNERS_ENV);
+        }
+
+        // Must return a JSON object with an "error" key — never panics.
+        assert!(
+            result.to_string().contains("error"),
+            "dispatch_route with wrong digest must degrade to {{\"error\": ...}}; got: {result}"
+        );
+        // Nothing leaked into the cache.
+        assert!(
+            !cache_dir.path().join("router_echo.wasm").exists(),
+            "a digest mismatch during dispatch must leave the cache empty"
+        );
     }
 }
