@@ -44,11 +44,11 @@ use crate::mcp_local::cache_dir;
 /// Env var holding the trusted-signer allowlist: a comma-separated list of
 /// `ed25519:<base64-standard-pubkey>` entries. An empty/unset allowlist makes
 /// every signature verification fail closed.
-const TRUSTED_SIGNERS_ENV: &str = "GREENTIC_MCP_TRUSTED_SIGNERS";
+pub(crate) const TRUSTED_SIGNERS_ENV: &str = "GREENTIC_MCP_TRUSTED_SIGNERS";
 /// Base URL of the store HTTP API (no trailing path).
-const STORE_URL_ENV: &str = "GREENTIC_STORE_URL";
+pub(crate) const STORE_URL_ENV: &str = "GREENTIC_STORE_URL";
 /// Optional `gts_` service token sent as a bearer credential.
-const STORE_TOKEN_ENV: &str = "GREENTIC_STORE_TOKEN";
+pub(crate) const STORE_TOKEN_ENV: &str = "GREENTIC_STORE_TOKEN";
 
 /// The ZIP entry names this loader looks for inside the `.gtxpack`.
 const DESCRIBE_ENTRY: &str = "describe.json";
@@ -131,7 +131,29 @@ pub async fn ensure_cached(
     // 5. Atomically install the verified wasm into the cache.
     write_atomic(&dest, &wasm).map_err(|e| StorePullError::Io(e.to_string()))?;
 
+    // 6. Write the sidecar digest so `mcp_local::exec_config_for` can pin it.
+    //    This is `sha256(extension.wasm)` — the artifact mcp-exec actually runs —
+    //    not the gtxpack digest that the admin pins. Both are verified: the gtxpack
+    //    digest validates the archive, and the wasm digest validates what mcp-exec
+    //    will execute. This separation is intentional: gtxpack digest = registration
+    //    integrity pin; wasm digest = execution-time pin.
+    let wasm_digest = hex_sha256(&wasm);
+    let sidecar_dest = sidecar_path(&dest);
+    write_atomic(&sidecar_dest, wasm_digest.as_bytes())
+        .map_err(|e| StorePullError::Io(format!("write wasm sidecar: {e}")))?;
+
     Ok(())
+}
+
+/// Return the sidecar path for a cached wasm file (e.g. `router_echo.wasm.sha256`).
+pub(crate) fn sidecar_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
+    let mut path = wasm_dest.to_path_buf();
+    let new_extension = match path.extension() {
+        Some(ext) => format!("{}.sha256", ext.to_string_lossy()),
+        None => "sha256".to_string(),
+    };
+    path.set_extension(new_extension);
+    path
 }
 
 /// Verify the Ed25519 signature embedded in `describe.json`.
@@ -259,7 +281,7 @@ async fn download_artifact(url: &str) -> Result<Vec<u8>, StorePullError> {
 }
 
 /// Hex-lowercase SHA256 of `bytes`. Matches the store's `hex::encode` output.
-fn hex_sha256(bytes: &[u8]) -> String {
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
     digest.iter().fold(
@@ -338,6 +360,92 @@ fn unique_temp_path(dest: &Path) -> PathBuf {
         .unwrap_or("artifact");
     let parent = dest.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".{stem}.{pid}.{nonce}.tmp"))
+}
+
+/// Shared test fixtures for cross-module integration tests (mcp_source tests
+/// that need to build signed `.gtxpack` archives without re-duplicating the
+/// signing/archive logic).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+pub(crate) mod fixtures {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::io::Write as _;
+
+    pub(crate) use super::hex_sha256;
+
+    /// Resolve the `router_echo` fixture wasm if built; else `None` (test self-skips).
+    pub(crate) fn fixture_wasm() -> Option<std::path::PathBuf> {
+        let p = std::env::var("GREENTIC_MCP_ROUTER_ECHO_WASM")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../../greentic-mcp/target/wasm32-wasip2/release/router_echo.wasm")
+            });
+        p.exists().then_some(p)
+    }
+
+    /// A minimal unsigned describe document for `router_echo 1.0.0`.
+    pub(crate) fn sample_describe() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "greentic.ai/v1",
+            "kind": "ProviderExtension",
+            "metadata": {
+                "id": "router_echo",
+                "version": "1.0.0",
+                "summary": "echo router for tests"
+            }
+        })
+    }
+
+    /// Sign `describe` the same way the store does — serialize unsigned describe,
+    /// sign those bytes, then inject `signature {algorithm, publicKey, value}`.
+    pub(crate) fn sign_describe_like_store(
+        describe: &serde_json::Value,
+        signing: &SigningKey,
+    ) -> Vec<u8> {
+        let message = serde_json::to_vec(describe).unwrap();
+        let signature = signing.sign(&message);
+        let signature_b64 =
+            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        let public_b64 =
+            base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes());
+        let mut signed = describe.clone();
+        signed.as_object_mut().unwrap().insert(
+            "signature".to_string(),
+            serde_json::json!({
+                "algorithm": "ed25519",
+                "publicKey": public_b64,
+                "value": signature_b64,
+            }),
+        );
+        serde_json::to_vec(&signed).unwrap()
+    }
+
+    /// Build a `.gtxpack` ZIP from raw `describe.json` bytes + `extension.wasm` bytes.
+    pub(crate) fn build_gtxpack(describe_json: &[u8], wasm: &[u8]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file(DESCRIBE_ENTRY, options).unwrap();
+            writer.write_all(describe_json).unwrap();
+            writer.start_file(WASM_ENTRY, options).unwrap();
+            writer.write_all(wasm).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Format a trusted-signer env value for `signing`.
+    pub(crate) fn pubkey_env_value(signing: &SigningKey) -> String {
+        format!(
+            "ed25519:{}",
+            base64::engine::general_purpose::STANDARD
+                .encode(signing.verifying_key().to_bytes())
+        )
+    }
 }
 
 #[cfg(test)]

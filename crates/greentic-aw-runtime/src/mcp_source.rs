@@ -491,6 +491,36 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
                 .component_ref
                 .as_deref()
                 .ok_or_else(|| "local-wasm server missing component_ref".to_string())?;
+            // Lazy store-pull: ensure the wasm is downloaded and verified before
+            // listing tools. Requires both version and digest to be present on
+            // the wire row; a missing field is treated as a pull failure so the
+            // server is skipped rather than silently running an unverified wasm.
+            let version = server
+                .component_version
+                .as_deref()
+                .ok_or_else(|| {
+                    format!(
+                        "local-wasm server '{}' missing component_version; cannot pull",
+                        component
+                    )
+                })?;
+            let digest = server
+                .component_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    format!(
+                        "local-wasm server '{}' missing component_digest; cannot pull",
+                        component
+                    )
+                })?;
+            crate::mcp_store_pull::ensure_cached(component, version, digest)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "local-wasm store-pull failed for '{}': {e}",
+                        component
+                    )
+                })?;
             let tools = crate::mcp_local::local_list_tools(component).await;
             Ok(tools
                 .into_iter()
@@ -547,6 +577,36 @@ async fn call_route(
                 .component_ref
                 .as_deref()
                 .ok_or_else(|| "local-wasm route missing component_ref".to_string())?;
+            // Lazy store-pull: guard the dispatch path the same way as the list
+            // path. The catalog build would have already pulled for in-session
+            // routes, but a route can also be constructed or replayed without a
+            // prior catalog probe (e.g. from a persisted session snapshot).
+            let version = route
+                .component_version
+                .as_deref()
+                .ok_or_else(|| {
+                    format!(
+                        "local-wasm route '{}' missing component_version; cannot pull",
+                        component
+                    )
+                })?;
+            let digest = route
+                .component_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    format!(
+                        "local-wasm route '{}' missing component_digest; cannot pull",
+                        component
+                    )
+                })?;
+            crate::mcp_store_pull::ensure_cached(component, version, digest)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "local-wasm store-pull failed for '{}' during dispatch: {e}",
+                        component
+                    )
+                })?;
             Ok(crate::mcp_local::local_call_tool(component, &route.raw_tool_name, args).await)
         }
     }
@@ -940,8 +1000,9 @@ mod tests {
     /// catalog probe via `mcp_local::local_list_tools` → dispatch via
     /// `mcp_local::local_call_tool` — all in-process, no network.
     ///
-    /// Self-skips when the router_echo fixture is absent so the test never
-    /// blocks CI that hasn't built the WASM target. To run live:
+    /// This is the Phase-1 / operator-seeded path: the wasm is already in cache,
+    /// no store pull. Self-skips when the router_echo fixture is absent so the
+    /// test never blocks CI that hasn't built the WASM target. To run live:
     ///   `GREENTIC_MCP_ROUTER_ECHO_WASM=<path> cargo test -p greentic-aw-runtime mcp_source`
     #[allow(unsafe_code)]
     #[tokio::test]
@@ -962,14 +1023,20 @@ mod tests {
         // Safety: serial attribute ensures no concurrent env-var mutation with
         // other tests that share GREENTIC_MCP_LOCAL_CACHE_DIR.
         unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
+        // Pre-seed the cache (operator-seeded path, no store pull, no sidecar).
         std::fs::copy(&src, dir.path().join("router_echo.wasm")).unwrap();
 
+        // Build a fake admin row that carries version + digest; since the wasm
+        // is already in cache the store-pull no-ops (dest exists) so the store
+        // URL is never called. The digest here is the gtxpack digest that
+        // would be checked during a real pull — moot for a cache-hit path.
         let admin = MockServer::start().await;
         let body = json!({ "servers": [{
             "id": "local", "name": "Local", "transport_url": "",
             "auth_header_name": null, "auth_token": null, "allowed_tools": null,
             "roles": ["agentic_worker"], "transport": "local-wasm",
-            "component_ref": "router_echo", "component_version": "1.0.0"
+            "component_ref": "router_echo", "component_version": "1.0.0",
+            "component_digest": "0000000000000000000000000000000000000000000000000000000000000000"
         }]});
         mount_admin(&admin, body).await;
 
@@ -980,5 +1047,140 @@ mod tests {
         let route = catalog.route("local", "echo").expect("route for echo must exist");
         let out = dispatch_route(route, "{\"message\":\"hi\"}").await;
         assert!(!out.to_string().contains("\"error\""), "dispatch must succeed; got: {out}");
+    }
+
+    /// Task 3 TDD test: admin row carries `component_version` + `component_digest`
+    /// but the cache starts empty. The lazy pull path must download the `.gtxpack`
+    /// from a wiremock store, verify it, extract the wasm, write the sidecar, and
+    /// then list + dispatch successfully.
+    ///
+    /// Also proves the degrade contract: a wrong `component_digest` → empty
+    /// catalog (the server is skipped).
+    ///
+    /// Self-skips when the `router_echo` fixture wasm is absent.
+    #[allow(unsafe_code)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn lazy_pull_on_catalog_miss_and_dispatch() {
+        use crate::mcp_store_pull::{
+            STORE_TOKEN_ENV, STORE_URL_ENV, TRUSTED_SIGNERS_ENV,
+            fixtures::{
+                build_gtxpack, fixture_wasm, hex_sha256, pubkey_env_value, sample_describe,
+                sign_describe_like_store,
+            },
+        };
+        use ed25519_dalek::SigningKey;
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let Some(wasm_src) = fixture_wasm() else {
+            return; // self-skip: fixture not built
+        };
+        let wasm_bytes = std::fs::read(&wasm_src).unwrap();
+
+        // Build a signed .gtxpack archive.
+        let signing_key = SigningKey::from_bytes(&[20u8; 32]);
+        let signed_describe = sign_describe_like_store(&sample_describe(), &signing_key);
+        let archive = build_gtxpack(&signed_describe, &wasm_bytes);
+        let gtxpack_digest = hex_sha256(&archive);
+
+        // Stand up a mock store for the artifact endpoint.
+        let store_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/v1/extensions/router_echo/1.0.0/artifact"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(archive.clone()),
+            )
+            .mount(&store_server)
+            .await;
+
+        // Empty cache directory — no wasm pre-seeded.
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        // Safety: serial ensures exclusive env-var ownership.
+        unsafe {
+            std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache_dir.path());
+            std::env::set_var(STORE_URL_ENV, store_server.uri());
+            std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing_key));
+            std::env::remove_var(STORE_TOKEN_ENV);
+        }
+
+        // Admin row: transport=local-wasm, version+digest present, NO pre-seeded cache.
+        let admin = MockServer::start().await;
+        let body = json!({ "servers": [{
+            "id": "local", "name": "Local", "transport_url": "",
+            "auth_header_name": null, "auth_token": null, "allowed_tools": null,
+            "roles": ["agentic_worker"], "transport": "local-wasm",
+            "component_ref": "router_echo", "component_version": "1.0.0",
+            "component_digest": gtxpack_digest
+        }]});
+        mount_admin(&admin, body).await;
+
+        let source = McpToolSource::new(admin.uri(), "gtc_live_x");
+        let catalog = source.catalog(&tenant()).await;
+
+        // After lazy pull: wasm must be cached, sidecar written, echo tool listed.
+        let wasm_in_cache = cache_dir.path().join("router_echo.wasm");
+        let sidecar_in_cache = cache_dir.path().join("router_echo.wasm.sha256");
+        assert!(wasm_in_cache.exists(), "wasm must be in cache after lazy pull");
+        assert!(sidecar_in_cache.exists(), "wasm digest sidecar must be written");
+        assert!(
+            catalog.tool_entry("local", "echo").is_some(),
+            "echo tool must be listed after lazy pull"
+        );
+
+        // Dispatch must succeed (lazy pull no-ops on cache hit, sidecar pins digest).
+        let route = catalog.route("local", "echo").expect("route for echo");
+        let out = dispatch_route(route, "{\"message\":\"world\"}").await;
+        assert!(
+            !out.to_string().contains("\"error\""),
+            "dispatch must succeed after lazy pull; got: {out}"
+        );
+
+        // --- Wrong-digest degrade test ---
+        // Remove the cache so a fresh pull is attempted, but serve the store
+        // again (same server, fresh mount needed since MockServer is consumed).
+        std::fs::remove_file(&wasm_in_cache).unwrap();
+        std::fs::remove_file(&sidecar_in_cache).unwrap();
+
+        let store_server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/api/v1/extensions/router_echo/1.0.0/artifact"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/octet-stream")
+                    .set_body_bytes(archive),
+            )
+            .mount(&store_server2)
+            .await;
+        unsafe { std::env::set_var(STORE_URL_ENV, store_server2.uri()) };
+
+        let admin2 = MockServer::start().await;
+        let wrong_digest = "f".repeat(64); // definitely wrong
+        let body2 = json!({ "servers": [{
+            "id": "local", "name": "Local", "transport_url": "",
+            "auth_header_name": null, "auth_token": null, "allowed_tools": null,
+            "roles": ["agentic_worker"], "transport": "local-wasm",
+            "component_ref": "router_echo", "component_version": "1.0.0",
+            "component_digest": wrong_digest
+        }]});
+        mount_admin(&admin2, body2).await;
+
+        let source2 = McpToolSource::new(admin2.uri(), "gtc_live_x");
+        let catalog2 = source2.catalog(&tenant()).await;
+        // Integrity check fails → server skipped → empty catalog.
+        assert!(
+            catalog2.is_empty(),
+            "wrong component_digest must degrade to empty catalog"
+        );
+
+        // Cleanup env vars.
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(TRUSTED_SIGNERS_ENV);
+        }
     }
 }
