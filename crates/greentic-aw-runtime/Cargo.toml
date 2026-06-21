@@ -55,6 +55,10 @@ reqwest             = { version = "0.12", default-features = false, features = [
 secrecy             = "0.10"
 serde               = { version = "1", features = ["derive"] }
 serde_json          = { workspace = true }
+# JCS (RFC 8785) canonicalization — MUST match the store's describe signing
+# (greentic-store-server signs `serde_jcs::to_vec(&describe)`); the local-wasm
+# MCP signature verify reconstructs the same bytes.
+serde_jcs           = "0.1"
 thiserror           = { workspace = true }
 tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing             = { workspace = true }

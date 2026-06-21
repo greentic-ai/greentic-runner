@@ -23,15 +23,15 @@
 //! ## Canonicalization (the correctness gate)
 //!
 //! The store signs the describe document **before** injecting the `signature`
-//! object: `serde_json::to_vec(&describe)` of the unsigned describe
-//! (`greentic-store-api` publish handler). It then inserts
-//! `signature {algorithm, publicKey, value}` and repacks the archive so
-//! `describe.json` carries that signature verbatim. Neither the store nor this
-//! runner enable serde_json's `preserve_order` feature, so both serialize
-//! object keys in sorted (`BTreeMap`) order. To reconstruct the signed bytes we
-//! therefore parse `describe.json`, drop the `signature` field, and
-//! `serde_json::to_vec` the remainder — yielding bytes identical to what the
-//! store signed.
+//! object: `serde_jcs::to_vec(&describe)` of the unsigned describe — JCS
+//! canonicalization, RFC 8785 (`greentic-store-api` publish handler). It then
+//! inserts `signature {algorithm, publicKey, value}` and repacks the archive so
+//! `describe.json` carries that signature verbatim. To reconstruct the signed
+//! bytes we parse `describe.json`, drop the `signature` field, and
+//! `serde_jcs::to_vec` the remainder — yielding bytes identical to what the
+//! store signed. We use JCS (not plain `serde_json::to_vec`) so the two sides
+//! agree even on values where JCS and serde_json diverge (floats, non-ASCII
+//! keys, exponent-form numbers).
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -164,8 +164,9 @@ pub(crate) fn sidecar_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
 /// Verify the Ed25519 signature embedded in `describe.json`.
 ///
 /// Reconstructs the exact bytes the store signed — the describe document with
-/// its `signature` field removed, re-serialized via `serde_json::to_vec` — then
-/// checks the decoded signature against every key in `trusted`. Succeeds if any
+/// its `signature` field removed, re-serialized via `serde_jcs::to_vec` (JCS,
+/// RFC 8785) — then checks the decoded signature against every key in
+/// `trusted`. Succeeds if any
 /// trusted key validates the signature; fails closed when `trusted` is empty.
 ///
 /// # Errors
@@ -187,14 +188,17 @@ pub fn verify_describe_signature(
         })?;
 
     // Reconstruct the signed message: describe without the `signature` field,
-    // serialized exactly as the store did (sorted-key serde_json::to_vec).
+    // serialized exactly as the store did. The store signs
+    // `serde_jcs::to_vec(&describe)` (JCS / RFC 8785) BEFORE injecting the
+    // signature, so we must canonicalize with the SAME serializer — not plain
+    // `serde_json::to_vec` (which diverges from JCS on floats / non-ASCII keys).
     let mut unsigned = describe.clone();
     unsigned
         .as_object_mut()
         .ok_or_else(|| StorePullError::Signature("describe.json is not a JSON object".into()))?
         .remove("signature");
-    let signed_message = serde_json::to_vec(&unsigned)
-        .map_err(|e| StorePullError::Signature(format!("re-serialize describe: {e}")))?;
+    let signed_message = serde_jcs::to_vec(&unsigned)
+        .map_err(|e| StorePullError::Signature(format!("re-serialize describe (JCS): {e}")))?;
 
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(signature_b64.trim())
@@ -421,13 +425,14 @@ pub(crate) mod fixtures {
         })
     }
 
-    /// Sign `describe` the same way the store does — serialize unsigned describe,
-    /// sign those bytes, then inject `signature {algorithm, publicKey, value}`.
+    /// Sign `describe` the same way the store does — JCS-canonicalize the
+    /// unsigned describe (`serde_jcs::to_vec`), sign those bytes, then inject
+    /// `signature {algorithm, publicKey, value}`.
     pub(crate) fn sign_describe_like_store(
         describe: &serde_json::Value,
         signing: &SigningKey,
     ) -> Vec<u8> {
-        let message = serde_json::to_vec(describe).unwrap();
+        let message = serde_jcs::to_vec(describe).unwrap();
         let signature = signing.sign(&message);
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
         let public_b64 =
@@ -502,12 +507,12 @@ mod tests {
         })
     }
 
-    /// Sign `describe` THE SAME WAY THE STORE DOES: serialize the unsigned
-    /// describe with `serde_json::to_vec`, sign those bytes, then inject the
-    /// `signature {algorithm, publicKey, value}` object. Returns the signed
-    /// describe bytes (what the archive's `describe.json` carries).
+    /// Sign `describe` THE SAME WAY THE STORE DOES: JCS-canonicalize the
+    /// unsigned describe with `serde_jcs::to_vec` (RFC 8785), sign those bytes,
+    /// then inject the `signature {algorithm, publicKey, value}` object. Returns
+    /// the signed describe bytes (what the archive's `describe.json` carries).
     fn sign_describe_like_store(describe: &serde_json::Value, signing: &SigningKey) -> Vec<u8> {
-        let message = serde_json::to_vec(describe).unwrap();
+        let message = serde_jcs::to_vec(describe).unwrap();
         let signature = signing.sign(&message);
         let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
         let public_b64 =
@@ -573,6 +578,36 @@ mod tests {
         let signed: serde_json::Value = serde_json::from_slice(&signed_bytes).unwrap();
         let trusted = vec![signing.verifying_key()];
         verify_describe_signature(&signed, &trusted).expect("valid signature must verify");
+    }
+
+    /// Proves the verify genuinely uses JCS (RFC 8785), not plain
+    /// `serde_json::to_vec`: a describe carrying an integer-valued float
+    /// (`64.0`) serializes as `64.0` under serde_json but `64` under JCS, so the
+    /// two canonicalizers DIVERGE on this document. The store signs with JCS, so
+    /// the verify must reconstruct with JCS — the old serde_json reconstruction
+    /// would compute different bytes and fail. This guards against a silent
+    /// regression back to `serde_json::to_vec`.
+    #[test]
+    #[serial_test::serial]
+    fn verify_describe_signature_uses_jcs_canonicalization() {
+        let describe = serde_json::json!({
+            "apiVersion": "greentic.ai/v1",
+            "kind": "ProviderExtension",
+            "runtime": { "memoryLimitMB": 64.0 },
+            "metadata": { "id": "router_echo", "version": "1.0.0", "summary": "x" }
+        });
+        // The two canonicalizers MUST differ on this value, else the test would
+        // pass even with a serde_json reconstruction (defeating its purpose).
+        assert_ne!(
+            serde_json::to_vec(&describe).unwrap(),
+            serde_jcs::to_vec(&describe).unwrap(),
+            "expected serde_json and JCS to diverge on an integer-valued float"
+        );
+        let signing = SigningKey::from_bytes(&[9u8; 32]);
+        let signed_bytes = sign_describe_like_store(&describe, &signing);
+        let signed: serde_json::Value = serde_json::from_slice(&signed_bytes).unwrap();
+        verify_describe_signature(&signed, &[signing.verifying_key()])
+            .expect("store-signed (JCS) describe must verify under the JCS reconstruction");
     }
 
     #[test]
@@ -764,7 +799,10 @@ mod tests {
         let dest = cache.path().join("router_echo.wasm");
         std::fs::write(&dest, b"stale-unverified-bytes").unwrap();
         assert!(dest.exists(), "pre-condition: wasm exists");
-        assert!(!sidecar_path(&dest).exists(), "pre-condition: sidecar absent");
+        assert!(
+            !sidecar_path(&dest).exists(),
+            "pre-condition: sidecar absent"
+        );
 
         let server = mock_store(archive).await;
         unsafe {
