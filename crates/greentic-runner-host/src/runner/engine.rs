@@ -2892,10 +2892,16 @@ fn evaluate_custom_routing(
 
     // Build a rich context for condition evaluation:
     // Start with output payload, then overlay entry and synthesised "response".
-    // The success `event` default is chosen from the success-family port this
-    // node actually routes on, so happy paths named `on_complete`/`on_submit`
-    // resolve instead of stalling at `Wait`.
-    let ctx = build_routing_context(output, state, default_success_event(routes));
+    // The default `event` is chosen from the success/error-family port this node
+    // actually routes on, so happy paths named `on_complete`/`on_submit` and
+    // failure paths named `on_cancel`/`on_timeout` resolve instead of stalling
+    // at `Wait`.
+    let ctx = build_routing_context(
+        output,
+        state,
+        default_success_event(routes),
+        default_error_event(routes),
+    );
 
     let mut has_condition = false;
     for route in routes {
@@ -3060,6 +3066,12 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
 /// historical default keep routing unchanged (e.g. http).
 const SUCCESS_EVENT_PORTS: [&str; 3] = ["on_success", "on_complete", "on_submit"];
 
+/// Error-family outcome ports, priority order, mirroring [`SUCCESS_EVENT_PORTS`]
+/// for the failure (`ok == false`) branch. `on_error` is first so the historical
+/// default is preserved; `on_cancel` / `on_timeout` let a node whose failure
+/// port is named differently (qa cancel, http timeout) route instead of stalling.
+const ERROR_EVENT_PORTS: [&str; 3] = ["on_error", "on_cancel", "on_timeout"];
+
 /// Derive the success `event` to default to when a node succeeds (`ok == true`)
 /// but emits no explicit `outcome`. Designer-built nodes whose happy port is
 /// `on_complete` (native `qa.process` / `llm.openai.chat` / `template_render`)
@@ -3070,15 +3082,30 @@ const SUCCESS_EVENT_PORTS: [&str; 3] = ["on_success", "on_complete", "on_submit"
 /// back to `on_success` when no success-family port is referenced (preserving
 /// the prior behaviour).
 fn default_success_event(routes: &[Value]) -> &'static str {
+    default_event(routes, &SUCCESS_EVENT_PORTS, "on_success")
+}
+
+/// Failure-branch counterpart of [`default_success_event`]: the `event` to
+/// default to when a node fails (`ok == false`) without an explicit `outcome`.
+/// Picks the first error-family port the node actually routes on, falling back
+/// to `on_error`.
+fn default_error_event(routes: &[Value]) -> &'static str {
+    default_event(routes, &ERROR_EVENT_PORTS, "on_error")
+}
+
+/// Pick the first port in `ports` (priority order) that the node has an outgoing
+/// `event == "<port>"` edge for; `fallback` when none is referenced.
+fn default_event(routes: &[Value], ports: &[&'static str], fallback: &'static str) -> &'static str {
     let referenced: Vec<&str> = routes
         .iter()
         .filter_map(|route| route.get("condition").and_then(Value::as_str))
         .filter_map(condition_event_eq)
         .collect();
-    SUCCESS_EVENT_PORTS
-        .into_iter()
+    ports
+        .iter()
+        .copied()
         .find(|port| referenced.contains(port))
-        .unwrap_or("on_success")
+        .unwrap_or(fallback)
 }
 
 /// Extract `<value>` from an `event == "<value>"` condition; `None` for any
@@ -3095,6 +3122,7 @@ fn build_routing_context(
     output: &NodeOutput,
     state: &ExecutionState,
     success_event: &str,
+    error_event: &str,
 ) -> Value {
     let mut ctx = match &output.payload {
         Value::Object(map) => map.clone(),
@@ -3140,15 +3168,23 @@ fn build_routing_context(
     // (`event == "<outcome>"`, emitted by the designer for nodes with multiple
     // outgoing edges) resolves. Prefer an explicit outcome the node emitted in
     // its output metadata; otherwise derive a default from `ok` — `success_event`
-    // on success (the success-family port the node actually has an edge for; see
-    // `default_success_event`), `on_error` on failure. Without this, a multi-edge
-    // node falls through to `Wait` at runtime.
+    // on success / `error_event` on failure (the success/error-family port the
+    // node actually has an edge for; see `default_success_event` /
+    // `default_error_event`). Without this, a multi-edge node falls through to
+    // `Wait` at runtime.
     let event = output
         .meta
         .get("outcome")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| if output.ok { success_event } else { "on_error" }.to_string());
+        .unwrap_or_else(|| {
+            if output.ok {
+                success_event
+            } else {
+                error_event
+            }
+            .to_string()
+        });
     ctx.insert("event".into(), Value::String(event));
 
     Value::Object(ctx)
@@ -4482,6 +4518,58 @@ mod tests {
         assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
         // A non-numeric operand on an ordering op is false, not a panic.
         assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
+    }
+
+    /// Symmetric to the success default: when a node FAILS (`ok == false`)
+    /// without an explicit outcome, route to the error-family port the node
+    /// actually has an edge for (priority `on_error` → `on_cancel` →
+    /// `on_timeout`), not blindly `on_error`. Lets a node whose failure port is
+    /// `on_cancel` (qa) or `on_timeout` (http) route instead of stalling.
+    #[test]
+    fn failure_default_matches_available_outcome_port() {
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+        // ok:false, no explicit outcome — the failure case.
+        let err_out = NodeOutput {
+            ok: false,
+            payload: json!({}),
+            meta: Value::Null,
+        };
+
+        // qa shape: failure port is `on_cancel`, no `on_error` edge.
+        let on_cancel_routing = json!([
+            { "condition": "event == \"on_complete\"", "to": "next" },
+            { "condition": "event == \"on_cancel\"", "to": "cancelled" }
+        ]);
+        match evaluate_custom_routing(&on_cancel_routing, &err_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "cancelled"),
+            other => panic!("expected Next(\"cancelled\") via on_cancel default, got {other:?}"),
+        }
+
+        // http shape: `on_error` present → on_error (priority, unchanged).
+        let on_error_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok" },
+            { "condition": "event == \"on_error\"", "to": "err" }
+        ]);
+        match evaluate_custom_routing(&on_error_routing, &err_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
+            other => panic!("expected Next(\"err\") via on_error default, got {other:?}"),
+        }
+
+        // on_timeout-only failure port.
+        let on_timeout_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok" },
+            { "condition": "event == \"on_timeout\"", "to": "timed_out" }
+        ]);
+        match evaluate_custom_routing(&on_timeout_routing, &err_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "timed_out"),
+            other => panic!("expected Next(\"timed_out\") via on_timeout default, got {other:?}"),
+        }
     }
 
     #[test]
