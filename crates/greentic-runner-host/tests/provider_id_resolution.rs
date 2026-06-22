@@ -1,9 +1,9 @@
-//! M1.1b regression tests for ProviderRegistry post-cutover.
+//! Provider resolution regression tests.
 //!
-//! Verifies that `extract_inline_providers` preserves the wire
-//! `provider_id` (Option<String>) verbatim instead of synthesizing
-//! `Some(provider_type)`, and that `ProviderRegistry::resolve` enforces
-//! defense-in-depth when a caller supplies both id and type.
+//! Post greentic-types 1.1.0-dev.27836473437 the `ProviderDecl.provider_id`
+//! field was removed. Inline manifest providers are now identified solely by
+//! `provider_type`. These tests verify that `ProviderRegistry::resolve` works
+//! correctly under the new schema.
 
 use std::collections::BTreeMap;
 
@@ -15,10 +15,9 @@ use greentic_types::{
 };
 use semver::Version;
 
-fn decl(provider_type: &str, provider_id: Option<&str>) -> ProviderDecl {
+fn decl(provider_type: &str) -> ProviderDecl {
     ProviderDecl {
         provider_type: provider_type.into(),
-        provider_id: provider_id.map(str::to_owned),
         capabilities: Vec::new(),
         ops: Vec::new(),
         config_schema_ref: "schemas/x.json".into(),
@@ -73,25 +72,23 @@ fn registry_for(providers: Vec<ProviderDecl>) -> Result<ProviderRegistry> {
 }
 
 #[test]
-fn resolve_by_provider_id_returns_inline_decl_with_matching_id() {
-    let registry = registry_for(vec![decl("vendor.cache", Some("vendor.cache.primary"))]).unwrap();
+fn resolve_by_provider_type_works() {
+    let registry = registry_for(vec![decl("vendor.cache")]).unwrap();
     let binding = registry
-        .resolve(Some("vendor.cache.primary"), None)
-        .expect("inline decl with provider_id resolves by id");
-    assert_eq!(binding.provider_id.as_deref(), Some("vendor.cache.primary"));
+        .resolve(None, Some("vendor.cache"))
+        .expect("provider_type lookup resolves inline decl");
     assert_eq!(binding.provider_type, "vendor.cache");
 }
 
 #[test]
-fn resolve_by_id_no_longer_matches_provider_type_post_cutover() {
-    // Pre-M1.1b, extract_inline_providers synthesized `provider_id =
-    // Some(provider_type)`, so `resolve(Some("vendor.search"), None)` against
-    // a decl with no `provider_id` would silently succeed by id-fallback.
-    // Post-cutover this MUST NOT resolve via the id path.
-    let registry = registry_for(vec![decl("vendor.search", None)]).unwrap();
+fn resolve_by_id_fails_for_inline_provider_without_instance_file() {
+    // Inline providers no longer carry a provider_id (field removed from
+    // ProviderDecl). Resolving by id against an inline-only registry must
+    // fail — only instance-file-loaded providers have ids.
+    let registry = registry_for(vec![decl("vendor.search")]).unwrap();
     let err = registry
         .resolve(Some("vendor.search"), None)
-        .expect_err("no inline decl declares provider_id 'vendor.search'");
+        .expect_err("inline decl has no provider_id, id-lookup must fail");
     assert!(
         err.to_string()
             .contains("provider_id `vendor.search` not found"),
@@ -100,77 +97,37 @@ fn resolve_by_id_no_longer_matches_provider_type_post_cutover() {
 }
 
 #[test]
-fn resolve_by_provider_type_still_works_for_unnamed_decl() {
-    let registry = registry_for(vec![decl("vendor.search", None)]).unwrap();
+fn resolve_by_provider_type_fills_default_provider_id() {
+    // When resolving by type alone the binding's provider_id defaults to the
+    // provider_type string (see binding_from_decl's default_provider_id arg).
+    let registry = registry_for(vec![decl("vendor.search")]).unwrap();
     let binding = registry
         .resolve(None, Some("vendor.search"))
-        .expect("provider_type lookup still resolves unnamed decls");
+        .expect("provider_type lookup resolves");
     assert_eq!(binding.provider_type, "vendor.search");
     assert_eq!(binding.provider_id.as_deref(), Some("vendor.search"));
 }
 
 #[test]
-fn resolve_rejects_id_type_mismatch_when_both_supplied() {
-    // Defense-in-depth: caller supplies both provider_id and provider_type.
-    // The inline decl carries provider_id="shared" with provider_type="vendor.a".
-    // A caller asking for provider_type="vendor.b" must fail loudly, not get
-    // an unexpected vendor.a binding.
-    let registry = registry_for(vec![decl("vendor.a", Some("shared"))]).unwrap();
+fn resolve_rejects_unknown_provider_type() {
+    let registry = registry_for(vec![decl("vendor.cache")]).unwrap();
     let err = registry
-        .resolve(Some("shared"), Some("vendor.b"))
-        .expect_err("id/type mismatch must fail");
-    let msg = err.to_string();
+        .resolve(None, Some("vendor.unknown"))
+        .expect_err("unknown provider_type must fail");
     assert!(
-        msg.contains("provider_id `shared`")
-            && msg.contains("`vendor.a`")
-            && msg.contains("`vendor.b`"),
-        "expected mismatch diagnostic naming both types, got: {msg}"
+        err.to_string().contains("no provider runtime found"),
+        "unexpected error: {err}"
     );
 }
 
 #[test]
-fn resolve_with_matching_id_and_type_succeeds() {
-    let registry = registry_for(vec![decl("vendor.cache", Some("vendor.cache.primary"))]).unwrap();
-    let binding = registry
-        .resolve(Some("vendor.cache.primary"), Some("vendor.cache"))
-        .expect("matching id + type pair resolves");
-    assert_eq!(binding.provider_id.as_deref(), Some("vendor.cache.primary"));
-    assert_eq!(binding.provider_type, "vendor.cache");
-}
-
-#[test]
-fn registry_rejects_pack_with_duplicate_provider_id() {
-    // validate_basic must fire at the trust boundary. Two decls both
-    // declaring provider_id="dup" would otherwise lead OperatorRegistry's
-    // last-wins HashMap insert to disagree with ProviderRegistry::resolve's
-    // first-match Vec scan — policy routing and runtime invocation could
-    // resolve to different decls.
-    let err = registry_for(vec![
-        decl("vendor.a", Some("dup")),
-        decl("vendor.b", Some("dup")),
-    ])
-    .err()
-    .expect("duplicate provider_id rejected at registry construction");
-    // anyhow's `.context()` only prints the outer message via `{}`; use
-    // `{:#}` (or chain()) to get the underlying GreenticError text.
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("validation") && msg.contains("duplicate provider_id"),
-        "expected validation failure naming duplicate provider_id, got: {msg}"
-    );
-}
-
-#[test]
-fn registry_rejects_pack_with_cross_namespace_collision() {
-    // A Slack decl whose provider_id matches a Teams decl's provider_type
-    // would let id-lookup keyed "teams" silently bind to the Slack runtime.
-    // The runner must reject the manifest at construction time.
-    let err = registry_for(vec![decl("teams", None), decl("slack", Some("teams"))])
+fn resolve_rejects_ambiguous_multiple_providers_of_same_type() {
+    let err = registry_for(vec![decl("vendor.cache"), decl("vendor.cache")])
         .err()
-        .expect("cross-namespace collision rejected at registry construction");
+        .expect("duplicate provider_type rejected at registry construction");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("validation") && msg.contains("provider_id 'teams'"),
-        "expected collision validation failure, got: {msg}"
+        msg.contains("duplicate provider_type"),
+        "expected duplicate provider_type validation failure, got: {msg}"
     );
 }

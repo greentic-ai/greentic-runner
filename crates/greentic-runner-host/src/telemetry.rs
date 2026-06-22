@@ -1,5 +1,23 @@
-use greentic_types::telemetry::{attr_keys, set_current_tenant_ctx};
+use greentic_types::telemetry::set_current_tenant_ctx;
 use greentic_types::{EnvId, TenantCtx, TenantId};
+
+/// Canonical `TenantCtx.attributes` keys for deploy-spec rollout identifiers
+/// (B11/C5) and the messaging endpoint discriminator (M1.4).
+///
+/// Previously exported by `greentic_types::telemetry::attr_keys`; the upstream
+/// module was removed in greentic-types 1.1.0-dev.27836473437 and the new
+/// `set_current_tenant_ctx` no longer projects these from the attributes map.
+/// The runner-host is the sole producer of these values, so the constants live
+/// here now. The string values are unchanged to keep existing telemetry
+/// dashboards and queries stable.
+pub(crate) mod attr_keys {
+    pub const CUSTOMER_ID: &str = "gt.customer_id";
+    pub const DEPLOYMENT_ID: &str = "gt.deployment_id";
+    pub const BUNDLE_ID: &str = "gt.bundle_id";
+    pub const REVISION_ID: &str = "gt.revision_id";
+    pub const PACK_ID: &str = "gt.pack_id";
+    pub const MESSAGING_ENDPOINT_ID: &str = "gt.messaging_endpoint_id";
+}
 use rand::{RngExt, rng};
 use std::str::FromStr;
 use tracing::Span;
@@ -81,6 +99,54 @@ fn flow_tenant_ctx(
     ctx
 }
 
+/// Project a [`TenantCtx`] into a [`greentic_telemetry::TelemetryCtx`] for span
+/// annotation export.
+///
+/// This replaces the removed `greentic_types::telemetry::tenant_ctx_to_telemetry`.
+/// The new `set_current_tenant_ctx` only copies the core identity fields into the
+/// task-local slot; it no longer projects rollout/pack/messaging attributes. The
+/// `annotate_span` export path still needs the full projection so that `gt.*`
+/// attributes reach exported OTLP spans.
+#[cfg(feature = "telemetry")]
+fn tenant_ctx_to_telemetry(ctx: &TenantCtx) -> greentic_telemetry::TelemetryCtx {
+    let mut t =
+        greentic_telemetry::TelemetryCtx::new(ctx.tenant_id.as_ref()).with_env(ctx.env.as_str());
+    if let Some(team) = ctx.team_id.as_ref().or(ctx.team.as_ref()) {
+        t = t.with_team(team.as_str());
+    }
+    if let Some(session) = ctx.session_id() {
+        t = t.with_session(session);
+    }
+    if let Some(flow) = ctx.flow_id() {
+        t = t.with_flow(flow);
+    }
+    if let Some(node) = ctx.node_id() {
+        t = t.with_node(node);
+    }
+    if let Some(provider) = ctx.provider_id() {
+        t = t.with_provider(provider);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::CUSTOMER_ID) {
+        t = t.with_customer_id(v);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::DEPLOYMENT_ID) {
+        t = t.with_deployment_id(v);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::BUNDLE_ID) {
+        t = t.with_bundle_id(v);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::REVISION_ID) {
+        t = t.with_revision_id(v);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::PACK_ID) {
+        t = t.with_pack_id(v);
+    }
+    if let Some(v) = ctx.attributes.get(attr_keys::MESSAGING_ENDPOINT_ID) {
+        t = t.with_messaging_endpoint_id(v);
+    }
+    t
+}
+
 /// Install per-invocation telemetry for `span`: stamp the tenant context (live
 /// `pack_id` + rollout IDs) into the task-local slot, and export the `gt.*`
 /// attribution as real OpenTelemetry attributes on `span`.
@@ -115,10 +181,7 @@ pub fn set_flow_context(
     );
     set_current_tenant_ctx(&ctx);
     #[cfg(feature = "telemetry")]
-    greentic_telemetry::annotate_span(
-        span,
-        &greentic_types::telemetry::tenant_ctx_to_telemetry(&ctx),
-    );
+    greentic_telemetry::annotate_span(span, &tenant_ctx_to_telemetry(&ctx));
     #[cfg(not(feature = "telemetry"))]
     let _ = span;
 }
@@ -147,8 +210,8 @@ impl RolloutIds {
 }
 
 /// Stamp the rollout IDs onto `ctx.attributes` under the canonical
-/// [`attr_keys`](greentic_types::telemetry::attr_keys), so the telemetry bridge
-/// (`set_current_tenant_ctx`) copies them into `TelemetryCtx` for spans/logs.
+/// [`attr_keys`], so the local [`tenant_ctx_to_telemetry`] projection copies
+/// them into `TelemetryCtx` for span export.
 ///
 /// Authoritative over these four keys: a present ID is written, an absent one
 /// is cleared. Stamping is therefore safe to re-run on a reused `TenantCtx`
