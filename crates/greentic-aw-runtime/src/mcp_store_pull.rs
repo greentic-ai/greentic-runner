@@ -34,7 +34,7 @@
 //! keys, exponent-form numbers).
 
 use base64::Engine as _;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -57,6 +57,13 @@ const WASM_ENTRY: &str = "extension.wasm";
 /// Maximum size of a `.gtxpack` artifact accepted from the store. Prevents a
 /// hostile or misconfigured store from OOM-ing the runner before the digest check.
 const MAX_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Maximum DECOMPRESSED size of any single ZIP entry inside a `.gtxpack`. The
+/// `MAX_ARTIFACT_BYTES` cap bounds the compressed archive, but a hostile (or
+/// MITM'd) store could ship a small archive whose entries inflate hugely (a zip
+/// bomb). Bound the inflated output so extraction can never OOM the runner. A
+/// generous ceiling — real `extension.wasm` binaries are well under this.
+const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Typed, non-panicking failure modes for the store-pull path.
 #[derive(Debug, thiserror::Error)]
@@ -83,11 +90,14 @@ pub enum StorePullError {
 
 /// Ensure `<cache_dir>/<component_ref>.wasm` exists and is verified.
 ///
-/// Short-circuits only when BOTH `<ref>.wasm` AND its `<ref>.wasm.sha256` sidecar
-/// are present — a wasm-only entry without a sidecar means a prior unverified seed
-/// (or a stale partial pull) and must be re-pulled and re-verified. Otherwise the
-/// matching `.gtxpack` is downloaded, its sha256 is checked against
-/// `component_digest`, the embedded describe signature is verified against the
+/// Short-circuits only when `<ref>.wasm`, its `<ref>.wasm.sha256` sidecar, AND
+/// the `<ref>.wasm.gtxpack` marker are all present AND the marker equals this
+/// call's `component_digest` — so a version/digest upgrade (a re-registered or
+/// security-patched component) re-pulls instead of serving the stale cached
+/// wasm. A wasm-only entry (or one with a stale/missing marker) is re-pulled and
+/// re-verified. Otherwise the matching `.gtxpack` is downloaded, its sha256 is
+/// checked against `component_digest`, the embedded describe signature is verified
+/// against the
 /// trusted allowlist, and `extension.wasm` is extracted into the cache atomically
 /// alongside a fresh sidecar.
 ///
@@ -105,7 +115,17 @@ pub async fn ensure_cached(
     component_digest: &str,
 ) -> Result<(), StorePullError> {
     let dest = cache_dir().join(format!("{component_ref}.wasm"));
-    if dest.exists() && sidecar_path(&dest).exists() {
+    // Cache-hit ONLY when the cached wasm, its execution-digest sidecar, AND the
+    // pinned-gtxpack marker are all present and the marker matches THIS request's
+    // `component_digest`. Keying on file existence alone (the previous behaviour)
+    // ignored the version/digest: a re-registered component (new version, new
+    // digest — e.g. a security patch) would short-circuit on the stale cached
+    // wasm and the runner would keep executing the OLD code indefinitely.
+    // Comparing the marker forces a re-pull whenever the pinned digest changes.
+    if dest.exists()
+        && sidecar_path(&dest).exists()
+        && gtxpack_marker_matches(&gtxpack_marker_path(&dest), component_digest)
+    {
         return Ok(());
     }
 
@@ -133,19 +153,24 @@ pub async fn ensure_cached(
     // 4. Authenticity: Ed25519 over the describe-minus-signature.
     verify_describe_signature(&describe, &trusted_signers())?;
 
-    // 5. Atomically install the verified wasm into the cache.
-    write_atomic(&dest, &wasm).map_err(|e| StorePullError::Io(e.to_string()))?;
-
-    // 6. Write the sidecar digest so `mcp_local::exec_config_for` can pin it.
-    //    This is `sha256(extension.wasm)` — the artifact mcp-exec actually runs —
-    //    not the gtxpack digest that the admin pins. Both are verified: the gtxpack
-    //    digest validates the archive, and the wasm digest validates what mcp-exec
-    //    will execute. This separation is intentional: gtxpack digest = registration
-    //    integrity pin; wasm digest = execution-time pin.
+    // 5. Atomically install. The write ORDER is load-bearing for crash- and
+    //    concurrency-safety:
+    //    (a) the execution-digest sidecar (`sha256(extension.wasm)`) FIRST — so a
+    //        concurrent reader never observes the wasm WITHOUT its sidecar, which
+    //        `mcp_local::exec_config_for` would treat as an operator-seeded cache
+    //        and run with `allow_unverified: true`. This is `sha256(extension.wasm)`
+    //        — the artifact mcp-exec actually runs — not the gtxpack digest.
+    //    (b) the verified wasm itself.
+    //    (c) the pinned-gtxpack marker LAST, as the completion sentinel — its
+    //        presence AND matching value is what the cache-hit check above trusts.
+    //        Writing it last means a half-finished pull (sidecar/wasm but no marker)
+    //        re-pulls rather than serving an unconfirmed cache.
     let wasm_digest = hex_sha256(&wasm);
-    let sidecar_dest = sidecar_path(&dest);
-    write_atomic(&sidecar_dest, wasm_digest.as_bytes())
+    write_atomic(&sidecar_path(&dest), wasm_digest.as_bytes())
         .map_err(|e| StorePullError::Io(format!("write wasm sidecar: {e}")))?;
+    write_atomic(&dest, &wasm).map_err(|e| StorePullError::Io(e.to_string()))?;
+    write_atomic(&gtxpack_marker_path(&dest), component_digest.as_bytes())
+        .map_err(|e| StorePullError::Io(format!("write gtxpack marker: {e}")))?;
 
     Ok(())
 }
@@ -159,6 +184,32 @@ pub(crate) fn sidecar_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
     };
     path.set_extension(new_extension);
     path
+}
+
+/// Path of the pinned-gtxpack-digest marker for a cached wasm
+/// (e.g. `router_echo.wasm.gtxpack`). It stores the `component_digest` (the
+/// `sha256(.gtxpack)`) that produced the cached wasm; written LAST on a
+/// successful pull and read by [`ensure_cached`] to detect version/digest
+/// upgrades on a cache hit (a changed pin ⇒ re-pull).
+fn gtxpack_marker_path(wasm_dest: &std::path::Path) -> std::path::PathBuf {
+    let mut path = wasm_dest.to_path_buf();
+    let new_extension = match path.extension() {
+        Some(ext) => format!("{}.gtxpack", ext.to_string_lossy()),
+        None => "gtxpack".to_string(),
+    };
+    path.set_extension(new_extension);
+    path
+}
+
+/// True only when the marker file exists and its contents equal `expected_digest`
+/// (case-insensitive, whitespace-trimmed). A missing/unreadable marker or any
+/// mismatch returns `false`, forcing a re-pull — fail-safe toward re-verifying
+/// rather than serving a possibly-stale cached wasm.
+fn gtxpack_marker_matches(marker: &std::path::Path, expected_digest: &str) -> bool {
+    match std::fs::read_to_string(marker) {
+        Ok(contents) => contents.trim().eq_ignore_ascii_case(expected_digest.trim()),
+        Err(_) => false,
+    }
 }
 
 /// Verify the Ed25519 signature embedded in `describe.json`.
@@ -213,9 +264,13 @@ pub fn verify_describe_signature(
         )));
     }
 
+    // `verify_strict` (not `verify`) — additionally rejects signatures with a
+    // small-order public-key/`R` component. A legitimately generated signature
+    // never triggers this; using the strict check matches the admin's
+    // `store_verify` path and removes a theoretical malleability foothold.
     if trusted
         .iter()
-        .any(|key| key.verify(&signed_message, &signature).is_ok())
+        .any(|key| key.verify_strict(&signed_message, &signature).is_ok())
     {
         Ok(())
     } else {
@@ -339,18 +394,30 @@ fn unzip_describe_and_wasm(
 }
 
 /// Read a single named entry from `archive`, mapping a missing entry to a
-/// descriptive [`StorePullError::Archive`].
+/// descriptive [`StorePullError::Archive`]. The decompressed output is bounded by
+/// [`MAX_ZIP_ENTRY_BYTES`] so a zip bomb (a small archive declaring/inflating a
+/// huge entry) cannot OOM the runner.
 fn read_zip_entry<R: std::io::Read + std::io::Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
 ) -> Result<Vec<u8>, StorePullError> {
-    let mut entry = archive
+    let entry = archive
         .by_name(name)
         .map_err(|e| StorePullError::Archive(format!("{name} not in gtxpack: {e}")))?;
-    let mut buffer = Vec::with_capacity(usize::try_from(entry.size()).unwrap_or(0));
-    entry
+    // `entry.size()` is the attacker-controlled declared size from the ZIP
+    // header — clamp the pre-allocation so a lying header can't OOM us before a
+    // byte is read.
+    let prealloc = usize::try_from(entry.size().min(MAX_ZIP_ENTRY_BYTES)).unwrap_or(0);
+    let mut buffer = Vec::with_capacity(prealloc);
+    // Cap the actual inflated read at the limit + 1 so we can detect overflow.
+    let read = std::io::Read::take(entry, MAX_ZIP_ENTRY_BYTES + 1)
         .read_to_end(&mut buffer)
         .map_err(|e| StorePullError::Archive(format!("read {name}: {e}")))?;
+    if read as u64 > MAX_ZIP_ENTRY_BYTES {
+        return Err(StorePullError::Archive(format!(
+            "{name} decompresses past the {MAX_ZIP_ENTRY_BYTES}-byte limit (possible zip bomb)"
+        )));
+    }
     Ok(buffer)
 }
 
@@ -568,6 +635,38 @@ mod tests {
     }
 
     // ---- unit tests (no fixture wasm required) ----
+
+    /// The gtxpack marker is what makes a cache hit honour version/digest
+    /// upgrades: a cached wasm is only reused when its marker equals the
+    /// requested `component_digest`. Missing or mismatched ⇒ false ⇒ re-pull.
+    #[test]
+    fn gtxpack_marker_matches_is_case_insensitive_and_fails_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("router_echo.wasm.gtxpack");
+
+        // Missing marker (e.g. a pre-upgrade cache without one) ⇒ re-pull.
+        assert!(!gtxpack_marker_matches(&marker, "abc123"));
+
+        // Present + equal (case-insensitive, whitespace-trimmed) ⇒ cache hit.
+        std::fs::write(&marker, "  ABC123\n").unwrap();
+        assert!(gtxpack_marker_matches(&marker, "abc123"));
+
+        // Present but DIFFERENT (the digest was upgraded) ⇒ re-pull, so the new
+        // version actually reaches the runner instead of serving stale wasm.
+        assert!(!gtxpack_marker_matches(&marker, "def456"));
+    }
+
+    /// The marker path is the wasm path with `.gtxpack` appended, distinct from
+    /// the `.sha256` execution-digest sidecar.
+    #[test]
+    fn gtxpack_marker_path_appends_extension() {
+        let wasm = std::path::Path::new("/cache/router_echo.wasm");
+        assert_eq!(
+            gtxpack_marker_path(wasm),
+            std::path::Path::new("/cache/router_echo.wasm.gtxpack")
+        );
+        assert_ne!(gtxpack_marker_path(wasm), sidecar_path(wasm));
+    }
 
     #[test]
     #[serial_test::serial]
@@ -827,32 +926,87 @@ mod tests {
         );
     }
 
-    /// When BOTH the wasm and its sidecar already exist, `ensure_cached` must
-    /// short-circuit without hitting the network. No mock server is set up, so
-    /// any network attempt would error, proving short-circuit actually happened.
+    /// When the wasm, its sidecar, AND a gtxpack marker MATCHING the requested
+    /// digest all exist, `ensure_cached` short-circuits without hitting the
+    /// network. No mock server is set up, so any network attempt would error,
+    /// proving the short-circuit actually happened.
     #[tokio::test]
     #[serial_test::serial]
-    async fn wasm_with_sidecar_short_circuits() {
+    async fn cache_with_matching_marker_short_circuits() {
         let cache = tempfile::tempdir().unwrap();
         let dest = cache.path().join("router_echo.wasm");
-        // Seed both the wasm and its sidecar.
+        // Seed wasm + sidecar + a marker matching the digest we will request.
         std::fs::write(&dest, b"cached-wasm").unwrap();
         std::fs::write(sidecar_path(&dest), b"somedigest").unwrap();
+        std::fs::write(gtxpack_marker_path(&dest), b"pinneddigest").unwrap();
 
         unsafe {
             std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache.path());
-            // Intentionally set a bogus store URL — any network attempt would fail.
+            // Bogus store URL — any network attempt would fail.
             std::env::set_var(STORE_URL_ENV, "http://127.0.0.1:1");
             std::env::remove_var(TRUSTED_SIGNERS_ENV);
         }
 
-        let result = ensure_cached("router_echo", "1.0.0", "anydigest").await;
+        let result = ensure_cached("router_echo", "1.0.0", "pinneddigest").await;
 
         unsafe {
             std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
             std::env::remove_var(STORE_URL_ENV);
         }
 
-        result.expect("both wasm + sidecar present must short-circuit with Ok");
+        result.expect("wasm + sidecar + matching marker must short-circuit with Ok");
+    }
+
+    /// Regression for the cache-staleness bug: when the cached wasm's marker
+    /// records a DIFFERENT (older) gtxpack digest than the one now requested —
+    /// i.e. the component was upgraded/re-registered — `ensure_cached` must NOT
+    /// short-circuit on the stale wasm but re-pull and replace it, so the new
+    /// (e.g. security-patched) version actually reaches the runner.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stale_marker_triggers_repull_on_upgrade() {
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let new_wasm = b"new-verified-wasm-bytes";
+        let signed_describe = sign_describe_like_store(&sample_describe(), &signing);
+        let archive = build_gtxpack(&signed_describe, new_wasm);
+        let new_digest = hex_sha256(&archive);
+
+        let cache = tempfile::tempdir().unwrap();
+        let dest = cache.path().join("router_echo.wasm");
+        // Pre-seed a COMPLETE older cache entry: wasm + sidecar + a marker that
+        // records the OLD digest (different from `new_digest`).
+        std::fs::write(&dest, b"old-cached-wasm").unwrap();
+        std::fs::write(sidecar_path(&dest), hex_sha256(b"old-cached-wasm")).unwrap();
+        std::fs::write(gtxpack_marker_path(&dest), b"0000oldolddigest").unwrap();
+
+        let server = mock_store(archive).await;
+        unsafe {
+            std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", cache.path());
+            std::env::set_var(STORE_URL_ENV, server.uri());
+            std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing));
+        }
+
+        // Same version path (the mock serves 1.0.0) but a DIFFERENT digest: the
+        // staleness check keys on the pinned digest (the marker), not the URL
+        // version, so a changed digest alone must force the re-pull.
+        let result = ensure_cached("router_echo", "1.0.0", &new_digest).await;
+
+        let cached_after = std::fs::read(&dest).unwrap_or_default();
+        let marker_after = std::fs::read_to_string(gtxpack_marker_path(&dest)).unwrap_or_default();
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var(STORE_URL_ENV);
+            std::env::remove_var(TRUSTED_SIGNERS_ENV);
+        }
+
+        result.expect("stale-marker cache must re-pull the upgraded component");
+        assert_eq!(
+            cached_after, new_wasm,
+            "the upgraded wasm must replace the stale one"
+        );
+        assert!(
+            marker_after.trim().eq_ignore_ascii_case(&new_digest),
+            "the marker must be rewritten to the new pinned digest"
+        );
     }
 }
