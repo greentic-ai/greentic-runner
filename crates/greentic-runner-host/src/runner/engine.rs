@@ -205,6 +205,9 @@ enum NodeKind {
 enum EmitKind {
     Log,
     Response,
+    /// Routes the payload to `ExecutionState::emitted_events`, bypassing the
+    /// reply egress channel.  Use the `emit.event` builtin node kind in a flow.
+    Event,
     Other(String),
 }
 
@@ -813,6 +816,10 @@ impl FlowEngine {
             NodeKind::BuiltinEmit { kind } => {
                 match kind {
                     EmitKind::Log | EmitKind::Response => {}
+                    EmitKind::Event => {
+                        state.push_emitted_event(payload.clone());
+                        return Ok(DispatchOutcome::complete(NodeOutput::new(payload)));
+                    }
                     EmitKind::Other(component) => {
                         tracing::debug!(%component, "handling emit.* as builtin");
                     }
@@ -1896,6 +1903,14 @@ pub struct ExecutionState {
     nodes: HashMap<String, NodeOutput>,
     #[serde(default)]
     egress: Vec<Value>,
+    /// Payloads routed by `emit.event` builtin nodes.
+    ///
+    /// Kept strictly separate from `egress` (the reply channel) and from
+    /// `clear_egress` — emitted events accumulate across the entire flow run
+    /// (including across snapshot/wait boundaries) and are consumed by the
+    /// event-bus layer after the flow completes.
+    #[serde(default)]
+    pub emitted_events: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_output: Option<Value>,
     #[serde(default)]
@@ -1909,9 +1924,19 @@ impl ExecutionState {
             input,
             nodes: HashMap::new(),
             egress: Vec::new(),
+            emitted_events: Vec::new(),
             last_output: None,
             redirect_count: 0,
         }
+    }
+
+    /// Append `payload` to the dedicated event channel.
+    ///
+    /// Unlike `push_egress`, this channel is NOT cleared by `clear_egress` and
+    /// is NOT folded into the reply output by `finalize_with`.  It is read by
+    /// the event-bus layer after the flow run completes.
+    pub fn push_emitted_event(&mut self, payload: Value) {
+        self.emitted_events.push(payload);
     }
 
     /// Refresh `entry` from `input` if the snapshot was loaded without an
@@ -2542,6 +2567,7 @@ fn emit_kind_from_ref(component_ref: &str) -> EmitKind {
     match component_ref {
         "emit.log" => EmitKind::Log,
         "emit.response" => EmitKind::Response,
+        "emit.event" => EmitKind::Event,
         other => EmitKind::Other(other.to_string()),
     }
 }
@@ -2550,6 +2576,7 @@ fn emit_ref_from_kind(kind: &EmitKind) -> String {
     match kind {
         EmitKind::Log => "emit.log".to_string(),
         EmitKind::Response => "emit.response".to_string(),
+        EmitKind::Event => "emit.event".to_string(),
         EmitKind::Other(other) => other.clone(),
     }
 }
@@ -4543,6 +4570,53 @@ mod tests {
             "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
             output["output"]["reply"]
         );
+    }
+
+    // ── Task A1: emit.event channel tests ──────────────────────────────────
+
+    #[test]
+    fn emit_kind_from_ref_maps_emit_event() {
+        let kind = emit_kind_from_ref("emit.event");
+        assert!(
+            matches!(kind, EmitKind::Event),
+            "emit.event must map to EmitKind::Event, got {kind:?}"
+        );
+    }
+
+    #[test]
+    fn emit_ref_from_kind_roundtrips_event() {
+        let kind = EmitKind::Event;
+        assert_eq!(emit_ref_from_kind(&kind), "emit.event");
+    }
+
+    #[test]
+    fn push_emitted_event_accumulates_separate_from_egress() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "reply" }));
+        state.push_emitted_event(json!({ "kind": "order.placed", "id": 1 }));
+        state.push_emitted_event(json!({ "kind": "order.placed", "id": 2 }));
+
+        // egress is unaffected by emitted_events
+        let result = state.clone().finalize_with(None);
+        assert_eq!(result, json!([{ "text": "reply" }]));
+
+        // emitted_events collected independently
+        assert_eq!(state.emitted_events.len(), 2);
+        assert_eq!(state.emitted_events[0]["id"], json!(1));
+        assert_eq!(state.emitted_events[1]["id"], json!(2));
+    }
+
+    #[test]
+    fn clear_egress_does_not_touch_emitted_events() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_emitted_event(json!({ "kind": "tick" }));
+        state.push_egress(json!({ "text": "reply" }));
+
+        state.clear_egress();
+
+        // emitted_events must survive clear_egress
+        assert_eq!(state.emitted_events.len(), 1);
+        assert_eq!(state.emitted_events[0]["kind"], json!("tick"));
     }
 }
 
