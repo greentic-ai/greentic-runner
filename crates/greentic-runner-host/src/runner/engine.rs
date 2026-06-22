@@ -2892,7 +2892,10 @@ fn evaluate_custom_routing(
 
     // Build a rich context for condition evaluation:
     // Start with output payload, then overlay entry and synthesised "response".
-    let ctx = build_routing_context(output, state);
+    // The success `event` default is chosen from the success-family port this
+    // node actually routes on, so happy paths named `on_complete`/`on_submit`
+    // resolve instead of stalling at `Wait`.
+    let ctx = build_routing_context(output, state, default_success_event(routes));
 
     let mut has_condition = false;
     for route in routes {
@@ -3008,7 +3011,48 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
 ///   }
 /// }
 /// ```
-fn build_routing_context(output: &NodeOutput, state: &ExecutionState) -> Value {
+/// Success-family outcome ports, in the priority order used to pick the default
+/// success `event` for a node that succeeded without emitting an explicit
+/// `outcome`. `on_success` is first so components whose success name is the
+/// historical default keep routing unchanged (e.g. http).
+const SUCCESS_EVENT_PORTS: [&str; 3] = ["on_success", "on_complete", "on_submit"];
+
+/// Derive the success `event` to default to when a node succeeds (`ok == true`)
+/// but emits no explicit `outcome`. Designer-built nodes whose happy port is
+/// `on_complete` (native `qa.process` / `llm.openai.chat` / `template_render`)
+/// or `on_submit` (forms) compile to `event == "<port>"` conditions; with a
+/// blanket `on_success` default those never match and the node stalls at
+/// `Wait`. We instead pick the first success-family port the node actually has
+/// an outgoing `event == "<port>"` edge for, so the happy path routes. Falls
+/// back to `on_success` when no success-family port is referenced (preserving
+/// the prior behaviour).
+fn default_success_event(routes: &[Value]) -> &'static str {
+    let referenced: Vec<&str> = routes
+        .iter()
+        .filter_map(|route| route.get("condition").and_then(Value::as_str))
+        .filter_map(condition_event_eq)
+        .collect();
+    SUCCESS_EVENT_PORTS
+        .into_iter()
+        .find(|port| referenced.contains(port))
+        .unwrap_or("on_success")
+}
+
+/// Extract `<value>` from an `event == "<value>"` condition; `None` for any
+/// other shape (different path, `!=`, no `==`).
+fn condition_event_eq(condition: &str) -> Option<&str> {
+    let idx = condition.find("==")?;
+    if condition[..idx].trim() != "event" {
+        return None;
+    }
+    Some(condition[idx + 2..].trim().trim_matches('"'))
+}
+
+fn build_routing_context(
+    output: &NodeOutput,
+    state: &ExecutionState,
+    success_event: &str,
+) -> Value {
     let mut ctx = match &output.payload {
         Value::Object(map) => map.clone(),
         _ => JsonMap::new(),
@@ -3052,14 +3096,16 @@ fn build_routing_context(output: &NodeOutput, state: &ExecutionState) -> Value {
     // Inject the node's outcome as `event` so port-name routing
     // (`event == "<outcome>"`, emitted by the designer for nodes with multiple
     // outgoing edges) resolves. Prefer an explicit outcome the node emitted in
-    // its output metadata; otherwise derive a default from `ok` (success/error).
-    // Without this, a multi-edge node falls through to `Wait` at runtime.
+    // its output metadata; otherwise derive a default from `ok` — `success_event`
+    // on success (the success-family port the node actually has an edge for; see
+    // `default_success_event`), `on_error` on failure. Without this, a multi-edge
+    // node falls through to `Wait` at runtime.
     let event = output
         .meta
         .get("outcome")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| if output.ok { "on_success" } else { "on_error" }.to_string());
+        .unwrap_or_else(|| if output.ok { success_event } else { "on_error" }.to_string());
     ctx.insert("event".into(), Value::String(event));
 
     Value::Object(ctx)
@@ -4304,6 +4350,58 @@ mod tests {
         match evaluate_custom_routing(&raw_routing, &routed, &state, &flow_ir, &current) {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
             other => panic!("expected Next(\"err\"), got {other:?}"),
+        }
+    }
+
+    /// When a successful node emits no explicit `outcome`, the runner must
+    /// derive the success `event` from the success-family port the node
+    /// actually has an outgoing edge for (priority `on_success` → `on_complete`
+    /// → `on_submit`), not blindly default to `on_success`. This is what lets
+    /// native nodes whose happy port is `on_complete` (qa.process,
+    /// llm.openai.chat, template_render) — or `on_submit` (forms) — route
+    /// instead of silently stalling at `Wait`, while leaving `on_success`
+    /// components (e.g. http) unchanged.
+    #[test]
+    fn success_default_matches_available_outcome_port() {
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+        // ok:true, no explicit outcome — the case every native happy path hits.
+        let ok_out = NodeOutput::new(json!({ "answer": "hi" }));
+
+        // qa/llm/template shape: happy port is `on_complete`, no `on_success` edge.
+        let on_complete_routing = json!([
+            { "condition": "event == \"on_complete\"", "to": "next" },
+            { "condition": "event == \"on_cancel\"", "to": "cancelled" }
+        ]);
+        match evaluate_custom_routing(&on_complete_routing, &ok_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "next"),
+            other => panic!("expected Next(\"next\") via on_complete default, got {other:?}"),
+        }
+
+        // form shape: happy port is `on_submit`.
+        let on_submit_routing = json!([
+            { "condition": "event == \"on_submit\"", "to": "saved" },
+            { "condition": "event == \"on_cancel\"", "to": "cancelled" }
+        ]);
+        match evaluate_custom_routing(&on_submit_routing, &ok_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "saved"),
+            other => panic!("expected Next(\"saved\") via on_submit default, got {other:?}"),
+        }
+
+        // http shape: `on_success` present → still routes on_success (priority,
+        // no regression for components whose success name is the old default).
+        let on_success_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok" },
+            { "condition": "event == \"on_error\"", "to": "err" }
+        ]);
+        match evaluate_custom_routing(&on_success_routing, &ok_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "ok"),
+            other => panic!("expected Next(\"ok\") via on_success default, got {other:?}"),
         }
     }
 
