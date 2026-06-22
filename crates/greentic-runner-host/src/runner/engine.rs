@@ -2953,30 +2953,73 @@ fn evaluate_custom_routing(
     }
 }
 
-/// Evaluate a simple condition expression like `response.action == "about"`.
+/// Evaluate a simple condition expression used by `Routing::Custom` entries and
+/// `conditional_branch` guards (e.g. `response.action == "about"`,
+/// `register.q_age >= 18`, `msg.text contains "hello"`).
 ///
-/// Supports dotted path lookups against a JSON value context.
-/// Format: `<path> == "<value>"` or `<path> != "<value>"`
+/// Dotted paths resolve against the JSON context; an unresolved path is false.
+/// Operators (detected longest-token-first so `>=`/`<=` win over `>`/`<`):
+/// - `== ` / `!=` — case-insensitive string equality.
+/// - `>=` / `<=` / `>` / `<` — numeric ordering; both operands are parsed as
+///   `f64`, and a non-numeric operand makes the condition false (never a panic).
+/// - `contains` — case-insensitive substring of the resolved string.
 fn evaluate_simple_condition(condition: &str, ctx: &Value) -> bool {
-    // Parse: `path == "value"` or `path != "value"`
-    let (path, expected, negate) = if let Some(idx) = condition.find("==") {
-        let path = condition[..idx].trim();
-        let val = condition[idx + 2..].trim().trim_matches('"');
-        (path, val, false)
-    } else if let Some(idx) = condition.find("!=") {
-        let path = condition[..idx].trim();
-        let val = condition[idx + 2..].trim().trim_matches('"');
-        (path, val, true)
-    } else {
-        return false;
-    };
+    if let Some((path, expected)) = split_condition(condition, "==") {
+        return string_eq(ctx, path, expected, false);
+    }
+    if let Some((path, expected)) = split_condition(condition, "!=") {
+        return string_eq(ctx, path, expected, true);
+    }
+    if let Some((path, expected)) = split_condition(condition, ">=") {
+        return numeric_cmp(ctx, path, expected, |a, b| a >= b);
+    }
+    if let Some((path, expected)) = split_condition(condition, "<=") {
+        return numeric_cmp(ctx, path, expected, |a, b| a <= b);
+    }
+    if let Some((path, expected)) = split_condition(condition, ">") {
+        return numeric_cmp(ctx, path, expected, |a, b| a > b);
+    }
+    if let Some((path, expected)) = split_condition(condition, "<") {
+        return numeric_cmp(ctx, path, expected, |a, b| a < b);
+    }
+    if let Some((path, expected)) = split_condition(condition, " contains ") {
+        let needle = expected.to_lowercase();
+        return resolve_dotted_path(ctx, path)
+            .is_some_and(|actual| actual.to_lowercase().contains(&needle));
+    }
+    false
+}
 
-    // Resolve dotted path against context (case-insensitive comparison)
-    let actual = resolve_dotted_path(ctx, path);
-    let matches = actual
+/// Split a condition on the first occurrence of `op` into a trimmed
+/// `(path, value)`, with surrounding quotes stripped from the value.
+/// `None` when `op` is absent.
+fn split_condition<'a>(condition: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
+    let idx = condition.find(op)?;
+    let path = condition[..idx].trim();
+    let value = condition[idx + op.len()..].trim().trim_matches('"');
+    Some((path, value))
+}
+
+/// Case-insensitive string equality of the resolved path against `expected`,
+/// optionally negated. An unresolved path is treated as not-equal.
+fn string_eq(ctx: &Value, path: &str, expected: &str, negate: bool) -> bool {
+    let matches = resolve_dotted_path(ctx, path)
         .as_deref()
         .is_some_and(|a| a.eq_ignore_ascii_case(expected));
     if negate { !matches } else { matches }
+}
+
+/// Numeric comparison of the resolved path against `expected`. Both sides are
+/// parsed as `f64`; if either fails to parse the condition is false.
+fn numeric_cmp(ctx: &Value, path: &str, expected: &str, cmp: impl Fn(f64, f64) -> bool) -> bool {
+    let Some(actual) = resolve_dotted_path(ctx, path).and_then(|a| a.trim().parse::<f64>().ok())
+    else {
+        return false;
+    };
+    let Ok(rhs) = expected.parse::<f64>() else {
+        return false;
+    };
+    cmp(actual, rhs)
 }
 
 /// Resolve a dotted path like `response.action` against a JSON value.
@@ -4403,6 +4446,42 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "ok"),
             other => panic!("expected Next(\"ok\") via on_success default, got {other:?}"),
         }
+    }
+
+    /// `evaluate_simple_condition` backs the user-authored `conditional_branch`
+    /// expressions the catalog documents (e.g. `register.q_age >= 18`,
+    /// `submit.status == "ok"`). Beyond `==`/`!=` it must handle numeric
+    /// ordering (`>=` `<=` `>` `<`) and `contains` (case-insensitive substring);
+    /// otherwise those conditions silently evaluate to false and route wrong.
+    #[test]
+    fn condition_evaluator_supports_comparisons_and_contains() {
+        let ctx = json!({
+            "register": { "q_age": 18 },
+            "submit": { "status": "ok" },
+            "msg": { "text": "Hello World" }
+        });
+
+        // Numeric ordering (operands parsed as numbers).
+        assert!(evaluate_simple_condition("register.q_age >= 18", &ctx));
+        assert!(!evaluate_simple_condition("register.q_age > 18", &ctx));
+        assert!(evaluate_simple_condition("register.q_age <= 18", &ctx));
+        assert!(!evaluate_simple_condition("register.q_age < 18", &ctx));
+
+        // contains: case-insensitive substring over the resolved string.
+        assert!(evaluate_simple_condition(
+            "msg.text contains \"world\"",
+            &ctx
+        ));
+        assert!(!evaluate_simple_condition(
+            "msg.text contains \"bye\"",
+            &ctx
+        ));
+
+        // Existing equality semantics unchanged (regression guard).
+        assert!(evaluate_simple_condition("submit.status == \"ok\"", &ctx));
+        assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
+        // A non-numeric operand on an ordering op is false, not a panic.
+        assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
     }
 
     #[test]
