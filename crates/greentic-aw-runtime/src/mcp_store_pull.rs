@@ -986,7 +986,10 @@ mod tests {
             std::env::set_var(TRUSTED_SIGNERS_ENV, pubkey_env_value(&signing));
         }
 
-        let result = ensure_cached("router_echo", "2.0.0", &new_digest).await;
+        // Same version path (the mock serves 1.0.0) but a DIFFERENT digest: the
+        // staleness check keys on the pinned digest (the marker), not the URL
+        // version, so a changed digest alone must force the re-pull.
+        let result = ensure_cached("router_echo", "1.0.0", &new_digest).await;
 
         let cached_after = std::fs::read(&dest).unwrap_or_default();
         let marker_after = std::fs::read_to_string(gtxpack_marker_path(&dest)).unwrap_or_default();
