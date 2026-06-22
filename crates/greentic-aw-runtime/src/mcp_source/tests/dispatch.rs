@@ -45,6 +45,32 @@ fn parse_rows_defaults_transport_to_http_and_reads_local_wasm() {
     assert_eq!(rows[1].component_ref.as_deref(), Some("weather.component"));
 }
 
+/// Regression: the admin serializes `transport_url: null` for local-wasm
+/// servers. The whole `WireBody` must still deserialize (a bare `String`
+/// `transport_url` rejected `null`, dropping ALL of a tenant's MCP tools the
+/// moment one local-wasm server was registered). The http row alongside it must
+/// survive too.
+#[test]
+fn parse_rows_accepts_null_transport_url_for_local_wasm() {
+    let body = json!({"servers": [
+        { "id": "h", "name": "H", "transport_url": "https://x/", "auth_header_name": null,
+          "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"] },
+        { "id": "l", "name": "L", "transport_url": null, "auth_header_name": null,
+          "auth_token": null, "allowed_tools": null, "roles": ["agentic_worker"],
+          "transport": "local-wasm", "component_ref": "weather.component",
+          "component_version": "1.0.0" }
+    ]});
+    let rows = parse_rows(body).expect("null transport_url must not break the list");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the http row must survive alongside the local-wasm row"
+    );
+    assert_eq!(rows[0].transport_url, "https://x/");
+    assert!(matches!(rows[1].transport, Transport::LocalWasm));
+    assert_eq!(rows[1].transport_url, "", "null maps to empty string");
+}
+
 #[test]
 fn parse_rows_carries_component_version_and_digest() {
     let body = json!({"servers": [

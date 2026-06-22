@@ -41,7 +41,14 @@ pub(super) struct WireRow {
     pub(super) id: String,
     #[allow(dead_code)]
     pub(super) name: String,
-    pub(super) transport_url: String,
+    /// `Option` because the admin serializes `transport_url: null` for
+    /// `local-wasm` servers (they have no URL). A bare `String` here makes
+    /// serde reject the WHOLE server list on the first local-wasm row, silently
+    /// dropping every MCP tool for that tenant. `#[serde(default)]` also tolerates
+    /// the field being absent. Mapped to `""` in `parse_rows`; the local-wasm
+    /// branch never parses it as a URL.
+    #[serde(default)]
+    pub(super) transport_url: Option<String>,
     pub(super) auth_header_name: Option<String>,
     pub(super) auth_token: Option<String>,
     /// `None` = expose every tool; `Some([])` = none; else whitelist of raw names.
