@@ -1,0 +1,386 @@
+//! [`McpToolSource`] — per-tenant, TTL-gated source of agentic-worker MCP
+//! tool catalogs — plus all transport-level helpers (connect, list, dispatch).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use secrecy::ExposeSecret;
+use serde_json::json;
+
+use greentic_mcp_client::{McpAuth, McpClientOptions, McpHttpClient, McpToolDef};
+
+use crate::tenant::TenantContext;
+
+use super::types::{
+    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpRoute, McpToolCatalog, McpToolEntry, ParsedServer,
+    SERVER_TIMEOUT, Transport, WireBody,
+};
+
+/// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
+///
+/// Mirrors [`crate::http_provider::HttpConfigProvider`]: the admin origin and
+/// a tenant `gtc_live_*` bearer token are captured at construction; the tenant
+/// is implied by the token, with the [`TenantContext`] used only as the cache
+/// key.
+pub struct McpToolSource {
+    base_url: String,
+    token: String,
+    client: reqwest::Client,
+    cache: DashMap<String, Arc<McpToolCatalog>>,
+}
+
+impl McpToolSource {
+    /// `base_url` is the admin origin (no trailing slash needed); `token` is a
+    /// tenant `gtc_live_*` key.
+    pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        // A per-request timeout bounds a hung admin so a slow registry cannot
+        // block the step indefinitely (mirrors `HttpConfigProvider::new`).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_default();
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            token: token.into(),
+            client,
+            cache: DashMap::new(),
+        }
+    }
+
+    /// Stable per-tenant, per-role cache key. `TenantContext` exposes no single
+    /// opaque id, so the `(tenant_id, env_id)` pair is joined — the same pair
+    /// `TenantContext::key_prefix` is built from. The `role` is appended so the
+    /// agentic-worker and flow-editor catalogs for the same tenant do not
+    /// collide in the shared cache.
+    fn cache_key(tenant: &TenantContext, role: &str) -> String {
+        format!("{}:{}:{}", tenant.tenant_id, tenant.env_id, role)
+    }
+
+    /// Return the tenant's agentic-worker MCP tool catalog (filtered to the
+    /// [`MCP_ROLE_AGENTIC_WORKER`] role), rebuilding when stale or absent.
+    ///
+    /// Convenience wrapper over [`catalog_for_role`] preserving the agent-loop
+    /// call site. See [`catalog_for_role`] for the resilience contract.
+    ///
+    /// [`catalog_for_role`]: McpToolSource::catalog_for_role
+    pub async fn catalog(&self, tenant: &TenantContext) -> Arc<McpToolCatalog> {
+        self.catalog_for_role(tenant, MCP_ROLE_AGENTIC_WORKER).await
+    }
+
+    /// Return the tenant's MCP tool catalog filtered to servers carrying
+    /// `role`, rebuilding when stale or absent. Use [`MCP_ROLE_FLOW_EDITOR`]
+    /// for the flow-execution path and [`MCP_ROLE_AGENTIC_WORKER`] for the
+    /// agent loop.
+    ///
+    /// Infallible by contract: any admin network or non-200 response degrades
+    /// to an empty (cached) catalog with a `warn`, and a dead/slow MCP server
+    /// is skipped with a `warn` while the catalog still returns the servers
+    /// that worked.
+    pub async fn catalog_for_role(
+        &self,
+        tenant: &TenantContext,
+        role: &str,
+    ) -> Arc<McpToolCatalog> {
+        let key = Self::cache_key(tenant, role);
+
+        if let Some(entry) = self.cache.get(&key) {
+            let snap = entry.value();
+            if snap.fetched_at.elapsed() < CATALOG_TTL {
+                return snap.clone();
+            }
+        }
+
+        let built = Arc::new(self.build_catalog(&key, role).await);
+        self.cache.insert(key, built.clone());
+        built
+    }
+
+    /// Fetch the admin rows and probe each server carrying `role`. Always
+    /// returns a catalog (possibly empty); never errors.
+    async fn build_catalog(&self, tenant_key: &str, role: &str) -> McpToolCatalog {
+        let servers = match self.fetch_servers().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    tenant = %tenant_key,
+                    error = %e,
+                    "mcp-servers fetch failed; serving empty MCP catalog"
+                );
+                return McpToolCatalog::empty();
+            }
+        };
+
+        let mut catalog = McpToolCatalog::empty();
+        for server in &servers {
+            if !server.roles.iter().any(|r| r == role) {
+                continue;
+            }
+            self.probe_server(&mut catalog, server, tenant_key).await;
+        }
+        catalog
+    }
+
+    /// GET the tenant's MCP servers from the admin. Returns an error string on
+    /// any network failure or non-200 status (the caller degrades to empty).
+    async fn fetch_servers(&self) -> Result<Vec<ParsedServer>, String> {
+        let url = format!("{}/api/v1/designer/tenant/me/mcp-servers", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+
+        let status = resp.status();
+        if status.as_u16() != 200 {
+            return Err(format!("admin returned status {}", status.as_u16()));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("decode failed: {e}"))?;
+        parse_rows(body)
+    }
+
+    /// Probe one server and ingest its (filtered) tools into `catalog`. A
+    /// timeout, connection error, or bad transport URL is skipped with a
+    /// `warn` — the catalog keeps the servers that worked.
+    async fn probe_server(
+        &self,
+        catalog: &mut McpToolCatalog,
+        server: &ParsedServer,
+        tenant_key: &str,
+    ) {
+        match tokio::time::timeout(SERVER_TIMEOUT, list_server_tools(server)).await {
+            Ok(Ok(defs)) => ingest_server_tools(catalog, server, &defs),
+            Ok(Err(e)) => tracing::warn!(
+                tenant = %tenant_key,
+                server = %server.id,
+                error = %e,
+                "mcp server probe failed; skipping its tools"
+            ),
+            Err(_) => tracing::warn!(
+                tenant = %tenant_key,
+                server = %server.id,
+                "mcp server probe timed out after {}s; skipping its tools",
+                SERVER_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+/// Parse the `{servers:[...]}` wire body into [`ParsedServer`]s.
+pub(crate) fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, String> {
+    use secrecy::SecretString;
+
+    let wire: WireBody = serde_json::from_value(body).map_err(|e| e.to_string())?;
+    Ok(wire
+        .servers
+        .into_iter()
+        .map(|w| ParsedServer {
+            id: w.id,
+            transport_url: w.transport_url,
+            auth_header_name: w.auth_header_name,
+            auth_token: w.auth_token.map(SecretString::from),
+            allowed_tools: w.allowed_tools,
+            roles: w.roles,
+            transport: w.transport,
+            component_ref: w.component_ref,
+            component_version: w.component_version,
+            component_digest: w.component_digest,
+        })
+        .collect())
+}
+
+/// Apply the server's `allowed_tools` filter and insert each accepted tool's
+/// schema + route, keyed `(server_id, raw_tool_name)`.
+fn ingest_server_tools(catalog: &mut McpToolCatalog, server: &ParsedServer, defs: &[McpToolDef]) {
+    for def in defs {
+        if let Some(allow) = &server.allowed_tools
+            && !allow.iter().any(|a| a == &def.name)
+        {
+            continue;
+        }
+        let key = (server.id.clone(), def.name.clone());
+        catalog.tools.insert(
+            key.clone(),
+            McpToolEntry {
+                description: def.description.clone(),
+                parameters: def.input_schema.clone(),
+            },
+        );
+        catalog.routes.insert(
+            key,
+            McpRoute {
+                server_id: server.id.clone(),
+                transport_url: server.transport_url.clone(),
+                auth_header_name: server.auth_header_name.clone(),
+                auth_token: server.auth_token.clone(),
+                raw_tool_name: def.name.clone(),
+                transport: server.transport,
+                component_ref: server.component_ref.clone(),
+                component_version: server.component_version.clone(),
+                component_digest: server.component_digest.clone(),
+            },
+        );
+    }
+}
+
+/// Build an [`McpAuth`] from an optional token + optional header name.
+fn build_auth(token: Option<&secrecy::SecretString>, header_name: Option<&str>) -> Option<McpAuth> {
+    token.map(|t| McpAuth {
+        header_name: header_name.map(str::to_string),
+        token: t.expose_secret().to_string(),
+    })
+}
+
+fn client_opts() -> McpClientOptions {
+    McpClientOptions {
+        timeout: SERVER_TIMEOUT,
+        client_name: "greentic-aw-runtime".to_string(),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// Construct a client for a parsed server row. Synchronous: `McpHttpClient::new`
+/// does no I/O (the network handshake happens in `initialize`/`list_tools`).
+fn connect(server: &ParsedServer) -> Result<McpHttpClient, String> {
+    let endpoint = url::Url::parse(&server.transport_url)
+        .map_err(|e| format!("invalid transport_url '{}': {e}", server.transport_url))?;
+    let auth = build_auth(
+        server.auth_token.as_ref(),
+        server.auth_header_name.as_deref(),
+    );
+    McpHttpClient::new(endpoint, auth, client_opts()).map_err(|e| e.to_string())
+}
+
+/// Construct a client from a dispatch route.
+fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
+    let endpoint = url::Url::parse(&route.transport_url)
+        .map_err(|e| format!("invalid transport_url '{}': {e}", route.transport_url))?;
+    let auth = build_auth(route.auth_token.as_ref(), route.auth_header_name.as_deref());
+    McpHttpClient::new(endpoint, auth, client_opts()).map_err(|e| e.to_string())
+}
+
+/// Connect, handshake, and list a server's tools. Errors are stringified.
+///
+/// Branches on [`Transport`]: `Http` uses the existing `greentic-mcp-client`
+/// path; `LocalWasm` runs the component in-process via [`crate::mcp_local`].
+async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, String> {
+    match server.transport {
+        Transport::Http => {
+            let mut client = connect(server)?;
+            client.initialize().await.map_err(|e| e.to_string())?;
+            client.list_tools().await.map_err(|e| e.to_string())
+        }
+        Transport::LocalWasm => {
+            let component = server
+                .component_ref
+                .as_deref()
+                .ok_or_else(|| "local-wasm server missing component_ref".to_string())?;
+            // Lazy store-pull: ensure the wasm is downloaded and verified before
+            // listing tools. Requires both version and digest to be present on
+            // the wire row; a missing field is treated as a pull failure so the
+            // server is skipped rather than silently running an unverified wasm.
+            let version = server.component_version.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm server '{}' missing component_version; cannot pull",
+                    component
+                )
+            })?;
+            let digest = server.component_digest.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm server '{}' missing component_digest; cannot pull",
+                    component
+                )
+            })?;
+            crate::mcp_store_pull::ensure_cached(component, version, digest)
+                .await
+                .map_err(|e| format!("local-wasm store-pull failed for '{}': {e}", component))?;
+            let tools = crate::mcp_local::local_list_tools(component).await;
+            Ok(tools
+                .into_iter()
+                .map(|tool_def| McpToolDef {
+                    name: tool_def.name,
+                    description: tool_def.description,
+                    input_schema: tool_def.input_schema,
+                })
+                .collect())
+        }
+    }
+}
+
+/// Invoke an MCP tool through its route. Always returns a JSON [`Value`],
+/// never panics — bad arguments, connection failures, and timeouts all become
+/// `{"error": "..."}`.
+pub async fn dispatch_route(route: &McpRoute, args: &str) -> serde_json::Value {
+    let parsed: serde_json::Value = match serde_json::from_str(args) {
+        Ok(v) => v,
+        Err(e) => return json!({ "error": format!("invalid tool arguments: {e}") }),
+    };
+
+    match tokio::time::timeout(SERVER_TIMEOUT, call_route(route, &parsed)).await {
+        Ok(Ok(value)) => value,
+        Ok(Err(e)) => json!({ "error": e }),
+        Err(_) => json!({
+            "error": format!("tool call timed out after {}s", SERVER_TIMEOUT.as_secs())
+        }),
+    }
+}
+
+/// Invoke an MCP tool through its route. Errors are stringified.
+///
+/// Branches on [`Transport`]: `Http` uses the existing `greentic-mcp-client`
+/// path; `LocalWasm` runs the component in-process via [`crate::mcp_local`].
+/// [`dispatch_route`] wraps this with the timeout + `{"error": ...}` contract,
+/// which now covers both transports.
+async fn call_route(
+    route: &McpRoute,
+    args: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match route.transport {
+        Transport::Http => {
+            let mut client = connect_route(route)?;
+            client.initialize().await.map_err(|e| e.to_string())?;
+            let out = client
+                .call_tool(&route.raw_tool_name, args)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(out.to_value())
+        }
+        Transport::LocalWasm => {
+            let component = route
+                .component_ref
+                .as_deref()
+                .ok_or_else(|| "local-wasm route missing component_ref".to_string())?;
+            // Lazy store-pull: guard the dispatch path the same way as the list
+            // path. The catalog build would have already pulled for in-session
+            // routes, but a route can also be constructed or replayed without a
+            // prior catalog probe (e.g. from a persisted session snapshot).
+            let version = route.component_version.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm route '{}' missing component_version; cannot pull",
+                    component
+                )
+            })?;
+            let digest = route.component_digest.as_deref().ok_or_else(|| {
+                format!(
+                    "local-wasm route '{}' missing component_digest; cannot pull",
+                    component
+                )
+            })?;
+            crate::mcp_store_pull::ensure_cached(component, version, digest)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "local-wasm store-pull failed for '{}' during dispatch: {e}",
+                        component
+                    )
+                })?;
+            Ok(crate::mcp_local::local_call_tool(component, &route.raw_tool_name, args).await)
+        }
+    }
+}
