@@ -1568,7 +1568,8 @@ impl FlowEngine {
                 message
             );
         }
-        Ok(NodeOutput::new(value))
+        let meta = outcome_meta(&value);
+        Ok(NodeOutput::with_meta(value, meta))
     }
 
     async fn execute_provider_invoke(
@@ -2086,6 +2087,20 @@ fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx 
         i18n_id: None,
         flow_id: ctx.flow_id.to_string(),
         node_id: Some(node_id.to_string()),
+    }
+}
+
+/// Surface a component-emitted `outcome` (from its output envelope) as node
+/// metadata, so the routing context can match `event == "<outcome>"`. A
+/// component opts in by adding `"outcome": "<name>"` to its output envelope
+/// (alongside `ok`); `<name>` must be one of its declared
+/// `ComponentDescribe.outcomes`. Returns `Value::Null` when the component does
+/// not emit one — the engine then falls back to the `ok`-derived default
+/// (`on_success`/`on_error`) in `build_routing_context`.
+fn outcome_meta(output: &Value) -> Value {
+    match output.get("outcome").and_then(Value::as_str) {
+        Some(outcome) => json!({ "outcome": outcome }),
+        None => Value::Null,
     }
 }
 
@@ -4290,6 +4305,21 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
             other => panic!("expected Next(\"err\"), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn outcome_meta_surfaces_component_emitted_outcome() {
+        // A component opts into outcome routing by adding `outcome` to its
+        // output envelope; the runner surfaces it as node meta for routing.
+        assert_eq!(
+            outcome_meta(&json!({ "ok": true, "outcome": "on_complete" })),
+            json!({ "outcome": "on_complete" })
+        );
+        // No `outcome` → null meta → engine uses the ok-derived default.
+        assert_eq!(
+            outcome_meta(&json!({ "ok": true, "body": {} })),
+            Value::Null
+        );
     }
 
     /// Live end-to-end test: `dw.agent` NATS dispatch path.
