@@ -3034,6 +3034,19 @@ fn build_routing_context(output: &NodeOutput, state: &ExecutionState) -> Value {
     }
     ctx.insert("response".into(), Value::Object(response));
 
+    // Inject the node's outcome as `event` so port-name routing
+    // (`event == "<outcome>"`, emitted by the designer for nodes with multiple
+    // outgoing edges) resolves. Prefer an explicit outcome the node emitted in
+    // its output metadata; otherwise derive a default from `ok` (success/error).
+    // Without this, a multi-edge node falls through to `Wait` at runtime.
+    let event = output
+        .meta
+        .get("outcome")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| if output.ok { "on_success" } else { "on_error" }.to_string());
+    ctx.insert("event".into(), Value::String(event));
+
     Value::Object(ctx)
 }
 
@@ -4241,6 +4254,41 @@ mod tests {
         match decision_go {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "next"),
             other => panic!("expected Next(\"next\"), got {other:?}"),
+        }
+    }
+
+    /// A node with 2+ outgoing edges compiles (in the designer) to
+    /// `event == "<outcome>"` conditions. The runner must inject `event` into
+    /// the routing context — from the node's emitted outcome, else a default
+    /// derived from `ok` — so those conditions resolve instead of falling
+    /// through to `Wait`. Without the injection, multi-edge nodes silently
+    /// pause at runtime.
+    #[test]
+    fn multi_edge_node_routes_on_injected_event() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "next" },
+            { "condition": "event == \"on_error\"", "to": "err" }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        // ok:true with no explicit outcome → default event "on_success" → "next".
+        let ok_out = NodeOutput::new(json!({ "x": 1 }));
+        match evaluate_custom_routing(&raw_routing, &ok_out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "next"),
+            other => panic!("expected Next(\"next\"), got {other:?}"),
+        }
+
+        // An explicit outcome in the node metadata wins over the ok-default.
+        let routed = NodeOutput::with_meta(json!({}), json!({ "outcome": "on_error" }));
+        match evaluate_custom_routing(&raw_routing, &routed, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
+            other => panic!("expected Next(\"err\"), got {other:?}"),
         }
     }
 
