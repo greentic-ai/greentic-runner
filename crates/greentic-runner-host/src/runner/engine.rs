@@ -100,10 +100,25 @@ pub enum FlowStatus {
     Waiting(Box<FlowWait>),
 }
 
+/// Bundle returned by [`ExecutionState::finalize_with`].
+///
+/// `output` carries the egress-based reply value (unchanged from the previous
+/// `Value` return); `emitted_events` carries the sidecar events that were
+/// pushed via [`ExecutionState::push_emitted_event`] during the run and must
+/// NOT be mixed into the reply output.
+struct FinalizedFlow {
+    output: Value,
+    emitted_events: Vec<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FlowExecution {
     pub output: Value,
     pub status: FlowStatus,
+    /// Side-channel events collected during execution via `emit.event` nodes.
+    /// These are distinct from the reply `output` and are consumed by the
+    /// caller (Task A3+) to route events onto an external bus.
+    pub emitted_events: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -224,17 +239,19 @@ struct ComponentCall {
 }
 
 impl FlowExecution {
-    fn completed(output: Value) -> Self {
+    fn completed(finalized: FinalizedFlow) -> Self {
         Self {
-            output,
+            output: finalized.output,
             status: FlowStatus::Completed,
+            emitted_events: finalized.emitted_events,
         }
     }
 
-    fn waiting(output: Value, wait: FlowWait) -> Self {
+    fn waiting(finalized: FinalizedFlow, wait: FlowWait) -> Self {
         Self {
-            output,
+            output: finalized.output,
             status: FlowStatus::Waiting(Box::new(wait)),
+            emitted_events: finalized.emitted_events,
         }
     }
 }
@@ -700,9 +717,9 @@ impl FlowEngine {
                                 next_node: node_id.as_str().to_string(),
                                 state: snapshot_state,
                             };
-                            let output_value = state.finalize_with(Some(output.payload.clone()));
+                            let finalized = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::waiting(
-                                output_value,
+                                finalized,
                                 FlowWait {
                                     reason: Some(format!(
                                         "awaiting user submit at node `{}`",
@@ -747,9 +764,9 @@ impl FlowEngine {
                         next_node: resume_target.as_str().to_string(),
                         state: snapshot_state,
                     };
-                    let output_value = state.clone().finalize_with(None);
+                    let finalized = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
-                        output_value,
+                        finalized,
                         FlowWait { reason, snapshot },
                     ));
                 }
@@ -1996,19 +2013,25 @@ impl ExecutionState {
         self.redirect_count = self.redirect_count.saturating_add(1);
     }
 
-    fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
-        if self.egress.is_empty() {
-            return final_payload.unwrap_or(Value::Null);
-        }
-        let mut emitted = std::mem::take(&mut self.egress);
-        if let Some(value) = final_payload {
-            match value {
-                Value::Null => {}
-                Value::Array(items) => emitted.extend(items),
-                other => emitted.push(other),
+    fn finalize_with(mut self, final_payload: Option<Value>) -> FinalizedFlow {
+        let emitted_events = std::mem::take(&mut self.emitted_events);
+        let output = if self.egress.is_empty() {
+            final_payload.unwrap_or(Value::Null)
+        } else {
+            let mut emitted = std::mem::take(&mut self.egress);
+            if let Some(value) = final_payload {
+                match value {
+                    Value::Null => {}
+                    Value::Array(items) => emitted.extend(items),
+                    other => emitted.push(other),
+                }
             }
+            Value::Array(emitted)
+        };
+        FinalizedFlow {
+            output,
+            emitted_events,
         }
-        Value::Array(emitted)
     }
 }
 
@@ -3119,9 +3142,9 @@ mod tests {
         let mut state = ExecutionState::new(json!({}));
         state.push_egress(json!({ "text": "first" }));
         state.push_egress(json!({ "text": "second" }));
-        let result = state.finalize_with(Some(json!({ "text": "final" })));
+        let finalized = state.finalize_with(Some(json!({ "text": "final" })));
         assert_eq!(
-            result,
+            finalized.output,
             json!([
                 { "text": "first" },
                 { "text": "second" },
@@ -3134,12 +3157,12 @@ mod tests {
     fn finalize_flattens_final_array() {
         let mut state = ExecutionState::new(json!({}));
         state.push_egress(json!({ "text": "only" }));
-        let result = state.finalize_with(Some(json!([
+        let finalized = state.finalize_with(Some(json!([
             { "text": "extra-1" },
             { "text": "extra-2" }
         ])));
         assert_eq!(
-            result,
+            finalized.output,
             json!([
                 { "text": "only" },
                 { "text": "extra-1" },
@@ -4597,8 +4620,8 @@ mod tests {
         state.push_emitted_event(json!({ "kind": "order.placed", "id": 2 }));
 
         // egress is unaffected by emitted_events
-        let result = state.clone().finalize_with(None);
-        assert_eq!(result, json!([{ "text": "reply" }]));
+        let finalized = state.clone().finalize_with(None);
+        assert_eq!(finalized.output, json!([{ "text": "reply" }]));
 
         // emitted_events collected independently
         assert_eq!(state.emitted_events.len(), 2);
@@ -4617,6 +4640,21 @@ mod tests {
         // emitted_events must survive clear_egress
         assert_eq!(state.emitted_events.len(), 1);
         assert_eq!(state.emitted_events[0]["kind"], json!("tick"));
+    }
+
+    // ── Task A2: FinalizedFlow / FlowExecution.emitted_events tests ──────────
+
+    #[test]
+    fn finalize_with_returns_emitted_events_separately_from_output() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "reply" }));
+        state.push_emitted_event(json!({ "event_type": "orders.created", "payload": {} }));
+
+        let finalized = state.finalize_with(None);
+        // Reply egress is the flow output; emitted events are a sidecar.
+        assert_eq!(finalized.output, json!([{ "text": "reply" }]));
+        assert_eq!(finalized.emitted_events.len(), 1);
+        assert_eq!(finalized.emitted_events[0]["event_type"], "orders.created");
     }
 }
 
