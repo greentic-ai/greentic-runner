@@ -526,50 +526,54 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
     };
     let finished_at = OffsetDateTime::now_utc();
 
+    let mut emitted_events: Vec<serde_json::Value> = Vec::new();
     let status = match execution {
-        Ok(result) => match result.status {
-            greentic_runner_host::runner::engine::FlowStatus::Completed => {
-                // Flow ran to a real terminator — discard any stale resume
-                // snapshot so the next activity starts fresh at the entry.
-                if let Some(path) = session_snapshot_path.as_deref() {
-                    let _ = std::fs::remove_file(path);
-                }
-                RunCompletion::Ok
-            }
-            greentic_runner_host::runner::engine::FlowStatus::Waiting(wait) => {
-                let reason = wait
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "flow paused unexpectedly".to_string());
-                if let Some(path) = session_snapshot_path.as_deref() {
-                    if let Err(err) = save_session_snapshot(path, &wait.snapshot) {
-                        // Persisting the snapshot is best-effort — losing
-                        // it just means the next activity restarts at the
-                        // entry, which is the pre-fix behaviour. Surface
-                        // the failure to the operator log via the run
-                        // result error and continue.
-                        RunCompletion::Err(anyhow::anyhow!(
-                            "{reason} (and failed to persist resume snapshot to {}: {err})",
-                            path.display()
-                        ))
-                    } else {
-                        // Successfully paused. Surface the run as Ok so
-                        // greentic-start can emit the rendered card and
-                        // wait for the user's next submission.
-                        RunCompletion::Ok
+        Ok(result) => {
+            emitted_events = result.emitted_events;
+            match result.status {
+                greentic_runner_host::runner::engine::FlowStatus::Completed => {
+                    // Flow ran to a real terminator — discard any stale resume
+                    // snapshot so the next activity starts fresh at the entry.
+                    if let Some(path) = session_snapshot_path.as_deref() {
+                        let _ = std::fs::remove_file(path);
                     }
-                } else {
-                    // No persistence configured — preserve the legacy
-                    // behaviour (treat pause as an error so the caller at
-                    // least sees that the run did not complete).
-                    RunCompletion::Err(anyhow::anyhow!(reason))
+                    RunCompletion::Ok
+                }
+                greentic_runner_host::runner::engine::FlowStatus::Waiting(wait) => {
+                    let reason = wait
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "flow paused unexpectedly".to_string());
+                    if let Some(path) = session_snapshot_path.as_deref() {
+                        if let Err(err) = save_session_snapshot(path, &wait.snapshot) {
+                            // Persisting the snapshot is best-effort — losing
+                            // it just means the next activity restarts at the
+                            // entry, which is the pre-fix behaviour. Surface
+                            // the failure to the operator log via the run
+                            // result error and continue.
+                            RunCompletion::Err(anyhow::anyhow!(
+                                "{reason} (and failed to persist resume snapshot to {}: {err})",
+                                path.display()
+                            ))
+                        } else {
+                            // Successfully paused. Surface the run as Ok so
+                            // greentic-start can emit the rendered card and
+                            // wait for the user's next submission.
+                            RunCompletion::Ok
+                        }
+                    } else {
+                        // No persistence configured — preserve the legacy
+                        // behaviour (treat pause as an error so the caller at
+                        // least sees that the run did not complete).
+                        RunCompletion::Err(anyhow::anyhow!(reason))
+                    }
                 }
             }
-        },
+        }
         Err(err) => RunCompletion::Err(err),
     };
 
-    let result = recorder.finalise(status, started_at, finished_at)?;
+    let result = recorder.finalise(status, started_at, finished_at, emitted_events)?;
 
     let run_json_path = directories.root.join("run.json");
     fs::write(&run_json_path, serde_json::to_vec_pretty(&result)?)
@@ -838,6 +842,8 @@ pub struct RunResult {
     pub node_summaries: Vec<NodeSummary>,
     pub failures: BTreeMap<String, NodeFailure>,
     pub artifacts_dir: PathBuf,
+    #[serde(default)]
+    pub emitted_events: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -918,6 +924,7 @@ impl RunRecorder {
         completion: RunCompletion,
         started_at: OffsetDateTime,
         finished_at: OffsetDateTime,
+        emitted_events: Vec<serde_json::Value>,
     ) -> Result<RunResult> {
         let status = match &completion {
             RunCompletion::Ok => RunStatus::Success,
@@ -1008,6 +1015,7 @@ impl RunRecorder {
             node_summaries: summaries,
             failures,
             artifacts_dir: self.directories.root.clone(),
+            emitted_events,
         })
     }
 
@@ -1745,5 +1753,39 @@ mod tests {
                 std::env::remove_var("GREENTIC_ENV");
             },
         }
+    }
+
+    fn make_recorder() -> (RunRecorder, TempDir) {
+        let tmp = TempDir::new().expect("tempdir");
+        let dirs = prepare_run_dirs(Some(tmp.path().join("run"))).expect("dirs");
+        let recorder = RunRecorder::new(dirs, &sample_profile(), Some("flow.demo".into()), sample_metadata(), None)
+            .expect("recorder");
+        (recorder, tmp)
+    }
+
+    #[test]
+    fn finalise_bridges_emitted_events_from_flow_execution_to_run_result() {
+        let (recorder, _tmp) = make_recorder();
+        let events = vec![json!({"event_type": "orders.created"})];
+        let result = recorder
+            .finalise(RunCompletion::Ok, OffsetDateTime::now_utc(), OffsetDateTime::now_utc(), events.clone())
+            .expect("finalise ok");
+
+        assert_eq!(result.emitted_events, events);
+    }
+
+    #[test]
+    fn finalise_emitted_events_empty_on_error_path() {
+        let (recorder, _tmp) = make_recorder();
+        let result = recorder
+            .finalise(
+                RunCompletion::Err(anyhow::anyhow!("boom")),
+                OffsetDateTime::now_utc(),
+                OffsetDateTime::now_utc(),
+                Vec::new(),
+            )
+            .expect("finalise err");
+
+        assert!(result.emitted_events.is_empty());
     }
 }
