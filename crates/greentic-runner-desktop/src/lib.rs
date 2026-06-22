@@ -1758,8 +1758,14 @@ mod tests {
     fn make_recorder() -> (RunRecorder, TempDir) {
         let tmp = TempDir::new().expect("tempdir");
         let dirs = prepare_run_dirs(Some(tmp.path().join("run"))).expect("dirs");
-        let recorder = RunRecorder::new(dirs, &sample_profile(), Some("flow.demo".into()), sample_metadata(), None)
-            .expect("recorder");
+        let recorder = RunRecorder::new(
+            dirs,
+            &sample_profile(),
+            Some("flow.demo".into()),
+            sample_metadata(),
+            None,
+        )
+        .expect("recorder");
         (recorder, tmp)
     }
 
@@ -1768,7 +1774,12 @@ mod tests {
         let (recorder, _tmp) = make_recorder();
         let events = vec![json!({"event_type": "orders.created"})];
         let result = recorder
-            .finalise(RunCompletion::Ok, OffsetDateTime::now_utc(), OffsetDateTime::now_utc(), events.clone())
+            .finalise(
+                RunCompletion::Ok,
+                OffsetDateTime::now_utc(),
+                OffsetDateTime::now_utc(),
+                events.clone(),
+            )
             .expect("finalise ok");
 
         assert_eq!(result.emitted_events, events);
