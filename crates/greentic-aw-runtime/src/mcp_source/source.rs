@@ -182,7 +182,9 @@ pub(crate) fn parse_rows(body: serde_json::Value) -> Result<Vec<ParsedServer>, S
         .into_iter()
         .map(|w| ParsedServer {
             id: w.id,
-            transport_url: w.transport_url,
+            // `null`/absent (local-wasm) → ""; the local-wasm branch never reads
+            // it as a URL, and http rows always carry a real URL.
+            transport_url: w.transport_url.unwrap_or_default(),
             auth_header_name: w.auth_header_name,
             auth_token: w.auth_token.map(SecretString::from),
             allowed_tools: w.allowed_tools,
