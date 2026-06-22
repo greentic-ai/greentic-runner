@@ -7,8 +7,10 @@ use async_trait::async_trait;
 use greentic_session::{SessionData, SessionKey as StoreSessionKey};
 use greentic_types::{
     EnvId, FlowId, GreenticError, PackId, ReplyScope, SessionCursor as TypesSessionCursor,
-    TenantCtx, TenantId, UserId, telemetry::attr_keys,
+    TenantCtx, TenantId, UserId,
 };
+
+use crate::telemetry::attr_keys;
 use rand::{RngExt, rng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1050,8 +1052,8 @@ impl IngressEnvelope {
         if let Some(session) = &self.session_hint {
             ctx = ctx.with_session(session.clone());
         }
-        // M1.4: ride the attributes map so the greentic-types
-        // `tenant_ctx_to_telemetry` bridge projects it onto
+        // M1.4: ride the attributes map so the runner-host local
+        // `tenant_ctx_to_telemetry` projection copies it onto
         // `TelemetryCtx::messaging_endpoint_id` for OTel export.
         if let Some(eid) = &self.messaging_endpoint_id {
             ctx.attributes

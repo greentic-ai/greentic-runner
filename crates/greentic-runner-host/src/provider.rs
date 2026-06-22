@@ -287,11 +287,11 @@ fn extract_inline_providers(manifest: &PackManifest) -> Result<Vec<ProviderExtDe
         .providers
         .iter()
         .map(|provider| ProviderExtDecl {
-            // M1.1b hard-cutover: preserve the wire `provider_id` verbatim
-            // (Option<String>). Previously synthesized as `Some(provider_type)`,
-            // which conflated identity with type and made cross-namespace
-            // collisions ambiguous.
-            provider_id: provider.provider_id.clone(),
+            // ProviderDecl.provider_id was removed upstream (greentic-types
+            // 1.1.0-dev.27836473437). Inline providers from the manifest no
+            // longer carry a separate identity; the provider_type is the sole
+            // identifier. Instance-file-loaded providers still carry an id.
+            provider_id: None,
             provider_type: provider.provider_type.clone(),
             capabilities: provider.capabilities.clone(),
             ops: provider.ops.clone(),
