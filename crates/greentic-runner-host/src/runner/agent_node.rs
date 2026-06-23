@@ -815,9 +815,9 @@ mod aw {
                 let policy: Arc<dyn greentic_aw_runtime::guardrail::GuardrailPolicy> =
                     match guardrail_policy_from_env() {
                         Some(http) => Arc::new(http),
-                        None => Arc::new(
-                            greentic_aw_runtime::guardrail::StaticGuardrailPolicy(Vec::new()),
-                        ),
+                        None => Arc::new(greentic_aw_runtime::guardrail::StaticGuardrailPolicy(
+                            Vec::new(),
+                        )),
                     };
                 policy
             },

@@ -145,7 +145,9 @@ mod tests {
             .and(path("/api/v1/designer/guardrail-policy"))
             .and(query_param("env", "prod"))
             .and(header("authorization", "Bearer gtc_live_x"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])),
+            )
             .mount(&server)
             .await;
         let p = HttpGuardrailPolicy::new(server.uri(), "gtc_live_x");
@@ -171,7 +173,9 @@ mod tests {
     async fn cache_hit_skips_second_http() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -201,7 +205,9 @@ mod tests {
     async fn transient_failure_serves_stale() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(body(&["greentic:guardrail/pii"])),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -209,8 +215,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let p =
-            HttpGuardrailPolicy::with_ttl(server.uri(), "gtc_live_x", Duration::from_secs(0));
+        let p = HttpGuardrailPolicy::with_ttl(server.uri(), "gtc_live_x", Duration::from_secs(0));
         let t = TenantContext::new("acme", "prod");
         let first = p.mandatory_guardrails(&t).await.unwrap();
         assert_eq!(first.len(), 1);

@@ -263,9 +263,11 @@ impl greentic_aw_runtime::guardrail::GuardrailPolicy for FailingPolicy {
         >,
     > {
         Box::pin(async move {
-            Err(greentic_aw_runtime::guardrail::GuardrailPolicyError::Unavailable(
-                "admin down".into(),
-            ))
+            Err(
+                greentic_aw_runtime::guardrail::GuardrailPolicyError::Unavailable(
+                    "admin down".into(),
+                ),
+            )
         })
     }
 }
@@ -353,8 +355,6 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
                 "policy-unavailable error must carry a non-empty message"
             );
         }
-        other => panic!(
-            "expected AgentError::GuardrailDenied (inbound/internal), got: {other:?}"
-        ),
+        other => panic!("expected AgentError::GuardrailDenied (inbound/internal), got: {other:?}"),
     }
 }

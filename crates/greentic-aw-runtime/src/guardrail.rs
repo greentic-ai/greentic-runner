@@ -380,11 +380,13 @@ mod tests {
     #[tokio::test]
     async fn no_mandatory_policy_is_empty() {
         let t = TenantContext::new("t", "e");
-        assert!(NoMandatoryGuardrails
-            .mandatory_guardrails(&t)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            NoMandatoryGuardrails
+                .mandatory_guardrails(&t)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
