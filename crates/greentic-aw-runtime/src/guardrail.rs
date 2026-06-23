@@ -1,8 +1,20 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use greentic_ext_runtime::capability::CapabilityRegistry;
 use greentic_extension_sdk_contract::{CapabilityId, CapabilityRef as ExtCapabilityRef};
 
 use crate::config::GuardrailRef;
 use crate::tenant::TenantContext;
+
+/// Failure obtaining the mandatory guardrail policy. Treated as fail-closed by
+/// the agent loop (the step is denied), matching the unresolvable-mandatory-cap
+/// behavior.
+#[derive(Debug, thiserror::Error)]
+pub enum GuardrailPolicyError {
+    #[error("mandatory guardrail policy unavailable: {0}")]
+    Unavailable(String),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GuardrailDirection {
@@ -70,7 +82,12 @@ pub trait GuardrailEvaluator: Send + Sync {
 }
 
 pub trait GuardrailPolicy: Send + Sync {
-    fn mandatory_guardrails(&self, tenant: &TenantContext) -> Vec<GuardrailRef>;
+    /// The platform-mandated guardrails for this tenant+env. `Err` means the
+    /// policy could not be determined and the caller MUST fail closed.
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>;
 }
 
 /// A no-op [`GuardrailEvaluator`] that unconditionally accepts every input.
@@ -159,16 +176,25 @@ impl GuardrailEvaluator for ExtRuntimeGuardrailEvaluator {
 pub struct NoMandatoryGuardrails;
 
 impl GuardrailPolicy for NoMandatoryGuardrails {
-    fn mandatory_guardrails(&self, _tenant: &TenantContext) -> Vec<GuardrailRef> {
-        Vec::new()
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>
+    {
+        Box::pin(async move { Ok(Vec::new()) })
     }
 }
 
 pub struct StaticGuardrailPolicy(pub Vec<GuardrailRef>);
 
 impl GuardrailPolicy for StaticGuardrailPolicy {
-    fn mandatory_guardrails(&self, _tenant: &TenantContext) -> Vec<GuardrailRef> {
-        self.0.clone()
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GuardrailRef>, GuardrailPolicyError>> + Send + 'a>>
+    {
+        let refs = self.0.clone();
+        Box::pin(async move { Ok(refs) })
     }
 }
 
@@ -351,24 +377,28 @@ pub fn run_chain(
 mod tests {
     use super::*;
 
-    #[test]
-    fn no_mandatory_policy_is_empty() {
-        let policy = NoMandatoryGuardrails;
-        let t = TenantContext::new("t1", "dev");
-        assert!(policy.mandatory_guardrails(&t).is_empty());
+    #[tokio::test]
+    async fn no_mandatory_policy_is_empty() {
+        let t = TenantContext::new("t", "e");
+        assert!(
+            NoMandatoryGuardrails
+                .mandatory_guardrails(&t)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
-    #[test]
-    fn static_policy_returns_its_list() {
-        use crate::config::GuardrailRef;
+    #[tokio::test]
+    async fn static_policy_returns_refs() {
+        let t = TenantContext::new("t", "e");
         let refs = vec![GuardrailRef {
-            cap_id: "greentic.cap.guardrail.v1".into(),
+            cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
         }];
         let policy = StaticGuardrailPolicy(refs.clone());
-        let t = TenantContext::new("t1", "dev");
-        assert_eq!(policy.mandatory_guardrails(&t), refs);
+        assert_eq!(policy.mandatory_guardrails(&t).await.unwrap(), refs);
     }
 
     // cap IDs must be "namespace:path" format to satisfy CapabilityId::from_str.

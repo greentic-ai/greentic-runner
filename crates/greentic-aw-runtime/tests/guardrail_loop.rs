@@ -47,12 +47,15 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),
+            credential_ref: None,
         },
         limits: AgentLimits {
             max_iter: 4,
             timeout: Duration::from_secs(60),
             ..AgentLimits::default()
         },
+        memory: None,
+        knowledge: None,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -141,12 +144,15 @@ async fn no_mandatory_guardrails_passes_through() {
         llm: LlmProviderRef {
             provider: "mock".into(),
             model: "m".into(),
+            credential_ref: None,
         },
         limits: AgentLimits {
             max_iter: 4,
             timeout: Duration::from_secs(60),
             ..AgentLimits::default()
         },
+        memory: None,
+        knowledge: None,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -231,6 +237,122 @@ async fn mandatory_ref_with_empty_registry_fails_closed() {
             assert!(
                 !message.is_empty(),
                 "fail-closed error must carry a non-empty message"
+            );
+        }
+        other => panic!("expected AgentError::GuardrailDenied (inbound/internal), got: {other:?}"),
+    }
+}
+
+/// A policy stub that always returns `Err(Unavailable)` — simulates an admin
+/// server being down at policy-fetch time.
+struct FailingPolicy;
+
+impl greentic_aw_runtime::guardrail::GuardrailPolicy for FailingPolicy {
+    fn mandatory_guardrails<'a>(
+        &'a self,
+        _t: &'a greentic_aw_runtime::tenant::TenantContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Vec<greentic_aw_runtime::config::GuardrailRef>,
+                        greentic_aw_runtime::guardrail::GuardrailPolicyError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(
+                greentic_aw_runtime::guardrail::GuardrailPolicyError::Unavailable(
+                    "admin down".into(),
+                ),
+            )
+        })
+    }
+}
+
+/// When the policy provider itself returns `Err`, the loop must fail closed
+/// with `AgentError::GuardrailDenied { code: "internal", .. }` before any
+/// LLM call is attempted.
+#[tokio::test]
+async fn failing_policy_fails_closed_with_guardrail_denied() {
+    let tc = TenantContext::new("acme", "prod");
+    let config = greentic_aw_runtime::config::AgentConfig {
+        agent_id: "a".into(),
+        system_prompt: "test".into(),
+        tools: vec![],
+        guardrails: vec![],
+        llm: greentic_aw_runtime::config::LlmProviderRef {
+            provider: "mock".into(),
+            model: "m".into(),
+            credential_ref: None,
+        },
+        limits: greentic_aw_runtime::config::AgentLimits {
+            max_iter: 4,
+            timeout: std::time::Duration::from_secs(60),
+            ..greentic_aw_runtime::config::AgentLimits::default()
+        },
+        memory: None,
+        knowledge: None,
+    };
+
+    let cp = greentic_aw_runtime::mock::MockConfigProvider::new();
+    cp.insert(&tc, "a", config);
+
+    let llm_script = vec![Ok(greentic_aw_runtime::llm::LlmResponse {
+        content: Some("should never arrive".into()),
+        tool_calls: vec![],
+        tokens_in: 1,
+        tokens_out: 1,
+    })];
+
+    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let runtime = AgentRuntime::new(
+        std::sync::Arc::new(cp),
+        std::sync::Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),
+        ext,
+        std::sync::Arc::new(greentic_aw_runtime::mock::MockLlmBackend::new(llm_script)),
+        std::sync::Arc::new(greentic_aw_runtime::mock::MockTelemetry::new()),
+        std::sync::Arc::new(greentic_aw_runtime::cost::MockTokenMeter::new(0)),
+        std::sync::Arc::new(greentic_aw_runtime::mock::NoopToolLedger),
+        None,
+    )
+    .with_guardrails(
+        std::sync::Arc::new(FailingPolicy),
+        std::sync::Arc::new(greentic_aw_runtime::guardrail::AcceptAllEvaluator),
+    );
+
+    let result = runtime
+        .step(
+            tc,
+            "session-fail-policy",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+            },
+        )
+        .await;
+
+    match result {
+        Err(AgentError::GuardrailDenied {
+            direction,
+            code,
+            message,
+            ..
+        }) => {
+            assert_eq!(
+                direction,
+                GuardrailDirection::Inbound,
+                "policy-unavailable error must carry Inbound direction"
+            );
+            assert_eq!(
+                code, "internal",
+                "policy-unavailable error must use the 'internal' code"
+            );
+            assert!(
+                !message.is_empty(),
+                "policy-unavailable error must carry a non-empty message"
             );
         }
         other => panic!("expected AgentError::GuardrailDenied (inbound/internal), got: {other:?}"),
