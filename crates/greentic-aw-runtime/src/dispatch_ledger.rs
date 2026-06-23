@@ -211,9 +211,8 @@ mod in_memory {
         fn get<'a>(
             &'a self,
             key: &'a str,
-        ) -> Pin<
-            Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>,
-        > {
+        ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>
+        {
             let result = self
                 .entries
                 .lock()
@@ -276,6 +275,9 @@ mod tests {
 
     #[test]
     fn dispatch_key_format() {
-        assert_eq!(dispatch_key("sess::pack=p::flow=f"), "aw:dispatch:sess::pack=p::flow=f");
+        assert_eq!(
+            dispatch_key("sess::pack=p::flow=f"),
+            "aw:dispatch:sess::pack=p::flow=f"
+        );
     }
 }
