@@ -16,12 +16,12 @@ pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ targe
 pkg-fmt = "tgz"
 bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
 targets = [
-  "x86_64-unknown-linux-gnu",
-  "aarch64-unknown-linux-gnu",
-  "x86_64-apple-darwin",
-  "aarch64-apple-darwin",
-  "x86_64-pc-windows-msvc",
-  "aarch64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
 ]
 
 [package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
@@ -31,64 +31,6 @@ pkg-fmt = "zip"
 [package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
 pkg-fmt = "zip"
-
-[dependencies]
-anyhow.workspace = true
-base64.workspace = true
-blake3.workspace = true
-clap.workspace = true
-greentic-runner-host = { workspace = true }
-greentic-runner-desktop = { workspace = true }
-greentic-interfaces.workspace = true
-greentic-interfaces-host.workspace = true
-greentic-interfaces-wasmtime.workspace = true
-greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
-greentic-config.workspace = true
-greentic-distributor-client.workspace = true
-greentic_pack.workspace = true
-wasmtime-environ.workspace = true
-humantime.workspace = true
-runner-core = { workspace = true }
-chrono.workspace = true
-wasmtime.workspace = true
-wasmtime-wasi.workspace = true
-serde_json.workspace = true
-serde_cbor.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-serde_yaml_bw.workspace = true
-serde.workspace = true
-sha2.workspace = true
-wasmparser.workspace = true
-url.workspace = true
-indexmap.workspace = true
-toml.workspace = true
-zip.workspace = true
-tempfile.workspace = true
-walkdir.workspace = true
-
-[build-dependencies]
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-[features]
-# Passthrough feature flags so the `info` report can accurately partition host
-# capabilities into enabled/disabled. These stay disabled by default — enable
-# them on the host crate and mirror them here if you need them surfaced.
-default = ["verify"]
-verify = ["greentic-runner-host/verify"]
-session-redis = ["greentic-runner-host/session-redis"]
-component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
-fault-injection = ["greentic-runner-host/fault-injection"]
-legacy-gen-bindings = []
-
-[dev-dependencies]
-greentic-flow.workspace = true
-greentic-config-types.workspace = true
-serial_test.workspace = true
-semver.workspace = true
-insta.workspace = true
-greentic-state.workspace = true
 
 [lib]
 name = "greentic_runner"
@@ -107,3 +49,61 @@ required-features = ["legacy-gen-bindings"]
 name = "greentic-runner-cli"
 path = "src/bin/greentic-runner-cli.rs"
 required-features = ["legacy-gen-bindings"]
+
+[features]
+# Passthrough feature flags so the `info` report can accurately partition host
+# capabilities into enabled/disabled. These stay disabled by default — enable
+# them on the host crate and mirror them here if you need them surfaced.
+default = ["verify"]
+verify = ["greentic-runner-host/verify"]
+session-redis = ["greentic-runner-host/session-redis"]
+component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
+fault-injection = ["greentic-runner-host/fault-injection"]
+legacy-gen-bindings = []
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+clap.workspace = true
+greentic-config.workspace = true
+greentic-distributor-client.workspace = true
+greentic-interfaces.workspace = true
+greentic-interfaces-host.workspace = true
+greentic-interfaces-wasmtime.workspace = true
+greentic-runner-desktop = { workspace = true }
+greentic-runner-host = { workspace = true }
+greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
+greentic_pack.workspace = true
+humantime.workspace = true
+indexmap.workspace = true
+runner-core = { workspace = true }
+serde.workspace = true
+serde_cbor.workspace = true
+serde_json.workspace = true
+serde_yaml_bw.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+walkdir.workspace = true
+wasmparser.workspace = true
+wasmtime.workspace = true
+wasmtime-environ.workspace = true
+wasmtime-wasi.workspace = true
+zip.workspace = true
+
+[build-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+greentic-config-types.workspace = true
+greentic-flow.workspace = true
+greentic-state.workspace = true
+insta.workspace = true
+semver.workspace = true
+serial_test.workspace = true
