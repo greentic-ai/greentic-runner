@@ -223,7 +223,9 @@ fn build_runtime(
 async fn local_wasm_mcp_tool_offered_called_and_result_in_trail() {
     let Some(fixture_path) = fixture_wasm() else {
         // Self-skip: router_echo.wasm not built; test does not block CI.
-        eprintln!("SKIP: router_echo.wasm not found; set GREENTIC_MCP_ROUTER_ECHO_WASM to run live");
+        eprintln!(
+            "SKIP: router_echo.wasm not found; set GREENTIC_MCP_ROUTER_ECHO_WASM to run live"
+        );
         return;
     };
 
@@ -252,8 +254,11 @@ async fn local_wasm_mcp_tool_offered_called_and_result_in_trail() {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
     }];
-    let (runtime, tenant_ctx) =
-        build_runtime(llm.clone(), Some(mcp_source), build_agent_config(allowed_tools));
+    let (runtime, tenant_ctx) = build_runtime(
+        llm.clone(),
+        Some(mcp_source),
+        build_agent_config(allowed_tools),
+    );
 
     let output = runtime
         .step(tenant_ctx, "s", "a", AgentInput { text: "go".into() })
@@ -312,8 +317,11 @@ async fn local_wasm_unreachable_component_degrades_no_tool_offered() {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
     }];
-    let (runtime, tenant_ctx) =
-        build_runtime(llm.clone(), Some(mcp_source), build_agent_config(allowed_tools));
+    let (runtime, tenant_ctx) = build_runtime(
+        llm.clone(),
+        Some(mcp_source),
+        build_agent_config(allowed_tools),
+    );
 
     let output = runtime
         .step(tenant_ctx, "s", "a", AgentInput { text: "go".into() })
