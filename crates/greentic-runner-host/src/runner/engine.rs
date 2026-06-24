@@ -218,6 +218,10 @@ struct ComponentCall {
     operation: String,
     input: Value,
     config: Value,
+    /// Whether the originating node has an `on_error`-family route, so a
+    /// component failure is surfaced as a node_io `{errors}` output and routed
+    /// to that branch instead of aborting the flow (see `node_has_error_route`).
+    has_error_route: bool,
 }
 
 impl FlowExecution {
@@ -1432,6 +1436,7 @@ impl FlowEngine {
             operation,
             input: payload.input,
             config: payload.config,
+            has_error_route: node_has_error_route(&node.routing),
         };
 
         self.invoke_component_call(ctx, node_id, call, event).await
@@ -1460,6 +1465,7 @@ impl FlowEngine {
             operation,
             input,
             config,
+            has_error_route: node_has_error_route(&node.routing),
         };
         self.invoke_component_call(ctx, node_id, call, event).await
     }
@@ -1561,6 +1567,13 @@ impl FlowEngine {
         }
 
         if let Some((code, message)) = component_error(&value) {
+            // node_io error routing: a node with an `on_error`-family route
+            // surfaces the failure as an `{errors}` output and lets its error
+            // branch handle it. Nodes without such a route keep the historical
+            // hard-fail, so this is purely additive.
+            if call.has_error_route {
+                return Ok(NodeOutput::errored(value));
+            }
             bail!(
                 "component {} failed: {}: {}",
                 call.component_ref,
@@ -2069,6 +2082,17 @@ impl NodeOutput {
             meta,
         }
     }
+
+    /// A failure output (`ok == false`). `build_routing_context` derives the
+    /// `error_event` from this, so a node with an `on_error`-family route lands
+    /// on its failure branch; `node_output_view` exposes the `{errors}` envelope.
+    fn errored(payload: Value) -> Self {
+        Self {
+            ok: false,
+            payload,
+            meta: Value::Null,
+        }
+    }
 }
 
 fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx {
@@ -2109,10 +2133,10 @@ fn to_node_output(value: &Value) -> greentic_types::node_io::NodeOutput {
         // `ok` flag — deserialize them directly so `kind`/`retryable`/etc. round-trip.
         let native_errors = map.contains_key("errors") && !map.contains_key("ok");
         let native_data = map.contains_key("data") && !map.contains_key("ok") && map.len() == 1;
-        if native_errors || native_data {
-            if let Ok(parsed) = serde_json::from_value::<NioOutput>(value.clone()) {
-                return parsed;
-            }
+        if (native_errors || native_data)
+            && let Ok(parsed) = serde_json::from_value::<NioOutput>(value.clone())
+        {
+            return parsed;
         }
         // Legacy failure envelope `{ok:false, error:{code,message}}` → Errors.
         if let Some((code, message)) = component_error(value) {
@@ -3123,6 +3147,32 @@ const SUCCESS_EVENT_PORTS: [&str; 3] = ["on_success", "on_complete", "on_submit"
 /// default is preserved; `on_cancel` / `on_timeout` let a node whose failure
 /// port is named differently (qa cancel, http timeout) route instead of stalling.
 const ERROR_EVENT_PORTS: [&str; 3] = ["on_error", "on_cancel", "on_timeout"];
+
+/// Whether a node opts into node_io error routing: a `Routing::Custom` array with
+/// at least one route targeting an error-family port (`on_error` / `on_cancel` /
+/// `on_timeout`), either as an explicit `event` field or via an `event == "<port>"`
+/// condition (the form the designer emits). Such a node surfaces a component
+/// failure as an `{errors}` output routed to that branch; every other node keeps
+/// the historical hard-fail (`bail!`) on error — so this change is purely additive.
+fn node_has_error_route(routing: &Routing) -> bool {
+    let Routing::Custom(raw) = routing else {
+        return false;
+    };
+    let Some(routes) = raw.as_array() else {
+        return false;
+    };
+    routes.iter().any(|route| {
+        let by_event = route
+            .get("event")
+            .and_then(Value::as_str)
+            .is_some_and(|e| ERROR_EVENT_PORTS.contains(&e));
+        let by_condition = route
+            .get("condition")
+            .and_then(Value::as_str)
+            .is_some_and(|c| ERROR_EVENT_PORTS.iter().any(|port| c.contains(port)));
+        by_event || by_condition
+    })
+}
 
 /// Derive the success `event` to default to when a node succeeds (`ok == true`)
 /// but emits no explicit `outcome`. Designer-built nodes whose happy port is
@@ -4559,6 +4609,59 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
             other => panic!("expected Next(\"err\"), got {other:?}"),
         }
+    }
+
+    /// A node whose component reports a failure (`{ok:false, error}`) and which
+    /// has an `on_error`-family route must surface a node_io `Errors` output
+    /// (`ok == false`) and route to that branch instead of aborting the flow.
+    #[test]
+    fn errored_output_routes_to_on_error_branch() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" },
+            { "condition": "event == \"on_error\"", "to": "err_node" }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let errored =
+            NodeOutput::errored(json!({ "ok": false, "error": { "code": "E", "message": "m" } }));
+        match evaluate_custom_routing(&raw_routing, &errored, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err_node"),
+            other => panic!("expected on_error route, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_has_error_route_detects_error_family_ports() {
+        let with_err = Routing::Custom(json!([
+            { "condition": "event == \"on_success\"", "to": "n" },
+            { "condition": "event == \"on_error\"", "to": "e" }
+        ]));
+        assert!(
+            node_has_error_route(&with_err),
+            "on_error route must be detected"
+        );
+
+        let only_success = Routing::Custom(json!([
+            { "condition": "event == \"on_success\"", "to": "n" }
+        ]));
+        assert!(
+            !node_has_error_route(&only_success),
+            "a success-only Custom routing has no error branch"
+        );
+
+        let plain = Routing::Next {
+            node_id: NodeId::from_str("n").unwrap(),
+        };
+        assert!(
+            !node_has_error_route(&plain),
+            "Routing::Next has no error branch"
+        );
     }
 
     /// When a successful node emits no explicit `outcome`, the runner must
