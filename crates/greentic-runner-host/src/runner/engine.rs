@@ -1948,7 +1948,7 @@ impl ExecutionState {
     fn outputs_map(&self) -> JsonMap<String, Value> {
         let mut outputs = JsonMap::new();
         for (id, output) in &self.nodes {
-            outputs.insert(id.clone(), output.payload.clone());
+            outputs.insert(id.clone(), node_output_view(&output.payload));
         }
         outputs
     }
@@ -2097,6 +2097,58 @@ fn component_exec_ctx(ctx: &FlowContext<'_>, node_id: &str) -> ComponentExecCtx 
 /// `ComponentDescribe.outcomes`. Returns `Value::Null` when the component does
 /// not emit one — the engine then falls back to the `ok`-derived default
 /// (`on_success`/`on_error`) in `build_routing_context`.
+/// Adapt a raw component/node result `Value` into the typed node_io [`NodeOutput`]
+/// (`greentic_types::node_io`). Native `{data}` / `{errors}` envelopes parse straight
+/// through; legacy `{ok, error}` results are shimmed (`ok:false` + `error` → `Errors`,
+/// otherwise → `Data{data: <value>}`) so existing packs keep routing unchanged.
+fn to_node_output(value: &Value) -> greentic_types::node_io::NodeOutput {
+    use greentic_types::node_io::{ErrorKind, NodeError, NodeOutput as NioOutput};
+
+    if let Value::Object(map) = value {
+        // Native node_io envelopes carry a sole `errors` or `data` key and no legacy
+        // `ok` flag — deserialize them directly so `kind`/`retryable`/etc. round-trip.
+        let native_errors = map.contains_key("errors") && !map.contains_key("ok");
+        let native_data = map.contains_key("data") && !map.contains_key("ok") && map.len() == 1;
+        if native_errors || native_data {
+            if let Ok(parsed) = serde_json::from_value::<NioOutput>(value.clone()) {
+                return parsed;
+            }
+        }
+        // Legacy failure envelope `{ok:false, error:{code,message}}` → Errors.
+        if let Some((code, message)) = component_error(value) {
+            return NioOutput::failed(vec![NodeError {
+                code,
+                message,
+                kind: ErrorKind::Internal,
+                retryable: false,
+                source: None,
+                details: Value::Null,
+            }]);
+        }
+    }
+    // Default: a bare result (or `{ok:true, ...}`) is success data.
+    NioOutput::ok(value.clone())
+}
+
+/// Build the per-node template view exposed under `{{node.<id>...}}`. Object payloads
+/// keep their fields at the top level (legacy `{{node.<id>.<field>}}`) and additionally
+/// gain canonical node_io surfaces `data` (`{{node.<id>.data.<field>}}`) and `errors`
+/// (`{{node.<id>.errors}}`). Non-object payloads are exposed verbatim, as before.
+fn node_output_view(payload: &Value) -> Value {
+    let nio = to_node_output(payload);
+    let data = nio.data().cloned().unwrap_or(Value::Null);
+    let errors = serde_json::to_value(nio.errors()).unwrap_or_else(|_| Value::Array(Vec::new()));
+    match payload {
+        Value::Object(map) => {
+            let mut view = map.clone();
+            view.insert("data".to_string(), data);
+            view.insert("errors".to_string(), errors);
+            Value::Object(view)
+        }
+        other => other.clone(),
+    }
+}
+
 fn outcome_meta(output: &Value) -> Value {
     match output.get("outcome").and_then(Value::as_str) {
         Some(outcome) => json!({ "outcome": outcome }),
@@ -3228,6 +3280,67 @@ mod tests {
     }
 
     #[test]
+    fn to_node_output_legacy_success_becomes_data() {
+        // Legacy `{ok:true, ...fields}` (no node_io envelope) → Data{data}.
+        let out = to_node_output(&json!({ "ok": true, "temp": "20C" }));
+        assert!(out.is_ok(), "legacy ok:true must classify as Data");
+        let data = out.data().expect("data present");
+        assert_eq!(data.get("temp").and_then(Value::as_str), Some("20C"));
+    }
+
+    #[test]
+    fn to_node_output_legacy_error_becomes_errors() {
+        // Legacy `{ok:false, error:{code,message}}` → Errors{errors:[NodeError]}.
+        let out = to_node_output(
+            &json!({ "ok": false, "error": { "code": "E_BAD", "message": "boom" } }),
+        );
+        assert!(!out.is_ok(), "legacy ok:false must classify as Errors");
+        let errs = out.errors();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].code, "E_BAD");
+        assert_eq!(errs[0].message, "boom");
+    }
+
+    #[test]
+    fn to_node_output_native_data_envelope_roundtrips() {
+        // A node_io-native `{data:{...}}` envelope parses straight to Data.
+        let out = to_node_output(&json!({ "data": { "x": 1 } }));
+        assert!(out.is_ok());
+        assert_eq!(
+            out.data().and_then(|d| d.get("x")).and_then(Value::as_i64),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn to_node_output_native_errors_envelope_roundtrips() {
+        // A node_io-native `{errors:[...]}` envelope parses straight to Errors.
+        let out = to_node_output(&json!({
+            "errors": [ { "code": "C", "message": "m", "kind": "validation",
+                          "retryable": false, "details": {} } ]
+        }));
+        assert!(!out.is_ok());
+        assert_eq!(out.errors()[0].code, "C");
+        assert_eq!(
+            out.errors()[0].kind,
+            greentic_types::node_io::ErrorKind::Validation
+        );
+    }
+
+    #[test]
+    fn to_node_output_bare_object_becomes_data() {
+        // A bare result with no envelope keys → Data{data: <whole value>}.
+        let out = to_node_output(&json!({ "foo": 1 }));
+        assert!(out.is_ok());
+        assert_eq!(
+            out.data()
+                .and_then(|d| d.get("foo"))
+                .and_then(Value::as_i64),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn templating_renders_with_partials_and_data() {
         let mut state = ExecutionState::new(json!({ "city": "London" }));
         state.nodes.insert(
@@ -3238,6 +3351,22 @@ mod tests {
         // templating context includes node outputs for runner-side payload rendering.
         let ctx = state.context();
         assert_eq!(ctx["nodes"]["forecast"]["payload"]["temp"], json!("20C"));
+    }
+
+    #[test]
+    fn outputs_map_exposes_node_io_data_and_errors_alongside_flat() {
+        let mut state = ExecutionState::new(json!({}));
+        state.nodes.insert(
+            "forecast".to_string(),
+            NodeOutput::new(json!({ "temp": "20C" })),
+        );
+        let outs = state.outputs_map();
+        // Legacy flat ref `{{node.forecast.temp}}` keeps working.
+        assert_eq!(outs["forecast"]["temp"], json!("20C"));
+        // Canonical node_io ref `{{node.forecast.data.temp}}` resolves to the same.
+        assert_eq!(outs["forecast"]["data"]["temp"], json!("20C"));
+        // `{{node.forecast.errors}}` is present and empty for a success output.
+        assert_eq!(outs["forecast"]["errors"], json!([]));
     }
 
     #[test]
