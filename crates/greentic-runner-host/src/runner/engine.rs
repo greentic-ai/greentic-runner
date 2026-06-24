@@ -100,10 +100,25 @@ pub enum FlowStatus {
     Waiting(Box<FlowWait>),
 }
 
+/// Bundle returned by [`ExecutionState::finalize_with`].
+///
+/// `output` carries the egress-based reply value (unchanged from the previous
+/// `Value` return); `emitted_events` carries the sidecar events that were
+/// pushed via [`ExecutionState::push_emitted_event`] during the run and must
+/// NOT be mixed into the reply output.
+struct FinalizedFlow {
+    output: Value,
+    emitted_events: Vec<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub struct FlowExecution {
     pub output: Value,
     pub status: FlowStatus,
+    /// Side-channel events collected during execution via `emit.event` nodes.
+    /// These are distinct from the reply `output` and are consumed by the
+    /// caller (Task A3+) to route events onto an external bus.
+    pub emitted_events: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +220,9 @@ enum NodeKind {
 enum EmitKind {
     Log,
     Response,
+    /// Routes the payload to `ExecutionState::emitted_events`, bypassing the
+    /// reply egress channel.  Use the `emit.event` builtin node kind in a flow.
+    Event,
     Other(String),
 }
 
@@ -221,17 +239,19 @@ struct ComponentCall {
 }
 
 impl FlowExecution {
-    fn completed(output: Value) -> Self {
+    fn completed(finalized: FinalizedFlow) -> Self {
         Self {
-            output,
+            output: finalized.output,
             status: FlowStatus::Completed,
+            emitted_events: finalized.emitted_events,
         }
     }
 
-    fn waiting(output: Value, wait: FlowWait) -> Self {
+    fn waiting(finalized: FinalizedFlow, wait: FlowWait) -> Self {
         Self {
-            output,
+            output: finalized.output,
             status: FlowStatus::Waiting(Box::new(wait)),
+            emitted_events: finalized.emitted_events,
         }
     }
 }
@@ -689,6 +709,7 @@ impl FlowEngine {
                             // routing with the user's new submit payload.
                             let mut snapshot_state = state.clone();
                             snapshot_state.clear_egress();
+                            snapshot_state.clear_emitted_events();
                             let snapshot = FlowSnapshot {
                                 pack_id: step_ctx.pack_id.to_string(),
                                 flow_id: step_ctx.flow_id.to_string(),
@@ -697,9 +718,9 @@ impl FlowEngine {
                                 next_node: node_id.as_str().to_string(),
                                 state: snapshot_state,
                             };
-                            let output_value = state.finalize_with(Some(output.payload.clone()));
+                            let finalized = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::waiting(
-                                output_value,
+                                finalized,
                                 FlowWait {
                                     reason: Some(format!(
                                         "awaiting user submit at node `{}`",
@@ -736,6 +757,7 @@ impl FlowEngine {
                     })?;
                     let mut snapshot_state = state.clone();
                     snapshot_state.clear_egress();
+                    snapshot_state.clear_emitted_events();
                     let snapshot = FlowSnapshot {
                         pack_id: step_ctx.pack_id.to_string(),
                         flow_id: step_ctx.flow_id.to_string(),
@@ -744,9 +766,9 @@ impl FlowEngine {
                         next_node: resume_target.as_str().to_string(),
                         state: snapshot_state,
                     };
-                    let output_value = state.clone().finalize_with(None);
+                    let finalized = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
-                        output_value,
+                        finalized,
                         FlowWait { reason, snapshot },
                     ));
                 }
@@ -813,6 +835,10 @@ impl FlowEngine {
             NodeKind::BuiltinEmit { kind } => {
                 match kind {
                     EmitKind::Log | EmitKind::Response => {}
+                    EmitKind::Event => {
+                        state.push_emitted_event(payload.clone());
+                        return Ok(DispatchOutcome::complete(NodeOutput::new(payload)));
+                    }
                     EmitKind::Other(component) => {
                         tracing::debug!(%component, "handling emit.* as builtin");
                     }
@@ -1897,6 +1923,15 @@ pub struct ExecutionState {
     nodes: HashMap<String, NodeOutput>,
     #[serde(default)]
     egress: Vec<Value>,
+    /// Emitted by `emit.event` nodes during execution.
+    ///
+    /// Kept strictly separate from `egress` (the reply channel) and not touched
+    /// by `clear_egress`. Once-only delivery guarantee: events surfaced on a
+    /// Waiting or Completed [`FlowExecution`] result are cleared from the
+    /// persisted snapshot (via `clear_emitted_events`) so they are not
+    /// re-surfaced when the flow resumes after a wait.
+    #[serde(default)]
+    pub emitted_events: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_output: Option<Value>,
     #[serde(default)]
@@ -1910,9 +1945,19 @@ impl ExecutionState {
             input,
             nodes: HashMap::new(),
             egress: Vec::new(),
+            emitted_events: Vec::new(),
             last_output: None,
             redirect_count: 0,
         }
+    }
+
+    /// Append `payload` to the dedicated event channel.
+    ///
+    /// Unlike `push_egress`, this channel is NOT cleared by `clear_egress` and
+    /// is NOT folded into the reply output by `finalize_with`.  It is read by
+    /// the event-bus layer after the flow run completes.
+    pub fn push_emitted_event(&mut self, payload: Value) {
+        self.emitted_events.push(payload);
     }
 
     /// Refresh `entry` from `input` if the snapshot was loaded without an
@@ -1964,6 +2009,13 @@ impl ExecutionState {
         self.egress.clear();
     }
 
+    /// Clear already-surfaced emitted events from a snapshot so they are not
+    /// re-delivered when the flow resumes after a wait. Call this on the
+    /// snapshot state immediately after `clear_egress` on every Waiting path.
+    fn clear_emitted_events(&mut self) {
+        self.emitted_events.clear();
+    }
+
     fn redirect_count(&self) -> u32 {
         self.redirect_count
     }
@@ -1972,19 +2024,25 @@ impl ExecutionState {
         self.redirect_count = self.redirect_count.saturating_add(1);
     }
 
-    fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
-        if self.egress.is_empty() {
-            return final_payload.unwrap_or(Value::Null);
-        }
-        let mut emitted = std::mem::take(&mut self.egress);
-        if let Some(value) = final_payload {
-            match value {
-                Value::Null => {}
-                Value::Array(items) => emitted.extend(items),
-                other => emitted.push(other),
+    fn finalize_with(mut self, final_payload: Option<Value>) -> FinalizedFlow {
+        let emitted_events = std::mem::take(&mut self.emitted_events);
+        let output = if self.egress.is_empty() {
+            final_payload.unwrap_or(Value::Null)
+        } else {
+            let mut emitted = std::mem::take(&mut self.egress);
+            if let Some(value) = final_payload {
+                match value {
+                    Value::Null => {}
+                    Value::Array(items) => emitted.extend(items),
+                    other => emitted.push(other),
+                }
             }
+            Value::Array(emitted)
+        };
+        FinalizedFlow {
+            output,
+            emitted_events,
         }
-        Value::Array(emitted)
     }
 }
 
@@ -2557,6 +2615,7 @@ fn emit_kind_from_ref(component_ref: &str) -> EmitKind {
     match component_ref {
         "emit.log" => EmitKind::Log,
         "emit.response" => EmitKind::Response,
+        "emit.event" => EmitKind::Event,
         other => EmitKind::Other(other.to_string()),
     }
 }
@@ -2565,6 +2624,7 @@ fn emit_ref_from_kind(kind: &EmitKind) -> String {
     match kind {
         EmitKind::Log => "emit.log".to_string(),
         EmitKind::Response => "emit.response".to_string(),
+        EmitKind::Event => "emit.event".to_string(),
         EmitKind::Other(other) => other.clone(),
     }
 }
@@ -3245,9 +3305,9 @@ mod tests {
         let mut state = ExecutionState::new(json!({}));
         state.push_egress(json!({ "text": "first" }));
         state.push_egress(json!({ "text": "second" }));
-        let result = state.finalize_with(Some(json!({ "text": "final" })));
+        let finalized = state.finalize_with(Some(json!({ "text": "final" })));
         assert_eq!(
-            result,
+            finalized.output,
             json!([
                 { "text": "first" },
                 { "text": "second" },
@@ -3260,12 +3320,12 @@ mod tests {
     fn finalize_flattens_final_array() {
         let mut state = ExecutionState::new(json!({}));
         state.push_egress(json!({ "text": "only" }));
-        let result = state.finalize_with(Some(json!([
+        let finalized = state.finalize_with(Some(json!([
             { "text": "extra-1" },
             { "text": "extra-2" }
         ])));
         assert_eq!(
-            result,
+            finalized.output,
             json!([
                 { "text": "only" },
                 { "text": "extra-1" },
@@ -4885,6 +4945,258 @@ mod tests {
         eprintln!(
             "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
             output["output"]["reply"]
+        );
+    }
+
+    // ── Task A1: emit.event channel tests ──────────────────────────────────
+
+    #[test]
+    fn emit_kind_from_ref_maps_emit_event() {
+        let kind = emit_kind_from_ref("emit.event");
+        assert!(
+            matches!(kind, EmitKind::Event),
+            "emit.event must map to EmitKind::Event, got {kind:?}"
+        );
+    }
+
+    #[test]
+    fn emit_ref_from_kind_roundtrips_event() {
+        let kind = EmitKind::Event;
+        assert_eq!(emit_ref_from_kind(&kind), "emit.event");
+    }
+
+    #[test]
+    fn push_emitted_event_accumulates_separate_from_egress() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "reply" }));
+        state.push_emitted_event(json!({ "kind": "order.placed", "id": 1 }));
+        state.push_emitted_event(json!({ "kind": "order.placed", "id": 2 }));
+
+        // egress is unaffected by emitted_events
+        let finalized = state.clone().finalize_with(None);
+        assert_eq!(finalized.output, json!([{ "text": "reply" }]));
+
+        // emitted_events collected independently
+        assert_eq!(state.emitted_events.len(), 2);
+        assert_eq!(state.emitted_events[0]["id"], json!(1));
+        assert_eq!(state.emitted_events[1]["id"], json!(2));
+    }
+
+    #[test]
+    fn clear_egress_does_not_touch_emitted_events() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_emitted_event(json!({ "kind": "tick" }));
+        state.push_egress(json!({ "text": "reply" }));
+
+        state.clear_egress();
+
+        // emitted_events must survive clear_egress
+        assert_eq!(state.emitted_events.len(), 1);
+        assert_eq!(state.emitted_events[0]["kind"], json!("tick"));
+    }
+
+    // ── Task A2: FinalizedFlow / FlowExecution.emitted_events tests ──────────
+
+    #[test]
+    fn finalize_with_returns_emitted_events_separately_from_output() {
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "reply" }));
+        state.push_emitted_event(json!({ "event_type": "orders.created", "payload": {} }));
+
+        let finalized = state.finalize_with(None);
+        // Reply egress is the flow output; emitted events are a sidecar.
+        assert_eq!(finalized.output, json!([{ "text": "reply" }]));
+        assert_eq!(finalized.emitted_events.len(), 1);
+        assert_eq!(finalized.emitted_events[0]["event_type"], "orders.created");
+    }
+
+    /// Regression: an `emit.event` node before a `session.wait` must deliver its
+    /// event exactly once (on the Waiting result). The persisted snapshot must NOT
+    /// carry those already-surfaced events so they are not re-delivered when the
+    /// flow resumes. Verifies the once-only delivery guarantee across wait→resume.
+    #[test]
+    fn emitted_events_before_wait_delivered_once_not_on_resume() {
+        // Flow: emit-ev (emit.event) → wait-node (session.wait) → done-node (emit.log/End)
+        let emit_ev_id = NodeId::from_str("emit-ev").unwrap();
+        let wait_id = NodeId::from_str("wait-node").unwrap();
+        let done_id = NodeId::from_str("done-node").unwrap();
+
+        let emit_ev_node = Node {
+            id: emit_ev_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.event".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "kind": "E1" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: wait_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+        let wait_node = Node {
+            id: wait_id.clone(),
+            component: FlowComponentRef {
+                id: "session.wait".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "reason": "awaiting user" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: done_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+        let done_node = Node {
+            id: done_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "done" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(emit_ev_id.clone(), emit_ev_node);
+        nodes.insert(wait_id.clone(), wait_node);
+        nodes.insert(done_id.clone(), done_node);
+
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("emit-wait.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(emit_ev_id.to_string()),
+            )]),
+            nodes,
+            metadata: Default::default(),
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "emit-wait.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "emit-wait.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-emit-wait"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+
+        // Phase 1: initial execute — must pause at session.wait with E1 in emitted_events.
+        let waiting_result = rt
+            .block_on(engine.execute(ctx, json!({})))
+            .expect("initial execute");
+
+        let snapshot = match waiting_result.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            FlowStatus::Completed => panic!("expected Waiting, got Completed"),
+        };
+
+        assert_eq!(
+            waiting_result.emitted_events.len(),
+            1,
+            "E1 must appear exactly once on the Waiting result"
+        );
+        assert_eq!(
+            waiting_result.emitted_events[0]["kind"],
+            json!("E1"),
+            "E1 payload must match"
+        );
+
+        // Phase 2: resume — E1 must NOT reappear on the resumed result.
+        let resume_ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "emit-wait.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-emit-wait"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        let resumed_result = rt
+            .block_on(engine.resume(resume_ctx, snapshot, json!({ "user_reply": "ok" })))
+            .expect("resume");
+
+        assert!(
+            matches!(resumed_result.status, FlowStatus::Completed),
+            "expected Completed after resume, got: {:?}",
+            resumed_result.status
+        );
+        assert!(
+            resumed_result.emitted_events.is_empty(),
+            "E1 must NOT reappear on the resumed result; got: {:?}",
+            resumed_result.emitted_events
         );
     }
 }
