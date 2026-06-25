@@ -246,11 +246,17 @@ mod tests {
             "provider.memory.chronicle"
         );
         assert_eq!(
-            mem.long_term.as_ref().expect("long_term present").capability,
+            mem.long_term
+                .as_ref()
+                .expect("long_term present")
+                .capability,
             "cap://memory/long-term"
         );
         assert_eq!(
-            mem.short_term.as_ref().expect("short_term present").provider,
+            mem.short_term
+                .as_ref()
+                .expect("short_term present")
+                .provider,
             "provider.memory.redis"
         );
         assert!(cfg.tools.is_empty());
