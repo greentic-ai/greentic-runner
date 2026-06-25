@@ -18,6 +18,7 @@ pub mod config;
 pub mod config_provider;
 pub mod cost;
 pub mod dispatch_ledger;
+pub mod dw;
 pub mod error;
 pub mod graph;
 pub mod guardrail;
@@ -54,7 +55,9 @@ pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
 };
-pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
+pub use config::{
+    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
+};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
