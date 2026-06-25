@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+use crate::{AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings};
+
 /// Minimal typed view of a designer-exported `DwApplication` `manifest.json`.
 /// Tolerant of unknown fields so future pack additions don't break parsing.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -89,6 +91,63 @@ pub fn provider_slug(provider_id: &str) -> String {
     provider_id.to_string()
 }
 
+/// Convert a parsed `DwApplication` manifest into a runtime [`AgentConfig`].
+///
+/// `llm.model` is left empty (with a `warn`) when the manifest declares no
+/// model default — the runtime forwards `model` to the provider verbatim, so a
+/// foreign fallback would silently mis-route. `credential_ref` is left `None`
+/// here; populating it is the separate credential-surfacing prerequisite.
+#[must_use]
+pub fn agent_config_from_dw_manifest(m: &DwApplicationManifest) -> AgentConfig {
+    let llm_provider_id = m.llm_provider_id().unwrap_or_default();
+    let provider = provider_slug(llm_provider_id);
+    let model = m.model_for(llm_provider_id).unwrap_or_default().to_string();
+    if model.is_empty() {
+        tracing::warn!(
+            agent = %m.manifest_id,
+            provider_id = %llm_provider_id,
+            "DwApplication manifest has no model default; leaving llm.model empty"
+        );
+    }
+
+    AgentConfig {
+        agent_id: m.manifest_id.clone(),
+        system_prompt: m.system_prompt().to_string(),
+        tools: Vec::new(),
+        guardrails: Vec::new(),
+        llm: LlmProviderRef {
+            provider,
+            model,
+            credential_ref: None,
+        },
+        limits: AgentLimits::default(),
+        memory: build_memory(m),
+        knowledge: None,
+    }
+}
+
+fn build_memory(m: &DwApplicationManifest) -> Option<MemorySettings> {
+    let mem_ref = |cap: &str| {
+        m.memory_provider_id(cap)
+            .map(|provider_id| MemoryProviderRef {
+                provider: provider_id.to_string(),
+                capability: cap.to_string(),
+                params: serde_json::Map::new(),
+                credential_ref: None,
+            })
+    };
+    let short_term = mem_ref("cap://memory/short-term");
+    let long_term = mem_ref("cap://memory/long-term");
+    if short_term.is_none() && long_term.is_none() {
+        None
+    } else {
+        Some(MemorySettings {
+            short_term,
+            long_term,
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -168,5 +227,42 @@ mod tests {
         assert_eq!(provider_slug("deepseek"), "deepseek");
         // non-matching string passes through unchanged
         assert_eq!(provider_slug("provider.llm"), "provider.llm");
+    }
+
+    #[test]
+    fn converts_manifest_to_agent_config() {
+        let m: DwApplicationManifest = serde_json::from_str(FIXTURE).expect("parse");
+        let cfg = agent_config_from_dw_manifest(&m);
+
+        assert_eq!(cfg.agent_id, "onboarding-companion");
+        assert_eq!(cfg.system_prompt, "You are an Onboarding Companion.");
+        assert_eq!(cfg.llm.provider, "deepseek");
+        assert_eq!(cfg.llm.model, "deepseek-chat");
+        assert!(cfg.llm.credential_ref.is_none());
+
+        let mem = cfg.memory.expect("memory present");
+        assert_eq!(
+            mem.long_term.as_ref().expect("long_term present").provider,
+            "provider.memory.chronicle"
+        );
+        assert_eq!(
+            mem.long_term.as_ref().expect("long_term present").capability,
+            "cap://memory/long-term"
+        );
+        assert_eq!(
+            mem.short_term.as_ref().expect("short_term present").provider,
+            "provider.memory.redis"
+        );
+        assert!(cfg.tools.is_empty());
+        assert!(cfg.knowledge.is_none());
+    }
+
+    #[test]
+    fn missing_model_yields_empty_string() {
+        let json = r#"{"manifest_id":"x","manifest":{"capability_plan":{"default_provider_ids":{"cap://llm/chat":"provider.llm.deepseek.chat"}},"defaults":{"values":{"system_prompt":"hi"}}}}"#;
+        let m: DwApplicationManifest = serde_json::from_str(json).expect("parse");
+        let cfg = agent_config_from_dw_manifest(&m);
+        assert_eq!(cfg.llm.model, "");
+        assert!(cfg.memory.is_none());
     }
 }

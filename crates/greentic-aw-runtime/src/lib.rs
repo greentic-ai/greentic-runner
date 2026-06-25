@@ -54,7 +54,9 @@ pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
 };
-pub use config::{AgentConfig, AgentLimits, LlmProviderRef, ToolRef};
+pub use config::{
+    AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
+};
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
