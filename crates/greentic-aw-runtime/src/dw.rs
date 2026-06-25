@@ -75,6 +75,20 @@ impl DwApplicationManifest {
     }
 }
 
+/// Map a catalog `provider_id` to its provider slug. Catalog ids follow
+/// `provider.llm.{slug}.{variant}` (e.g. `provider.llm.deepseek.chat`); this
+/// strips prefix + variant to `{slug}`. Anything not matching is returned
+/// unchanged, so a pre-resolved slug like `"deepseek"` passes through.
+#[must_use]
+pub fn provider_slug(provider_id: &str) -> String {
+    if let Some(rest) = provider_id.strip_prefix("provider.llm.")
+        && let Some((slug, _variant)) = rest.split_once('.')
+    {
+        return slug.to_string();
+    }
+    provider_id.to_string()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -144,5 +158,15 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(m.system_prompt(), "");
+    }
+
+    #[test]
+    fn provider_slug_strips_catalog_prefix() {
+        assert_eq!(provider_slug("provider.llm.deepseek.chat"), "deepseek");
+        assert_eq!(provider_slug("provider.llm.anthropic.chat"), "anthropic");
+        // pre-resolved slug passes through unchanged
+        assert_eq!(provider_slug("deepseek"), "deepseek");
+        // non-matching string passes through unchanged
+        assert_eq!(provider_slug("provider.llm"), "provider.llm");
     }
 }
