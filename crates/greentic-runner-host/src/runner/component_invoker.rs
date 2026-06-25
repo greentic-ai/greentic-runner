@@ -43,10 +43,29 @@ impl PackRuntimeComponentInvoker {
     }
 }
 
-/// Synthesize an LLM-facing description (the component manifest carries no
-/// per-operation prose today).
+/// Synthesize an LLM-facing description for an operation that carries no prose
+/// of its own. Used as a fallback when the component manifest does not supply a
+/// per-operation `description` (sourced from the component's WIT doc comment).
 fn describe_operation(component_ref: &str, operation: &str) -> String {
     format!("Invoke operation '{operation}' of greentic component '{component_ref}'.")
+}
+
+/// Resolve the LLM-facing description for an operation: prefer the manifest's
+/// `description` (sourced from the component's WIT doc comment) when present and
+/// non-empty, otherwise fall back to the synthesized string.
+fn resolve_operation_description(
+    component_ref: &str,
+    operation: &greentic_types::ComponentOperation,
+) -> String {
+    match operation
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(description) => description.to_string(),
+        None => describe_operation(component_ref, &operation.name),
+    }
 }
 
 /// Map a component's manifest operations to LLM-facing tool operations.
@@ -59,7 +78,7 @@ fn map_operations(
         .map(|op| ComponentOperation {
             component_ref: component_ref.to_string(),
             operation: op.name.clone(),
-            description: describe_operation(component_ref, &op.name),
+            description: resolve_operation_description(component_ref, op),
             parameters: op.input_schema.clone(),
         })
         .collect()
