@@ -81,6 +81,12 @@ impl DwApplicationManifest {
 /// `provider.llm.{slug}.{variant}` (e.g. `provider.llm.deepseek.chat`); this
 /// strips prefix + variant to `{slug}`. Anything not matching is returned
 /// unchanged, so a pre-resolved slug like `"deepseek"` passes through.
+///
+/// SYNC: kept byte-for-byte identical to the designer's copy at
+/// `greentic-designer/src/orchestrate/dw_form_to_agent_config.rs` (`provider_slug`).
+/// The shared home is `greentic-types` (both crates already depend on it), but
+/// extracting it there is gated on the org-wide greentic-types release-train;
+/// until that lifts, any change here MUST be mirrored in the designer copy.
 #[must_use]
 pub fn provider_slug(provider_id: &str) -> String {
     if let Some(rest) = provider_id.strip_prefix("provider.llm.")
@@ -99,6 +105,12 @@ pub fn provider_slug(provider_id: &str) -> String {
 /// here; populating it is the separate credential-surfacing prerequisite.
 #[must_use]
 pub fn agent_config_from_dw_manifest(m: &DwApplicationManifest) -> AgentConfig {
+    if m.llm_provider_id().is_none() {
+        tracing::warn!(
+            agent = %m.manifest_id,
+            "DwApplication manifest declares no LLM provider; leaving llm.provider empty"
+        );
+    }
     let llm_provider_id = m.llm_provider_id().unwrap_or_default();
     let provider = provider_slug(llm_provider_id);
     let model = m.model_for(llm_provider_id).unwrap_or_default().to_string();
@@ -270,5 +282,16 @@ mod tests {
         let cfg = agent_config_from_dw_manifest(&m);
         assert_eq!(cfg.llm.model, "");
         assert!(cfg.memory.is_none());
+    }
+
+    #[test]
+    fn missing_llm_provider_yields_empty_provider() {
+        // No `cap://llm/chat` default at all → provider left empty (with a warn).
+        let m: DwApplicationManifest =
+            serde_json::from_str(r#"{"manifest_id":"bare"}"#).expect("parse");
+        assert_eq!(m.llm_provider_id(), None);
+        let cfg = agent_config_from_dw_manifest(&m);
+        assert_eq!(cfg.llm.provider, "");
+        assert_eq!(cfg.llm.model, "");
     }
 }
