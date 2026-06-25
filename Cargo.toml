@@ -107,6 +107,12 @@ version = ">=0.5.0-0, <0.6.0-0"
 [workspace.dependencies.greentic-interfaces-wasmtime]
 version = ">=0.5.0-0, <0.6.0-0"
 
+[workspace.dependencies.greentic-x-runtime]
+version = "0.4.20"
+
+[workspace.dependencies.greentic-x-types]
+version = "0.4.20"
+
 [workspace.dependencies.greentic-oauth-host]
 version = ">=0.5.0-0, <0.6.0-0"
 

@@ -16,6 +16,7 @@ verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
+greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
 [dependencies]
 anyhow.workspace = true
@@ -36,6 +37,8 @@ greentic-flow.workspace = true
 greentic-interfaces.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
+greentic-x-runtime = { workspace = true, optional = true }
+greentic-x-types = { workspace = true, optional = true }
 greentic-secrets-lib.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
