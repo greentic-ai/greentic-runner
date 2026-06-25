@@ -123,7 +123,9 @@ mod tests {
         let cfg = agentic_stream_config();
         assert_eq!(cfg.name, "greentic-agentic");
         assert!(
-            cfg.subjects.iter().any(|s| s == "greentic.agentic.request.v1"),
+            cfg.subjects
+                .iter()
+                .any(|s| s == "greentic.agentic.request.v1"),
             "expected greentic.agentic.request.v1 in subjects, got {:?}",
             cfg.subjects
         );
@@ -157,6 +159,9 @@ mod tests {
     #[test]
     fn consumer_config_caps_max_deliver() {
         let cfg = agentic_consumer_config();
-        assert_eq!(cfg.max_deliver, 5, "max_deliver should be 5 to prevent poison-pill loops");
+        assert_eq!(
+            cfg.max_deliver, 5,
+            "max_deliver should be 5 to prevent poison-pill loops"
+        );
     }
 }

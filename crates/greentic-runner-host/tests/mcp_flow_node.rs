@@ -757,7 +757,9 @@ fn mcp_node_local_wasm_calls_echo_tool_in_process() -> Result<()> {
                 .join("../../../greentic-mcp/target/wasm32-wasip2/release/router_echo.wasm")
         });
     if !fixture_path.exists() {
-        eprintln!("SKIP: router_echo.wasm not found; set GREENTIC_MCP_ROUTER_ECHO_WASM to run live");
+        eprintln!(
+            "SKIP: router_echo.wasm not found; set GREENTIC_MCP_ROUTER_ECHO_WASM to run live"
+        );
         return Ok(());
     }
 
@@ -848,13 +850,12 @@ fn mcp_node_local_wasm_calls_echo_tool_in_process() -> Result<()> {
     }
 
     // The echo result is bound under `echo_result` — no error key.
-    let echo_result = find_key(&execution.output, "echo_result")
-        .with_context(|| {
-            format!(
-                "output key `echo_result` missing, got {:?}",
-                execution.output
-            )
-        })?;
+    let echo_result = find_key(&execution.output, "echo_result").with_context(|| {
+        format!(
+            "output key `echo_result` missing, got {:?}",
+            execution.output
+        )
+    })?;
     assert!(
         !echo_result.to_string().contains("\"error\""),
         "echo result must not contain an error; got: {echo_result}"

@@ -440,11 +440,11 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
 
     #[cfg(feature = "agentic-worker")]
     {
+        #[cfg(feature = "desktop-agent-ephemeral")]
+        use greentic_runner_host::runner::agent_node::build_agent_node_handler_ephemeral;
         use greentic_runner_host::runner::agent_node::{
             agent_configs_from_manifest, build_agent_node_handler, merge_agent_sources,
         };
-        #[cfg(feature = "desktop-agent-ephemeral")]
-        use greentic_runner_host::runner::agent_node::build_agent_node_handler_ephemeral;
 
         let blobs = pack.manifest_agent_blobs();
         if !blobs.is_empty() {
@@ -460,13 +460,8 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
-                    build_agent_node_handler_ephemeral(
-                        merged,
-                        tenant,
-                        sm,
-                        vec![Arc::clone(&pack)],
-                    )
-                    .await
+                    build_agent_node_handler_ephemeral(merged, tenant, sm, vec![Arc::clone(&pack)])
+                        .await
                 }
                 #[cfg(not(feature = "desktop-agent-ephemeral"))]
                 {

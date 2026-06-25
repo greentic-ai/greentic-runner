@@ -477,7 +477,12 @@ async fn recall_memory_call_is_handled_host_side() {
 // ---------------------------------------------------------------------------
 
 /// Build a tool-call `LlmResponse` with explicit args (for `remember`/`recall`).
-fn tool_call_with_args(call_id: &str, ext: &str, tool: &str, args: serde_json::Value) -> LlmResponse {
+fn tool_call_with_args(
+    call_id: &str,
+    ext: &str,
+    tool: &str,
+    args: serde_json::Value,
+) -> LlmResponse {
     LlmResponse {
         content: None,
         tool_calls: vec![ToolCallRecord {
@@ -526,7 +531,9 @@ fn build_st_runtime(
         Arc::new(NoopToolLedger),
         None,
     )
-    .with_short_term_memory(Arc::new(greentic_aw_runtime::memory::InMemoryMemoryProvider::new()));
+    .with_short_term_memory(Arc::new(
+        greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
+    ));
     (rt, llm, tc)
 }
 

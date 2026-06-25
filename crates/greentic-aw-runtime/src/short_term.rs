@@ -111,7 +111,11 @@ mod tests {
         let s = remember_tool_schema();
         assert_eq!(s.tool_name, REMEMBER_TOOL);
         assert_eq!(s.extension_id, SHORT_TERM_EXTENSION_ID);
-        let req = s.parameters.get("required").and_then(|v| v.as_array()).unwrap();
+        let req = s
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .unwrap();
         let names: Vec<&str> = req.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"key") && names.contains(&"value"));
     }
@@ -121,7 +125,11 @@ mod tests {
         let s = recall_tool_schema();
         assert_eq!(s.tool_name, RECALL_TOOL);
         assert_eq!(s.extension_id, SHORT_TERM_EXTENSION_ID);
-        let req = s.parameters.get("required").and_then(|v| v.as_array()).unwrap();
+        let req = s
+            .parameters
+            .get("required")
+            .and_then(|v| v.as_array())
+            .unwrap();
         let names: Vec<&str> = req.iter().filter_map(|v| v.as_str()).collect();
         assert!(names.contains(&"key"));
     }
