@@ -93,6 +93,7 @@ fn host_config(tenant: &str, retry: FlowRetryConfig) -> HostConfig {
         trace: TraceConfig::from_env().with_overrides(TraceMode::Off, None),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
     }
 }
 

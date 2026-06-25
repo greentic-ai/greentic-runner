@@ -30,6 +30,8 @@ pub mod component_api;
 pub mod config;
 pub mod engine;
 pub mod fault;
+#[cfg(feature = "greentic-x-provider")]
+pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
 pub mod metrics;

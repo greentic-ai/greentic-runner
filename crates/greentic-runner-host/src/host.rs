@@ -7,9 +7,11 @@ use serde_json::Value;
 
 use crate::activity::Activity;
 use crate::boot;
-use crate::config::HostConfig;
+use crate::config::{Fast2FlowRoutingConfig, HostConfig};
 use crate::engine::host::{SessionHost, StateHost};
 use crate::engine::runtime::IngressEnvelope;
+#[cfg(feature = "greentic-x-provider")]
+use crate::greentic_x_provider::RunnerPackFast2FlowRoutingProvider;
 use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
 use crate::runner::adapt_timer;
@@ -21,6 +23,10 @@ use crate::storage::{
     state_host_from,
 };
 use crate::wasi::RunnerWasiPolicy;
+#[cfg(feature = "greentic-x-provider")]
+use greentic_x_runtime::{Fast2FlowMessageEnvelope, Fast2FlowRouteRequest};
+#[cfg(feature = "greentic-x-provider")]
+use serde::Deserialize;
 
 #[derive(Clone, Debug)]
 pub struct TelemetryCfg {
@@ -158,6 +164,10 @@ impl RunnerHost {
             .active
             .load(tenant)
             .with_context(|| format!("tenant {tenant} not loaded"))?;
+        let activity = apply_fast2flow_routing(&runtime, tenant, activity)?;
+        if activity.action() == Some("response") && activity.flow_id().is_none() {
+            return Ok(vec![activity]);
+        }
         let (pack_id, flow_id) = resolve_flow_id(&runtime, &activity)?;
         let action = activity.action().map(|value| value.to_string());
         let session = activity.session_id().map(|value| value.to_string());
@@ -301,6 +311,172 @@ impl TenantHandle {
     }
 }
 
+fn apply_fast2flow_routing(
+    runtime: &TenantRuntime,
+    tenant: &str,
+    activity: Activity,
+) -> Result<Activity> {
+    let config = &runtime.config().fast2flow;
+    if !config.enabled || activity.flow_id().is_some() {
+        return Ok(activity);
+    }
+    apply_fast2flow_routing_enabled(runtime, tenant, activity, config)
+}
+
+#[cfg(feature = "greentic-x-provider")]
+fn apply_fast2flow_routing_enabled(
+    runtime: &TenantRuntime,
+    tenant: &str,
+    activity: Activity,
+    config: &Fast2FlowRoutingConfig,
+) -> Result<Activity> {
+    let Some(text) = activity.payload().get("text").and_then(Value::as_str) else {
+        return Ok(activity);
+    };
+    if text.trim().is_empty() {
+        return Ok(activity);
+    }
+
+    let mut envelope = Fast2FlowMessageEnvelope::new(text.trim().to_owned());
+    if let Some(channel) = activity.channel() {
+        envelope = envelope.with_channel(channel.to_owned());
+    }
+    if let Some(provider) = activity.provider_id() {
+        envelope = envelope.with_provider(provider.to_owned());
+    }
+    let request = Fast2FlowRouteRequest {
+        scope: config.scope.clone().unwrap_or_else(|| tenant.to_owned()),
+        envelope,
+        session_active: activity.session_id().is_some(),
+        input_locale: "en".to_owned(),
+        time_budget_ms: config.time_budget_ms,
+        registry_path: config.registry_path.clone(),
+        indexes_path: config.indexes_path.clone(),
+        now_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        metadata: Default::default(),
+    };
+    let provider = RunnerPackFast2FlowRoutingProvider::new(runtime.pack())
+        .map_err(|err| anyhow!(err.to_string()))?
+        .with_component_ref(config.component_ref.clone())
+        .with_operation(config.operation.clone())
+        .with_tenant(tenant.to_owned());
+    let route = provider
+        .route_intent_value(request)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    let route: RunnerFast2FlowRouteResult = serde_json::from_value(route)
+        .map_err(|err| anyhow!("failed to decode Fast2Flow route result: {err}"))?;
+
+    match route.directive {
+        RunnerFast2FlowDirective::Continue => Ok(activity),
+        RunnerFast2FlowDirective::Dispatch {
+            target,
+            flow_type,
+            entities,
+        } => apply_fast2flow_target(activity, &target, flow_type, entities),
+        RunnerFast2FlowDirective::Respond { message } => Ok(Activity::custom(
+            "response",
+            serde_json::json!({ "messages": [{ "text": message }] }),
+        )
+        .ensure_tenant(tenant)),
+        RunnerFast2FlowDirective::Deny { reason } => Ok(Activity::custom(
+            "response",
+            serde_json::json!({ "messages": [{ "text": reason }] }),
+        )
+        .ensure_tenant(tenant)),
+    }
+}
+
+#[cfg(feature = "greentic-x-provider")]
+#[derive(Debug, Deserialize)]
+struct RunnerFast2FlowRouteResult {
+    directive: RunnerFast2FlowDirective,
+}
+
+#[cfg(feature = "greentic-x-provider")]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum RunnerFast2FlowDirective {
+    Continue,
+    Dispatch {
+        target: String,
+        #[serde(default)]
+        flow_type: RunnerFast2FlowFlowType,
+        #[serde(default)]
+        entities: Vec<greentic_x_runtime::Fast2FlowRoutingEntity>,
+    },
+    Respond {
+        message: String,
+    },
+    Deny {
+        reason: String,
+    },
+}
+
+#[cfg(feature = "greentic-x-provider")]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RunnerFast2FlowFlowType {
+    #[default]
+    Deterministic,
+    Agentic,
+}
+
+#[cfg(not(feature = "greentic-x-provider"))]
+fn apply_fast2flow_routing_enabled(
+    _runtime: &TenantRuntime,
+    _tenant: &str,
+    _activity: Activity,
+    _config: &Fast2FlowRoutingConfig,
+) -> Result<Activity> {
+    bail!("fast2flow routing requires the greentic-x-provider feature")
+}
+
+#[cfg(feature = "greentic-x-provider")]
+fn apply_fast2flow_target(
+    activity: Activity,
+    target: &str,
+    flow_type: RunnerFast2FlowFlowType,
+    entities: Vec<greentic_x_runtime::Fast2FlowRoutingEntity>,
+) -> Result<Activity> {
+    let target = target.trim();
+    if target.is_empty() {
+        bail!("fast2flow dispatch target is empty");
+    }
+    let activity = match flow_type {
+        RunnerFast2FlowFlowType::Deterministic => activity.with_flow_type("deterministic"),
+        RunnerFast2FlowFlowType::Agentic => activity.with_flow_type("agentic"),
+    };
+    if let Some((pack_id, flow_id)) = target.split_once('/') {
+        if pack_id.trim().is_empty() || flow_id.trim().is_empty() {
+            bail!("fast2flow dispatch target `{target}` must be `pack_id/flow_id` or `flow_id`");
+        }
+        return Ok(attach_fast2flow_entities(
+            activity.with_pack(pack_id.trim()).with_flow(flow_id.trim()),
+            entities,
+        ));
+    }
+    Ok(attach_fast2flow_entities(
+        activity.with_flow(target),
+        entities,
+    ))
+}
+
+#[cfg(feature = "greentic-x-provider")]
+fn attach_fast2flow_entities(
+    activity: Activity,
+    entities: Vec<greentic_x_runtime::Fast2FlowRoutingEntity>,
+) -> Activity {
+    if entities.is_empty() {
+        return activity;
+    }
+    activity.with_payload_field(
+        "fast2flow",
+        serde_json::json!({
+            "entities": entities,
+        }),
+    )
+}
+
 fn resolve_flow_id(runtime: &TenantRuntime, activity: &Activity) -> Result<(String, String)> {
     let engine = runtime.engine();
     if let Some(flow_id) = activity.flow_id() {
@@ -358,4 +534,35 @@ fn is_pack_archive(path: &Path) -> bool {
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.eq_ignore_ascii_case("gtpack"))
         .unwrap_or(false)
+}
+
+#[cfg(all(test, feature = "greentic-x-provider"))]
+mod fast2flow_tests {
+    use greentic_x_runtime::Fast2FlowRoutingEntity;
+
+    use super::*;
+
+    #[test]
+    fn dispatch_target_attaches_flow_type_and_prefill_entities_to_payload() {
+        let activity = Activity::text("show traffic tomorrow");
+        let routed = apply_fast2flow_target(
+            activity,
+            "telco-x/prefix-traffic",
+            RunnerFast2FlowFlowType::Agentic,
+            vec![Fast2FlowRoutingEntity::new("date", "20260611").with_format("iso", "2026-06-11")],
+        )
+        .expect("target should route");
+
+        assert_eq!(routed.pack_id(), Some("telco-x"));
+        assert_eq!(routed.flow_id(), Some("prefix-traffic"));
+        assert_eq!(routed.flow_type(), Some("agentic"));
+        assert_eq!(
+            routed.payload()["fast2flow"]["entities"][0]["normalized"],
+            "20260611"
+        );
+        assert_eq!(
+            routed.payload()["fast2flow"]["entities"][0]["formats"]["iso"],
+            "2026-06-11"
+        );
+    }
 }

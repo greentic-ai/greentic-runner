@@ -111,6 +111,26 @@ impl Activity {
         self
     }
 
+    /// Merge a namespaced field into the activity payload. The only caller is the
+    /// fast2flow dispatch path, so gate the helper to keep default builds free of
+    /// dead-code warnings.
+    #[cfg(feature = "greentic-x-provider")]
+    pub(crate) fn with_payload_field(mut self, key: impl Into<String>, value: Value) -> Self {
+        match &mut self.payload {
+            Value::Object(object) => {
+                object.insert(key.into(), value);
+            }
+            existing => {
+                let original = std::mem::replace(existing, Value::Null);
+                *existing = json!({
+                    key.into(): value,
+                    "value": original,
+                });
+            }
+        }
+        self
+    }
+
     /// Attach a session identifier used for retries/idempotency.
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
