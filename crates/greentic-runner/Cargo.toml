@@ -89,6 +89,13 @@ agentic-worker = [
     "greentic-runner-host/agentic-worker",
     "greentic-runner-desktop/agentic-worker",
 ]
+# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…) via
+# greentic-llm. Passthrough to the host/desktop crates. Opt-in (pulls rig-core);
+# `gtc`/greentic-start must add this to its runner feature list to surface it.
+greentic-llm-backend = [
+    "greentic-runner-host/greentic-llm-backend",
+    "greentic-runner-desktop/greentic-llm-backend",
+]
 
 [dev-dependencies]
 greentic-flow.workspace = true
