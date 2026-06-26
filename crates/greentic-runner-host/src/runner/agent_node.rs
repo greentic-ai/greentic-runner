@@ -483,15 +483,43 @@ mod aw {
                     }
                 }
             }
-            None => {
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Arc::new(RetryingLlmBackend::new(
-                    OpenAiLlmBackend::new(openai_key),
+            None => in_process_llm_backend(),
+        }
+    }
+
+    /// In-process LLM backend when no bridge extension is configured.
+    ///
+    /// With the `greentic-llm-backend` feature and an LLM key present, routes the
+    /// worker's LLM call through greentic-llm so a `dw.agent` can use any provider
+    /// its `AgentConfig.llm` declares (DeepSeek, Anthropic, Gemini, …) — the
+    /// provider + model ride on each request, the key + optional base URL come
+    /// from the env. Otherwise falls back to the legacy env-keyed OpenAI client.
+    /// Shared by every non-bridge construction path so they never drift.
+    pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
+        use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
+        use std::time::Duration;
+
+        #[cfg(feature = "greentic-llm-backend")]
+        {
+            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default();
+            if !api_key.trim().is_empty() {
+                let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+                tracing::info!("AW LLM via in-process greentic-llm (multi-provider)");
+                return Arc::new(RetryingLlmBackend::new(
+                    greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
                     3,
                     Duration::from_millis(250),
-                ))
+                ));
             }
         }
+        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        Arc::new(RetryingLlmBackend::new(
+            OpenAiLlmBackend::new(openai_key),
+            3,
+            Duration::from_millis(250),
+        ))
     }
 
     /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
@@ -544,7 +572,7 @@ mod aw {
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::{
-            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RetryingLlmBackend,
+            ExtensionLlmBackend, LlmBackend, OtelTelemetry, RetryingLlmBackend,
         };
 
         let ext_runtime = build_ext_runtime()?;
@@ -577,14 +605,7 @@ mod aw {
                     Duration::from_millis(250),
                 ))
             }
-            None => {
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Arc::new(RetryingLlmBackend::new(
-                    OpenAiLlmBackend::new(openai_key),
-                    3,
-                    Duration::from_millis(250),
-                ))
-            }
+            None => in_process_llm_backend(),
         };
 
         let agent_count = merged_agents.len();

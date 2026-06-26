@@ -29,6 +29,8 @@ pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
 pub mod llm_extension;
+#[cfg(feature = "greentic-llm-backend")]
+pub mod llm_greentic;
 pub mod llm_openai;
 pub mod long_term;
 pub mod r#loop;
@@ -71,6 +73,8 @@ pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
     BridgeCredential, ExtensionLlmBackend, LlmExtensionInvoker, RuntimeInvoker,
 };
+#[cfg(feature = "greentic-llm-backend")]
+pub use llm_greentic::GreenticLlmBackend;
 pub use llm_openai::OpenAiLlmBackend;
 pub use long_term::{
     EpisodeIngest, EpisodeSource, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
