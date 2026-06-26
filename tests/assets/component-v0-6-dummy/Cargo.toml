@@ -7,9 +7,6 @@ rust-version = "1.91"
 description = "Greentic component component-v0-6-dummy"
 build = "build.rs"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [package.metadata.greentic]
 abi_version = "0.6.0"
 
@@ -18,6 +15,9 @@ package = "greentic:component"
 
 [package.metadata.component.target]
 world = "greentic:component/component@0.6.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 greentic-interfaces-guest = { workspace = true, features = ["component-v0-6"] }

@@ -1560,6 +1560,34 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
+    add_telemetry_logging_stub(linker)?;
+    Ok(())
+}
+
+/// Some generated MCP components import `greentic:telemetry/logging` for guest
+/// instrumentation (it's baked in by the generator's telemetry wiring). The
+/// runner emits its own telemetry via the native pipeline and does not consume
+/// these guest events, so we satisfy the import with no-ops — otherwise such a
+/// component fails to instantiate ("matching implementation was not found in the
+/// linker"). Registered dynamically (`func_new`) so we don't need generated
+/// bindings for the interface; the signature is resolved at instantiation.
+fn add_telemetry_logging_stub(linker: &mut Linker<ComponentState>) -> Result<()> {
+    let mut inst = match linker.instance("greentic:telemetry/logging") {
+        Ok(inst) => inst,
+        // Already defined by another registration path — nothing to do.
+        Err(_) => return Ok(()),
+    };
+    // log: func(lvl: level, message: string, fields: fields)
+    inst.func_new("log", |_store, _ty, _params, _results| Ok(()))?;
+    // span-start: func(name: string, fields: fields) -> u64
+    inst.func_new("span-start", |_store, _ty, _params, results| {
+        if let Some(slot) = results.get_mut(0) {
+            *slot = wasmtime::component::Val::U64(0);
+        }
+        Ok(())
+    })?;
+    // span-end: func(id: u64)
+    inst.func_new("span-end", |_store, _ty, _params, _results| Ok(()))?;
     Ok(())
 }
 

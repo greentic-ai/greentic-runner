@@ -48,11 +48,12 @@ crates/
                              #   ingress adapters, session/state, admin API
   greentic-runner-desktop/   # Desktop CLI integration
   runner-core/               # Pack resolution, signing verification, cache helpers
-  greentic-i18n/             # Compile-time i18n (embedded locale bundles)
   tests/                     # Integration test harness
 ```
 
 The `greentic-runner` crate is the thin entrypoint. Almost all runtime logic lives in `greentic-runner-host`.
+
+i18n is handled inline in runner-host (`crates/greentic-runner-host/src/runner/i18n.rs`), not as a separate workspace crate.
 
 ## Architecture
 
@@ -72,7 +73,7 @@ The `greentic-runner` crate is the thin entrypoint. Almost all runtime logic liv
 ### WASM Component Model
 
 - **Target**: `wasm32-wasip2` (WASI Preview 2, Component Model)
-- **Wasmtime 43** with `component-model` + `cranelift`
+- **Wasmtime 45** with `component-model` + `cranelift`
 - Components export `greentic:component@0.6.0` world
 - Host links: WASI-p2, WASI-HTTP, WASI-TLS, state/session/secrets/telemetry/OAuth helpers
 - Components run on dedicated threads via `tokio::task::block_in_place` to avoid blocking the async runtime
@@ -100,7 +101,7 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 
 ## Conventions
 
-- **Rust 1.94.0**, edition 2024, pinned via `rust-toolchain.toml`
+- **Rust 1.95.0**, edition 2024, pinned via `rust-toolchain.toml`
 - **YAML**: Uses `serde_yaml_gtc` (imported as `serde_yaml_bw`), not `serde_yaml`
 - **Error handling**: `anyhow::Result<T>` with `.context()`; `thiserror` for domain errors
 - **Serialization**: JSON for messages, CBOR for components/caching, YAML for config
