@@ -160,6 +160,49 @@ not resolve.
   `tool_call(tavily_search, {query:…}) → tool_result(<web results>) → reply`
   with a real answer + source URL, instead of the "missing field `query`" error.
 
+## Validation — proven end-to-end via local spike (2026-06-26)
+
+The design was validated with a local `[patch]` spike (siblings at the
+runner-pinned revs + the changes above). After fixing the steps below, the
+`tavily_research_e2e` (DeepSeek + a real Tavily key, `GREENTIC_EXT_ALLOW_UNSIGNED=1`)
+produced the intended trail:
+
+```
+[0] tool_call tavily_search → OK result {"answer":"... Rust Coreutils ... GNU compatibility ..."}
+[1] tool_call tavily_search → OK result {"answer":"In 2025, Rust continues ..."}
+[2] reply: grounded answer citing a real source (Phoronix) — terminated_by: final_reply
+```
+
+A deterministic check (printing `list_tools("greentic.tavily")`) confirmed
+`input_schema_json` is now the full `{query, …, required:["query"]}` schema
+instead of empty.
+
+Spike commits (off the pinned tag revs, for the real PRs):
+- sdk-contract `Tool.input_schema`/`description`: `greentic-designer-sdk` branch
+  `spike/v2-tool-input-schema` (ccbdd58)
+- ext-runtime mapper: `greentic-designer-extensions` branch
+  `spike/v2-tool-input-schema` (c9a073a)
+- tavily `describe.json`: `component-tavily-ext` branch
+  `spike/v2-tool-input-schema` (c652792)
+
+### Two extra gotchas the spike surfaced (must be part of step 3)
+
+1. **`describe.json` is JSON-Schema-validated at load.** The v1.2.25 ext-runtime
+   rejected a **top-level `requiredSecrets`** field
+   (`Additional properties are not allowed ('requiredSecrets' was unexpected)`).
+   Tavily's shipped `describe.json` carries one; it must be dropped (per-tool
+   `secret_requirements` is the operative field) — or the describe meta-schema
+   updated to allow it. Note this means the **describe meta-schema** must also
+   learn about the new `input_schema` / `description` tool fields (the spike's
+   tavily schema passed, so the meta-schema already tolerates additional tool
+   properties — confirm before relying on it).
+2. **Secret permission prefix matching.** The host gate
+   (`HostState::secrets::get`) allows a URI when `uri == allowed ||
+   uri.starts_with("{allowed}/")`. Tavily declared `permissions.secrets:
+   ["secret://tavily/"]` (trailing slash), so the check looked for
+   `secret://tavily//` and **denied** `secret://tavily/api_key`. Use the exact
+   `secret://tavily/api_key` (or `secret://tavily` with no trailing slash).
+
 ## Out of scope
 
 - Reading the schema from the wasm component (the v1 WIT-introspection path) for
