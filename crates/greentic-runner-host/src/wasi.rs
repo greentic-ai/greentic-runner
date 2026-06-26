@@ -65,6 +65,16 @@ impl RunnerWasiPolicy {
         Self::default()
     }
 
+    /// Locked-down WASI policy for identity probes.
+    ///
+    /// No preopens, no env passthrough, no stdio inheritance. This is the
+    /// only reduced-authority boundary that the probe path can enforce today
+    /// (the linker import surface must match the full component; see
+    /// [`crate::pack::register_identity_probe`] doc comment).
+    pub fn probe() -> Self {
+        Self::new().inherit_stdio(false)
+    }
+
     pub fn allow_env(mut self, key: impl Into<String>) -> Self {
         self.env_allow.push(key.into());
         self

@@ -126,6 +126,7 @@ nodes:
     };
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "messaging-conformance".parse()?,
         name: None,

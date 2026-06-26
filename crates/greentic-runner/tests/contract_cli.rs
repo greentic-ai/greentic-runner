@@ -117,6 +117,7 @@ fn write_fixture_artifact(fixture_name: &str, path: &Path) -> Result<()> {
 
 fn build_component_pack_v06(component_path: &Path, pack_path: &Path) -> Result<()> {
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "component.v06".parse()?,
         name: Some("component.v06".into()),

@@ -59,17 +59,17 @@ impl RunnerPackComponentProvider {
         self
     }
 
-    pub fn with_strategy_cache(mut self, cache: Arc<InMemoryComponentCache>) -> Self {
-        self.strategy_cache = cache;
-        self
-    }
-
     fn component_ref(envelope: &ComponentInvocationEnvelope) -> String {
         metadata_string(envelope, "component_ref").unwrap_or_else(|| envelope.component_id.clone())
     }
 
     fn operation(&self, envelope: &ComponentInvocationEnvelope) -> String {
         metadata_string(envelope, "operation").unwrap_or_else(|| self.default_operation.clone())
+    }
+
+    pub fn with_strategy_cache(mut self, cache: Arc<InMemoryComponentCache>) -> Self {
+        self.strategy_cache = cache;
+        self
     }
 
     fn exec_ctx(&self, envelope: &ComponentInvocationEnvelope) -> ComponentExecCtx {
@@ -243,11 +243,11 @@ impl RunnerPackFast2FlowRoutingProvider {
     }
 }
 
-impl RunnerPackFast2FlowRoutingProvider {
-    pub fn route_intent_value(
+impl Fast2FlowRoutingProvider for RunnerPackFast2FlowRoutingProvider {
+    fn route_intent(
         &self,
         request: Fast2FlowRouteRequest,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<Fast2FlowRouteResult, RuntimeError> {
         let scope = request.scope.clone();
         let ctx = self.exec_ctx(&request);
         let input_json = serde_json::to_string(&request).map_err(|err| {
@@ -271,17 +271,6 @@ impl RunnerPackFast2FlowRoutingProvider {
                 message: err.to_string(),
             })?;
 
-        Ok(output)
-    }
-}
-
-impl Fast2FlowRoutingProvider for RunnerPackFast2FlowRoutingProvider {
-    fn route_intent(
-        &self,
-        request: Fast2FlowRouteRequest,
-    ) -> Result<Fast2FlowRouteResult, RuntimeError> {
-        let scope = request.scope.clone();
-        let output = self.route_intent_value(request)?;
         serde_json::from_value(output).map_err(|err| RuntimeError::Fast2FlowRoutingFailed {
             scope,
             message: format!("failed to decode Fast2Flow route result: {err}"),
