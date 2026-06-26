@@ -13,6 +13,9 @@ test-mock = []
 # greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
 # instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
 greentic-llm-backend = ["dep:greentic-llm"]
+# Dev/desktop escape hatch: load unsigned tool extensions (still requires
+# GREENTIC_EXT_ALLOW_UNSIGNED=1 at runtime). Never enable in published builds.
+dev-allow-unsigned = ["greentic-ext-runtime/dev-allow-unsigned"]
 # NATS serve mode (agentic.call out-of-process dispatch). Pulls in the event
 # bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
 # credit-free canned-reply runtime.

@@ -393,12 +393,85 @@ mod aw {
     /// Per-extension failures (bad signature, malformed describe) are logged and
     /// skipped so one broken extension never aborts boot; the watcher still
     /// hot-reloads later changes.
+    /// Resolves an agentic-worker tool extension's `secret://…` reference to an
+    /// environment variable: strip the `secret://` scheme and upper-case every
+    /// run of non-alphanumeric chars to a single `_` — e.g.
+    /// `secret://tavily/api_key` → `TAVILY_API_KEY`. Lets local/desktop runs
+    /// supply tool secrets via the env (the in-process AW path has no broker).
+    struct EnvSecretsBackend;
+
+    impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
+        fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            let name = env_var_name_for_secret(uri);
+            std::env::var(&name)
+                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+        }
+    }
+
+    /// A process-shared blocking HTTP client for tool extensions.
+    ///
+    /// `reqwest::blocking::Client` owns an internal tokio runtime; dropping it
+    /// from within an async context panics ("cannot drop a runtime …"). The
+    /// in-process AW path creates and drops short-lived `ExtensionRuntime`s
+    /// inside the async runner, so we keep ONE client alive for the whole
+    /// process (built off the async runtime) and hand out cheap clones — a
+    /// clone dropped in async context never drops the underlying runtime, which
+    /// is released only at process exit (outside any runtime).
+    fn shared_blocking_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        use std::sync::OnceLock;
+        static CLIENT: OnceLock<Option<greentic_ext_runtime::reqwest::blocking::Client>> =
+            OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                // Build on a plain OS thread so reqwest's internal runtime is
+                // not constructed inside a tokio context.
+                std::thread::spawn(|| {
+                    greentic_ext_runtime::reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .ok()
+                })
+                .join()
+                .ok()
+                .flatten()
+            })
+            .clone()
+    }
+
+    pub(crate) fn env_var_name_for_secret(uri: &str) -> String {
+        let body = uri.strip_prefix("secret://").unwrap_or(uri);
+        let mut out = String::with_capacity(body.len());
+        let mut prev_underscore = false;
+        for ch in body.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_uppercase());
+                prev_underscore = false;
+            } else if !prev_underscore {
+                out.push('_');
+                prev_underscore = true;
+            }
+        }
+        out.trim_matches('_').to_string()
+    }
+
     pub(crate) fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
-        use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig, discovery};
+        use greentic_ext_runtime::{
+            DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
+        };
 
         let root = extension_discovery_dir();
         let paths = DiscoveryPaths::new(root.clone());
-        let mut runtime = match ExtensionRuntime::new(RuntimeConfig::from_paths(paths)) {
+        // Wire an env-resolved secrets backend and an HTTP client so tool
+        // extensions can read their declared `secret://…` references and reach
+        // their upstreams. `HostOverrides::default()` leaves both empty, which
+        // silently breaks any AW tool that needs either (e.g. tavily_search).
+        let overrides = HostOverrides {
+            secrets_backend: Arc::new(EnvSecretsBackend),
+            http_client: shared_blocking_http_client(),
+            ..HostOverrides::default()
+        };
+        let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
+        let mut runtime = match ExtensionRuntime::new(config) {
             Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");

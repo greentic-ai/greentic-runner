@@ -274,9 +274,12 @@ mod tests {
         let pack_path = temp.path().join("tavily-research.gtpack");
         build_research_pack(&pack_path).expect("build research pack");
 
+        // The question defaults to a stable factual one (deterministic), but can
+        // be overridden via E2E_QUESTION to exercise a live tavily_search.
+        let question = std::env::var("E2E_QUESTION").unwrap_or_else(|_| QUESTION.to_string());
         let opts = RunOptions {
             entry_flow: Some(FLOW_ID.to_string()),
-            input: json!({ "text": QUESTION }),
+            input: json!({ "text": question }),
             ..desktop_defaults()
         };
 
