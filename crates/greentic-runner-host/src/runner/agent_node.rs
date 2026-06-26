@@ -393,12 +393,85 @@ mod aw {
     /// Per-extension failures (bad signature, malformed describe) are logged and
     /// skipped so one broken extension never aborts boot; the watcher still
     /// hot-reloads later changes.
+    /// Resolves an agentic-worker tool extension's `secret://…` reference to an
+    /// environment variable: strip the `secret://` scheme and upper-case every
+    /// run of non-alphanumeric chars to a single `_` — e.g.
+    /// `secret://tavily/api_key` → `TAVILY_API_KEY`. Lets local/desktop runs
+    /// supply tool secrets via the env (the in-process AW path has no broker).
+    struct EnvSecretsBackend;
+
+    impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
+        fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            let name = env_var_name_for_secret(uri);
+            std::env::var(&name)
+                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+        }
+    }
+
+    /// A process-shared blocking HTTP client for tool extensions.
+    ///
+    /// `reqwest::blocking::Client` owns an internal tokio runtime; dropping it
+    /// from within an async context panics ("cannot drop a runtime …"). The
+    /// in-process AW path creates and drops short-lived `ExtensionRuntime`s
+    /// inside the async runner, so we keep ONE client alive for the whole
+    /// process (built off the async runtime) and hand out cheap clones — a
+    /// clone dropped in async context never drops the underlying runtime, which
+    /// is released only at process exit (outside any runtime).
+    fn shared_blocking_http_client() -> Option<greentic_ext_runtime::reqwest::blocking::Client> {
+        use std::sync::OnceLock;
+        static CLIENT: OnceLock<Option<greentic_ext_runtime::reqwest::blocking::Client>> =
+            OnceLock::new();
+        CLIENT
+            .get_or_init(|| {
+                // Build on a plain OS thread so reqwest's internal runtime is
+                // not constructed inside a tokio context.
+                std::thread::spawn(|| {
+                    greentic_ext_runtime::reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()
+                        .ok()
+                })
+                .join()
+                .ok()
+                .flatten()
+            })
+            .clone()
+    }
+
+    pub(crate) fn env_var_name_for_secret(uri: &str) -> String {
+        let body = uri.strip_prefix("secret://").unwrap_or(uri);
+        let mut out = String::with_capacity(body.len());
+        let mut prev_underscore = false;
+        for ch in body.chars() {
+            if ch.is_ascii_alphanumeric() {
+                out.push(ch.to_ascii_uppercase());
+                prev_underscore = false;
+            } else if !prev_underscore {
+                out.push('_');
+                prev_underscore = true;
+            }
+        }
+        out.trim_matches('_').to_string()
+    }
+
     pub(crate) fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
-        use greentic_ext_runtime::{DiscoveryPaths, ExtensionRuntime, RuntimeConfig, discovery};
+        use greentic_ext_runtime::{
+            DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
+        };
 
         let root = extension_discovery_dir();
         let paths = DiscoveryPaths::new(root.clone());
-        let mut runtime = match ExtensionRuntime::new(RuntimeConfig::from_paths(paths)) {
+        // Wire an env-resolved secrets backend and an HTTP client so tool
+        // extensions can read their declared `secret://…` references and reach
+        // their upstreams. `HostOverrides::default()` leaves both empty, which
+        // silently breaks any AW tool that needs either (e.g. tavily_search).
+        let overrides = HostOverrides {
+            secrets_backend: Arc::new(EnvSecretsBackend),
+            http_client: shared_blocking_http_client(),
+            ..HostOverrides::default()
+        };
+        let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
+        let mut runtime = match ExtensionRuntime::new(config) {
             Ok(runtime) => runtime,
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");
@@ -483,15 +556,43 @@ mod aw {
                     }
                 }
             }
-            None => {
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Arc::new(RetryingLlmBackend::new(
-                    OpenAiLlmBackend::new(openai_key),
+            None => in_process_llm_backend(),
+        }
+    }
+
+    /// In-process LLM backend when no bridge extension is configured.
+    ///
+    /// With the `greentic-llm-backend` feature and an LLM key present, routes the
+    /// worker's LLM call through greentic-llm so a `dw.agent` can use any provider
+    /// its `AgentConfig.llm` declares (DeepSeek, Anthropic, Gemini, …) — the
+    /// provider + model ride on each request, the key + optional base URL come
+    /// from the env. Otherwise falls back to the legacy env-keyed OpenAI client.
+    /// Shared by every non-bridge construction path so they never drift.
+    pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
+        use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
+        use std::time::Duration;
+
+        #[cfg(feature = "greentic-llm-backend")]
+        {
+            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default();
+            if !api_key.trim().is_empty() {
+                let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+                tracing::info!("AW LLM via in-process greentic-llm (multi-provider)");
+                return Arc::new(RetryingLlmBackend::new(
+                    greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
                     3,
                     Duration::from_millis(250),
-                ))
+                ));
             }
         }
+        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        Arc::new(RetryingLlmBackend::new(
+            OpenAiLlmBackend::new(openai_key),
+            3,
+            Duration::from_millis(250),
+        ))
     }
 
     /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
@@ -544,7 +645,7 @@ mod aw {
         use greentic_aw_runtime::ManifestToolOverlayProvider;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
         use greentic_aw_runtime::{
-            ExtensionLlmBackend, LlmBackend, OpenAiLlmBackend, OtelTelemetry, RetryingLlmBackend,
+            ExtensionLlmBackend, LlmBackend, OtelTelemetry, RetryingLlmBackend,
         };
 
         let ext_runtime = build_ext_runtime()?;
@@ -577,14 +678,7 @@ mod aw {
                     Duration::from_millis(250),
                 ))
             }
-            None => {
-                let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Arc::new(RetryingLlmBackend::new(
-                    OpenAiLlmBackend::new(openai_key),
-                    3,
-                    Duration::from_millis(250),
-                ))
-            }
+            None => in_process_llm_backend(),
         };
 
         let agent_count = merged_agents.len();

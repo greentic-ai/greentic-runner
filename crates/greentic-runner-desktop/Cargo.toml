@@ -12,6 +12,8 @@ default = ["agentic-worker"]
 # Propagates the agentic-worker feature to the host shim.
 # Keep out of published defaults when greentic-aw-runtime is not on crates.io.
 agentic-worker = ["greentic-runner-host/agentic-worker"]
+# Multi-provider in-process LLM backend (DeepSeek/Anthropic/…) via greentic-llm.
+greentic-llm-backend = ["agentic-worker", "greentic-runner-host/greentic-llm-backend"]
 # Enables the ephemeral (in-memory) agent state store for desktop/local runs.
 # Activates test-mock types from greentic-aw-runtime; must NOT be in `default`
 # so the server build (agentic-worker only) never compiles the mocks.

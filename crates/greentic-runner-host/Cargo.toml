@@ -21,10 +21,13 @@ component-v0-6-introspection = []
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
+# routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
+greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
 # Adds the ephemeral (in-memory) agent builder for desktop/local runs.
 # Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
 # in the server binary — the server always uses the Redis path.
-desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock"]
+desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock", "greentic-aw-runtime?/dev-allow-unsigned"]
 # Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
 # memory backend into the agentic worker. Heavy (pulls the Chronicle graph
 # engine); off by default. The operator supplies Neo4j + the LLM and embedding

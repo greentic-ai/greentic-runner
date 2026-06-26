@@ -9,6 +9,13 @@ publish     = false
 [features]
 default   = []
 test-mock = []
+# Multi-provider in-process LLM backend: routes the worker's LLM call through
+# greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
+# instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
+greentic-llm-backend = ["dep:greentic-llm"]
+# Dev/desktop escape hatch: load unsigned tool extensions (still requires
+# GREENTIC_EXT_ALLOW_UNSIGNED=1 at runtime). Never enable in published builds.
+dev-allow-unsigned = ["greentic-ext-runtime/dev-allow-unsigned"]
 # NATS serve mode (agentic.call out-of-process dispatch). Pulls in the event
 # bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
 # credit-free canned-reply runtime.
@@ -42,6 +49,9 @@ greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", 
 greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
 greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.25-research" }
 greentic-extension-sdk-contract = "=1.2.11-research"
+# Multi-provider LLM door (rig-core under the hood). Optional — see the
+# `greentic-llm-backend` feature.
+greentic-llm = { git = "https://github.com/greenticai/greentic-llm", tag = "v1.2.6-research", optional = true }
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
