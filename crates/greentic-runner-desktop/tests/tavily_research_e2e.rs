@@ -76,6 +76,16 @@ mod tests {
     /// tavily-research-demo/agents/tavily_researcher.json (provider swapped to
     /// deepseek to match the test's LLM key).
     fn agent_blob() -> Value {
+        agent_blob_with_cred(None)
+    }
+
+    /// The research agent, optionally carrying an `llm.credential_ref` so the
+    /// runner resolves the LLM key from the secrets store instead of the env.
+    fn agent_blob_with_cred(credential_ref: Option<&str>) -> Value {
+        let mut llm = json!({ "provider": "deepseek", "model": "deepseek-chat" });
+        if let Some(cref) = credential_ref {
+            llm["credential_ref"] = json!(cref);
+        }
         json!({
             "agent_id": AGENT_ID,
             "system_prompt": "You are a research assistant. When the user asks about facts \
@@ -88,12 +98,16 @@ mod tests {
                 { "extension_id": "greentic.tavily", "tool_name": "tavily_extract" }
             ],
             "guardrails": [],
-            "llm": { "provider": "deepseek", "model": "deepseek-chat" },
+            "llm": llm,
             "limits": {}
         })
     }
 
     fn build_research_pack(pack_path: &Path) -> Result<()> {
+        build_research_pack_with_agent(pack_path, agent_blob())
+    }
+
+    fn build_research_pack_with_agent(pack_path: &Path, agent: Value) -> Result<()> {
         let node = json!({
             "component": "dw.agent",
             "operation": AGENT_ID,
@@ -123,7 +137,7 @@ mod tests {
         );
 
         let mut agents: BTreeMap<String, Value> = BTreeMap::new();
-        agents.insert(AGENT_ID.to_string(), agent_blob());
+        agents.insert(AGENT_ID.to_string(), agent);
 
         let manifest = PackManifest {
             schema_version: "1.0".into(),
@@ -496,6 +510,150 @@ mod tests {
         assert!(
             !reply.to_ascii_lowercase().contains("something went wrong"),
             "the agent must produce a real answer with the store-resolved Tavily key"
+        );
+    }
+
+    /// A secrets store that serves BOTH the LLM credential (any `…/llm/deepseek`
+    /// scope, the agent's `credential_ref`) and the Tavily key (any
+    /// `…/tavily/api_key` scope), and `NotFound` otherwise. Stands in for the dev
+    /// store `gtc setup` populates: neither key is reachable via the environment.
+    struct StoreOnlyLlmAndTavilySecrets {
+        llm_key: String,
+        tavily_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for StoreOnlyLlmAndTavilySecrets {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            if path.ends_with("/llm/deepseek") {
+                Ok(self.llm_key.clone().into_bytes())
+            } else if path.ends_with("/tavily/api_key") {
+                Ok(self.tavily_key.clone().into_bytes())
+            } else {
+                Err(greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// FULL zero-env proof: BOTH the LLM key (via the agent's `credential_ref`)
+    /// and the Tavily tool key are resolved ONLY from the injected secrets store,
+    /// with `GREENTIC_LLM_API_KEY`, `OPENAI_API_KEY`, and `TAVILY_API_KEY` all
+    /// removed from the environment. A non-fallback answer with a source URL
+    /// proves the in-process LLM backend authenticated with the store-resolved
+    /// key and `tavily_search` ran with the store-resolved key.
+    ///
+    /// Live — SKIPS unless `ZEROENV_LLM_KEY` and `ZEROENV_TAVILY_KEY` are present.
+    ///   ZEROENV_LLM_KEY=<deepseek> ZEROENV_TAVILY_KEY=<tvly-…> \
+    ///   cargo test -p greentic-runner-desktop \
+    ///     --features desktop-agent-ephemeral,greentic-llm-backend \
+    ///     full_zero_env_llm_and_tavily_from_store -- --nocapture
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn full_zero_env_llm_and_tavily_from_store() {
+        use std::sync::Arc;
+
+        // Test-only carriers — deliberately NOT the env names the runner falls
+        // back to (`GREENTIC_LLM_API_KEY`, `TAVILY_API_KEY`), so a pass cannot be
+        // a silent env fallback.
+        let llm_key = std::env::var("ZEROENV_LLM_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let tavily_key = std::env::var("ZEROENV_TAVILY_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let (Some(llm_key), Some(tavily_key)) = (llm_key, tavily_key) else {
+            eprintln!(
+                "SKIP: set ZEROENV_LLM_KEY + ZEROENV_TAVILY_KEY (NOT the *_API_KEY env names) \
+                 to run this full zero-env e2e."
+            );
+            return;
+        };
+
+        let ext_root = TempDir::new().expect("ext tempdir");
+        let tavily_installed =
+            install_tavily_extension(ext_root.path()).expect("install tavily ext");
+        assert!(tavily_installed, "this test requires the tavily gtxpack");
+
+        // SAFETY: #[serial] guarantees no concurrent env mutation in this suite.
+        unsafe {
+            std::env::remove_var("GREENTIC_AW_REDIS_URL");
+            // No bridge extension — exercise the in-process LLM path's store
+            // credential resolution.
+            std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+            // The whole point: NEITHER key may be reachable via env.
+            std::env::remove_var("GREENTIC_LLM_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("TAVILY_API_KEY");
+            std::env::set_var("GREENTIC_EXTENSIONS_DIR", ext_root.path());
+            // Provider/model still ride on the request; only the KEY is zero-env.
+            std::env::set_var("GREENTIC_LLM_PROVIDER", "deepseek");
+            std::env::set_var("GREENTIC_LLM_MODEL", "deepseek-chat");
+        }
+
+        let temp = TempDir::new().expect("pack tempdir");
+        let pack_path = temp.path().join("tavily-research.gtpack");
+        // Agent declares credential_ref "deepseek" → runner resolves
+        // `secrets://default/{tenant}/_/llm/deepseek` from the store.
+        build_research_pack_with_agent(&pack_path, agent_blob_with_cred(Some("deepseek")))
+            .expect("build research pack");
+
+        let secrets: Arc<dyn greentic_secrets_lib::SecretsManager> =
+            Arc::new(StoreOnlyLlmAndTavilySecrets {
+                llm_key,
+                tavily_key,
+            });
+
+        let question = std::env::var("E2E_QUESTION").unwrap_or_else(|_| {
+            "What is the latest stable Rust version? Answer in one sentence and cite the \
+             source URL."
+                .to_string()
+        });
+        let opts = RunOptions {
+            entry_flow: Some(FLOW_ID.to_string()),
+            input: json!({ "text": question }),
+            secrets_manager: Some(secrets),
+            ..desktop_defaults()
+        };
+
+        let result =
+            run_pack_with_options(&pack_path, opts).expect("run_pack_with_options should be Ok");
+
+        eprintln!(
+            "FULL ZERO-ENV: llm_env_unset={} tavily_env_unset={} status={:?} nodes={:?} error={:?}",
+            std::env::var("GREENTIC_LLM_API_KEY").is_err(),
+            std::env::var("TAVILY_API_KEY").is_err(),
+            result.status,
+            result
+                .node_summaries
+                .iter()
+                .map(|n| (n.node_id.as_str(), &n.status))
+                .collect::<Vec<_>>(),
+            result.error,
+        );
+
+        assert_eq!(
+            result.status,
+            RunStatus::Success,
+            "full zero-env run did not succeed; error={:?}",
+            result.error
+        );
+        let reply = reply_from_transcript(&result.artifacts_dir)
+            .expect("a successful run must carry an agent reply");
+        eprintln!(
+            "\n===== FULL ZERO-ENV AGENT REPLY (LLM + Tavily keys from store) =====\n{reply}\n\
+             ===================================================================="
+        );
+        assert!(
+            !reply.to_ascii_lowercase().contains("something went wrong"),
+            "with both keys store-resolved the agent must produce a real answer, \
+             got the runtime fallback message"
         );
     }
 }

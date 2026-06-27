@@ -645,17 +645,41 @@ mod aw {
     /// from the env. Otherwise falls back to the legacy env-keyed OpenAI client.
     /// Shared by every non-bridge construction path so they never drift.
     pub(crate) fn in_process_llm_backend() -> Arc<dyn greentic_aw_runtime::LlmBackend> {
+        in_process_llm_backend_with_key(None)
+    }
+
+    /// In-process LLM backend, optionally given a store-resolved API key.
+    ///
+    /// `override_key` (resolved from an agent's `credential_ref` via the
+    /// per-tenant secrets store) takes precedence over the env key when present —
+    /// this is what makes the in-process desktop LLM path zero-env. When `None`,
+    /// the key comes from `GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY` exactly as
+    /// before, so env-based and bridge-less runs are unaffected.
+    pub(crate) fn in_process_llm_backend_with_key(
+        override_key: Option<String>,
+    ) -> Arc<dyn greentic_aw_runtime::LlmBackend> {
         use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
         use std::time::Duration;
 
+        let store_resolved = override_key
+            .as_ref()
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false);
+
         #[cfg(feature = "greentic-llm-backend")]
         {
-            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
-                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+            let api_key = override_key
+                .clone()
+                .filter(|key| !key.trim().is_empty())
+                .or_else(|| std::env::var("GREENTIC_LLM_API_KEY").ok())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                 .unwrap_or_default();
             if !api_key.trim().is_empty() {
                 let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
-                tracing::info!("AW LLM via in-process greentic-llm (multi-provider)");
+                tracing::info!(
+                    store_resolved,
+                    "AW LLM via in-process greentic-llm (multi-provider)"
+                );
                 return Arc::new(RetryingLlmBackend::new(
                     greentic_aw_runtime::GreenticLlmBackend::new(api_key, base_url),
                     3,
@@ -663,12 +687,40 @@ mod aw {
                 ));
             }
         }
-        let openai_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+        let openai_key = override_key
+            .filter(|key| !key.trim().is_empty())
+            .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            .unwrap_or_default();
         Arc::new(RetryingLlmBackend::new(
             OpenAiLlmBackend::new(openai_key),
             3,
             Duration::from_millis(250),
         ))
+    }
+
+    /// Resolve an LLM API key from the per-tenant secrets store via the first
+    /// agent that declares `llm.credential_ref`, mirroring the credential URI
+    /// `secrets://default/{tenant}/_/llm/{credential_ref}` that
+    /// [`greentic_aw_runtime::llm_credential::SecretsBackedCredentialResolver`]
+    /// reads. This lets the in-process LLM backend be zero-env (key from store)
+    /// when no `GREENTIC_LLM_API_KEY` env is set.
+    ///
+    /// Returns `None` when no agent declares a credential_ref or the read misses.
+    /// The in-process backend carries a single key, so when agents declare
+    /// different credential_refs only the first is used — matching the existing
+    /// one-key in-process model; the bridge-extension path resolves per-request.
+    async fn resolve_in_process_llm_key(
+        secrets: &crate::secrets::DynSecretsManager,
+        tenant: &str,
+        merged_agents: &HashMap<String, AgentConfig>,
+    ) -> Option<String> {
+        let credential_ref = merged_agents
+            .values()
+            .find_map(|agent| agent.llm.credential_ref.clone())?;
+        let uri = format!("secrets://default/{tenant}/_/llm/{credential_ref}");
+        let bytes = secrets.read(&uri).await.ok()?;
+        let key = String::from_utf8(bytes).ok()?.trim().to_string();
+        if key.is_empty() { None } else { Some(key) }
     }
 
     /// Build a vault-style `BridgeCredential` from resolved parts. `None` when no
@@ -760,7 +812,33 @@ mod aw {
                     Duration::from_millis(250),
                 ))
             }
-            None => in_process_llm_backend(),
+            None => {
+                // Zero-env LLM: with no bridge extension and no env key, resolve
+                // the agent's `credential_ref` from the per-tenant store (the same
+                // manager whose candidate fallback bridges the gtc-setup scope).
+                // An env key still wins (legacy single-provider runs unaffected).
+                let env_key_present = std::env::var("GREENTIC_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("OPENAI_API_KEY")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                    })
+                    .is_some();
+                let store_key = if env_key_present {
+                    None
+                } else {
+                    resolve_in_process_llm_key(&secrets, &tenant, &merged_agents).await
+                };
+                if store_key.is_some() {
+                    tracing::info!(
+                        tenant = %tenant,
+                        "AW LLM key resolved from store via credential_ref (zero-env)"
+                    );
+                }
+                in_process_llm_backend_with_key(store_key)
+            }
         };
 
         let agent_count = merged_agents.len();
