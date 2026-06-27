@@ -362,4 +362,140 @@ mod tests {
             );
         }
     }
+
+    /// A secrets store that returns the Tavily key for any canonical
+    /// `…/tavily/api_key` scope and `NotFound` otherwise. Stands in for the dev
+    /// store `gtc setup` populates: the agent's tool secret is resolved from
+    /// here, never from the process environment.
+    struct StoreOnlyTavilySecrets {
+        tavily_key: String,
+    }
+
+    #[async_trait::async_trait]
+    impl greentic_secrets_lib::SecretsManager for StoreOnlyTavilySecrets {
+        async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            if path.ends_with("/tavily/api_key") {
+                Ok(self.tavily_key.clone().into_bytes())
+            } else {
+                Err(greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Zero-env tool-secret proof: the Tavily API key lives ONLY in the injected
+    /// secrets store (no `TAVILY_API_KEY` in the environment). The agent's
+    /// `tavily_search` tool must still resolve its `secret://tavily/api_key`
+    /// reference through `StoreToolSecretsBackend` and search the live web.
+    ///
+    /// Live — SKIPS unless an LLM key and `ZEROENV_TAVILY_KEY` are present.
+    ///   GREENTIC_LLM_API_KEY=<deepseek> ZEROENV_TAVILY_KEY=<tvly-…> \
+    ///   cargo test -p greentic-runner-desktop \
+    ///     --features desktop-agent-ephemeral,greentic-llm-backend \
+    ///     tavily_tool_secret_resolves_from_store_zero_env -- --nocapture
+    #[test]
+    #[serial_test::serial]
+    #[allow(unsafe_code)]
+    fn tavily_tool_secret_resolves_from_store_zero_env() {
+        use std::sync::Arc;
+
+        let llm_key = std::env::var("GREENTIC_LLM_API_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        // Test-only carrier for the Tavily key — deliberately NOT `TAVILY_API_KEY`
+        // (the env name the agent would fall back to), so a passing run proves the
+        // key came from the store.
+        let tavily_key = std::env::var("ZEROENV_TAVILY_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let (Some(llm_key), Some(tavily_key)) = (llm_key, tavily_key) else {
+            eprintln!(
+                "SKIP: set GREENTIC_LLM_API_KEY + ZEROENV_TAVILY_KEY (NOT TAVILY_API_KEY) \
+                 to run this zero-env tool-secret e2e."
+            );
+            return;
+        };
+
+        let ext_root = TempDir::new().expect("ext tempdir");
+        let tavily_installed =
+            install_tavily_extension(ext_root.path()).expect("install tavily ext");
+        assert!(
+            tavily_installed,
+            "this test requires the tavily gtxpack to be present"
+        );
+
+        // SAFETY: #[serial] guarantees no concurrent env mutation in this suite.
+        unsafe {
+            std::env::remove_var("GREENTIC_AW_REDIS_URL");
+            // The whole point: the Tavily key must NOT be reachable via env.
+            std::env::remove_var("TAVILY_API_KEY");
+            std::env::set_var("GREENTIC_EXTENSIONS_DIR", ext_root.path());
+            std::env::set_var("GREENTIC_LLM_API_KEY", &llm_key);
+            if std::env::var("GREENTIC_LLM_PROVIDER").is_err() {
+                std::env::set_var("GREENTIC_LLM_PROVIDER", "deepseek");
+            }
+            if std::env::var("GREENTIC_LLM_MODEL").is_err() {
+                std::env::set_var("GREENTIC_LLM_MODEL", "deepseek-chat");
+            }
+        }
+
+        let temp = TempDir::new().expect("pack tempdir");
+        let pack_path = temp.path().join("tavily-research.gtpack");
+        build_research_pack(&pack_path).expect("build research pack");
+
+        // The Tavily key is reachable ONLY through this injected store.
+        let secrets: Arc<dyn greentic_secrets_lib::SecretsManager> =
+            Arc::new(StoreOnlyTavilySecrets { tavily_key });
+
+        // A question that forces a live web search (Tavily), so success implies
+        // the store-resolved key actually authenticated the tool call.
+        let question = std::env::var("E2E_QUESTION").unwrap_or_else(|_| {
+            "Using web search, what is today's date according to a news source? \
+             Cite the source URL."
+                .to_string()
+        });
+        let opts = RunOptions {
+            entry_flow: Some(FLOW_ID.to_string()),
+            input: json!({ "text": question }),
+            secrets_manager: Some(secrets),
+            ..desktop_defaults()
+        };
+
+        let result =
+            run_pack_with_options(&pack_path, opts).expect("run_pack_with_options should be Ok");
+
+        eprintln!(
+            "ZERO-ENV tavily: TAVILY_API_KEY_unset={} status={:?} nodes={:?} error={:?}",
+            std::env::var("TAVILY_API_KEY").is_err(),
+            result.status,
+            result
+                .node_summaries
+                .iter()
+                .map(|n| (n.node_id.as_str(), &n.status))
+                .collect::<Vec<_>>(),
+            result.error,
+        );
+
+        assert_eq!(
+            result.status,
+            RunStatus::Success,
+            "zero-env run did not succeed; error={:?}",
+            result.error
+        );
+        let reply = reply_from_transcript(&result.artifacts_dir)
+            .expect("a successful run must carry an agent reply");
+        eprintln!(
+            "\n===== ZERO-ENV AGENT REPLY (Tavily key from store, not env) =====\n{reply}\n\
+             ================================================================"
+        );
+        assert!(
+            !reply.to_ascii_lowercase().contains("something went wrong"),
+            "the agent must produce a real answer with the store-resolved Tavily key"
+        );
+    }
 }
