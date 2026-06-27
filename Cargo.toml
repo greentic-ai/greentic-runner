@@ -246,7 +246,7 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.11-research" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.15-research" }
 # greentic-mcp-exec's `list_tools` (used by the local-wasm MCP transport) is not
 # yet on a published dev build; redirect onto the greentic-mcp branch commit that
 # carries it until it is published to crates.io (mirrors the greentic-types patch

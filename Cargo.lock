@@ -531,7 +531,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "tokio",
@@ -1426,7 +1426,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7aaa59787a7627e40b16e4d630c48cec94b6afd5ce5bcda6d1ccacf9ac0a2f6e"
 dependencies = [
  "greentic-interfaces-guest",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "qa-spec",
  "serde",
  "serde_cbor",
@@ -1439,7 +1439,7 @@ name = "component-v0-6-dummy"
 version = "0.1.0"
 dependencies = [
  "greentic-interfaces-guest",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "wit-bindgen 0.55.0",
@@ -3152,7 +3152,7 @@ dependencies = [
  "greentic-secrets-lib",
  "greentic-state",
  "greentic-telemetry",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "redis 1.2.4",
  "reqwest 0.12.28",
  "secrecy",
@@ -3194,7 +3194,7 @@ dependencies = [
  "camino",
  "directories",
  "greentic-config-types",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "once_cell",
  "serde",
  "serde_json",
@@ -3210,7 +3210,7 @@ version = "1.2.0-research.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ba264e2adc221a86937720ef086e108b9fe2908e2795439003be7a18300d3aa"
 dependencies = [
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "toml 1.1.2+spec-1.1.0",
@@ -3232,7 +3232,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-interfaces-guest",
  "greentic-secrets-lib",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "hex",
  "oci-distribution",
  "reqwest 0.13.4",
@@ -3252,7 +3252,7 @@ name = "greentic-dw-embedding"
 version = "1.2.0-research"
 source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#b29a7a6ca306ac9ec3be7d2345b4bce7aff4a097"
 dependencies = [
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3264,7 +3264,7 @@ version = "1.2.0-research"
 source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#b29a7a6ca306ac9ec3be7d2345b4bce7aff4a097"
 dependencies = [
  "greentic-dw-embedding",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -3278,7 +3278,7 @@ source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=res
 dependencies = [
  "async-trait",
  "greentic-dw-providers-common",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3296,7 +3296,7 @@ dependencies = [
  "greentic-dw-embedding",
  "greentic-dw-knowledge",
  "greentic-dw-llm",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3310,7 +3310,7 @@ version = "1.2.0-research"
 source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#b29a7a6ca306ac9ec3be7d2345b4bce7aff4a097"
 dependencies = [
  "greentic-cap-types",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3323,7 +3323,7 @@ source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=res
 dependencies = [
  "greentic-dw-llm",
  "greentic-dw-providers-common",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -3333,7 +3333,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#550eb4b6e71bda820f5ea28875871c7814a269e5"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -3360,7 +3360,7 @@ dependencies = [
  "greentic-dw-embedding",
  "greentic-dw-llm",
  "greentic-dw-memory-long-term",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3375,7 +3375,7 @@ source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=res
 dependencies = [
  "async-trait",
  "chrono",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -3383,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#550eb4b6e71bda820f5ea28875871c7814a269e5"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3402,7 +3402,7 @@ dependencies = [
  "greentic-interfaces",
  "greentic-pack-lib",
  "greentic-state",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "semver",
  "serde",
  "thiserror 2.0.18",
@@ -3411,7 +3411,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#550eb4b6e71bda820f5ea28875871c7814a269e5"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -3423,13 +3423,13 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "1.2.24"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?tag=v1.2.25-research#bd6beaa2cbc7ef97badd772c3aea12f62c93ecb4"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=50ce911f161f3d0d2488f4f455cd55cdbf69de05#50ce911f161f3d0d2488f4f455cd55cdbf69de05"
 dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
  "greentic-extension-sdk-contract",
- "greentic-types 0.5.3",
+ "greentic-types",
  "notify",
  "notify-debouncer-full",
  "reqwest 0.12.28",
@@ -3447,14 +3447,14 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.2.11-research"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.11-research#e5d7c9ec5897e4f8af202c5792026c9b450bdd8f"
+version = "1.2.15-research"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.15-research#91dca888c6ab7e8c57637b2ac2018b7814efe4e0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
- "greentic-types 0.5.3",
+ "greentic-types",
  "jsonschema 0.30.0",
  "semver",
  "serde",
@@ -3482,7 +3482,7 @@ dependencies = [
  "greentic-interfaces-host",
  "greentic-interfaces-wasmtime",
  "greentic-qa-lib",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "handlebars",
  "include_dir",
  "indexmap 2.14.0",
@@ -3528,7 +3528,7 @@ checksum = "a27e76f5a7de66ed4d85de1b6cf50ed751f62d3572012d30f2e6281e9989f7b0"
 dependencies = [
  "anyhow",
  "constant_time_eq 0.4.2",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "semver",
  "thiserror 2.0.18",
  "time",
@@ -3545,7 +3545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1261678c9dd741547e3130781038a02be79454b4a1983f55a2b7bf57fc1f1c17"
 dependencies = [
  "greentic-interfaces",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "wit-bindgen 0.57.1",
  "wit-bindgen-core 0.57.1",
  "wit-bindgen-rust 0.57.1",
@@ -3558,7 +3558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "60e302c2f69f0344f441c55de3bab4b527abdb134229cf51fccb1b0e56d07516"
 dependencies = [
  "greentic-interfaces",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "wasmtime",
@@ -3620,7 +3620,7 @@ dependencies = [
  "cap-std 4.0.2",
  "clap",
  "greentic-interfaces-wasmtime",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "hex",
  "reqwest 0.13.4",
  "rustls",
@@ -3651,7 +3651,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "greentic-flow",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "hex",
  "indexmap 2.14.0",
  "pkcs8",
@@ -3704,7 +3704,7 @@ dependencies = [
  "greentic-runner-desktop",
  "greentic-runner-host",
  "greentic-state",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "humantime",
  "indexmap 2.14.0",
  "insta",
@@ -3739,7 +3739,7 @@ dependencies = [
  "greentic-pack-lib",
  "greentic-runner-host",
  "greentic-secrets-lib",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "once_cell",
  "parking_lot",
  "runner-core",
@@ -3799,7 +3799,7 @@ dependencies = [
  "greentic-session",
  "greentic-state",
  "greentic-telemetry",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "handlebars",
  "hex",
  "hmac 0.13.0",
@@ -3852,7 +3852,7 @@ dependencies = [
  "greentic-config-types",
  "greentic-flow",
  "greentic-runner-host",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "jsonschema 0.45.1",
  "once_cell",
  "parking_lot",
@@ -3889,7 +3889,7 @@ dependencies = [
  "greentic-secrets-api",
  "greentic-secrets-provider-dev",
  "greentic-secrets-spec",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "hkdf 0.13.0",
  "lru 0.17.0",
  "once_cell",
@@ -3916,7 +3916,7 @@ dependencies = [
  "greentic-secrets-core",
  "greentic-secrets-provider-dev",
  "greentic-secrets-spec",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
 ]
 
 [[package]]
@@ -3943,7 +3943,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0709fb9caa60bb6a1df7a83f3816a3212ab2a6a8e0d43479de450d5469a624ea"
 dependencies = [
  "async-trait",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3956,7 +3956,7 @@ version = "1.2.0-research.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbe0f0aa6a0c4eff3a1bb626c81c4704284a3cd68050d093353db9e1a5d4748d"
 dependencies = [
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "hex",
  "parking_lot",
  "redis 1.2.4",
@@ -3973,7 +3973,7 @@ checksum = "ebdea684e7c12ca1c07037c1f16f1beb08609051bd42c2412cad3f805877bc2b"
 dependencies = [
  "dashmap",
  "greentic-interfaces",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "parking_lot",
  "redis 1.2.4",
  "serde",
@@ -4004,29 +4004,6 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "greentic-types"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20d524811eebe7fc0c12078b960771be4aed9a1b10f55f80cd6b3e79549c0260"
-dependencies = [
- "anyhow",
- "blake3",
- "chrono",
- "ciborium",
- "constant_time_eq 0.4.2",
- "fnv",
- "indexmap 2.14.0",
- "semver",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_with",
- "sha2 0.11.0",
- "thiserror 2.0.18",
- "unic-langid",
 ]
 
 [[package]]
@@ -6527,7 +6504,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.11.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -8942,7 +8919,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "futures-util",
- "greentic-types 1.2.0-research.1",
+ "greentic-types",
  "serde",
  "serde_json",
  "tokio",
@@ -10590,7 +10567,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

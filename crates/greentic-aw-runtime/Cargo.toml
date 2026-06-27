@@ -47,8 +47,8 @@ greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", 
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
 greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", tag = "v1.2.25-research" }
-greentic-extension-sdk-contract = "=1.2.11-research"
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "50ce911f161f3d0d2488f4f455cd55cdbf69de05" }
+greentic-extension-sdk-contract = "=1.2.15-research"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
 greentic-llm = { git = "https://github.com/greenticai/greentic-llm", tag = "v1.2.6-research", optional = true }
