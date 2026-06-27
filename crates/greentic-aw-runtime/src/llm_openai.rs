@@ -499,7 +499,7 @@ fn build_tool_call_record(call_id: String, name: &str, raw_args: &str) -> ToolCa
 /// 400 (`tools[..].function.name` invalid). We escape dots to `_DOT_` and join
 /// with `_FN_`, both of which round-trip exactly via [`split_tool_name`]. An
 /// empty extension id encodes to the bare tool name (legacy "no dot" case).
-pub(crate) fn encode_tool_name(extension_id: &str, tool_name: &str) -> String {
+pub fn encode_tool_name(extension_id: &str, tool_name: &str) -> String {
     if extension_id.is_empty() {
         return tool_name.to_string();
     }
@@ -509,7 +509,7 @@ pub(crate) fn encode_tool_name(extension_id: &str, tool_name: &str) -> String {
 /// Inverse of [`encode_tool_name`]: split an LLM-emitted function name back into
 /// `(extension_id, tool_name)`, restoring escaped dots. No separator → the whole
 /// string is the tool name with an empty extension id.
-pub(crate) fn split_tool_name(name: &str) -> (String, String) {
+pub fn split_tool_name(name: &str) -> (String, String) {
     match name.split_once("_FN_") {
         Some((ext, tool)) => (ext.replace("_DOT_", "."), tool.to_string()),
         None => (String::new(), name.to_string()),

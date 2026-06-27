@@ -75,7 +75,7 @@ pub use llm_extension::{
 };
 #[cfg(feature = "greentic-llm-backend")]
 pub use llm_greentic::GreenticLlmBackend;
-pub use llm_openai::OpenAiLlmBackend;
+pub use llm_openai::{OpenAiLlmBackend, encode_tool_name, split_tool_name};
 pub use long_term::{
     EpisodeIngest, EpisodeSource, IngestOutcome, LongTermMemory, LongTermMemoryError, RecallQuery,
     RecalledFact,
