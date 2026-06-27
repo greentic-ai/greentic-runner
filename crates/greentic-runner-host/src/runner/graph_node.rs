@@ -347,7 +347,11 @@ mod aw {
         let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
         let ledger = Arc::new(RedisToolLedger::new(manager));
 
-        let ext_runtime = super::super::agent_node::build_ext_runtime()?;
+        // Process-level graph serve path has no per-tenant secrets context;
+        // tool secrets resolve from the env only.
+        let ext_runtime = super::super::agent_node::build_ext_runtime(std::sync::Arc::new(
+            super::super::agent_node::EnvSecretsBackend,
+        ))?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
         let telemetry = Arc::new(OtelTelemetry);
 

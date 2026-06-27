@@ -398,10 +398,82 @@ mod aw {
     /// run of non-alphanumeric chars to a single `_` — e.g.
     /// `secret://tavily/api_key` → `TAVILY_API_KEY`. Lets local/desktop runs
     /// supply tool secrets via the env (the in-process AW path has no broker).
-    struct EnvSecretsBackend;
+    pub(crate) struct EnvSecretsBackend;
 
     impl greentic_ext_runtime::SecretsBackend for EnvSecretsBackend {
         fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            let name = env_var_name_for_secret(uri);
+            std::env::var(&name)
+                .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
+        }
+    }
+
+    /// Tool-secret backend that resolves an extension's `secret://<provider>/<key>`
+    /// reference from the per-tenant secrets store first, then falls back to the
+    /// process env. This is what makes `gtc start` zero-env: `gtc setup` persists
+    /// the value in the dev store, and the injected secrets manager's read-side
+    /// candidate fallback bridges the canonical `secrets://{env}/{tenant}/_/{provider}/{key}`
+    /// scope to the pack-namespaced scope setup actually wrote. The env fallback
+    /// preserves existing `TAVILY_API_KEY`-style runs.
+    struct StoreToolSecretsBackend {
+        secrets: crate::secrets::DynSecretsManager,
+        tenant: String,
+        env: String,
+    }
+
+    impl StoreToolSecretsBackend {
+        fn new(secrets: crate::secrets::DynSecretsManager, tenant: String) -> Self {
+            let env = std::env::var("GREENTIC_ENV")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "dev".to_string());
+            Self {
+                secrets,
+                tenant,
+                env,
+            }
+        }
+
+        /// Map `secret://<provider>/<key>` to the canonical store URI
+        /// `secrets://{env}/{tenant}/_/{provider}/{key}`. The injected manager's
+        /// candidate fallback handles the env/team/pack-namespace bridging.
+        fn canonical_store_uri(&self, uri: &str) -> Option<String> {
+            let body = uri.strip_prefix("secret://").unwrap_or(uri);
+            let (provider, key) = body.split_once('/')?;
+            if provider.is_empty() || key.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "secrets://{}/{}/_/{}/{}",
+                self.env, self.tenant, provider, key
+            ))
+        }
+    }
+
+    impl greentic_ext_runtime::SecretsBackend for StoreToolSecretsBackend {
+        fn get(&self, uri: &str) -> Result<String, greentic_ext_runtime::SecretsError> {
+            if let Some(store_uri) = self.canonical_store_uri(uri) {
+                // Read off a dedicated thread with its own current-thread runtime:
+                // the extension runtime may invoke this from within the async
+                // runner, where a nested `block_on` would panic.
+                let secrets = self.secrets.clone();
+                let resolved = std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .ok()?;
+                    runtime.block_on(async move { secrets.read(&store_uri).await.ok() })
+                })
+                .join()
+                .ok()
+                .flatten();
+                if let Some(bytes) = resolved
+                    && let Ok(value) = String::from_utf8(bytes)
+                {
+                    return Ok(value);
+                }
+            }
+            // Fallback: env var (preserves pre-store behaviour).
             let name = env_var_name_for_secret(uri);
             std::env::var(&name)
                 .map_err(|_| greentic_ext_runtime::SecretsError::NotFound(uri.to_string()))
@@ -454,19 +526,23 @@ mod aw {
         out.trim_matches('_').to_string()
     }
 
-    pub(crate) fn build_ext_runtime() -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
+    pub(crate) fn build_ext_runtime(
+        secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
+    ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
             DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
         };
 
         let root = extension_discovery_dir();
         let paths = DiscoveryPaths::new(root.clone());
-        // Wire an env-resolved secrets backend and an HTTP client so tool
+        // Wire the provided secrets backend and an HTTP client so tool
         // extensions can read their declared `secret://…` references and reach
         // their upstreams. `HostOverrides::default()` leaves both empty, which
         // silently breaks any AW tool that needs either (e.g. tavily_search).
+        // The per-tenant path passes a store-backed backend (zero-env); the
+        // process-level serve paths pass the env-only backend.
         let overrides = HostOverrides {
-            secrets_backend: Arc::new(EnvSecretsBackend),
+            secrets_backend,
             http_client: shared_blocking_http_client(),
             ..HostOverrides::default()
         };
@@ -648,7 +724,13 @@ mod aw {
             ExtensionLlmBackend, LlmBackend, OtelTelemetry, RetryingLlmBackend,
         };
 
-        let ext_runtime = build_ext_runtime()?;
+        // Per-tenant path: tool secrets resolve from the store first (zero-env),
+        // env as fallback. `secrets` is the injected per-tenant manager whose
+        // candidate fallback bridges the gtc-setup dev-store scope.
+        let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
+            StoreToolSecretsBackend::new(secrets.clone(), tenant.clone()),
+        );
+        let ext_runtime = build_ext_runtime(secrets_backend)?;
 
         // When the LLM bridge extension is configured, resolve credentials
         // per-tenant from the secrets broker rather than from global env vars.
@@ -868,7 +950,9 @@ mod aw {
         let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
         let ledger = Arc::new(RedisToolLedger::new(manager));
 
-        let ext_runtime = build_ext_runtime()?;
+        // Process-level serve path has no per-tenant secrets context, so tool
+        // secrets resolve from the env only.
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend))?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -1552,6 +1636,73 @@ mod aw {
             );
         }
 
+        /// In-memory `SecretsManager` for backend tests: returns seeded values,
+        /// `NotFound` otherwise.
+        struct MapSecrets(std::collections::HashMap<String, Vec<u8>>);
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for MapSecrets {
+            async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                self.0
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+            }
+            async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn store_tool_secret_backend_maps_secret_uri_to_store_scope() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let mut map = std::collections::HashMap::new();
+            // The injected manager resolves the canonical store scope (in real
+            // runs its candidate fallback bridges to the pack scope; here we seed
+            // the canonical path the backend constructs directly).
+            map.insert(
+                "secrets://dev/acme/_/tavily/api_key".to_string(),
+                b"tvly-xyz".to_vec(),
+            );
+            let secrets: crate::secrets::DynSecretsManager = Arc::new(MapSecrets(map));
+            let backend = super::StoreToolSecretsBackend {
+                secrets,
+                tenant: "acme".to_string(),
+                env: "dev".to_string(),
+            };
+            let got = backend
+                .get("secret://tavily/api_key")
+                .expect("resolve tavily key from store");
+            assert_eq!(got, "tvly-xyz");
+        }
+
+        #[test]
+        #[allow(unsafe_code)]
+        fn store_tool_secret_backend_falls_back_to_env_on_store_miss() {
+            use greentic_ext_runtime::SecretsBackend as _;
+            let secrets: crate::secrets::DynSecretsManager =
+                Arc::new(MapSecrets(std::collections::HashMap::new()));
+            let backend = super::StoreToolSecretsBackend {
+                secrets,
+                tenant: "acme".to_string(),
+                env: "dev".to_string(),
+            };
+            // SAFETY: single-threaded test; no concurrent env mutation.
+            unsafe {
+                std::env::set_var("ZEROENV_MYPROVIDER_MYKEY", "from-env");
+            }
+            let got = backend
+                .get("secret://zeroenv_myprovider/mykey")
+                .expect("env fallback resolves");
+            assert_eq!(got, "from-env");
+            unsafe {
+                std::env::remove_var("ZEROENV_MYPROVIDER_MYKEY");
+            }
+        }
+
         #[test]
         #[allow(unsafe_code)]
         fn load_process_agent_configs_reads_full_configs_and_skips_bad_files() {
@@ -1744,4 +1895,4 @@ pub use aw::{
 pub use aw::build_agent_node_handler_ephemeral;
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{build_ext_runtime, build_llm_backend};
+pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend};
