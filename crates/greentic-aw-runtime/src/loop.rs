@@ -1,6 +1,7 @@
 //! Plan-Act-Observe agent loop. Spec §5.3.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tracing::warn;
@@ -12,6 +13,47 @@ use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
 use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
 use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver};
+
+/// Agents already warned about unavailable tools, so the loud preflight warning
+/// fires once per agent per process (the loop resolves tools every iteration —
+/// we must not warn on each one).
+static PREFLIGHT_WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+/// Emit one loud, actionable warning when an agent declares tools that will not
+/// reach the LLM. No-op when nothing is missing; deduplicated per agent.
+///
+/// Without this the runtime drops unresolved tools silently and the agent runs
+/// with a reduced — or empty — tool set, then fabricates tool results.
+fn preflight_warn_tools(agent_id: &str, missing: &[crate::tools::MissingTool], declared: usize) {
+    if missing.is_empty() {
+        return;
+    }
+    let mut seen = PREFLIGHT_WARNED
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.insert(agent_id.to_string()) {
+        return;
+    }
+    let details = missing
+        .iter()
+        .map(|m| format!("    - {}/{}: {}", m.extension_id, m.tool_name, m.reason))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = format!(
+        "agentic worker tools unavailable — the agent will hallucinate tool results \
+         until fixed:\n{details}\n  fix: install the extension as a signed pack (with \
+         manifest.json) from the store, or run a dev-allow-unsigned runner with \
+         GREENTIC_EXT_ALLOW_UNSIGNED=1"
+    );
+    warn!(
+        agent = %agent_id,
+        missing = missing.len(),
+        declared,
+        "{}",
+        message
+    );
+}
 
 pub async fn run_step(
     runtime: &AgentRuntime,
@@ -187,6 +229,21 @@ pub async fn run_step(
         Some(src) => Some(src.catalog(&tenant).await),
         None => None,
     };
+
+    // Preflight: surface declared tools that won't reach the LLM. Without this
+    // the runtime drops unresolved tools silently (per-tool debug warns) and the
+    // agent runs with a smaller — or empty — tool set, then hallucinates tool
+    // results. Warn loudly, once per agent per process, with the reason + fix.
+    preflight_warn_tools(
+        &config.agent_id,
+        &crate::tools::missing_tools(
+            &runtime.ext_runtime,
+            mcp_catalog.as_deref(),
+            component_catalog.as_deref(),
+            &config.tools,
+        ),
+        config.tools.len(),
+    );
 
     let mut total_tokens: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
