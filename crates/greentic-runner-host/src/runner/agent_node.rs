@@ -1089,6 +1089,17 @@ mod aw {
         let base = base.with_short_term_memory(Arc::new(
             greentic_aw_runtime::memory::InMemoryMemoryProvider::new(),
         ));
+        // Billing metering: install the HTTP sink when both env vars are set;
+        // fall back to the built-in no-op (billing disabled) otherwise.
+        // Ship-dark: no-op until GREENTIC_BILLING_BASE_URL +
+        // GREENTIC_BILLING_SERVICE_SECRET are configured by the operator.
+        let base =
+            if let Some(http_meter) = greentic_aw_runtime::billing::HttpBillingMeter::from_env() {
+                tracing::info!("billing metering enabled for digital-worker LLM usage");
+                base.with_billing_meter(std::sync::Arc::new(http_meter))
+            } else {
+                base
+            };
         // Optionally attach an operator-configured native long-term memory
         // backend. With the `long-term-chronicle` feature off (default) this is
         // a no-op and `base` is wrapped unchanged.

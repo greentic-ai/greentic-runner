@@ -13,6 +13,7 @@
 #![deny(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+pub mod billing;
 pub mod component_source;
 pub mod config;
 pub mod config_provider;
@@ -143,6 +144,7 @@ pub struct AgentRuntime {
     pub(crate) llm: Arc<dyn LlmBackend>,
     pub(crate) telemetry: Arc<dyn Telemetry>,
     pub(crate) token_meter: Arc<dyn TokenMeter>,
+    pub(crate) billing_meter: Arc<dyn crate::billing::BillingMeter>,
     pub(crate) ledger: Arc<dyn ToolLedger>,
     /// Per-tenant agentic-worker MCP tool source. `None` disables MCP tools
     /// entirely (`mcp:`-prefixed tool refs then resolve to nothing). The real
@@ -201,6 +203,7 @@ impl AgentRuntime {
             llm,
             telemetry,
             token_meter,
+            billing_meter: Arc::new(crate::billing::NoopBillingMeter),
             ledger,
             mcp,
             guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
@@ -224,6 +227,17 @@ impl AgentRuntime {
     ) -> Self {
         self.guardrail_policy = policy;
         self.guardrail_evaluator = evaluator;
+        self
+    }
+
+    /// Install a billing sink. Defaults to [`crate::billing::NoopBillingMeter`]
+    /// (no-op, billing disabled); the host calls this when
+    /// `GREENTIC_BILLING_BASE_URL` and `GREENTIC_BILLING_SERVICE_SECRET` are
+    /// configured. The setter is intentionally separate from [`AgentRuntime::new`]
+    /// so the constructor signature remains stable across all consumers.
+    #[must_use]
+    pub fn with_billing_meter(mut self, meter: Arc<dyn crate::billing::BillingMeter>) -> Self {
+        self.billing_meter = meter;
         self
     }
 

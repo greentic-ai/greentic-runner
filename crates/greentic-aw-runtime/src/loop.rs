@@ -256,6 +256,19 @@ pub async fn run_step(
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
+        // Fire-and-forget billing emit: never blocks the agent step.
+        if let Err(e) = runtime
+            .billing_meter
+            .emit(
+                &tenant,
+                u64::from(response.tokens_in),
+                u64::from(response.tokens_out),
+                agent_id,
+            )
+            .await
+        {
+            warn!(error = %e, "billing meter emit failed; continuing");
+        }
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
