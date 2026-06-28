@@ -122,6 +122,78 @@ pub fn list_tools_for_llm(
     out
 }
 
+/// A tool an agent declared that will NOT be visible to the LLM, with a
+/// human-readable reason. Produced by [`missing_tools`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingTool {
+    pub extension_id: String,
+    pub tool_name: String,
+    pub reason: String,
+}
+
+/// Preflight check: of the `allowed` tools an agent declares, return those that
+/// cannot be resolved to a live LLM schema, each with a reason.
+///
+/// This mirrors the resolution logic in [`list_tools_for_llm`] exactly, but
+/// reports failures instead of dropping them silently. Callers use it to warn
+/// the operator at startup — otherwise an agent whose tools all failed to load
+/// runs with an empty tool set and hallucinates tool results.
+pub fn missing_tools(
+    ext_runtime: &ExtensionRuntime,
+    mcp: Option<&McpToolCatalog>,
+    components: Option<&ComponentToolCatalog>,
+    allowed: &[ToolRef],
+) -> Vec<MissingTool> {
+    let mut missing = Vec::new();
+    for t in allowed {
+        if let Some(server_id) = t.extension_id.strip_prefix("mcp:") {
+            if mcp
+                .and_then(|c| c.tool_entry(server_id, &t.tool_name))
+                .is_none()
+            {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "MCP tool not found in the tenant catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(component_ref) = t.extension_id.strip_prefix("component:") {
+            if components
+                .and_then(|c| c.tool_entry(component_ref, &t.tool_name))
+                .is_none()
+            {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "component tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        match ext_runtime.list_tools(&t.extension_id) {
+            Ok(defs) => {
+                if !defs.iter().any(|d| d.name == t.tool_name) {
+                    missing.push(MissingTool {
+                        extension_id: t.extension_id.clone(),
+                        tool_name: t.tool_name.clone(),
+                        reason: "extension loaded but does not expose this tool".to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: format!("extension failed to load: {e}"),
+                });
+            }
+        }
+    }
+    missing
+}
+
 /// Dispatch a single tool call. Wraps the blocking `invoke_tool` in
 /// `tokio::task::spawn_blocking` so the async executor thread is never
 /// stalled. Returns the tool result as a JSON Value.
@@ -357,6 +429,44 @@ mod tests {
         }];
         let schemas = list_tools_for_llm(&rt, None, None, &allowed);
         assert!(schemas.is_empty());
+    }
+
+    #[test]
+    fn missing_tools_reports_unloaded_extension() {
+        // No extensions loaded → the declared tool cannot resolve and is
+        // reported as missing with a load-failure reason (instead of being
+        // dropped silently, which is what causes hallucinated tool results).
+        let rt = ExtensionRuntime::for_test();
+        let allowed = vec![ToolRef {
+            extension_id: "greentic.hubspot".into(),
+            tool_name: "hubspot_contacts".into(),
+        }];
+        let missing = missing_tools(&rt, None, None, &allowed);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].extension_id, "greentic.hubspot");
+        assert_eq!(missing[0].tool_name, "hubspot_contacts");
+        assert!(
+            missing[0].reason.contains("failed to load"),
+            "got: {}",
+            missing[0].reason
+        );
+    }
+
+    #[test]
+    fn missing_tools_reports_mcp_tool_absent_from_catalog() {
+        let rt = ExtensionRuntime::for_test();
+        let allowed = vec![ToolRef {
+            extension_id: "mcp:github".into(),
+            tool_name: "create_issue".into(),
+        }];
+        // No catalog provided → the mcp tool is unresolvable.
+        let missing = missing_tools(&rt, None, None, &allowed);
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0].reason.contains("MCP tool not found"),
+            "got: {}",
+            missing[0].reason
+        );
     }
 
     use std::collections::HashMap;
