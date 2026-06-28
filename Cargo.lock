@@ -3333,7 +3333,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#e39abe8d287eb9feda572d84873df6915073fa6c"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -3383,7 +3383,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#e39abe8d287eb9feda572d84873df6915073fa6c"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3411,7 +3411,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0-dev.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#b172a0c9b07d6eb95edb3555996aed5a2bef6772"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#e39abe8d287eb9feda572d84873df6915073fa6c"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -3423,7 +3423,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "1.2.24"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=50ce911f161f3d0d2488f4f455cd55cdbf69de05#50ce911f161f3d0d2488f4f455cd55cdbf69de05"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=c47a0738be662844faab9c16da7ce85d9bb4af97#c47a0738be662844faab9c16da7ce85d9bb4af97"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3447,8 +3447,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.2.15-research"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.15-research#91dca888c6ab7e8c57637b2ac2018b7814efe4e0"
+version = "1.2.19-research"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.2.19-research#8e43c6852d273c2188aab6340ab8fa339c63e135"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
