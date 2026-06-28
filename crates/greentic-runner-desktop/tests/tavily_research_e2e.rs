@@ -391,7 +391,9 @@ mod tests {
             if path.ends_with("/tavily/api_key") {
                 Ok(self.tavily_key.clone().into_bytes())
             } else {
-                Err(greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+                Err(greentic_secrets_lib::SecretError::NotFound(
+                    path.to_string(),
+                ))
             }
         }
         async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
@@ -530,7 +532,9 @@ mod tests {
             } else if path.ends_with("/tavily/api_key") {
                 Ok(self.tavily_key.clone().into_bytes())
             } else {
-                Err(greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+                Err(greentic_secrets_lib::SecretError::NotFound(
+                    path.to_string(),
+                ))
             }
         }
         async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
