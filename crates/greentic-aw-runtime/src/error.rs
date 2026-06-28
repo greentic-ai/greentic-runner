@@ -29,6 +29,9 @@ pub enum AgentError {
     #[error("daily token budget exceeded")]
     TokenBudgetExceeded,
 
+    #[error("credit budget exceeded")]
+    CreditBudgetExceeded,
+
     #[error("session lock could not be acquired within wait window")]
     LockTimeout,
 
@@ -67,6 +70,9 @@ impl AgentError {
                 }),
             Self::TokenBudgetExceeded => "Daily usage limit reached. \
                  Please try again tomorrow or contact your administrator."
+                .to_string(),
+            Self::CreditBudgetExceeded => "Your account has no remaining credits. \
+                 Please top up your balance or contact your administrator."
                 .to_string(),
             Self::Timeout => {
                 "I'm taking longer than expected — please try a simpler request.".to_string()

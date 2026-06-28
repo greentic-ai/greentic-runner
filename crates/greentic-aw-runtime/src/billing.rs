@@ -6,12 +6,17 @@
 //! `GREENTIC_BILLING_SERVICE_SECRET` in the environment; the runner host calls
 //! [`HttpBillingMeter::from_env`] and installs it via
 //! [`crate::AgentRuntime::with_billing_meter`].
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::tenant::TenantContext;
+
+const BUDGET_TTL: Duration = Duration::from_secs(30);
 
 /// Errors the billing sink can return.
 ///
@@ -30,6 +35,12 @@ pub enum BillingError {
 /// possible and never block the agent step on the billing outcome. The
 /// [`HttpBillingMeter`] achieves this by spawning the HTTP POST and returning
 /// `Ok(())` immediately.
+///
+/// `over_budget` is a synchronous pre-call gate: it returns `true` ONLY when
+/// cloud-commerce definitively reports `available <= 0`. Any error, timeout, or
+/// parse failure must return `false` (fail-open) so a billing outage never
+/// halts real work. Implementations should cache the result per tenant with a
+/// short TTL to avoid a round-trip on every LLM call.
 pub trait BillingMeter: Send + Sync {
     fn emit<'a>(
         &'a self,
@@ -38,6 +49,17 @@ pub trait BillingMeter: Send + Sync {
         output_tokens: u64,
         agent_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>>;
+
+    fn over_budget<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
+}
+
+/// Returns `true` only when cloud-commerce DEFINITIVELY reports no credits.
+/// Pure helper so it can be unit-tested without HTTP.
+pub(crate) fn decide_over_budget(available: i64) -> bool {
+    available <= 0
 }
 
 /// Default: drop everything — billing disabled. Used when
@@ -53,6 +75,13 @@ impl BillingMeter for NoopBillingMeter {
         _agent_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn over_budget<'a>(
+        &'a self,
+        _tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(std::future::ready(false))
     }
 }
 
@@ -131,10 +160,16 @@ pub(crate) fn build_worker_batch(
 /// Fire-and-forget: the POST is spawned on a new Tokio task so `emit` returns
 /// `Ok(())` immediately and never adds latency or blocks the agent step on a
 /// billing outcome. Transport errors are logged at `WARN` level and swallowed.
+///
+/// `over_budget` performs a synchronous GET to `/v1/tenants/{id}/wallet` and
+/// caches the result per tenant for [`BUDGET_TTL`]. Any error returns `false`
+/// (fail-open). The same HTTP client (5s timeout) bounds blocking time.
 pub struct HttpBillingMeter {
     base_url: String,
     bearer: String,
     http: reqwest::Client,
+    /// Per-tenant TTL cache: tenant_id → (checked_at, is_over_budget).
+    over_budget_cache: Mutex<HashMap<String, (Instant, bool)>>,
 }
 
 impl HttpBillingMeter {
@@ -157,7 +192,26 @@ impl HttpBillingMeter {
             base_url: base_url.trim_end_matches('/').to_string(),
             bearer,
             http,
+            over_budget_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// GET `{base}/v1/tenants/{tenant_id}/wallet` and parse the `available`
+    /// field (string) to i64. Returns `None` on any error (fail-open).
+    async fn fetch_available(&self, tenant_id: &str) -> Option<i64> {
+        let url = format!("{}/v1/tenants/{tenant_id}/wallet", self.base_url);
+        let res = self
+            .http
+            .get(&url)
+            .header("x-greentic-service-auth", format!("Bearer {}", self.bearer))
+            .send()
+            .await
+            .ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = res.json().await.ok()?;
+        v.get("available")?.as_str()?.parse::<i64>().ok()
     }
 }
 
@@ -209,6 +263,36 @@ impl BillingMeter for HttpBillingMeter {
         // Return immediately — the agent step is never blocked on billing.
         Box::pin(async { Ok(()) })
     }
+
+    fn over_budget<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+    ) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            let tenant_id = &tenant.tenant_id;
+
+            // Check cache first; guard dropped before any await point.
+            {
+                if let Ok(guard) = self.over_budget_cache.lock()
+                    && let Some(&(at, over)) = guard.get(tenant_id.as_str())
+                    && at.elapsed() < BUDGET_TTL
+                {
+                    return over;
+                }
+            }
+
+            // Fetch wallet balance; fail-open on any error.
+            let over = match self.fetch_available(tenant_id).await {
+                Some(available) => decide_over_budget(available),
+                None => false,
+            };
+
+            if let Ok(mut guard) = self.over_budget_cache.lock() {
+                guard.insert(tenant_id.clone(), (Instant::now(), over));
+            }
+            over
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +310,30 @@ mod tests {
         let m = NoopBillingMeter;
         let t = TenantContext::new("acme", "prod");
         assert!(m.emit(&t, 10, 5, "agent-1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn noop_over_budget_is_always_false() {
+        let m = NoopBillingMeter;
+        let t = TenantContext::new("acme", "prod");
+        assert!(!m.over_budget(&t).await);
+    }
+
+    #[test]
+    fn decide_over_budget_positive_is_false() {
+        assert!(!decide_over_budget(1));
+        assert!(!decide_over_budget(100));
+    }
+
+    #[test]
+    fn decide_over_budget_zero_is_true() {
+        assert!(decide_over_budget(0));
+    }
+
+    #[test]
+    fn decide_over_budget_negative_is_true() {
+        assert!(decide_over_budget(-1));
+        assert!(decide_over_budget(-999));
     }
 
     #[test]
