@@ -35,6 +35,11 @@ pub async fn run_step(
         }
     }
 
+    // --- Credit balance gate (Slice D2): fail-open on billing unavailability ---
+    if runtime.billing_meter.over_budget(&tenant).await {
+        return Err(AgentError::CreditBudgetExceeded);
+    }
+
     // --- Acquire distributed lock (default wait 5s) ---
     let lock = runtime
         .state_store
