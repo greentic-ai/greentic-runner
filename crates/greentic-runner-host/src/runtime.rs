@@ -251,14 +251,47 @@ impl TenantRuntime {
                 crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
             }
 
-            if let Some(handler) = crate::runner::agent_node::build_agent_node_handler(
-                merged_agents,
-                config.tenant.clone(),
-                Arc::clone(&secrets_manager),
-                pack_runtimes.clone(),
-            )
-            .await
-            {
+            // DwAgent state-store selection. With GREENTIC_AW_REDIS_URL set, use the
+            // Redis-backed stores (production multi-process default). Without it, when
+            // built with `desktop-agent-ephemeral`, fall back to the process-global
+            // in-memory stores so a single-process runner (e.g. the designer's
+            // loopback test-chat sidecar) runs agentic-worker turns with NO external
+            // infra. Otherwise DwAgent nodes stay disabled — unchanged server
+            // behaviour (build_agent_node_handler returns None when Redis is unset).
+            let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let agent_handler = if redis_set {
+                crate::runner::agent_node::build_agent_node_handler(
+                    merged_agents,
+                    config.tenant.clone(),
+                    Arc::clone(&secrets_manager),
+                    pack_runtimes.clone(),
+                )
+                .await
+            } else {
+                #[cfg(feature = "desktop-agent-ephemeral")]
+                {
+                    crate::runner::agent_node::build_agent_node_handler_ephemeral(
+                        merged_agents,
+                        config.tenant.clone(),
+                        Arc::clone(&secrets_manager),
+                        pack_runtimes.clone(),
+                    )
+                    .await
+                }
+                #[cfg(not(feature = "desktop-agent-ephemeral"))]
+                {
+                    crate::runner::agent_node::build_agent_node_handler(
+                        merged_agents,
+                        config.tenant.clone(),
+                        Arc::clone(&secrets_manager),
+                        pack_runtimes.clone(),
+                    )
+                    .await
+                }
+            };
+            if let Some(handler) = agent_handler {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
             }
