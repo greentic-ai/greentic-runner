@@ -88,6 +88,11 @@ legacy-gen-bindings = []
 knowledge-chronicle = ["greentic-runner-host/knowledge-chronicle"]
 # Long-term episodic memory tier (same Chronicle stack, separate capability).
 long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
+# No-infra agentic-worker state: process-global in-memory stores when
+# GREENTIC_AW_REDIS_URL is unset, so a single-process runner runs dw.agent turns
+# without Redis. For local/sidecar use (e.g. the designer's loopback test-chat
+# runner sidecar) — NOT production deploys (use the Redis-backed stores). Off by default.
+desktop-agent-ephemeral = ["greentic-runner-host/desktop-agent-ephemeral"]
 # Gates DwAgent (agentic-worker) nodes and their unpublishable runtime deps.
 # Enabled by default for local workspace builds; excluded from published
 # defaults because greentic-aw-runtime is not on crates.io.
