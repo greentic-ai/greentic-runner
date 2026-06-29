@@ -246,6 +246,13 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
+# greentic-types' ComponentOperation.description (carried by component_invoker +
+# the knowledge tier) is not yet published to crates.io; redirect onto the rev
+# that adds it (greenticai/greentic-types feat/component-operation-description,
+# same version 1.2.0-research.1 so all `1.2.0-research.1` pins in the graph stay
+# satisfied — no consumer-graph version cascade). Drop this once the field is
+# published. Mirrors the greentic-mcp-exec / sdk-contract patches below.
+greentic-types = { git = "https://github.com/greenticai/greentic-types.git", rev = "3ef1de73c9222700c981dd562d92a88b8615635e" }
 greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.11-research" }
 # greentic-mcp-exec's `list_tools` (used by the local-wasm MCP transport) is not
 # yet on a published dev build; redirect onto the greentic-mcp branch commit that
