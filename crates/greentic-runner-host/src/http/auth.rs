@@ -133,6 +133,7 @@ mod tests {
                 health: Arc::new(HealthState::new()),
                 reload: None,
                 admin,
+                host: crate::host::RunnerHost::for_test(),
                 sql: crate::sql::SqlGateway::new(std::collections::HashMap::new(), String::new()),
             },
         }

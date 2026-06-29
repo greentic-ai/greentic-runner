@@ -515,6 +515,7 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         host.health_state(),
         Some(reload_handle),
         admin.clone(),
+        Arc::clone(&host),
     )?;
 
     tokio::select! {
