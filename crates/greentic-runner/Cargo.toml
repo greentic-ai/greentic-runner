@@ -82,6 +82,12 @@ session-redis = ["greentic-runner-host/session-redis"]
 component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
+# Operator-configured Chronicle document-RAG (knowledge tier). Off by default
+# (pulls cross-org git deps + a native RocksDB build); enable for a knowledge
+# build: `--features knowledge-chronicle`.
+knowledge-chronicle = ["greentic-runner-host/knowledge-chronicle"]
+# Long-term episodic memory tier (same Chronicle stack, separate capability).
+long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
 # Gates DwAgent (agentic-worker) nodes and their unpublishable runtime deps.
 # Enabled by default for local workspace builds; excluded from published
 # defaults because greentic-aw-runtime is not on crates.io.
