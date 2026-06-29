@@ -63,6 +63,9 @@ impl HostServer {
     /// Like [`HostServer::new`] but wires an optional [`SqlGateway`] into the
     /// server state.  When `sql_gateway` is `None` the server uses an empty
     /// gateway that returns 404/401 for all `/sql` routes — safe by default.
+    // Builder param set mirrors the existing fields plus `host`; a config-struct
+    // refactor is deferred. See B0 plan.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_sql(
         port: u16,
         active: Arc<ActivePacks>,

@@ -110,7 +110,7 @@ async fn execute_chat(
             let msg = format!("{e:#}");
             // handle_activity returns "tenant <name> not loaded" when the tenant
             // isn't present in ActivePacks. Surface that as 404.
-            let (code, error) = if msg.contains("not loaded") || msg.contains("not registered") {
+            let (code, error) = if msg.contains("not loaded") {
                 (StatusCode::NOT_FOUND, "tenant_not_loaded")
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, "agent_chat_failed")
