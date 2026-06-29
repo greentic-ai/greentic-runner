@@ -34,6 +34,7 @@ use axum::routing::{get, post};
 use axum::{Router, serve};
 use tokio::net::TcpListener;
 
+use crate::host::RunnerHost;
 use crate::http::{self, admin, auth::AdminAuth, health::HealthState};
 use crate::routing::TenantRouting;
 use crate::runtime::ActivePacks;
@@ -54,8 +55,9 @@ impl HostServer {
         health: Arc<HealthState>,
         reload: Option<PackReloadHandle>,
         admin: AdminAuth,
+        host: Arc<RunnerHost>,
     ) -> Result<Self> {
-        Self::with_sql(port, active, routing, health, reload, admin, None)
+        Self::with_sql(port, active, routing, health, reload, admin, host, None)
     }
 
     /// Like [`HostServer::new`] but wires an optional [`SqlGateway`] into the
@@ -68,6 +70,7 @@ impl HostServer {
         health: Arc<HealthState>,
         reload: Option<PackReloadHandle>,
         admin: AdminAuth,
+        host: Arc<RunnerHost>,
         sql_gateway: Option<SqlGateway>,
     ) -> Result<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
@@ -79,6 +82,7 @@ impl HostServer {
             health,
             reload,
             admin,
+            host,
             sql,
         };
         let router = Router::new()
@@ -86,6 +90,7 @@ impl HostServer {
             .route("/healthz", get(http::health::handler))
             .route("/admin/packs/status", get(admin::status))
             .route("/admin/packs/reload", post(admin::reload))
+            .route("/agent/chat", post(crate::http::agent_chat::agent_chat))
             .route(
                 "/sql/{conn}/schema",
                 get(crate::sql::routes::schema_handler),
@@ -119,6 +124,9 @@ pub struct ServerState {
     pub health: Arc<HealthState>,
     pub reload: Option<PackReloadHandle>,
     pub admin: AdminAuth,
+    /// The runner host instance used by the `POST /agent/chat` handler to
+    /// dispatch activity turns to loaded worker packs.
+    pub host: Arc<RunnerHost>,
     /// SQL gateway for `/sql/{conn}/schema` and `/sql/{conn}/query`.
     /// Defaults to an empty gateway (returns 404/401 for all connections)
     /// when no SQL connections are configured.

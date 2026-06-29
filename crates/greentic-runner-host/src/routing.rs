@@ -86,6 +86,11 @@ impl TenantRouting {
         }
     }
 
+    /// Return the configured default tenant identifier.
+    pub fn default_tenant(&self) -> &str {
+        &self.default_tenant
+    }
+
     pub fn resolve(&self, parts: &Parts) -> Result<String> {
         match &self.resolver {
             TenantResolver::Env => Ok(self.default_tenant.clone()),
