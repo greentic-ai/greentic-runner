@@ -959,15 +959,28 @@ mod aw {
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+        use std::sync::OnceLock;
 
         if merged_agents.is_empty() {
             return None;
         }
+        // Process-global in-memory state store, shared across every flow
+        // invocation in this process. The desktop runner rebuilds the agent
+        // handler on each `dw.agent` node call, so a per-call store would erase
+        // conversation memory between turns — a multi-turn agent could never
+        // act on a user's "yes" to a proposal made on the previous turn. A
+        // single shared store keeps memory alive for the lifetime of the
+        // process WITHOUT any external infrastructure (Redis remains optional,
+        // selected only when GREENTIC_AW_REDIS_URL is set). State is still lost
+        // on process exit — that is the documented desktop trade-off.
+        static EPHEMERAL_STATE_STORE: OnceLock<Arc<MockAgentStateStore>> = OnceLock::new();
         tracing::warn!(
             tenant = %tenant,
-            "AW desktop ephemeral state store (in-memory; sessions do not persist)"
+            "AW desktop ephemeral state store (in-memory, process-global; persists across \
+             turns for this process, lost on exit)"
         );
-        let state_store = Arc::new(MockAgentStateStore::new());
+        let state_store =
+            Arc::clone(EPHEMERAL_STATE_STORE.get_or_init(|| Arc::new(MockAgentStateStore::new())));
         let token_meter = Arc::new(MockTokenMeter::new(0));
         let ledger = Arc::new(NoopToolLedger);
         build_runtime_handler_with_stores(
