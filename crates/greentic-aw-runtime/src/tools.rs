@@ -15,6 +15,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use greentic_ext_runtime::ExtensionRuntime;
+use greentic_ext_runtime::host_ports::HostCallContext;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -194,7 +195,20 @@ pub fn missing_tools(
     missing
 }
 
-/// Dispatch a single tool call. Wraps the blocking `invoke_tool` in
+/// Build a [`HostCallContext`] from the per-step [`TenantContext`].
+///
+/// The extension host (e.g. the designer's `DesignerLlmBridge`) uses
+/// `ctx.tenant` to resolve the LLM provider per-tenant and `ctx.user_email`
+/// for optional per-user override (present only in interactive test-chat steps;
+/// `None` for autonomous workers).
+pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
+    HostCallContext {
+        tenant: Some(t.tenant_id.clone()),
+        user_email: t.user_email.clone(),
+    }
+}
+
+/// Dispatch a single tool call. Wraps the blocking `invoke_tool_ctx` in
 /// `tokio::task::spawn_blocking` so the async executor thread is never
 /// stalled. Returns the tool result as a JSON Value.
 ///
@@ -216,6 +230,7 @@ pub async fn dispatch_tool_call(
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
     call: ToolCallRecord,
+    tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
         let value = match mcp
@@ -266,8 +281,9 @@ pub async fn dispatch_tool_call(
     let args_json = call.args.to_string();
     let extension_id = call.extension_id.clone();
     let tool_name = call.tool_name.clone();
+    let ctx = host_ctx_from_tenant(tenant);
     let raw = tokio::task::spawn_blocking(move || {
-        ext_runtime.invoke_tool(&extension_id, &tool_name, &args_json)
+        ext_runtime.invoke_tool_ctx(&extension_id, &tool_name, &args_json, &ctx)
     })
     .await
     .map_err(|e| AgentError::ToolDispatch(format!("join: {e}")))?
@@ -373,6 +389,23 @@ impl ToolLedger for RedisToolLedger {
                 .map_err(|e| StateError::Redis(format!("ledger set_ex: {e}")))?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod ctx_tests {
+    use super::*;
+    use crate::tenant::TenantContext;
+
+    #[test]
+    fn host_ctx_carries_tenant_and_optional_user() {
+        let c1 = host_ctx_from_tenant(&TenantContext::new("acme", "prod"));
+        assert_eq!(c1.tenant.as_deref(), Some("acme"));
+        assert_eq!(c1.user_email, None);
+        let c2 = host_ctx_from_tenant(
+            &TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into())),
+        );
+        assert_eq!(c2.user_email.as_deref(), Some("u@x.com"));
     }
 }
 
@@ -657,7 +690,8 @@ mod tests {
             tool_name: "get_issue".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, call)
+        let tc = TenantContext::new("t", "e");
+        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, call, &tc)
             .await
             .expect("mcp dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "ok": 1 }), "got: {out}");
@@ -669,7 +703,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, missing)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, missing, &tc)
             .await
             .expect("missing mcp route still returns Ok");
         assert_eq!(
@@ -685,7 +719,7 @@ mod tests {
             tool_name: "nope".into(),
             args: serde_json::json!({}),
         };
-        let res = dispatch_tool_call(rt, None, None, non_mcp).await;
+        let res = dispatch_tool_call(rt, None, None, non_mcp, &tc).await;
         assert!(
             res.is_err(),
             "non-mcp dispatch against an unloaded extension must error"
@@ -782,13 +816,14 @@ mod tests {
         ));
         let rt = Arc::new(ExtensionRuntime::for_test());
 
+        let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {
             call_id: "c1".into(),
             extension_id: "component:greentic.refund".into(),
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), call)
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), call, &tc)
             .await
             .expect("component dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "refund_id": "r-1" }), "got: {out}");
@@ -800,7 +835,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), missing)
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), missing, &tc)
             .await
             .expect("missing component op still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
@@ -813,7 +848,7 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt, None, None, no_cat)
+        let out = dispatch_tool_call(rt, None, None, no_cat, &tc)
             .await
             .expect("component dispatch with no catalog still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");

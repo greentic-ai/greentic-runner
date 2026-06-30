@@ -1063,7 +1063,11 @@ mod aw {
         // Graph Tool nodes never carry mcp: or component: ids (they use
         // 'extension_id/tool' syntax over the WASM runtime), so neither the MCP
         // nor the component catalog is threaded here.
-        dispatch_tool_call(ext_runtime, None, None, call)
+        // No per-request TenantContext is available at the graph-node layer;
+        // use a no-op placeholder so the extension's host-LLM port receives an
+        // empty context (equivalent to the previous `invoke_tool` default).
+        let tenant = TenantContext::new("", "");
+        dispatch_tool_call(ext_runtime, None, None, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }
