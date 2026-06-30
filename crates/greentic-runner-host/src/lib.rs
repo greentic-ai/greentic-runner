@@ -67,6 +67,7 @@ pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;
 pub use host::{HostBuilder, RunnerHost, TenantHandle};
+pub use trace::{InMemoryObserver, NodeTraceEntry};
 pub use wasi::{PreopenSpec, RunnerWasiPolicy};
 
 pub use greentic_types::{EnvId, FlowId, PackId, TenantCtx, TenantId};

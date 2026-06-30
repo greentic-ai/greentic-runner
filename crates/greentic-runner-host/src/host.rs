@@ -9,17 +9,18 @@ use crate::activity::Activity;
 use crate::boot;
 use crate::config::HostConfig;
 use crate::engine::host::{SessionHost, StateHost};
-use crate::engine::runtime::IngressEnvelope;
+use crate::engine::runtime::{INJECTED_TRACE_OBSERVER, IngressEnvelope};
 use crate::http::health::HealthState;
 use crate::pack::PackRuntime;
 use crate::runner::adapt_timer;
-use crate::runner::engine::FlowEngine;
+use crate::runner::engine::{ExecutionObserver, FlowEngine};
 use crate::runtime::{ActivePacks, TenantRuntime};
 use crate::secrets::{DynSecretsManager, default_manager};
 use crate::storage::{
     DynSessionStore, DynStateStore, new_session_store, new_state_store, session_host_from,
     state_host_from,
 };
+use crate::trace::{InMemoryObserver, NodeTraceEntry};
 use crate::wasi::RunnerWasiPolicy;
 
 #[cfg(feature = "telemetry")]
@@ -170,6 +171,39 @@ impl RunnerHost {
     }
 
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
+        self.run_activity(tenant, activity, None).await
+    }
+
+    /// Handle one activity turn while capturing every intermediate node's INPUT
+    /// and OUTPUT, returning the normal replies alongside the collected
+    /// [`NodeTraceEntry`] list.
+    ///
+    /// Behaviourally identical to [`RunnerHost::handle_activity`] — it runs the
+    /// exact same flow path — but attaches an [`InMemoryObserver`] for the
+    /// duration of the turn. The observer composes with (never replaces) the
+    /// on-disk `TraceRecorder`, so trace-to-disk still works when enabled.
+    pub async fn handle_activity_traced(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<(Vec<Activity>, Vec<NodeTraceEntry>)> {
+        let observer = Arc::new(InMemoryObserver::new());
+        let replies = self
+            .run_activity(
+                tenant,
+                activity,
+                Some(Arc::clone(&observer) as Arc<dyn ExecutionObserver>),
+            )
+            .await?;
+        Ok((replies, observer.drain()))
+    }
+
+    async fn run_activity(
+        &self,
+        tenant: &str,
+        activity: Activity,
+        observer: Option<Arc<dyn ExecutionObserver>>,
+    ) -> Result<Vec<Activity>> {
         let runtime = self
             .active
             .load(tenant)
@@ -212,7 +246,15 @@ impl RunnerHost {
         }
         .canonicalize();
 
-        let result = runtime.state_machine().handle(envelope).await?;
+        let state_machine = runtime.state_machine();
+        let result = match observer {
+            Some(observer) => {
+                INJECTED_TRACE_OBSERVER
+                    .scope(observer, state_machine.handle(envelope))
+                    .await?
+            }
+            None => state_machine.handle(envelope).await?,
+        };
         Ok(normalize_replies(result, tenant))
     }
 

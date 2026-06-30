@@ -26,11 +26,13 @@ use super::state_machine::{FlowDefinition, FlowStep, PAYLOAD_FROM_LAST_INPUT};
 
 use crate::config::{HostConfig, SecretsPolicy};
 use crate::pack::FlowDescriptor;
-use crate::runner::engine::{FlowContext, FlowEngine, FlowSnapshot, FlowStatus, FlowWait};
+use crate::runner::engine::{
+    ExecutionObserver, FlowContext, FlowEngine, FlowSnapshot, FlowStatus, FlowWait,
+};
 use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
-use crate::trace::{PackTraceInfo, TraceContext, TraceMode, TraceRecorder};
+use crate::trace::{FanOutObserver, PackTraceInfo, TraceContext, TraceMode, TraceRecorder};
 
 const DEFAULT_ENV: &str = "local";
 const PACK_FLOW_ADAPTER: &str = "pack_flow";
@@ -347,6 +349,16 @@ pub struct StateMachineRuntime {
     runner: Runner,
 }
 
+tokio::task_local! {
+    /// Caller-injected execution observer scoped to a single activity turn.
+    ///
+    /// Set by `RunnerHost::handle_activity_traced` around the flow execution and
+    /// read in `PackFlowAdapter::call`, where it is fanned out alongside the
+    /// existing on-disk `TraceRecorder`. The normal `handle_activity` path never
+    /// sets it, so non-traced execution is byte-for-byte unchanged.
+    pub(crate) static INJECTED_TRACE_OBSERVER: Arc<dyn ExecutionObserver>;
+}
+
 impl StateMachineRuntime {
     /// Construct a runtime from explicit flow definitions (legacy entrypoint used by tests/examples).
     pub fn new(flows: Vec<FlowDefinition>) -> GResult<Self> {
@@ -630,6 +642,23 @@ impl Adapter for PackFlowAdapter {
             Some(TraceRecorder::new(trace_config, trace_ctx))
         };
 
+        // Compose the on-disk recorder with any caller-injected observer (set by
+        // `RunnerHost::handle_activity_traced`). Both must observe every node, so
+        // when both are present we fan out; otherwise we pass whichever exists.
+        let injected_observer = INJECTED_TRACE_OBSERVER.try_with(Arc::clone).ok();
+        let recorder_observer = trace
+            .as_ref()
+            .map(|recorder| recorder as &dyn ExecutionObserver);
+        let injected_observer_ref = injected_observer.as_deref();
+        let fan_out = match (recorder_observer, injected_observer_ref) {
+            (Some(recorder), Some(injected)) => Some(FanOutObserver::new(recorder, injected)),
+            _ => None,
+        };
+        let observer: Option<&dyn ExecutionObserver> = match fan_out.as_ref() {
+            Some(fan_out) => Some(fan_out),
+            None => recorder_observer.or(injected_observer_ref),
+        };
+
         let mocks = self.mocks.as_deref();
         let ctx = FlowContext {
             tenant: &self.tenant,
@@ -646,9 +675,7 @@ impl Adapter for PackFlowAdapter {
             reply_scope: envelope.reply_scope.as_ref(),
             retry_config,
             attempt: 1,
-            observer: trace
-                .as_ref()
-                .map(|recorder| recorder as &dyn crate::runner::engine::ExecutionObserver),
+            observer,
             mocks,
         };
 

@@ -85,6 +85,63 @@ async fn host_executes_demo_pack_flow() -> Result<()> {
 
 #[tokio::test]
 #[serial]
+async fn handle_activity_traced_captures_node_io() -> Result<()> {
+    let _secret_guard = EnvGuard::set("TELEGRAM_BOT_TOKEN", "test-token");
+    let _backend_guard = EnvGuard::set("SECRETS_BACKEND", "env");
+
+    let bindings = fixture_path("examples/bindings/default.bindings.yaml");
+    let config = HostConfig::load_from_path(&bindings)?;
+    let host = HostBuilder::new().with_config(config).build()?;
+    host.start().await?;
+
+    let _pack_temp = TempDir::new()?;
+    let pack_path = _pack_temp.path().join("runner-components.gtpack");
+    build_runner_components_pack(&pack_path)?;
+    host.load_pack("acme", pack_path.as_path()).await?;
+
+    let activity = Activity::text("hello from integration")
+        .with_tenant("acme")
+        .from_user("user-1");
+    let (replies, traces) = host.handle_activity_traced("acme", activity).await?;
+
+    assert!(
+        !replies.is_empty(),
+        "demo pack should emit at least one activity"
+    );
+    // demo.flow has two nodes: `qa` (component.exec) then `emit` (emit.response).
+    assert!(
+        traces.len() >= 2,
+        "expected a trace entry per executed node, got {}: {traces:?}",
+        traces.len()
+    );
+    for entry in &traces {
+        assert!(
+            !entry.input.is_null(),
+            "node {} should record a non-null input",
+            entry.node_id
+        );
+    }
+    let qa = traces
+        .iter()
+        .find(|entry| entry.node_id == "qa")
+        .expect("trace should include the `qa` node");
+    assert_eq!(qa.component, "component.exec");
+    assert!(
+        qa.error.is_none(),
+        "successful node should not record an error: {:?}",
+        qa.error
+    );
+    assert!(
+        qa.output.is_some(),
+        "successful node should record an output"
+    );
+
+    host.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn trace_written_on_failure() -> Result<()> {
     let temp = TempDir::new()?;
     let trace_path = temp.path().join("trace.json");
