@@ -203,7 +203,11 @@ pub fn missing_tools(
 /// `None` for autonomous workers).
 pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
     HostCallContext {
-        tenant: Some(t.tenant_id.clone()),
+        tenant: if t.tenant_id.is_empty() {
+            None
+        } else {
+            Some(t.tenant_id.clone())
+        },
         user_email: t.user_email.clone(),
     }
 }
@@ -406,6 +410,11 @@ mod ctx_tests {
             &TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into())),
         );
         assert_eq!(c2.user_email.as_deref(), Some("u@x.com"));
+        let c3 = host_ctx_from_tenant(&TenantContext::new("", ""));
+        assert_eq!(
+            c3.tenant, None,
+            "empty tenant_id must map to None, not Some(\"\")"
+        );
     }
 }
 
