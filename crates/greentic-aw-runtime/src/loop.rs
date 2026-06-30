@@ -437,6 +437,7 @@ pub async fn run_step(
                     mcp_catalog.clone(),
                     component_catalog.clone(),
                     call.clone(),
+                    &tenant,
                 )
                 .await
                 {
