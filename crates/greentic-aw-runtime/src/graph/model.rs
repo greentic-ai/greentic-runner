@@ -32,6 +32,11 @@ pub enum NodeKind {
         model: String,
         #[serde(default)]
         tools: Vec<String>,
+        /// LLM provider override (e.g. `"anthropic"`, `"openai"`).
+        /// Absent in existing graphs — defaults to `None`, which the executor
+        /// maps to `"openai"` for backward compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// A deterministic tool call node.
     #[serde(rename_all = "camelCase")]
@@ -52,6 +57,11 @@ pub enum NodeKind {
         system_prompt: String,
         model: String,
         routes: Vec<SupervisorRoute>,
+        /// LLM provider override (e.g. `"anthropic"`, `"openai"`).
+        /// Absent in existing graphs — defaults to `None`, which the executor
+        /// maps to `"openai"` for backward compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Fan-out node — spawns one branch per outgoing edge.
     ///
@@ -611,7 +621,7 @@ impl GraphConfig {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::graph::test_fixtures;
@@ -1086,5 +1096,72 @@ mod tests {
     fn schema_version_2_is_accepted_for_v2_graphs() {
         // supervisor_json uses schemaVersion 2 — parsing it is the acceptance test.
         GraphConfig::from_json(&test_fixtures::supervisor_json()).expect("v2 graph must parse");
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider field: backward-compat + round-trip tests
+    // -----------------------------------------------------------------------
+
+    /// Existing agent-node JSON without a `"provider"` key must deserialize to
+    /// `provider: None`. This is the backward-compatibility guarantee.
+    #[test]
+    fn agent_node_without_provider_deserializes_to_none() {
+        let json = serde_json::json!({
+            "id": "agent",
+            "kind": "agent",
+            "systemPrompt": "You help users.",
+            "model": "gpt-4o-mini"
+        });
+        let node: Node = serde_json::from_value(json).expect("should deserialize");
+        match node.kind {
+            NodeKind::Agent { provider, .. } => {
+                assert_eq!(provider, None, "absent provider must deserialize to None");
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    /// A JSON agent node with `"provider": "anthropic"` must deserialize to
+    /// `provider: Some("anthropic")`.
+    #[test]
+    fn agent_node_with_provider_deserializes_to_some() {
+        let json = serde_json::json!({
+            "id": "agent",
+            "kind": "agent",
+            "systemPrompt": "You help users.",
+            "model": "claude-3-5-sonnet",
+            "provider": "anthropic"
+        });
+        let node: Node = serde_json::from_value(json).expect("should deserialize");
+        match node.kind {
+            NodeKind::Agent { provider, .. } => {
+                assert_eq!(
+                    provider,
+                    Some("anthropic".to_string()),
+                    "explicit provider must round-trip"
+                );
+            }
+            other => panic!("expected Agent, got {other:?}"),
+        }
+    }
+
+    /// When `provider` is `None`, the serialized JSON must NOT contain a
+    /// `"provider"` key (`skip_serializing_if = "Option::is_none"`).
+    #[test]
+    fn agent_node_provider_none_is_omitted_from_json() {
+        let node = Node {
+            id: "agent".to_string(),
+            kind: NodeKind::Agent {
+                system_prompt: "You help users.".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                tools: vec![],
+                provider: None,
+            },
+        };
+        let value = serde_json::to_value(&node).expect("serialization must succeed");
+        assert!(
+            value.get("provider").is_none(),
+            "provider: None must be omitted from JSON, got: {value}"
+        );
     }
 }

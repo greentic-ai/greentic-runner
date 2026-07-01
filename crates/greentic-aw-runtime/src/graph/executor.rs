@@ -67,6 +67,10 @@ pub struct AgentTurnRequest {
     pub model: String,
     /// Current run state at the time of the turn.
     pub state: GraphRunState,
+    /// LLM provider override from the node's `provider` field.
+    /// `None` when the field is absent (existing graphs) — the host maps
+    /// `None` to `"openai"` for backward compatibility.
+    pub provider: Option<String>,
 }
 
 /// Result returned by an injected agent-turn closure.
@@ -124,6 +128,10 @@ pub struct SupervisorRequest {
     pub routes: Vec<crate::graph::model::SupervisorRoute>,
     /// Current run state at the time of the routing decision.
     pub state: GraphRunState,
+    /// LLM provider override from the node's `provider` field.
+    /// `None` when the field is absent (existing graphs) — the host maps
+    /// `None` to `"openai"` for backward compatibility.
+    pub provider: Option<String>,
 }
 
 /// Result returned by an injected supervisor closure.
@@ -474,12 +482,14 @@ impl GraphExecutor {
                 NodeKind::Agent {
                     system_prompt,
                     model,
+                    provider,
                     ..
                 } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
 
                     // Pre-clone so the closure can own the values it needs.
                     let node_id_for_err = cursor.clone();
+                    let provider_clone = provider.clone();
                     let (raw, replayed) = self
                         .visit_effect(tenant, run_id, &cursor, attempt, || {
                             let req = AgentTurnRequest {
@@ -487,6 +497,7 @@ impl GraphExecutor {
                                 system_prompt: system_prompt.clone(),
                                 model: model.clone(),
                                 state: state.clone(),
+                                provider: provider_clone,
                             };
                             let fut = (self.agent_turn)(req);
                             Box::pin(async move {
@@ -644,12 +655,14 @@ impl GraphExecutor {
                     system_prompt,
                     model,
                     routes,
+                    provider,
                 } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
                     let node_id_for_err = cursor.clone();
                     let routes_clone = routes.clone();
                     let system_prompt_clone = system_prompt.clone();
                     let model_clone = model.clone();
+                    let provider_clone = provider.clone();
 
                     let (raw, replayed) = self
                         .visit_effect(tenant, run_id, &cursor, attempt, || {
@@ -659,6 +672,7 @@ impl GraphExecutor {
                                 model: model_clone,
                                 routes: routes_clone.clone(),
                                 state: state.clone(),
+                                provider: provider_clone,
                             };
                             let fut = (self.supervisor)(req);
                             Box::pin(async move {
@@ -1166,12 +1180,14 @@ impl GraphExecutor {
                     NodeKind::Agent {
                         system_prompt,
                         model,
+                        provider,
                         ..
                     } => {
                         let attempt = *visits.get(&bc.cursor).unwrap_or(&0) + 1;
                         let node_id = bc.cursor.clone();
                         let sp = system_prompt.clone();
                         let md = model.clone();
+                        let pv = provider.clone();
                         let state_for_call = state.clone();
                         let (raw, replayed) = self
                             .visit_effect(tenant, run_id, &bc.cursor, attempt, || {
@@ -1180,6 +1196,7 @@ impl GraphExecutor {
                                     system_prompt: sp,
                                     model: md,
                                     state: state_for_call,
+                                    provider: pv,
                                 };
                                 let fut = (self.agent_turn)(req);
                                 Box::pin(async move {
@@ -1254,11 +1271,13 @@ impl GraphExecutor {
                         system_prompt,
                         model,
                         routes,
+                        provider,
                     } => {
                         let attempt = *visits.get(&bc.cursor).unwrap_or(&0) + 1;
                         let node_id = bc.cursor.clone();
                         let sp = system_prompt.clone();
                         let md = model.clone();
+                        let pv = provider.clone();
                         let routes_clone = routes.clone();
                         let state_for_call = state.clone();
                         let (raw, replayed) = self
@@ -1269,6 +1288,7 @@ impl GraphExecutor {
                                     model: md,
                                     routes: routes_clone.clone(),
                                     state: state_for_call,
+                                    provider: pv,
                                 };
                                 let fut = (self.supervisor)(req);
                                 Box::pin(async move {
@@ -2124,6 +2144,124 @@ mod tests {
         assert_eq!(sup_entry["attempt"], 1u32);
         assert_eq!(sup_entry["replayed"], false);
         assert_eq!(sup_entry["branch"], "tech");
+    }
+
+    // -----------------------------------------------------------------------
+    // Provider threading tests
+    // -----------------------------------------------------------------------
+
+    /// Test: when an agent node carries `"provider": "anthropic"`, the
+    /// `AgentTurnRequest` delivered to the closure must have
+    /// `provider = Some("anthropic")`.
+    #[tokio::test]
+    async fn agent_turn_request_carries_node_provider_when_set() {
+        use std::sync::Mutex;
+
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let captured: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+
+        let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+            *cap.lock().unwrap() = Some(req.provider.clone());
+            Box::pin(async move {
+                Ok(AgentTurnResult {
+                    reply: "ok".into(),
+                    resolved: true,
+                })
+            })
+        });
+
+        // Graph with provider set on the agent node.
+        let cfg_json = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "agent",
+            "nodes": [
+                {
+                    "id": "agent",
+                    "kind": "agent",
+                    "systemPrompt": "You help.",
+                    "model": "claude-3-5-sonnet",
+                    "provider": "anthropic"
+                },
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [
+                {"from": "agent", "to": "respond"}
+            ]
+        })
+        .to_string();
+        let cfg = GraphConfig::from_json(&cfg_json).expect("fixture valid");
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
+            supervisor_fn_unreachable(),
+        );
+        exec.start(&tenant(), "run-provider-set", &cfg, "hi")
+            .await
+            .expect("run should succeed");
+
+        let got = captured.lock().unwrap().take().expect("agent was called");
+        assert_eq!(
+            got,
+            Some("anthropic".to_string()),
+            "AgentTurnRequest.provider must be Some(\"anthropic\") when set on the node"
+        );
+    }
+
+    /// Test: when an agent node has NO `"provider"` field, the
+    /// `AgentTurnRequest` must have `provider = None` (backward compat).
+    #[tokio::test]
+    async fn agent_turn_request_provider_is_none_when_absent() {
+        use std::sync::Mutex;
+
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let captured: Arc<Mutex<Option<Option<String>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+
+        let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+            *cap.lock().unwrap() = Some(req.provider.clone());
+            Box::pin(async move {
+                Ok(AgentTurnResult {
+                    reply: "ok".into(),
+                    resolved: true,
+                })
+            })
+        });
+
+        // Graph WITHOUT provider — uses the triage fixture (no provider field).
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
+            supervisor_fn_unreachable(),
+        );
+        let cfg_json = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "agent",
+            "nodes": [
+                {
+                    "id": "agent",
+                    "kind": "agent",
+                    "systemPrompt": "You help.",
+                    "model": "gpt-4o-mini"
+                },
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [{"from": "agent", "to": "respond"}]
+        })
+        .to_string();
+        let cfg = GraphConfig::from_json(&cfg_json).expect("fixture valid");
+        exec.start(&tenant(), "run-provider-absent", &cfg, "hi")
+            .await
+            .expect("run should succeed");
+
+        let got = captured.lock().unwrap().take().expect("agent was called");
+        assert_eq!(
+            got, None,
+            "AgentTurnRequest.provider must be None when the node has no provider field"
+        );
     }
 
     // -----------------------------------------------------------------------
