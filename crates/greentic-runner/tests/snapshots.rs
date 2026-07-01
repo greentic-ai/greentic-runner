@@ -107,6 +107,7 @@ fn build_pack(
     let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: pack_id.parse()?,
         name: None,

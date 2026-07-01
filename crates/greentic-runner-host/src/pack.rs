@@ -3,13 +3,14 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::{ArtifactKey, CacheConfig, CacheManager, CpuPolicy, EngineProfile};
 use crate::component_api::{
     self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError,
 };
+use crate::identify_hint::IdentifyInstanceHint;
 use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
 use crate::provider::{ProviderBinding, ProviderRegistry};
 use crate::provider_core::{
@@ -18,6 +19,7 @@ use crate::provider_core::{
     schema_core_schema::SchemaCorePre as SchemaSchemaCorePre,
 };
 use crate::provider_core_only;
+use crate::runtime_refs::RuntimeRefsInjection;
 use crate::runtime_wasmtime::{Component, Engine, InstancePre, Linker, ResourceTable};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
@@ -28,6 +30,7 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     self as host_v1, HostFns, add_all_v1_to_linker,
     runner_host_http::RunnerHostHttp,
     runner_host_kv::RunnerHostKv,
+    runtime_config::{ConfigError, RuntimeConfigHost},
     secrets_store::{SecretsError, SecretsErrorV1_1, SecretsStoreHost, SecretsStoreHostV1_1},
     state_store::{
         OpAck as StateOpAck, StateKey as HostStateKey, StateStoreError as StateError,
@@ -40,6 +43,8 @@ use greentic_interfaces_wasmtime::host_helpers::v1::{
     },
 };
 use greentic_interfaces_wasmtime::http_client_client_v1_1::greentic::http::http_client as http_client_client_alias;
+use greentic_interfaces_wasmtime::instance_identity_instance_identity_describe_v0_1::InstanceIdentityDescribePre;
+use greentic_interfaces_wasmtime::instance_identity_v0_1::InstanceIdentityPre;
 use greentic_interfaces_wasmtime::{
     http_client_client_v1_0::greentic::interfaces_types::types as http_types_v1_0,
     http_client_client_v1_1::greentic::interfaces_types::types as http_types_v1_1,
@@ -77,7 +82,7 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
+use wasmtime_wasi_tls::p2::LinkOptions;
 use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
@@ -102,14 +107,6 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use greentic_flow::model::FlowDoc;
 
-static RUSTLS_CRYPTO_PROVIDER: Once = Once::new();
-
-fn ensure_rustls_crypto_provider() {
-    RUSTLS_CRYPTO_PROVIDER.call_once(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    });
-}
-
 #[allow(dead_code)]
 pub struct PackRuntime {
     /// Component artifact path (wasm file).
@@ -132,9 +129,30 @@ pub struct PackRuntime {
     wasi_policy: Arc<RunnerWasiPolicy>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
+    /// Per-revision lazy cache of `describe-identify-instance` results,
+    /// keyed by `component_ref`. `None` value means the component does not
+    /// export the describe world (or the hint was malformed) — the
+    /// caller falls back to passing input headers through unchanged. The
+    /// outer `Option` distinguishes "not probed yet" from "probed and
+    /// has no hint". `ArcSwap`-driven revision swaps allocate a fresh
+    /// `PackRuntime` so this cache is naturally invalidated.
+    identify_hint_cache: RwLock<HashMap<String, Option<IdentifyInstanceHint>>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
     cache: CacheManager,
+    /// `pack-config.v1.non_secret` map plumbed into each `HostState` for the
+    /// `greentic:runtime-config@1.0.0` host import. Defaults to `None` when no
+    /// producer (greentic-start) has materialized a `PackConfig` yet; in that
+    /// case all runtime-config lookups fall through to the secrets-store
+    /// compat shim.
+    runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+    /// `pack-config.v1.runtime_refs` (C5): per-pack `key → URI` bindings plus
+    /// the env-shared [`RuntimeRefResolver`]. Consulted by the
+    /// `greentic:runtime-config@1.0.0` host import AFTER `non_secret` and
+    /// BEFORE the compat shim. `None` when no producer set it yet.
+    ///
+    /// [`RuntimeRefResolver`]: crate::runtime_refs::RuntimeRefResolver
+    runtime_refs: Option<RuntimeRefsInjection>,
 }
 
 struct PackComponent {
@@ -143,6 +161,40 @@ struct PackComponent {
     #[allow(dead_code)]
     version: String,
     component: Arc<Component>,
+}
+
+/// Outcome of calling a provider component's `identify-instance` export
+/// (`greentic:provider-instance-identity@0.1.0`). Callers MUST treat the
+/// three variants differently per the WIT contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentifyOutcome {
+    /// Component does not export the world — caller falls back to the
+    /// operator's statically-declared `provider_id`.
+    Unsupported,
+    /// Component exported the world and returned `None` — caller MUST
+    /// fail closed (401/404), no fallback.
+    NoMatch,
+    /// Component identified the payload as belonging to this
+    /// `provider_id` — caller routes to the matching `MessagingEndpoint`.
+    Identified(String),
+}
+
+impl IdentifyOutcome {
+    /// Merge `other` into `self` per the lattice
+    /// `Identified > NoMatch > Unsupported`. Used by callers fanning the probe
+    /// out over multiple packs (overlays) where the strongest signal across
+    /// packs wins.
+    pub fn merge_in(&mut self, other: IdentifyOutcome) {
+        match (&*self, &other) {
+            // Identified is the top — never gets overwritten.
+            (IdentifyOutcome::Identified(_), _) => {}
+            // Promote to Identified from anything else.
+            (_, IdentifyOutcome::Identified(_)) => *self = other,
+            // NoMatch promotes Unsupported but cannot downgrade itself.
+            (IdentifyOutcome::Unsupported, IdentifyOutcome::NoMatch) => *self = other,
+            _ => {}
+        }
+    }
 }
 
 fn run_on_wasi_thread<F, T>(task_name: &'static str, task: F) -> Result<T>
@@ -268,6 +320,16 @@ pub struct HostState {
     exec_ctx: Option<ComponentExecCtx>,
     component_ref: Option<String>,
     provider_core_component: bool,
+    /// `pack-config.v1.non_secret` map for the `greentic:runtime-config@1.0.0`
+    /// host import. Populated by the producer (greentic-start) from the
+    /// deployed `PackConfig`; `None` when no PackConfig was published, in
+    /// which case lookups fall back to the secrets-store compat shim with
+    /// a once-per-process deprecation warning.
+    runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+    /// `pack-config.v1.runtime_refs` (C5) injection: per-pack `key → URI`
+    /// bindings plus the env-shared resolver. The host import resolves the
+    /// URI on every call so the value tracks `runtime.json` hot-reloads.
+    runtime_refs: Option<RuntimeRefsInjection>,
 }
 
 impl HostState {
@@ -285,6 +347,8 @@ impl HostState {
         exec_ctx: Option<ComponentExecCtx>,
         component_ref: Option<String>,
         provider_core_component: bool,
+        runtime_config_non_secret: Option<Arc<BTreeMap<String, Value>>>,
+        runtime_refs: Option<RuntimeRefsInjection>,
     ) -> Result<Self> {
         let default_env = std::env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string());
         Ok(Self {
@@ -301,6 +365,8 @@ impl HostState {
             exec_ctx,
             component_ref,
             provider_core_component,
+            runtime_config_non_secret,
+            runtime_refs,
         })
     }
 
@@ -777,6 +843,92 @@ impl SecretsStoreHostV1_1 for HostState {
     }
 }
 
+/// Process-global set of `pack-config.v1` keys for which the compat shim has
+/// already logged a deprecation warning. Used to debounce once-per-process
+/// per-key so resolving the same legacy key from many invocations does not
+/// spam the log.
+static WARNED_COMPAT_KEYS: Lazy<Mutex<HashSet<String>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+
+fn warn_compat_fallback_once(key: &str) {
+    let mut warned = WARNED_COMPAT_KEYS.lock();
+    if warned.insert(key.to_string()) {
+        warn!(
+            key = %key,
+            "runtime-config key resolved via secrets-store compat fallback; \
+             move this value into pack-config.v1.non_secret"
+        );
+    }
+}
+
+impl RuntimeConfigHost for HostState {
+    fn get(&mut self, key: String) -> Result<Option<String>, ConfigError> {
+        if key.trim().is_empty() {
+            return Err(ConfigError::InvalidKey);
+        }
+
+        // 1) Primary channel: pack-config.v1.non_secret. Values are stored as
+        //    `serde_json::Value`; the WIT contract returns UTF-8 strings
+        //    conventionally JSON-encoded, so stringify here.
+        if let Some(map) = self.runtime_config_non_secret.as_ref()
+            && let Some(value) = map.get(&key)
+        {
+            return serde_json::to_string(value).map(Some).map_err(|err| {
+                warn!(key = %key, error = %err, "runtime-config value JSON-encode failed");
+                ConfigError::Internal
+            });
+        }
+
+        // 1b) C5 channel: pack-config.v1.runtime_refs. Resolved on every call
+        //     so values track `runtime.json` hot-reloads. The per-pack `refs`
+        //     map gates which keys this channel claims; non-bound keys fall
+        //     through to the compat shim.
+        if let Some(injection) = self.runtime_refs.as_ref()
+            && let Some(uri) = injection.refs.get(&key)
+        {
+            use crate::runtime_refs::RuntimeRefResolverError;
+            return match injection.resolver.resolve(uri) {
+                Ok(Some(value)) => serde_json::to_string(&value).map(Some).map_err(|err| {
+                    warn!(key = %key, error = %err, "runtime-ref value JSON-encode failed");
+                    ConfigError::Internal
+                }),
+                Ok(None) => Ok(None),
+                Err(err @ RuntimeRefResolverError::Invalid(_)) => {
+                    warn!(key = %key, error = %err, "runtime-ref rejected");
+                    Err(ConfigError::InvalidKey)
+                }
+                Err(err @ RuntimeRefResolverError::Internal(_)) => {
+                    warn!(key = %key, error = %err, "runtime-ref resolution failed");
+                    Err(ConfigError::Internal)
+                }
+            };
+        }
+
+        // 2) Compat fallback: try the secrets-store. Warn once per key per
+        //    process so this stays visible without spamming the log.
+        match SecretsStoreHost::get(self, key.clone()) {
+            Ok(Some(bytes)) => match String::from_utf8(bytes) {
+                Ok(value) => {
+                    warn_compat_fallback_once(&key);
+                    Ok(Some(value))
+                }
+                Err(_) => {
+                    warn!(
+                        key = %key,
+                        "runtime-config compat fallback found non-UTF-8 secret bytes; \
+                         returning not-found"
+                    );
+                    Err(ConfigError::Internal)
+                }
+            },
+            Ok(None) => Ok(None),
+            Err(SecretsError::NotFound) => Ok(None),
+            Err(SecretsError::Denied) => Err(ConfigError::Denied),
+            Err(SecretsError::InvalidKey) => Err(ConfigError::InvalidKey),
+            Err(SecretsError::Internal) => Err(ConfigError::Internal),
+        }
+    }
+}
+
 impl HttpClientHost for HostState {
     fn send(
         &mut self,
@@ -1207,10 +1359,28 @@ pub struct ComponentState {
     resource_table: ResourceTable,
 }
 
+/// Install the process-default rustls [`rustls::crypto::CryptoProvider`] exactly once.
+///
+/// `wasmtime-wasi-tls` 45's `RustlsProvider::default()` builds its
+/// `rustls::ClientConfig` via `ClientConfig::builder()`, which resolves the
+/// process-default provider. Our dependency graph enables BOTH the `ring` and
+/// `aws_lc_rs` rustls backends, so there is no unambiguous implicit default and
+/// the builder panics ("no process-level CryptoProvider available") the first
+/// time [`WasiTlsCtxBuilder::build`] constructs the default provider. Install
+/// the workspace-selected aws-lc-rs provider before that ever happens.
+/// Idempotent: a returned `Err` means a default was already installed.
+fn install_default_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 impl ComponentState {
     pub fn new(host: HostState, policy: Arc<RunnerWasiPolicy>) -> Result<Self> {
-        ensure_rustls_crypto_provider();
-
+        // Must run before `WasiTlsCtxBuilder::build()` below, which eagerly
+        // constructs wasi-tls's default rustls provider.
+        install_default_crypto_provider();
         let wasi_ctx = policy
             .instantiate()
             .context("failed to build WASI context")?;
@@ -1285,13 +1455,91 @@ fn add_component_control_to_linker(linker: &mut Linker<ComponentState>) -> wasmt
     Ok(())
 }
 
+/// Reduced-authority linker for `identify-instance` and
+/// `describe-identify-instance` probes (M1 IID Phase D).
+///
+/// Identity probes match an inbound webhook payload against known
+/// per-endpoint discriminators (Telegram secret-token header, Slack
+/// signing-secret, Teams JWT issuer, …) and return an endpoint id
+/// or `none`. The WIT contract is a pure projection over `(headers,
+/// body)` — no outbound HTTP, no persistent state, no secrets.
+///
+/// # Why this delegates to `register_all` (Wasmtime eager-import constraint)
+///
+/// Wasmtime's [`Linker::instantiate_pre`] type-checks the component's
+/// **entire** import graph eagerly — not just the imports reachable from
+/// the export the caller intends to invoke. A provider component that
+/// exports `instance-identity-api` alongside `schema-core-api` typically
+/// also imports `http-client`, `secrets-store`, etc. for the latter.
+/// If the linker omits those imports, `instantiate_pre` fails with
+/// `"a matching implementation was not found in the linker"` before the
+/// identity export is even checked.
+///
+/// The ideal probe linker would register deny-shim handlers that satisfy
+/// the import graph but trap on actual invocation. That requires
+/// deny-shim support in `greentic-interfaces-wasmtime` (tracked as a
+/// follow-up). Until then, probes use the same linker surface as normal
+/// execution, with state-store disabled.
+///
+/// The reduced-authority boundary is enforced at the WASI policy layer
+/// instead: probe call sites construct a locked-down
+/// [`RunnerWasiPolicy`](crate::wasi::RunnerWasiPolicy) with no
+/// preopens, no env passthrough, and no stdio inheritance. See
+/// [`RunnerWasiPolicy::probe()`](crate::wasi::RunnerWasiPolicy::probe)
+/// and the `probe_wasi_policy_is_locked_down` test.
+pub fn register_identity_probe(linker: &mut Linker<ComponentState>) -> Result<()> {
+    // Delegates to `register_all` with state-store disabled. See doc
+    // comment above for the rationale (Wasmtime eager-import validation).
+    register_all(linker, false)
+}
+
+#[cfg(test)]
+mod register_identity_probe_tests {
+    use super::*;
+
+    /// Verify that [`register_identity_probe`] successfully links all
+    /// imports needed by real provider components (wasi-core, wasi-tls,
+    /// wasi-http, http-client, secrets-store, telemetry, etc.).
+    ///
+    /// Before this fix, the probe linker omitted most host imports.
+    /// Wasmtime's `instantiate_pre` validates the **entire** import
+    /// graph eagerly, so any provider with runtime imports (all real
+    /// providers) would fail before the identity export was checked.
+    #[test]
+    fn register_identity_probe_links_successfully() {
+        let engine = wasmtime::Engine::default();
+        let mut linker = Linker::<ComponentState>::new(&engine);
+        register_identity_probe(&mut linker).expect("probe linker registers all imports");
+    }
+
+    /// Verify that the probe WASI policy has no preopens, no env, and
+    /// no stdio — the only reduced-authority boundary available today.
+    #[test]
+    fn probe_wasi_policy_is_locked_down() {
+        let policy = RunnerWasiPolicy::probe();
+        assert!(!policy.inherit_stdio, "probe WASI must not inherit stdio");
+        assert!(
+            policy.preopens.is_empty(),
+            "probe WASI must have no preopens"
+        );
+        assert!(
+            policy.env_allow.is_empty(),
+            "probe WASI must not allow env vars"
+        );
+        assert!(
+            policy.env_set.is_empty(),
+            "probe WASI must not set env vars"
+        );
+    }
+}
+
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
     add_wasi_to_linker(linker)?;
 
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    add_wasi_tls_to_linker(linker, &opts)?;
+    wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -1308,6 +1556,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
             state_store: allow_state_store.then_some(|state: &mut ComponentState| state.host_mut()),
             secrets_store_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             secrets_store: None,
+            runtime_config: Some(|state: &mut ComponentState| state.host_mut()),
         },
     )?;
     add_http_client_client_world_aliases(linker)?;
@@ -1475,21 +1724,21 @@ impl WasiView for ComponentState {
     }
 }
 
-impl WasiTlsView for ComponentState {
-    fn tls(&mut self) -> WasiTlsCtxView<'_> {
-        WasiTlsCtxView {
-            ctx: &mut self.wasi_tls_ctx,
-            table: &mut self.resource_table,
-        }
-    }
-}
-
 impl WasiHttpView for ComponentState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
             hooks: Default::default(),
+        }
+    }
+}
+
+impl WasiTlsView for ComponentState {
+    fn tls(&mut self) -> WasiTlsCtxView<'_> {
+        WasiTlsCtxView {
+            ctx: &mut self.wasi_tls_ctx,
+            table: &mut self.resource_table,
         }
     }
 }
@@ -1841,10 +2090,40 @@ impl PackRuntime {
             wasi_policy,
             assets_tempdir,
             provider_registry: RwLock::new(None),
+            identify_hint_cache: RwLock::new(HashMap::new()),
             secrets,
             oauth_config,
             cache,
+            runtime_config_non_secret: None,
+            runtime_refs: None,
         })
+    }
+
+    /// Inject the `pack-config.v1.non_secret` map for this pack. Called by
+    /// the producer (greentic-start, C4.3) after loading the deployed
+    /// `PackConfig`. Passing `None` clears any previously-set map.
+    pub fn set_runtime_config_non_secret(&mut self, map: Option<Arc<BTreeMap<String, Value>>>) {
+        self.runtime_config_non_secret = map;
+    }
+
+    /// Read-only accessor for the injected `pack-config.v1.non_secret` map.
+    /// Used by the revision loader's tests to assert producer plumbing.
+    pub fn runtime_config_non_secret(&self) -> Option<&Arc<BTreeMap<String, Value>>> {
+        self.runtime_config_non_secret.as_ref()
+    }
+
+    /// Inject the `pack-config.v1.runtime_refs` channel (C5): per-pack
+    /// `key → URI` bindings plus the env-shared resolver. Called by
+    /// greentic-start after loading the deployed `PackConfig`. Passing
+    /// `None` clears any previously-set injection.
+    pub fn set_runtime_refs(&mut self, injection: Option<RuntimeRefsInjection>) {
+        self.runtime_refs = injection;
+    }
+
+    /// Read-only accessor for the injected runtime-refs channel. Used by
+    /// the revision loader's tests to assert producer plumbing.
+    pub fn runtime_refs(&self) -> Option<&RuntimeRefsInjection> {
+        self.runtime_refs.as_ref()
     }
 
     pub async fn list_flows(&self) -> Result<Vec<FlowDescriptor>> {
@@ -1932,6 +2211,9 @@ impl PackRuntime {
         config_json: Option<String>,
         input_json: String,
     ) -> Result<Value> {
+        let component_ref = resolve_component_key(component_ref, operation, |key| {
+            self.components.contains_key(key)
+        });
         let pack_component = self
             .components
             .get(component_ref)
@@ -1954,6 +2236,8 @@ impl PackRuntime {
             Self::merge_component_config_into_input_json(config_json.as_deref(), &input_json)
                 .context("merge component config into invocation payload")?;
         let ctx_owned = ctx;
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("component.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -1972,6 +2256,8 @@ impl PackRuntime {
                 Some(ctx_owned.clone()),
                 Some(component_ref_owned.clone()),
                 false,
+                runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2061,6 +2347,8 @@ impl PackRuntime {
         let op_owned = op.to_string();
         let ctx_owned = ctx;
         let world = binding.world.clone();
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("provider.invoke", move || {
             let mut linker = Linker::new(&engine);
@@ -2078,6 +2366,8 @@ impl PackRuntime {
                 Some(ctx_owned.clone()),
                 Some(component_ref_owned.clone()),
                 true,
+                runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2123,6 +2413,374 @@ impl PackRuntime {
             };
             deserialize_json_bytes(result)
         })
+    }
+
+    /// Call the provider component's `identify-instance` export
+    /// (`greentic:provider-instance-identity@0.1.0`) with the inbound
+    /// payload bytes. Returns an [`IdentifyOutcome`] — see the variant
+    /// docs for the per-case contract.
+    ///
+    /// # Payload shape (M1 IID.4d wrapper)
+    ///
+    /// `payload` is forwarded opaque to the component. The shape is set by
+    /// the caller; the M1 IID.4d wrapper convention from `greentic-start`
+    /// is `{headers: [{name,value}], body: <parsed-or-null>}` so providers
+    /// whose discriminator lives in HTTP headers (Telegram via
+    /// `x-telegram-bot-api-secret-token`) can identify the instance the
+    /// same call shape that body-based providers (Teams, Slack, Webex,
+    /// etc.) use. See the docstring on
+    /// `greentic:provider-instance-identity/instance-identity-api.identify-instance`
+    /// for the full contract; this host method does not parse or
+    /// validate the bytes.
+    ///
+    /// # Host authority on identity probes
+    ///
+    /// The linker registers the full host import surface (Wasmtime
+    /// validates all imports eagerly at `instantiate_pre`, not just
+    /// those reachable from the invoked export). The WASI sandbox is
+    /// locked down: no preopens, no env, no stdio. Deny-shim linker
+    /// handlers (trap on call, satisfy at link time) are a follow-up
+    /// in `greentic-interfaces-wasmtime`. See [`register_identity_probe`].
+    pub async fn invoke_identify_instance(
+        &self,
+        binding: &ProviderBinding,
+        payload: Vec<u8>,
+    ) -> Result<IdentifyOutcome> {
+        let component_ref_owned = binding.component_ref.clone();
+        let pack_component = self.components.get(&component_ref_owned).with_context(|| {
+            format!("provider component '{component_ref_owned}' not found in pack")
+        })?;
+        let component = pack_component.component.clone();
+
+        let engine = self.engine.clone();
+        let config = Arc::clone(&self.config);
+        let http_client = Arc::clone(&self.http_client);
+        let mocks = self.mocks.clone();
+        let session_store = self.session_store.clone();
+        let state_store = self.state_store.clone();
+        let secrets = Arc::clone(&self.secrets);
+        let oauth_config = self.oauth_config.clone();
+        let pack_id = self.metadata().pack_id.clone();
+
+        // Locked-down WASI policy: no preopens, no env, no stdio.
+        // The linker registers all imports (Wasmtime requires it for
+        // instantiate_pre), but the WASI sandbox is the tightest we
+        // can enforce today. See [`register_identity_probe`] docs.
+        let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
+        run_on_wasi_thread("provider.identify_instance", move || {
+            let mut linker = Linker::new(&engine);
+            register_identity_probe(&mut linker)?;
+            let host_state = HostState::new(
+                pack_id.clone(),
+                config,
+                http_client,
+                mocks,
+                session_store,
+                state_store,
+                secrets,
+                oauth_config,
+                None,
+                Some(component_ref_owned.clone()),
+                true,
+                runtime_config_non_secret,
+                runtime_refs,
+            )?;
+            let store_state = ComponentState::new(host_state, wasi_policy)?;
+            let mut store = wasmtime::Store::new(&engine, store_state);
+
+            let pre_instance = linker.instantiate_pre(component.as_ref())?;
+            let pre = match InstanceIdentityPre::<ComponentState>::new(pre_instance) {
+                Ok(pre) => pre,
+                Err(err) if is_missing_export_error(&format!("{err:#}")) => {
+                    return Ok(IdentifyOutcome::Unsupported);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+            let api = bindings.greentic_provider_instance_identity_instance_identity_api();
+            let result = api.call_identify_instance(&mut store, &payload)?;
+            Ok(match result {
+                Some(id) => IdentifyOutcome::Identified(id),
+                None => IdentifyOutcome::NoMatch,
+            })
+        })
+    }
+
+    /// Call the provider component's `describe-identify-instance` export
+    /// (`greentic:provider-instance-identity/instance-identity-describe@0.1.0`)
+    /// and parse the returned JSON into an [`IdentifyInstanceHint`].
+    ///
+    /// Returns `Ok(None)` for every "no hint available" case: the
+    /// component does not export the describe world, the export returned
+    /// `none`, the returned bytes are not valid JSON, or the `version`
+    /// gate failed. The two malformed cases are warn-logged so a typo'd
+    /// hint surfaces in operator logs without blocking ingest. Component
+    /// traps and other infrastructure errors propagate as `Err`.
+    ///
+    /// This is the uncached probe — see [`resolve_identify_hint`] for the
+    /// cached wrapper that callers SHOULD use on the inbound hot path.
+    ///
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn invoke_describe_identify_instance(
+        &self,
+        binding: &ProviderBinding,
+    ) -> Result<Option<IdentifyInstanceHint>> {
+        let component_ref_owned = binding.component_ref.clone();
+        let pack_component = self.components.get(&component_ref_owned).with_context(|| {
+            format!("provider component '{component_ref_owned}' not found in pack")
+        })?;
+        let component = pack_component.component.clone();
+
+        let engine = self.engine.clone();
+        let config = Arc::clone(&self.config);
+        let http_client = Arc::clone(&self.http_client);
+        let mocks = self.mocks.clone();
+        let session_store = self.session_store.clone();
+        let state_store = self.state_store.clone();
+        let secrets = Arc::clone(&self.secrets);
+        let oauth_config = self.oauth_config.clone();
+        let pack_id = self.metadata().pack_id.clone();
+
+        // Locked-down WASI policy — same rationale as
+        // `invoke_identify_instance`. See [`register_identity_probe`] docs.
+        let wasi_policy = Arc::new(RunnerWasiPolicy::probe());
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
+        run_on_wasi_thread("provider.describe_identify_instance", move || {
+            let mut linker = Linker::new(&engine);
+            register_identity_probe(&mut linker)?;
+            let host_state = HostState::new(
+                pack_id.clone(),
+                config,
+                http_client,
+                mocks,
+                session_store,
+                state_store,
+                secrets,
+                oauth_config,
+                None,
+                Some(component_ref_owned.clone()),
+                true,
+                runtime_config_non_secret,
+                runtime_refs,
+            )?;
+            let store_state = ComponentState::new(host_state, wasi_policy)?;
+            let mut store = wasmtime::Store::new(&engine, store_state);
+
+            let pre_instance = linker.instantiate_pre(component.as_ref())?;
+            let pre = match InstanceIdentityDescribePre::<ComponentState>::new(pre_instance) {
+                Ok(pre) => pre,
+                Err(err) if is_missing_export_error(&format!("{err:#}")) => {
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let bindings = block_on(async { pre.instantiate_async(&mut store).await })?;
+            let api = bindings.greentic_provider_instance_identity_instance_identity_describe_api();
+            let raw = api.call_describe_identify_instance(&mut store)?;
+            let Some(bytes) = raw else {
+                // Component exported the world but said "no hint right now".
+                // Per the WIT contract this is equivalent to a missing
+                // export — unhinted fallback at the caller.
+                return Ok(None);
+            };
+            match IdentifyInstanceHint::from_json(&bytes) {
+                Ok(hint) => Ok(Some(hint)),
+                Err(err) => {
+                    // Malformed hint or wrong version. Don't fail closed:
+                    // the contract demands the host fall back to unhinted
+                    // (invoke identify-instance with the global allowlist).
+                    // Warn so the provider author can fix the hint.
+                    warn!(
+                        event = "provider.describe_identify_instance.malformed",
+                        component_ref = %component_ref_owned,
+                        error = %err,
+                        "ignoring malformed describe-identify-instance hint; \
+                         falling back to unhinted wrapper"
+                    );
+                    Ok(None)
+                }
+            }
+        })
+    }
+
+    /// Cached wrapper around [`invoke_describe_identify_instance`]. The
+    /// hint for a given `binding.component_ref` is invariant across
+    /// inbound requests within a revision (it is a function of the
+    /// component itself, not of the payload), so we probe lazily on
+    /// first ask and reuse thereafter. `ArcSwap`-driven revision swaps
+    /// allocate a fresh [`PackRuntime`], naturally invalidating the cache.
+    ///
+    /// Returns `None` when the component does not export the describe
+    /// world, when the probe returns no hint, or when the probe fails
+    /// (trap, timeout, instantiation error). Failures are warn-logged
+    /// and cached — the same trap is logged once per revision per
+    /// component, not per request.
+    ///
+    /// [`invoke_describe_identify_instance`]:
+    ///     PackRuntime::invoke_describe_identify_instance
+    pub async fn resolve_identify_hint(
+        &self,
+        binding: &ProviderBinding,
+    ) -> Option<IdentifyInstanceHint> {
+        if let Some(cached) = self.identify_hint_cache.read().get(&binding.component_ref) {
+            return cached.clone();
+        }
+        let hint = match self.invoke_describe_identify_instance(binding).await {
+            Ok(hint) => hint,
+            Err(err) => {
+                warn!(
+                    event = "provider.describe_identify_instance.failed",
+                    component_ref = %binding.component_ref,
+                    error = %err,
+                    "describe-identify-instance probe failed; \
+                     falling back to unhinted wrapper for this component"
+                );
+                None
+            }
+        };
+        // Tolerate a concurrent populate — `insert` is idempotent on the
+        // same (component_ref, hint) shape and the probe is pure w.r.t.
+        // the component, so re-probing on a write-race yields identical
+        // bytes.
+        self.identify_hint_cache
+            .write()
+            .insert(binding.component_ref.clone(), hint.clone());
+        hint
+    }
+
+    /// Fan out [`resolve_identify_hint`] over each requested `provider_type`.
+    /// Result map is keyed by `provider_type`; `None` value means the
+    /// pack has no binding for that type OR the binding's component does
+    /// not export the describe world (unhinted — caller forwards input
+    /// headers unfiltered for back-compat).
+    ///
+    /// `provider_id`-collision errors from [`ProviderRegistry::resolve`]
+    /// against a `provider_type` query are propagated (M1.1 invariant
+    /// violation, malformed pack).
+    ///
+    /// Fan out [`resolve_identify_hint`] across requested types. `None` value
+    /// means the pack has no binding for that type OR the binding's component
+    /// does not export the describe world.
+    ///
+    /// The per-binding loop is inlined (rather than factored into a shared
+    /// `AsyncFnMut`-based helper) deliberately: routing through an
+    /// `AsyncFnMut` closure destabilises HRTB `Send` inference for the
+    /// returned future, which propagates up to host-level fan-out APIs and
+    /// from there to downstream spawned-service consumers. See the
+    /// regression test `identify_futures_are_send` on the host.
+    ///
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    pub async fn describe_identify_hints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+    ) -> Result<HashMap<String, Option<IdentifyInstanceHint>>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), None);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), None);
+                continue;
+            };
+            let hint = self.resolve_identify_hint(&binding).await;
+            out.insert((*ty).to_string(), hint);
+        }
+        Ok(out)
+    }
+
+    /// Unscoped legacy API: fan out [`invoke_identify_instance`] with the
+    /// caller-supplied opaque `payload` bytes forwarded verbatim. No
+    /// describe-identify-instance hint lookup, no per-provider header
+    /// scoping. New callers should use the `_scoped` sibling for
+    /// per-provider header allowlist scoping (Phase D).
+    ///
+    /// Loop inlined for the same reason as
+    /// [`describe_identify_hints_by_provider_type`].
+    ///
+    /// [`invoke_identify_instance`]: PackRuntime::invoke_identify_instance
+    /// [`describe_identify_hints_by_provider_type`]:
+    ///     PackRuntime::describe_identify_hints_by_provider_type
+    pub async fn identify_endpoints_by_provider_type(
+        &self,
+        provider_types: &[&str],
+        payload: &[u8],
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                continue;
+            };
+            let outcome = self
+                .invoke_identify_instance(&binding, payload.to_vec())
+                .await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
+    }
+
+    /// Per-provider scoped variant of [`identify_endpoints_by_provider_type`].
+    ///
+    /// The wrapper payload is built per-binding from `(headers, body)` and
+    /// the component's cached identify-instance hint (see
+    /// [`resolve_identify_hint`]): hinted providers see only the headers
+    /// their hint declares; unhinted providers see every header passed in.
+    /// Result-map semantics match the unscoped variant.
+    ///
+    /// Loop inlined for the same reason as
+    /// [`describe_identify_hints_by_provider_type`].
+    ///
+    /// [`identify_endpoints_by_provider_type`]:
+    ///     PackRuntime::identify_endpoints_by_provider_type
+    /// [`resolve_identify_hint`]: PackRuntime::resolve_identify_hint
+    /// [`describe_identify_hints_by_provider_type`]:
+    ///     PackRuntime::describe_identify_hints_by_provider_type
+    pub async fn identify_endpoints_by_provider_type_scoped(
+        &self,
+        provider_types: &[&str],
+        headers: &[(String, String)],
+        body: &Value,
+    ) -> Result<HashMap<String, IdentifyOutcome>> {
+        let mut out = HashMap::with_capacity(provider_types.len());
+        let registry = match self.provider_registry_optional()? {
+            Some(registry) => registry,
+            None => {
+                for ty in provider_types {
+                    out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                }
+                return Ok(out);
+            }
+        };
+        for ty in provider_types {
+            let Some(binding) = registry.try_resolve(None, Some(ty))? else {
+                out.insert((*ty).to_string(), IdentifyOutcome::Unsupported);
+                continue;
+            };
+            let hint = self.resolve_identify_hint(&binding).await;
+            let payload = build_scoped_identify_payload(headers, body, hint.as_ref());
+            let outcome = self.invoke_identify_instance(&binding, payload).await?;
+            out.insert((*ty).to_string(), outcome);
+        }
+        Ok(out)
     }
 
     pub(crate) fn provider_registry(&self) -> Result<ProviderRegistry> {
@@ -2220,6 +2878,8 @@ impl PackRuntime {
         let allow_state_store = self.allows_state_store(component_ref);
         let component = pack_component.component.clone();
         let component_ref_owned = component_ref.to_string();
+        let runtime_config_non_secret = self.runtime_config_non_secret.clone();
+        let runtime_refs = self.runtime_refs.clone();
 
         run_on_wasi_thread("component.describe", move || {
             let mut linker = Linker::new(&engine);
@@ -2238,6 +2898,8 @@ impl PackRuntime {
                 None,
                 Some(component_ref_owned),
                 false,
+                runtime_config_non_secret,
+                runtime_refs,
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
@@ -2435,10 +3097,93 @@ impl PackRuntime {
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
+            identify_hint_cache: RwLock::new(HashMap::new()),
             secrets: crate::secrets::default_manager()?,
             oauth_config: None,
             cache,
+            runtime_config_non_secret: None,
+            runtime_refs: None,
         })
+    }
+}
+
+/// Resolve a flow node's component reference to the key under which the
+/// component is actually registered, given the requested `operation` and a
+/// `is_registered` membership predicate over the pack's component keys.
+///
+/// greentic-pack resolves a component node to a bare component symbol
+/// (e.g. `ai.greentic.component-templates`) and carries the operation
+/// separately, so the full reference is the registration key. Older,
+/// hand-authored flows instead pack the operation into the node id
+/// (`qa.process`) while registering the component under the bare name
+/// (`qa`). For those, fall back to the segment before the last dot — but
+/// ONLY when that trailing segment IS the requested operation. Without the
+/// suffix check, a missing dotted component whose prefix happens to be a
+/// *different* registered component (`ai.greentic.component-templates` absent,
+/// `ai.greentic` present) would silently resolve to the wrong component and
+/// run it with the caller's tenant/session/state/secrets. Returns the
+/// reference unchanged when neither form matches, so the caller's
+/// "not found" error names the original reference.
+fn resolve_component_key<'a>(
+    component_ref: &'a str,
+    operation: &str,
+    is_registered: impl Fn(&str) -> bool,
+) -> &'a str {
+    if is_registered(component_ref) {
+        return component_ref;
+    }
+    if let Some((prefix, suffix)) = component_ref.rsplit_once('.')
+        && suffix == operation
+        && is_registered(prefix)
+    {
+        return prefix;
+    }
+    component_ref
+}
+
+#[cfg(test)]
+mod resolve_component_key_tests {
+    use super::resolve_component_key;
+    use std::collections::HashSet;
+
+    fn registered(keys: &[&'static str]) -> impl Fn(&str) -> bool {
+        let set: HashSet<&'static str> = keys.iter().copied().collect();
+        move |key: &str| set.contains(key)
+    }
+
+    #[test]
+    fn full_reference_is_used_when_registered() {
+        // greentic-pack's resolved symbol: full ref is the registration key.
+        let is_reg = registered(&["ai.greentic.component-templates", "ai.greentic"]);
+        assert_eq!(
+            resolve_component_key("ai.greentic.component-templates", "handle_message", is_reg),
+            "ai.greentic.component-templates"
+        );
+    }
+
+    #[test]
+    fn legacy_packed_id_falls_back_when_suffix_is_operation() {
+        // `qa.process` packs op into the id; component registered as `qa`.
+        let is_reg = registered(&["qa"]);
+        assert_eq!(resolve_component_key("qa.process", "process", is_reg), "qa");
+    }
+
+    #[test]
+    fn drifted_dotted_reference_does_not_fall_back_to_prefix() {
+        // Full symbol absent, a *different* prefix component present, and the
+        // trailing segment is NOT the requested operation -> must not silently
+        // resolve to the prefix; return the original so the caller errors out.
+        let is_reg = registered(&["ai.greentic"]);
+        assert_eq!(
+            resolve_component_key("ai.greentic.component-templates", "handle_message", is_reg),
+            "ai.greentic.component-templates"
+        );
+    }
+
+    #[test]
+    fn unregistered_reference_is_returned_unchanged() {
+        let is_reg = registered(&[]);
+        assert_eq!(resolve_component_key("foo", "bar", is_reg), "foo");
     }
 }
 
@@ -2540,6 +3285,187 @@ fn deserialize_json_bytes(bytes: Vec<u8>) -> Result<Value> {
             .map(Value::String)
             .map_err(|err| anyhow!(err))
     })
+}
+
+/// `wasmtime::component::bindgen!` returns this error shape when a
+/// `*Pre::new(...)` call resolves a world whose required export is
+/// absent on the component. We treat that as "component does not opt
+/// in" and let the caller fall back to the operator's statically
+/// declared instance. Mirrors the same pattern in `invoke_provider`
+/// for the legacy/path schema-core fallback.
+///
+/// The match is intentionally narrow: the error must mention BOTH a
+/// broad wasmtime marker (`"no exported instance named"` or
+/// `"no exported function named"`) AND the identity-world-specific
+/// name segment (`"instance-identity-api"`, `"identify-instance"`,
+/// `"instance-identity-describe-api"`, or `"describe-identify-instance"`).
+/// A component that exports the identity world with a malformed
+/// signature or a typo'd function name will NOT be silently treated
+/// as unsupported — it will surface as a hard error.
+fn is_missing_export_error(message: &str) -> bool {
+    let has_broad_marker = message.contains("no exported instance named")
+        || message.contains("no exported function named");
+    let has_identity_segment = message.contains("instance-identity-api")
+        || message.contains("identify-instance")
+        || message.contains("instance-identity-describe-api")
+        || message.contains("describe-identify-instance");
+    has_broad_marker && has_identity_segment
+}
+
+/// Build the M1 IID.4d wrapper payload (`{ headers, body }`) scoped per
+/// the provider's [`IdentifyInstanceHint`].
+///
+/// - `Some(hint)` ⇒ headers are filtered to ONLY those whose lowercase
+///   name appears in [`hint.header_names()`](IdentifyInstanceHint::header_names).
+///   A hint with no `Header` sources yields `"headers": []` — the
+///   component is declaring that it identifies from the body alone.
+/// - `None` ⇒ headers pass through unfiltered. The caller is responsible
+///   for prefiltering (greentic-start applies a global allowlist at the
+///   ingress boundary), so back-compat with not-yet-hinted providers
+///   matches the pre-PR-B2 behavior exactly: every probed component
+///   receives every allowlisted header.
+///
+/// `body` is forwarded verbatim regardless of hint shape. Body-path
+/// short-circuit (using the hint's `BodyPath { json_pointer }` to skip
+/// invoking `identify-instance` entirely) is a deliberately-deferred
+/// Phase D follow-up — the current pass scopes the header allowlist only.
+fn build_scoped_identify_payload(
+    headers: &[(String, String)],
+    body: &Value,
+    hint: Option<&IdentifyInstanceHint>,
+) -> Vec<u8> {
+    let scoped_headers: Vec<&(String, String)> = match hint {
+        // Hints carry 1-3 source headers in practice; a linear scan beats
+        // a HashSet for that size (no hash + no allocation).
+        Some(hint) => {
+            let allowed = hint.header_names();
+            headers
+                .iter()
+                .filter(|(name, _)| allowed.contains(&name.as_str()))
+                .collect()
+        }
+        None => headers.iter().collect(),
+    };
+    let wrapper = serde_json::json!({
+        "headers": scoped_headers
+            .iter()
+            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>(),
+        "body": body,
+    });
+    serde_json::to_vec(&wrapper).expect("wrapper payload always serializes")
+}
+
+#[cfg(test)]
+mod build_scoped_identify_payload_tests {
+    use super::*;
+    use crate::identify_hint::HintSource;
+    use serde_json::json;
+
+    fn hint(sources: Vec<HintSource>) -> IdentifyInstanceHint {
+        IdentifyInstanceHint { sources }
+    }
+
+    #[test]
+    fn unhinted_passes_all_input_headers_through() {
+        // Back-compat: components without describe-identify-instance must
+        // continue to see every header the caller (greentic-start)
+        // allowlisted. Pre-PR-B2 behavior verbatim.
+        let headers = vec![
+            (
+                "x-telegram-bot-api-secret-token".into(),
+                "telegram-tok".into(),
+            ),
+            ("x-future-routing-tag".into(), "abc".into()),
+        ];
+        let body = json!({ "update_id": 1 });
+        let bytes = build_scoped_identify_payload(&headers, &body, None);
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-telegram-bot-api-secret-token", "value": "telegram-tok" },
+                { "name": "x-future-routing-tag", "value": "abc" }
+            ])
+        );
+        assert_eq!(parsed["body"], body);
+    }
+
+    #[test]
+    fn header_hint_filters_to_declared_names_only() {
+        // Telegram-shape hint: declares one header, sees only that one.
+        // Other allowlisted headers (e.g. a future Slack signature) MUST
+        // NOT leak into the Telegram probe.
+        let h = hint(vec![HintSource::Header {
+            name: "x-telegram-bot-api-secret-token".into(),
+        }]);
+        let headers = vec![
+            (
+                "x-telegram-bot-api-secret-token".into(),
+                "telegram-tok".into(),
+            ),
+            ("x-slack-signature".into(), "v0=sig".into()),
+        ];
+        let body = json!({});
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-telegram-bot-api-secret-token", "value": "telegram-tok" }
+            ])
+        );
+    }
+
+    #[test]
+    fn hints_without_header_sources_drop_all_headers() {
+        // Body-path-only (Teams-shape) and degenerate-empty hints both yield
+        // an empty `Header` source set; the wrapper MUST carry no headers
+        // either way. Passing Telegram's secret token through to either is
+        // the exact blast-radius bug PR-B2 closes.
+        let headers = vec![(
+            "x-telegram-bot-api-secret-token".into(),
+            "should-not-leak".into(),
+        )];
+        let body = json!({ "anything": true });
+        for h in [
+            hint(vec![HintSource::BodyPath {
+                json_pointer: "/recipient/id".into(),
+            }]),
+            hint(vec![]),
+        ] {
+            let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+            let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(parsed["headers"], json!([]), "hint={:?}", h.sources);
+            assert_eq!(parsed["body"], body);
+        }
+    }
+
+    #[test]
+    fn header_filter_preserves_input_order_and_dups() {
+        // Multi-value headers and ordering matter to debuggability
+        // (operators reading the wrapper from a probe should see the
+        // headers in the same order they arrived). Filter is a
+        // retain-only operation; no sort, no dedup.
+        let h = hint(vec![HintSource::Header {
+            name: "x-route".into(),
+        }]);
+        let headers = vec![
+            ("x-route".into(), "a".into()),
+            ("x-other".into(), "skip".into()),
+            ("x-route".into(), "b".into()),
+        ];
+        let body = json!({});
+        let bytes = build_scoped_identify_payload(&headers, &body, Some(&h));
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            parsed["headers"],
+            json!([
+                { "name": "x-route", "value": "a" },
+                { "name": "x-route", "value": "b" }
+            ])
+        );
+    }
 }
 
 impl PackFlows {
@@ -4156,6 +5082,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4216,6 +5143,7 @@ mod tests {
             schema_version: None,
             entrypoints: IndexMap::new(),
             meta: None,
+            slot_schema: None,
             nodes,
         };
 
@@ -4251,6 +5179,156 @@ mod tests {
                 }]
             }))
         );
+    }
+
+    #[test]
+    fn missing_export_error_detection_recognises_bindgen_shapes() {
+        // Positive: identity-world missing-instance error
+        assert!(is_missing_export_error(
+            "instantiation: no exported instance named \
+             `greentic:provider-instance-identity/instance-identity-api@0.1.0`"
+        ));
+        // Positive: identity-world missing-function error
+        assert!(is_missing_export_error(
+            "instantiation: no exported function named `identify-instance`"
+        ));
+        // Negative: unrelated trap
+        assert!(!is_missing_export_error(
+            "Wasm trap: out of bounds memory access"
+        ));
+        // Negative: a DIFFERENT world's missing export must NOT match —
+        // e.g. schema-core missing is a hard error, not "unsupported"
+        assert!(!is_missing_export_error(
+            "instantiation: no exported instance named \
+             `greentic:provider-schema-core/schema-core-api@1.0.0`"
+        ));
+        // Negative: broad marker present but for a non-identity function
+        assert!(!is_missing_export_error(
+            "instantiation: no exported function named `invoke`"
+        ));
+    }
+
+    #[test]
+    fn identify_outcome_merge_in_follows_lattice() {
+        let unsupported = || IdentifyOutcome::Unsupported;
+        let no_match = || IdentifyOutcome::NoMatch;
+        let id_a = || IdentifyOutcome::Identified("a".to_string());
+        let id_b = || IdentifyOutcome::Identified("b".to_string());
+
+        // Unsupported is the floor — every other variant promotes it.
+        let mut x = unsupported();
+        x.merge_in(unsupported());
+        assert_eq!(x, unsupported());
+        let mut x = unsupported();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = unsupported();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a());
+
+        // NoMatch beats Unsupported but is overridable by Identified.
+        let mut x = no_match();
+        x.merge_in(unsupported());
+        assert_eq!(x, no_match(), "NoMatch must not downgrade to Unsupported");
+        let mut x = no_match();
+        x.merge_in(no_match());
+        assert_eq!(x, no_match());
+        let mut x = no_match();
+        x.merge_in(id_a());
+        assert_eq!(x, id_a(), "Identified must override NoMatch");
+
+        // Identified is the top — nothing overwrites it (first id wins).
+        let mut x = id_a();
+        x.merge_in(unsupported());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(no_match());
+        assert_eq!(x, id_a());
+        let mut x = id_a();
+        x.merge_in(id_b());
+        assert_eq!(
+            x,
+            id_a(),
+            "first Identified wins; later id does not replace"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_endpoints_pack_tests {
+    use super::*;
+    use crate::config::{
+        FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
+        WebhookPolicy,
+    };
+    use crate::trace::TraceConfig;
+    use crate::validate::ValidationConfig;
+
+    fn test_host_config() -> HostConfig {
+        HostConfig {
+            tenant: "test".to_string(),
+            bindings_path: PathBuf::from("/tmp/bindings.yaml"),
+            flow_type_bindings: HashMap::new(),
+            rate_limits: RateLimits::default(),
+            retry: FlowRetryConfig::default(),
+            http_enabled: false,
+            secrets_policy: SecretsPolicy::allow_all(),
+            state_store_policy: StateStorePolicy::default(),
+            webhook_policy: WebhookPolicy::default(),
+            timers: Vec::new(),
+            oauth: None,
+            mocks: None,
+            pack_bindings: Vec::new(),
+            env_passthrough: Vec::new(),
+            trace: TraceConfig::from_env(),
+            validation: ValidationConfig::from_env(),
+            operator_policy: OperatorPolicy::allow_all(),
+            fast2flow: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_manifest_returns_unsupported_for_all_types() {
+        // A PackRuntime with manifest: None (e.g. legacy single-component
+        // packs or the for_component_test constructor) has no provider
+        // registry. Every requested type must map to Unsupported — NOT
+        // NoMatch — so the caller knows it can fall back to the static
+        // provider_id rather than failing closed.
+        let pack = PackRuntime::for_component_test(
+            Vec::new(),
+            HashMap::new(),
+            "test-pack",
+            Arc::new(test_host_config()),
+        )
+        .expect("empty pack construction");
+        let result = pack
+            .identify_endpoints_by_provider_type(&["teams", "slack", "telegram"], b"{}")
+            .await
+            .expect("no-manifest path must succeed");
+        assert_eq!(result.len(), 3);
+        for ty in &["teams", "slack", "telegram"] {
+            assert_eq!(
+                result.get(*ty),
+                Some(&IdentifyOutcome::Unsupported),
+                "type '{ty}' must be Unsupported when pack has no manifest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_provider_types_returns_empty_map() {
+        let pack = PackRuntime::for_component_test(
+            Vec::new(),
+            HashMap::new(),
+            "test-pack",
+            Arc::new(test_host_config()),
+        )
+        .expect("empty pack construction");
+        let result = pack
+            .identify_endpoints_by_provider_type(&[], b"{}")
+            .await
+            .expect("empty types fast path");
+        assert!(result.is_empty());
     }
 }
 

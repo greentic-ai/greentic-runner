@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "value": "westeurope"
+    },
+    "environment": {
+      "value": "staging"
+    },
+    "operatorImage": {
+      "value": "ghcr.io/greenticai/greentic-runner:__REPLACE_ME__"
+    },
+    "vnetName": {
+      "value": "__REPLACE_ME__"
+    },
+    "containerAppSubnetName": {
+      "value": "__REPLACE_ME__"
+    },
+    "redisSubnetName": {
+      "value": "__REPLACE_ME__"
+    },
+    "keyVaultName": {
+      "value": "__REPLACE_ME__"
+    },
+    "redisSecretName": {
+      "value": "webchat-redis-url"
+    },
+    "customDomainName": {
+      "value": ""
+    },
+    "rustLog": {
+      "value": "info,greentic_runner=info,greentic_runner_host=info"
+    },
+    "namePrefix": {
+      "value": "greentic-webchat-staging"
+    }
+  }
+}

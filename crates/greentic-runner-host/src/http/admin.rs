@@ -12,7 +12,7 @@ pub async fn status(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
     let snapshot = state.active.snapshot();
     let tenants = snapshot
         .iter()
-        .map(|(tenant, runtime)| {
+        .map(|(key, runtime)| {
             let pack = runtime.pack();
             let metadata = pack.metadata();
             let required_secrets = runtime.required_secrets();
@@ -31,7 +31,7 @@ pub async fn status(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
                 })
                 .collect::<Vec<_>>();
             json!({
-                "tenant": tenant,
+                "tenant": key.tenant,
                 "pack_id": metadata.pack_id,
                 "version": metadata.version,
                 "digest": runtime.digest(),

@@ -824,6 +824,7 @@ fn build_activity(
 
 /// Look for `error_kind` + `error_message` at any of the carrier paths an
 /// Activity reply may nest them under (`payload.metadata`, `metadata`, root).
+#[cfg(feature = "fault-injection")]
 fn extract_error_envelope(value: &Value) -> Option<(String, String)> {
     let candidates = [
         value.get("payload").and_then(|p| p.get("metadata")),

@@ -485,6 +485,11 @@ async fn invoke_operator_api_preserves_provider_instance_config_for_component_ru
     )?;
 
     let payload = serde_cbor::to_vec(&json!({"message": "ping"}))?;
+    // M1.1b: id-only dispatch for state-store-backed instances. The inline
+    // pack decl no longer synthesizes `provider_id = Some(provider_type)`,
+    // so per_provider_id has no entry. invoke_operator probes the state
+    // store via main_pack.resolve_provider to derive provider_type and
+    // retries the operator lookup.
     let request = OperatorRequest {
         tenant_id: Some("demo".into()),
         provider_id: Some(PROVIDER_TYPE.to_string()),
@@ -607,6 +612,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
+
             capabilities: Vec::new(),
             ops: vec!["process".to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),
@@ -632,6 +638,7 @@ fn build_component_provider_pack(component_path: &Path, pack_path: &Path) -> Res
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "operator.component".parse()?,
         name: Some("operator.component".into()),
@@ -732,6 +739,7 @@ fn build_provider_pack_with_schemas(
     let inline = ProviderExtensionInline {
         providers: vec![ProviderDecl {
             provider_type: PROVIDER_TYPE.to_string(),
+
             capabilities: Vec::new(),
             ops: vec![PROVIDER_OP.to_string()],
             config_schema_ref: "schemas/config.schema.json".into(),
@@ -757,6 +765,7 @@ fn build_provider_pack_with_schemas(
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "operator.provider".parse()?,
         name: Some("operator.provider".into()),

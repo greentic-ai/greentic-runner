@@ -37,14 +37,16 @@ GREENTIC_HEAVY_WASM=1 cargo test --workspace
 LOCAL_CHECK_STEPS=fmt,clippy ci/local_check.sh
 ```
 
-`ci/local_check.sh` steps: `fmt`, `clippy`, `host_smoke`, `crate_tests`, `workspace_tests`, `conformance`, `package`.
+`ci/local_check.sh` steps: `fmt`, `dependency_sanity`, `clippy`, `host_smoke`, `crate_tests`, `workspace_tests`, `conformance`, `package`.
+
+The `dependency_sanity` step detects multiple wasmtime versions in the dependency tree (local workspace crates vs published greentic-* version skew) and fails early before clippy/tests hit confusing trait-mismatch errors.
 
 ## Workspace Layout
 
 ```
 crates/
   greentic-runner/           # Binary + public library (thin CLI wrapper)
-  greentic-runner-host/      # Core runtime (~9K lines): pack loading, flow engine,
+  greentic-runner-host/      # Core runtime (~29K lines): pack loading, flow engine,
                              #   ingress adapters, session/state, admin API
   greentic-runner-desktop/   # Desktop CLI integration
   runner-core/               # Pack resolution, signing verification, cache helpers
@@ -85,19 +87,87 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 
 ### Key Modules in `greentic-runner-host`
 
+**Core lifecycle & runtime**
+
+| Module | Responsibility |
+|--------|---------------|
+| `host.rs` | Multi-tenant builder, `RunnerHost` lifecycle |
+| `boot.rs` | Startup bootstrap sequence |
+| `runtime.rs` | `TenantRuntime`, atomic pack swapping via `ArcSwap` |
+| `runtime_refs.rs` | Shared runtime reference handles |
+| `runtime_wasmtime.rs` | Wasmtime engine/linker setup, WASI linkage |
+| `config.rs` | Runtime configuration loading and defaults |
+| `watcher.rs` | Pack index polling and hot reload |
+
+**Pack & component loading**
+
 | Module | Responsibility |
 |--------|---------------|
 | `pack.rs` | Component loading, flow/template discovery, Wasmtime linking |
-| `runner/engine.rs` | Flow DAG interpretation, node execution |
-| `host.rs` | Multi-tenant builder, `RunnerHost` lifecycle |
-| `runtime.rs` | `TenantRuntime`, atomic pack swapping |
-| `http/` | Axum routes (ingress adapters, admin, health) |
-| `runner/adapt_*.rs` | Ingress normalization per provider |
-| `runner/operator.rs` | Built-in operators (emit, wait, flow call, provider invoke) |
-| `engine/state_machine.rs` | State transitions, pause/resume orchestration |
-| `cache/` | Component artifact caching (memory + disk) |
-| `watcher.rs` | Pack index polling and hot reload |
+| `component_api.rs` | Component invoke API (describe, invoke) |
 | `verify.rs` | Ed25519 signature verification |
+| `wasi.rs` | WASI host-import wiring |
+| `cache/` | Component artifact caching (memory LRU + disk, singleflight dedup) |
+
+**Flow engine (`engine/`)**
+
+| Module | Responsibility |
+|--------|---------------|
+| `engine/mod.rs` | `FlowEngine` entry, DAG walker |
+| `engine/state_machine.rs` | State transitions, pause/resume orchestration |
+| `engine/builder.rs` | Engine builder pattern |
+| `engine/policy.rs` | Execution policy enforcement |
+| `engine/registry.rs` | Node-type registry |
+| `engine/glue/`, `engine/shims/` | Adapter glue and host shims for component calls |
+
+**Runner (invocation pipeline)**
+
+| Module | Responsibility |
+|--------|---------------|
+| `runner/engine.rs` | Flow DAG interpretation, node execution |
+| `runner/operator.rs` | Built-in operators (emit, wait, flow call, provider invoke) |
+| `runner/invocation.rs` | Invocation envelope construction and dispatch |
+| `runner/flow_adapter.rs` | Flow-to-runtime adapter |
+| `runner/schema_validator.rs` | Runtime schema validation |
+| `runner/contract_cache.rs` | Cached component contract descriptors |
+| `runner/contract_introspection.rs` | v0.6 component introspection support |
+| `runner/templating.rs` | Handlebars template rendering |
+| `runner/i18n.rs` | Inline i18n locale handling |
+| `runner/adapt_timer.rs` | Timer/cron ingress normalization |
+| `runner/adapt_events_email.rs` | Email event ingress normalization |
+
+**HTTP layer (`http/`)**
+
+| Module | Responsibility |
+|--------|---------------|
+| `http/mod.rs` | Axum router assembly (ingress adapters, admin, health) |
+| `http/admin.rs` | Admin API endpoints |
+| `http/health.rs` | Health/readiness probes |
+
+**Cross-cutting**
+
+| Module | Responsibility |
+|--------|---------------|
+| `activity.rs` | Canonical `Activity` type for ingress normalization |
+| `routing.rs` | Tenant + flow routing from inbound requests |
+| `identify_hint.rs` | Provider identification hints for routing |
+| `provider.rs` | Provider abstraction layer |
+| `provider_core.rs` | Provider-core schema integration |
+| `provider_core_only.rs` | Guard enforcing provider-core-only mode |
+| `oauth.rs` | OAuth token brokering for components |
+| `secrets.rs` | Secrets host-import implementation |
+| `storage/` | Session + state backend adapters (in-memory, Redis) |
+| `metrics.rs` | Prometheus metrics collectors |
+| `operator_metrics.rs` | Per-operator metric instrumentation |
+| `operator_registry.rs` | Operator registry (node-type → handler mapping) |
+| `telemetry.rs` | OpenTelemetry span setup |
+| `telemetry_scan.rs` | Telemetry configuration scanning |
+| `greentic_x_provider.rs` | Greentic-X extension provider (behind `greentic-x-provider` feature) |
+| `gtbind.rs` | Bindings generation helpers |
+| `fault/` | Fault injection framework (behind `fault-injection` feature) |
+| `testing/` | Test utilities and mock helpers |
+| `trace/` | Distributed tracing helpers |
+| `validate/` | Runtime validation utilities |
 
 ## Conventions
 
@@ -147,10 +217,12 @@ Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERI
 ## Workspace Features
 
 - `verify` (default) — validate pack files before loading
-- `telemetry` — OTLP export via `greentic-telemetry`
+- `telemetry` — explicit span annotation via `greentic-telemetry` (telemetry crate always linked; feature gates `annotate_span` calls)
 - `fault-injection` — testing fault injection
 - `session-redis` — Redis session storage backend
 - `component-v0-6-introspection` — v0.6 component inspection
+- `greentic-x-provider` — Greentic-X extension runtime integration (host crate; pulls `greentic-x-runtime` + `greentic-x-types`)
+- `legacy-gen-bindings` — gates the `greentic-gen-bindings` binary (runner crate only)
 
 ## Git Conventions
 
