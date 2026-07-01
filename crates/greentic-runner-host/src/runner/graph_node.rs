@@ -779,7 +779,7 @@ mod aw {
             tools: vec![],
             guardrails: vec![],
             llm: LlmProviderRef {
-                provider: "openai".into(),
+                provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
                 model: req.model.clone(),
                 credential_ref: None,
             },
@@ -916,7 +916,7 @@ mod aw {
             tools: vec![],
             guardrails: vec![],
             llm: LlmProviderRef {
-                provider: "openai".into(),
+                provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
                 model: req.model.clone(),
                 credential_ref: None,
             },
