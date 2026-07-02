@@ -186,6 +186,13 @@ enum NodeKind {
     TelcoXCall {
         target: String,
     },
+    /// Native runtime-dispatch node for the Human-in-the-Loop approval runtime.
+    /// Mirrors [`SorlaCall`] but routes to the `"approval"` runtime name and
+    /// applies an autonomy gate (auto-approve below the configured risk /
+    /// above the configured confidence) before dispatching.
+    ApprovalCall {
+        target: String,
+    },
     /// Flow-execution MCP node (LOCKED ENCODING v2): `component == "mcp"` with
     /// `server`/`tool` carried in the node payload/config. Invokes the named
     /// MCP tool through the tenant's `flow_editor` MCP catalog (reusing
@@ -872,6 +879,9 @@ impl FlowEngine {
             NodeKind::TelcoXCall { target } => {
                 self.execute_telco_x_call(ctx, target, payload).await
             }
+            NodeKind::ApprovalCall { target } => {
+                self.execute_approval_call(ctx, target, payload).await
+            }
             NodeKind::Mcp { server_id, tool } => self
                 .execute_mcp(ctx, server_id, tool, payload)
                 .await
@@ -982,6 +992,33 @@ impl FlowEngine {
         payload: Value,
     ) -> Result<DispatchOutcome> {
         self.execute_remote_dispatch(ctx, "telco-x", target, payload)
+            .await
+    }
+
+    /// Dispatch an `approval.call` flow node. Applies the autonomy gate first:
+    /// when the gate says a human is NOT required, complete immediately on the
+    /// `approved` branch WITHOUT creating a pending approval; otherwise dispatch
+    /// to the `"approval"` runtime over the shared remote-dispatch seam (which
+    /// durably pauses the flow until the human resolves it).
+    async fn execute_approval_call(
+        &self,
+        ctx: &FlowContext<'_>,
+        target: &str,
+        payload: Value,
+    ) -> Result<DispatchOutcome> {
+        let input = payload.get("input").cloned().unwrap_or(Value::Null);
+        if !approval_requires_human(&input) {
+            // Match the shape the resume path injects ({ok, output, error})
+            // so downstream conditions read the decision at the same
+            // relative path regardless of whether a human was involved.
+            let output = NodeOutput::new(serde_json::json!({
+                "ok": true,
+                "output": { "decision": "approved", "auto": true },
+                "error": serde_json::Value::Null,
+            }));
+            return Ok(DispatchOutcome::complete(output));
+        }
+        self.execute_remote_dispatch(ctx, "approval", target, payload)
             .await
     }
 
@@ -2438,6 +2475,9 @@ impl From<Node> for HostNode {
                 "telco-x.call" => NodeKind::TelcoXCall {
                     target: raw_operation.clone().unwrap_or_default(),
                 },
+                "approval.call" => NodeKind::ApprovalCall {
+                    target: raw_operation.clone().unwrap_or_default(),
+                },
                 comp if comp.starts_with("emit.") => NodeKind::BuiltinEmit {
                     kind: emit_kind_from_ref(comp),
                 },
@@ -2476,6 +2516,7 @@ impl From<Node> for HostNode {
             NodeKind::OperalaCall { .. } => "operala.call".to_string(),
             NodeKind::AgenticCall { .. } => "agentic.call".to_string(),
             NodeKind::TelcoXCall { .. } => "telco-x.call".to_string(),
+            NodeKind::ApprovalCall { .. } => "approval.call".to_string(),
             NodeKind::Mcp { server_id, tool } => format!("mcp:{server_id}/{tool}"),
         };
         let operation_name = if is_component_exec && operation_is_component_exec {
@@ -3290,6 +3331,74 @@ fn build_routing_context(
     ctx.insert("event".into(), Value::String(event));
 
     Value::Object(ctx)
+}
+
+/// Pure autonomy-gate decision for an `approval.call` node. Returns `true` when
+/// the request must go to a human (dispatch), `false` when it auto-approves.
+///
+/// The gate config fields (`mode`, `risk_threshold`, `confidence_threshold`)
+/// are compiled by the designer as FLAT fields directly on the node input
+/// (not nested under a `gate` object); `risk`/`confidence` are already
+/// flat/dynamic values populated at flow render time.
+fn approval_requires_human(input: &Value) -> bool {
+    let mode = input
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("always");
+    match mode {
+        "above_risk" => {
+            let risk = input.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
+            let threshold = input
+                .get("risk_threshold")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            risk >= threshold
+        }
+        "above_confidence" => {
+            let confidence = input
+                .get("confidence")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let threshold = input
+                .get("confidence_threshold")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            confidence < threshold
+        }
+        // "always" and any unknown mode fail safe: require a human.
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+mod approval_gate_tests {
+    use super::approval_requires_human;
+    use serde_json::json;
+
+    #[test]
+    fn above_risk_auto_approves_below_threshold() {
+        let input = json!({ "risk": 0.5, "mode": "above_risk", "risk_threshold": 0.7 });
+        assert!(!approval_requires_human(&input));
+    }
+
+    #[test]
+    fn above_risk_requires_human_at_or_above_threshold() {
+        let input = json!({ "risk": 0.9, "mode": "above_risk", "risk_threshold": 0.7 });
+        assert!(approval_requires_human(&input));
+    }
+
+    #[test]
+    fn above_confidence_requires_human_when_low_confidence() {
+        let input =
+            json!({ "confidence": 0.4, "mode": "above_confidence", "confidence_threshold": 0.8 });
+        assert!(approval_requires_human(&input));
+    }
+
+    #[test]
+    fn always_and_missing_gate_require_human() {
+        assert!(approval_requires_human(&json!({ "mode": "always" })));
+        assert!(approval_requires_human(&json!({})));
+    }
 }
 
 #[cfg(test)]
