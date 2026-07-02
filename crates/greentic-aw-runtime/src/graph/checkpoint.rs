@@ -41,6 +41,9 @@ use crate::tenant::TenantContext;
 #[serde(rename_all = "lowercase")]
 pub enum RunStatus {
     Running,
+    /// Parked at a [`crate::graph::model::NodeKind::Approval`] node, awaiting
+    /// a human decision via the host's `ApprovalFn` closure (Task C2).
+    AwaitingInput,
     Succeeded,
     Failed,
 }
@@ -435,6 +438,16 @@ mod tests {
 
         let back: RunStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back, RunStatus::Succeeded);
+    }
+
+    #[test]
+    fn awaiting_input_status_roundtrips() {
+        let j = serde_json::to_string(&RunStatus::AwaitingInput).unwrap();
+        assert_eq!(j, r#""awaitinginput""#);
+        assert_eq!(
+            serde_json::from_str::<RunStatus>(&j).unwrap(),
+            RunStatus::AwaitingInput
+        );
     }
 
     #[tokio::test]

@@ -71,6 +71,29 @@ pub enum NodeKind {
     ///
     /// Requires `schemaVersion: 2`.
     Join,
+    /// Human-in-the-loop approval node. Parks the run awaiting a human decision
+    /// (`RunStatus::AwaitingInput`) and advances along the `approved`/`denied`/
+    /// `timeout` edge once decided. The decision itself is supplied by the host's
+    /// `ApprovalFn` closure.
+    ///
+    /// Requires `schemaVersion: 2`.
+    Approval {
+        title: String,
+        #[serde(default = "default_approval_mode")]
+        mode: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk_threshold: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence_threshold: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deadline_ms: Option<u64>,
+    },
+}
+
+/// Default `mode` for an [`NodeKind::Approval`] node when omitted from the
+/// wire document — always require a human decision.
+fn default_approval_mode() -> String {
+    "always".to_string()
 }
 
 impl NodeKind {
@@ -84,6 +107,7 @@ impl NodeKind {
             NodeKind::Supervisor { .. } => "supervisor",
             NodeKind::Parallel => "parallel",
             NodeKind::Join => "join",
+            NodeKind::Approval { .. } => "approval",
         }
     }
 
@@ -91,7 +115,10 @@ impl NodeKind {
     fn requires_v2(&self) -> bool {
         matches!(
             self,
-            NodeKind::Supervisor { .. } | NodeKind::Parallel | NodeKind::Join
+            NodeKind::Supervisor { .. }
+                | NodeKind::Parallel
+                | NodeKind::Join
+                | NodeKind::Approval { .. }
         )
     }
 }
@@ -182,6 +209,8 @@ impl Graph {
     ///    before the join; no nested parallel; no respond inside a branch.
     /// 10. (v2) Join: ≥2 incoming edges; exactly 1 outgoing edge; only
     ///     reachable via a parallel node.
+    /// 11. (v2) Approval: ≥1 outgoing edge (branch labels are validated
+    ///     leniently — any of `approved`/`denied`/`timeout` is accepted).
     pub fn validate(&self, schema_version: u32) -> Result<(), String> {
         // Rule 1: node ids must be unique.
         let mut seen_ids: HashSet<&str> = HashSet::new();
@@ -282,6 +311,18 @@ impl Graph {
                                 node.id, edge.from
                             ));
                         }
+                    }
+                }
+                NodeKind::Approval { .. } => {
+                    // Rule 11. Branch labels (approved/denied/timeout) are
+                    // validated leniently — the executor (Task C2) resolves
+                    // the decision to whichever outgoing edge matches, so we
+                    // only require that the node isn't a dead end.
+                    if out.is_empty() {
+                        return Err(format!(
+                            "approval node '{}' must have at least 1 outgoing edge, found 0",
+                            node.id
+                        ));
                     }
                 }
             }
@@ -722,6 +763,29 @@ mod tests {
         assert_eq!(cfg.graph.entry, "entry");
         // Nodes: entry agent, parallel, agent_a, tool_b, join, respond
         assert!(cfg.graph.nodes.len() >= 5, "expected at least 5 nodes");
+    }
+
+    #[test]
+    fn approval_kind_serde_tag_and_validate() {
+        let n: NodeKind = serde_json::from_value(serde_json::json!({
+            "kind":"approval","title":"Send refund","mode":"always"
+        }))
+        .unwrap();
+        assert_eq!(n.kind_name(), "approval");
+
+        // A minimal graph: start -> approval -> respond(approved) must validate.
+        let v = serde_json::json!({
+            "schemaVersion": 2,
+            "entry": "gate",
+            "nodes": [
+                {"id": "gate", "kind": "approval", "title": "Send refund"},
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [
+                {"from": "gate", "to": "respond", "branch": "approved"}
+            ]
+        });
+        GraphConfig::from_json(&v.to_string()).expect("valid approval graph");
     }
 
     // -----------------------------------------------------------------------

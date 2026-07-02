@@ -351,7 +351,13 @@ impl GraphExecutor {
         // Check if a record already exists.
         if let Some(existing) = self.store.load(tenant, run_id).await? {
             return match existing.status {
-                RunStatus::Running => {
+                // TODO(C2): `AwaitingInput` means the run is parked at an
+                // approval node; re-driving without a decision is a no-op
+                // today since no node kind produces this status yet. Treat
+                // it as in-flight (same as `Running`) so the match stays
+                // exhaustive — the executor's park/advance arm decides the
+                // real resume semantics.
+                RunStatus::Running | RunStatus::AwaitingInput => {
                     // Resume the in-flight run.
                     self.drive_from_record(tenant, run_id, existing).await
                 }
@@ -413,7 +419,12 @@ impl GraphExecutor {
                     trail,
                 })
             }
-            RunStatus::Running => self.drive_from_record(tenant, run_id, rec).await,
+            // TODO(C2): same rationale as `start` above — `AwaitingInput`
+            // resume semantics (require a supplied decision before
+            // re-driving) land with the executor's park/advance arm.
+            RunStatus::Running | RunStatus::AwaitingInput => {
+                self.drive_from_record(tenant, run_id, rec).await
+            }
         }
     }
 
@@ -769,6 +780,18 @@ impl GraphExecutor {
                          consumed by the parallel arm)"
                     );
                     cursor = next_linear(&cfg, &cursor)?;
+                }
+
+                // TODO(C2): park via `RunStatus::AwaitingInput` and advance
+                // along the `approved`/`denied`/`timeout` edge once a
+                // decision arrives through the host's `ApprovalFn` closure.
+                // No graph can reach this arm yet (Task C1 only adds the
+                // type + validation), so fail loudly instead of silently
+                // mis-executing an approval gate.
+                NodeKind::Approval { .. } => {
+                    return Err(GraphExecError::Graph(GraphError::Invalid(format!(
+                        "node '{cursor}': approval node execution is not yet implemented"
+                    ))));
                 }
             }
         }
@@ -1348,6 +1371,16 @@ impl GraphExecutor {
                             branch_label,
                             node.kind.kind_name(),
                             bc.cursor
+                        ))));
+                    }
+                    // TODO(C2): approval-inside-parallel-branch semantics
+                    // (whether/how a branch parks for a decision) are decided
+                    // when the executor's park/advance arm lands. Fail loudly
+                    // for now rather than silently mis-executing.
+                    NodeKind::Approval { .. } => {
+                        return Err(GraphExecError::Graph(GraphError::Invalid(format!(
+                            "approval node '{}' inside parallel branch '{}': execution not yet implemented",
+                            bc.cursor, branch_label
                         ))));
                     }
                 }
