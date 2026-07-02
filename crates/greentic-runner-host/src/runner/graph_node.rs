@@ -39,9 +39,10 @@ mod aw {
     use greentic_aw_runtime::config_provider::InMemoryConfigProvider;
     use greentic_aw_runtime::error::ConfigError;
     use greentic_aw_runtime::graph::{
-        AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointError, CheckpointStore,
-        GraphConfig, GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus,
-        SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
+        AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome,
+        ApprovalRequest, BoxFut, CheckpointError, CheckpointStore, GraphConfig, GraphExecError,
+        GraphExecutor, GraphRole, GraphRunState, RunStatus, SupervisorFn, SupervisorRequest,
+        SupervisorResult, ToolCallRequest, ToolFn,
     };
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
@@ -410,6 +411,7 @@ mod aw {
         agent_turn: AgentTurnFn,
         tool: ToolFn,
         supervisor: SupervisorFn,
+        approval: ApprovalFn,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -452,6 +454,14 @@ mod aw {
                 token_meter,
                 ledger,
             );
+            // NOTE(Task C3): the real `ApprovalFn` is designer-provided (it
+            // wires the `greentic.approval.request.v1` / `.response.v1` NATS
+            // round trip so a human decision can arrive asynchronously). This
+            // in-process runner-host path does not yet have that transport
+            // wired up, so it always parks (`Awaiting`) — safe (a graph run
+            // simply stays `AwaitingInput` forever) but not yet resolvable
+            // from here. Task C3 replaces this with a real approval bridge.
+            let approval = default_approval_awaiting();
             Self {
                 graphs,
                 checkpoint,
@@ -459,6 +469,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor,
+                approval,
             }
         }
 
@@ -468,6 +479,7 @@ mod aw {
         ///
         /// [`from_parts`]: RuntimeGraphNodeHandler::from_parts
         #[cfg(test)]
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn with_effects(
             graphs: Arc<dyn GraphConfigSource>,
             checkpoint: Arc<dyn CheckpointStore>,
@@ -475,6 +487,7 @@ mod aw {
             agent_turn: AgentTurnFn,
             tool: ToolFn,
             supervisor: SupervisorFn,
+            approval: ApprovalFn,
         ) -> Self {
             Self {
                 graphs,
@@ -483,6 +496,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor,
+                approval,
             }
         }
 
@@ -631,6 +645,7 @@ mod aw {
                 self.agent_turn.clone(),
                 self.tool.clone(),
                 self.supervisor.clone(),
+                self.approval.clone(),
             );
 
             let result = if slot.resume {
@@ -1033,6 +1048,19 @@ mod aw {
         })
     }
 
+    /// Default [`ApprovalFn`] for the in-process runner-host path: always
+    /// reports `Awaiting`.
+    ///
+    /// The real `ApprovalFn` is designer-provided and wires the
+    /// `greentic.approval.request.v1` / `.response.v1` round trip so a human
+    /// decision can arrive asynchronously and unpark the run. This in-process
+    /// default has no such transport, so it parks the run safely
+    /// (`RunStatus::AwaitingInput`) but never resolves it. See the
+    /// `from_parts` doc comment; Task C3 wires the real consumer.
+    fn default_approval_awaiting() -> ApprovalFn {
+        Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+    }
+
     /// Parse + dispatch a single Tool-node call. See [`build_tool`].
     async fn run_one_tool(
         req: ToolCallRequest,
@@ -1080,8 +1108,9 @@ mod aw {
 
         use greentic_aw_runtime::graph::model::SupervisorRoute;
         use greentic_aw_runtime::graph::{
-            AgentTurnFn, AgentTurnRequest, AgentTurnResult, GraphConfig, InMemoryCheckpointStore,
-            SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
+            AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome,
+            ApprovalRequest, GraphConfig, InMemoryCheckpointStore, SupervisorFn, SupervisorRequest,
+            SupervisorResult, ToolCallRequest, ToolFn,
         };
         use greentic_aw_runtime::mock::MockAgentStateStore;
         use serde_json::json;
@@ -1152,6 +1181,12 @@ mod aw {
             })
         }
 
+        /// A trivial approval fn that always reports `Awaiting` — none of
+        /// these fixtures contain an approval node, so this is never invoked.
+        fn approval_fn_awaiting() -> ApprovalFn {
+            Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+        }
+
         fn handler_with(
             graphs: Arc<dyn GraphConfigSource>,
             agent_turn: AgentTurnFn,
@@ -1164,6 +1199,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor_fn_noop(),
+                approval_fn_awaiting(),
             )
         }
 
@@ -1255,6 +1291,7 @@ mod aw {
                 agent_fn_resolves_on(counter, 1),
                 tool_fn_ok(),
                 supervisor_fn_noop(),
+                approval_fn_awaiting(),
             );
 
             let first = handler
@@ -1597,6 +1634,7 @@ mod aw {
                 agent,
                 tool_fn_ok(),
                 supervisor,
+                approval_fn_awaiting(),
             )
         }
 

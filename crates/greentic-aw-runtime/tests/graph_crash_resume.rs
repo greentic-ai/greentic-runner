@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use greentic_aw_runtime::graph::{
-    AgentTurnFn, AgentTurnRequest, AgentTurnResult, CheckpointStore, GraphConfig, GraphExecError,
-    GraphExecutor, InMemoryCheckpointStore, RunStatus, SupervisorFn, SupervisorRequest,
-    SupervisorResult, ToolCallRequest, ToolFn,
+    AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome, ApprovalRequest,
+    CheckpointStore, GraphConfig, GraphExecError, GraphExecutor, InMemoryCheckpointStore,
+    RunStatus, SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
 };
 use greentic_aw_runtime::tenant::TenantContext;
 
@@ -104,6 +104,12 @@ fn supervisor_fn_unreachable() -> SupervisorFn {
     })
 }
 
+/// A trivial approval fn that always reports `Awaiting` — none of these
+/// crash-resume fixtures contain an approval node, so this is never invoked.
+fn approval_fn_awaiting() -> ApprovalFn {
+    Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+}
+
 // ---------------------------------------------------------------------------
 // Test 1: resume_after_crash_reexecutes_only_unfinished_work
 //
@@ -145,6 +151,7 @@ async fn resume_after_crash_reexecutes_only_unfinished_work() {
             agent_fn_crash_on_second(agent_a_count.clone()),
             tool_fn_always_ok(tool_a_count.clone(), 1),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let err = exec_a
@@ -193,6 +200,7 @@ async fn resume_after_crash_reexecutes_only_unfinished_work() {
         agent_fn_resolves_always(agent_b_count.clone()),
         tool_fn_always_ok(tool_b_count.clone(), 2),
         supervisor_fn_unreachable(),
+        approval_fn_awaiting(),
     );
 
     let outcome = exec_b
@@ -293,6 +301,7 @@ async fn resume_replays_ledgered_attempt_across_instances() {
             agent_fn_crash_on_second(agent_a_count.clone()),
             tool_fn_always_ok(tool_a_count.clone(), 1),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let err = exec_a
@@ -341,6 +350,7 @@ async fn resume_replays_ledgered_attempt_across_instances() {
         agent_fn_resolves_always(agent_b_count.clone()),
         tool_fn_always_ok(tool_b_count.clone(), 2),
         supervisor_fn_unreachable(),
+        approval_fn_awaiting(),
     );
 
     let outcome = exec_b
@@ -588,6 +598,7 @@ async fn parallel_resume_after_crash_completes_without_duplicate_effects() {
             a_agent_turn,
             a_tool,
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let err = exec_a
@@ -675,6 +686,7 @@ async fn parallel_resume_after_crash_completes_without_duplicate_effects() {
         b_agent_turn,
         b_tool,
         supervisor_fn_unreachable(),
+        approval_fn_awaiting(),
     );
 
     let outcome = exec_b
@@ -817,6 +829,7 @@ async fn supervisor_decision_survives_crash() {
                 })
             }),
             a_sup,
+            approval_fn_awaiting(),
         );
 
         let err = exec_a
@@ -915,6 +928,7 @@ async fn supervisor_decision_survives_crash() {
             })
         }),
         b_sup,
+        approval_fn_awaiting(),
     );
 
     let outcome = exec_b
