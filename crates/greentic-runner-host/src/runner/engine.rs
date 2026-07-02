@@ -1008,9 +1008,13 @@ impl FlowEngine {
     ) -> Result<DispatchOutcome> {
         let input = payload.get("input").cloned().unwrap_or(Value::Null);
         if !approval_requires_human(&input) {
+            // Match the shape the resume path injects ({ok, output, error})
+            // so downstream conditions read the decision at the same
+            // relative path regardless of whether a human was involved.
             let output = NodeOutput::new(serde_json::json!({
-                "decision": "approved",
-                "auto": true,
+                "ok": true,
+                "output": { "decision": "approved", "auto": true },
+                "error": serde_json::Value::Null,
             }));
             return Ok(DispatchOutcome::complete(output));
         }
@@ -3331,17 +3335,21 @@ fn build_routing_context(
 
 /// Pure autonomy-gate decision for an `approval.call` node. Returns `true` when
 /// the request must go to a human (dispatch), `false` when it auto-approves.
+///
+/// The gate config fields (`mode`, `risk_threshold`, `confidence_threshold`)
+/// are compiled by the designer as FLAT fields directly on the node input
+/// (not nested under a `gate` object); `risk`/`confidence` are already
+/// flat/dynamic values populated at flow render time.
 fn approval_requires_human(input: &Value) -> bool {
-    let gate = input.get("gate");
-    let mode = gate
-        .and_then(|g| g.get("mode"))
+    let mode = input
+        .get("mode")
         .and_then(Value::as_str)
         .unwrap_or("always");
     match mode {
         "above_risk" => {
             let risk = input.get("risk").and_then(Value::as_f64).unwrap_or(0.0);
-            let threshold = gate
-                .and_then(|g| g.get("risk_threshold"))
+            let threshold = input
+                .get("risk_threshold")
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             risk >= threshold
@@ -3351,8 +3359,8 @@ fn approval_requires_human(input: &Value) -> bool {
                 .get("confidence")
                 .and_then(Value::as_f64)
                 .unwrap_or(0.0);
-            let threshold = gate
-                .and_then(|g| g.get("confidence_threshold"))
+            let threshold = input
+                .get("confidence_threshold")
                 .and_then(Value::as_f64)
                 .unwrap_or(1.0);
             confidence < threshold
@@ -3369,27 +3377,26 @@ mod approval_gate_tests {
 
     #[test]
     fn above_risk_auto_approves_below_threshold() {
-        let input = json!({ "risk": 0.5, "gate": { "mode": "above_risk", "risk_threshold": 0.7 } });
+        let input = json!({ "risk": 0.5, "mode": "above_risk", "risk_threshold": 0.7 });
         assert!(!approval_requires_human(&input));
     }
 
     #[test]
     fn above_risk_requires_human_at_or_above_threshold() {
-        let input = json!({ "risk": 0.9, "gate": { "mode": "above_risk", "risk_threshold": 0.7 } });
+        let input = json!({ "risk": 0.9, "mode": "above_risk", "risk_threshold": 0.7 });
         assert!(approval_requires_human(&input));
     }
 
     #[test]
     fn above_confidence_requires_human_when_low_confidence() {
-        let input = json!({ "confidence": 0.4, "gate": { "mode": "above_confidence", "confidence_threshold": 0.8 } });
+        let input =
+            json!({ "confidence": 0.4, "mode": "above_confidence", "confidence_threshold": 0.8 });
         assert!(approval_requires_human(&input));
     }
 
     #[test]
     fn always_and_missing_gate_require_human() {
-        assert!(approval_requires_human(
-            &json!({ "gate": { "mode": "always" } })
-        ));
+        assert!(approval_requires_human(&json!({ "mode": "always" })));
         assert!(approval_requires_human(&json!({})));
     }
 }
