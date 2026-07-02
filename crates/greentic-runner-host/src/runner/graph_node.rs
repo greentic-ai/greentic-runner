@@ -39,9 +39,10 @@ mod aw {
     use greentic_aw_runtime::config_provider::InMemoryConfigProvider;
     use greentic_aw_runtime::error::ConfigError;
     use greentic_aw_runtime::graph::{
-        AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, CheckpointError, CheckpointStore,
-        GraphConfig, GraphExecError, GraphExecutor, GraphRole, GraphRunState, RunStatus,
-        SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
+        AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome,
+        ApprovalRequest, BoxFut, CheckpointError, CheckpointStore, GraphConfig, GraphExecError,
+        GraphExecutor, GraphRole, GraphRunState, RunStatus, SupervisorFn, SupervisorRequest,
+        SupervisorResult, ToolCallRequest, ToolFn,
     };
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
@@ -410,6 +411,7 @@ mod aw {
         agent_turn: AgentTurnFn,
         tool: ToolFn,
         supervisor: SupervisorFn,
+        approval: ApprovalFn,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -452,6 +454,16 @@ mod aw {
                 token_meter,
                 ledger,
             );
+            // NOTE: the real `ApprovalFn` is designer-provided (it wires the
+            // `greentic.approval.request.v1` / `.response.v1` NATS round trip
+            // so a human decision can arrive asynchronously). This in-process
+            // runner-host path does not yet have that transport wired up, so
+            // it always parks (`Awaiting`) — safe (a graph run simply stays
+            // `AwaitingInput`, and `derive_run_id` resumes rather than forks
+            // it on every later call for the same session) but not yet
+            // resolvable from here. A future designer-side approval bridge
+            // (subscriber + node) replaces this with a real consumer.
+            let approval = default_approval_awaiting();
             Self {
                 graphs,
                 checkpoint,
@@ -459,6 +471,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor,
+                approval,
             }
         }
 
@@ -468,6 +481,7 @@ mod aw {
         ///
         /// [`from_parts`]: RuntimeGraphNodeHandler::from_parts
         #[cfg(test)]
+        #[allow(clippy::too_many_arguments)]
         pub(crate) fn with_effects(
             graphs: Arc<dyn GraphConfigSource>,
             checkpoint: Arc<dyn CheckpointStore>,
@@ -475,6 +489,7 @@ mod aw {
             agent_turn: AgentTurnFn,
             tool: ToolFn,
             supervisor: SupervisorFn,
+            approval: ApprovalFn,
         ) -> Self {
             Self {
                 graphs,
@@ -483,6 +498,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor,
+                approval,
             }
         }
 
@@ -500,9 +516,10 @@ mod aw {
         /// `session_id` always maps to the same `safe_session`, so checkpoint
         /// resume works correctly across calls.
         ///
-        /// When the base slot is already terminal, retry
+        /// When the base slot is already terminal (`Succeeded`/`Failed`), retry
         /// `"{safe_session}__{graph_id}__{n}"` for `n = 2..` until a slot is
-        /// absent (→ start fresh) or Running (→ resume). Bounded at
+        /// absent (→ start fresh) or non-terminal — `Running` or `AwaitingInput`
+        /// (→ resume). Bounded at
         /// [`MAX_RUN_ID_SUFFIX`]. Exhausting all suffixes returns
         /// [`RunIdError::SuffixExhausted`] (distinct from
         /// [`GraphExecError::IterationCap`] so the caller can surface a
@@ -519,7 +536,16 @@ mod aw {
             let base = format!("{safe_session}__{graph_id}");
             match self.checkpoint.load(tenant, &base).await? {
                 None => return Ok(RunSlot::start(base)),
-                Some(rec) if rec.status == RunStatus::Running => {
+                // `AwaitingInput` is a parked, non-terminal state (the run is
+                // paused at an approval node, not done) — same resume
+                // treatment as `Running`. Without this arm, every call after
+                // a park would fall through to the terminal branch below and
+                // mint a fresh `__n` run id, orphaning the parked run forever
+                // (it can never be decided because nothing ever resumes it)
+                // and silently forking the conversation.
+                Some(rec)
+                    if matches!(rec.status, RunStatus::Running | RunStatus::AwaitingInput) =>
+                {
                     return Ok(RunSlot::resume(base));
                 }
                 Some(_) => {}
@@ -528,7 +554,9 @@ mod aw {
                 let candidate = format!("{safe_session}__{graph_id}__{n}");
                 match self.checkpoint.load(tenant, &candidate).await? {
                     None => return Ok(RunSlot::start(candidate)),
-                    Some(rec) if rec.status == RunStatus::Running => {
+                    Some(rec)
+                        if matches!(rec.status, RunStatus::Running | RunStatus::AwaitingInput) =>
+                    {
                         return Ok(RunSlot::resume(candidate));
                     }
                     Some(_) => continue,
@@ -631,6 +659,7 @@ mod aw {
                 self.agent_turn.clone(),
                 self.tool.clone(),
                 self.supervisor.clone(),
+                self.approval.clone(),
             );
 
             let result = if slot.resume {
@@ -642,6 +671,35 @@ mod aw {
             };
 
             match result {
+                // `AwaitingInput` means the run parked at an approval node
+                // (see `default_approval_awaiting` below): it is neither a
+                // completed respond nor a failure, so it must not be
+                // reported as `terminated_by: "respond"` (a caller branching
+                // on that value would wrongly treat the pause as done) nor
+                // surfaced as an error. This runner-host path has no
+                // approval-transport integration yet (that lands with the
+                // designer NATS bridge), so a parked run has no other
+                // observable signal beyond this envelope + the warning
+                // below — the run itself remains durably `AwaitingInput` in
+                // the checkpoint store and `derive_run_id` resumes it (not
+                // forks a new run) on every subsequent call for the same
+                // session until a decision arrives.
+                Ok(outcome) if outcome.status == RunStatus::AwaitingInput => {
+                    tracing::warn!(
+                        graph_id,
+                        session_id,
+                        run_id = %slot.run_id,
+                        "graph run parked awaiting human approval; no approval \
+                         transport is wired on this in-process runner-host path, \
+                         so the run stays AwaitingInput until an external decision \
+                         resolves it"
+                    );
+                    Ok(json!({
+                        "reply": outcome.reply,
+                        "trail": outcome.trail,
+                        "terminated_by": "awaiting_approval",
+                    }))
+                }
                 Ok(outcome) => Ok(json!({
                     "reply": outcome.reply,
                     "trail": outcome.trail,
@@ -1033,6 +1091,23 @@ mod aw {
         })
     }
 
+    /// Default [`ApprovalFn`] for the in-process runner-host path: always
+    /// reports `Awaiting`.
+    ///
+    /// The real `ApprovalFn` is designer-provided and wires the
+    /// `greentic.approval.request.v1` / `.response.v1` round trip so a human
+    /// decision can arrive asynchronously and unpark the run. This in-process
+    /// default has no such transport, so it parks the run safely
+    /// (`RunStatus::AwaitingInput`) but never resolves it. `derive_run_id`
+    /// resumes (not forks) the parked run on every subsequent call for the
+    /// same session, so it stays resolvable once a real `ApprovalFn` is
+    /// wired in. See the `from_parts` doc comment; the designer-side
+    /// approval bridge (subscriber + node, cross-repo Phase 2) supplies the
+    /// real consumer.
+    fn default_approval_awaiting() -> ApprovalFn {
+        Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+    }
+
     /// Parse + dispatch a single Tool-node call. See [`build_tool`].
     async fn run_one_tool(
         req: ToolCallRequest,
@@ -1080,8 +1155,9 @@ mod aw {
 
         use greentic_aw_runtime::graph::model::SupervisorRoute;
         use greentic_aw_runtime::graph::{
-            AgentTurnFn, AgentTurnRequest, AgentTurnResult, GraphConfig, InMemoryCheckpointStore,
-            SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
+            AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome,
+            ApprovalRequest, GraphConfig, InMemoryCheckpointStore, SupervisorFn, SupervisorRequest,
+            SupervisorResult, ToolCallRequest, ToolFn,
         };
         use greentic_aw_runtime::mock::MockAgentStateStore;
         use serde_json::json;
@@ -1119,6 +1195,51 @@ mod aw {
             GraphConfig::from_json(&triage_graph_json(max_iterations)).expect("fixture valid")
         }
 
+        /// Graph with a human-in-the-loop approval gate: `start` (agent) ->
+        /// `approval` -> `respond` (branch `"approved"`). Mirrors the
+        /// aw-runtime executor test fixture (`approval_json` in
+        /// `graph/executor.rs`), which is `pub(crate)` there and thus not
+        /// importable here.
+        fn approval_graph_json() -> String {
+            json!({
+                "schemaVersion": 2,
+                "entry": "start",
+                "nodes": [
+                    {"id": "start", "kind": "agent", "systemPrompt": "greet the user", "model": "gpt-4o-mini", "tools": []},
+                    {"id": "approval", "kind": "approval", "title": "Approve refund?", "mode": "always"},
+                    {"id": "respond", "kind": "respond"}
+                ],
+                "edges": [
+                    {"from": "start", "to": "approval"},
+                    {"from": "approval", "to": "respond", "branch": "approved"}
+                ]
+            })
+            .to_string()
+        }
+
+        fn approval_cfg() -> GraphConfig {
+            GraphConfig::from_json(&approval_graph_json()).expect("approval fixture valid")
+        }
+
+        /// An [`ApprovalFn`] whose decision flips based on a shared flag:
+        /// `Awaiting` while `false`, `Decided { branch: "approved" }` once
+        /// `true`. Lets a single handler drive both the initial park and a
+        /// later resume-with-decision within one test.
+        fn approval_fn_toggle(decide: Arc<std::sync::atomic::AtomicBool>) -> ApprovalFn {
+            Arc::new(move |_req: ApprovalRequest| {
+                let decide = decide.clone();
+                Box::pin(async move {
+                    if decide.load(Ordering::SeqCst) {
+                        Ok(ApprovalOutcome::Decided {
+                            branch: "approved".to_string(),
+                        })
+                    } else {
+                        Ok(ApprovalOutcome::Awaiting)
+                    }
+                })
+            })
+        }
+
         fn provider_with(graph_id: &str, cfg: GraphConfig) -> Arc<InMemoryGraphProvider> {
             let mut graphs = HashMap::new();
             graphs.insert(graph_id.to_string(), cfg);
@@ -1152,6 +1273,12 @@ mod aw {
             })
         }
 
+        /// A trivial approval fn that always reports `Awaiting` — none of
+        /// these fixtures contain an approval node, so this is never invoked.
+        fn approval_fn_awaiting() -> ApprovalFn {
+            Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+        }
+
         fn handler_with(
             graphs: Arc<dyn GraphConfigSource>,
             agent_turn: AgentTurnFn,
@@ -1164,6 +1291,7 @@ mod aw {
                 agent_turn,
                 tool,
                 supervisor_fn_noop(),
+                approval_fn_awaiting(),
             )
         }
 
@@ -1255,6 +1383,7 @@ mod aw {
                 agent_fn_resolves_on(counter, 1),
                 tool_fn_ok(),
                 supervisor_fn_noop(),
+                approval_fn_awaiting(),
             );
 
             let first = handler
@@ -1276,6 +1405,114 @@ mod aw {
                 .await
                 .expect("store ok");
             assert!(fresh.is_some(), "fresh __2 run id should be recorded");
+        }
+
+        /// Task C3: a graph run parked at an approval node (`RunStatus::
+        /// AwaitingInput`) must be surfaced as neither a completed respond
+        /// nor a failure, and — unlike a terminal (`Succeeded`/`Failed`) run
+        /// — the SAME run id must be resumed on every later call for the
+        /// same session, not forked into a fresh `__n` slot (which would
+        /// orphan the parked run: it could never be decided because nothing
+        /// would ever resume it again).
+        #[tokio::test]
+        async fn awaiting_input_parks_without_orphaning_and_resumes_on_decision() {
+            let graphs = provider_with("approval-graph", approval_cfg());
+            let checkpoint = Arc::new(InMemoryCheckpointStore::default());
+            let state_store = Arc::new(MockAgentStateStore::new());
+            let decide = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let handler = RuntimeGraphNodeHandler::with_effects(
+                graphs,
+                checkpoint.clone(),
+                state_store,
+                agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
+                tool_fn_ok(),
+                supervisor_fn_noop(),
+                approval_fn_toggle(decide.clone()),
+            );
+            let tenant = TenantContext::new("t", "e");
+
+            // Call 1: the run drives to the approval node and parks.
+            let first = handler
+                .execute(
+                    "t",
+                    "e",
+                    "approval-graph",
+                    "sess-approve",
+                    &json!({"user_text": "please refund"}),
+                )
+                .await
+                .expect("a parked run must be Ok, not an Err");
+            assert_ne!(
+                first["terminated_by"].as_str(),
+                Some("respond"),
+                "a parked run must not be reported as a completed respond: {first:?}"
+            );
+            assert_ne!(
+                first["terminated_by"].as_str(),
+                Some("error"),
+                "a parked run must not be reported as an error: {first:?}"
+            );
+
+            let rec = checkpoint
+                .load(&tenant, "sess-approve__approval-graph")
+                .await
+                .expect("store accessible")
+                .expect("base run id must be recorded");
+            assert_eq!(
+                rec.status,
+                RunStatus::AwaitingInput,
+                "persisted record must reflect the park"
+            );
+
+            // Call 2 (still undecided): must RESUME the base run id in
+            // place, not fork "__2" (the bug this test guards against).
+            let second = handler
+                .execute(
+                    "t",
+                    "e",
+                    "approval-graph",
+                    "sess-approve",
+                    &json!({"user_text": "still waiting"}),
+                )
+                .await
+                .expect("a re-parked run must be Ok, not an Err");
+            assert_ne!(second["terminated_by"].as_str(), Some("respond"));
+
+            let forked = checkpoint
+                .load(&tenant, "sess-approve__approval-graph__2")
+                .await
+                .expect("store accessible");
+            assert!(
+                forked.is_none(),
+                "an AwaitingInput run must resume in place, not fork a fresh run id"
+            );
+
+            // Call 3: the decision has arrived — the SAME base run id
+            // resolves via `executor.resume()`, not a fresh run.
+            decide.store(true, Ordering::SeqCst);
+            let third = handler
+                .execute(
+                    "t",
+                    "e",
+                    "approval-graph",
+                    "sess-approve",
+                    &json!({"user_text": "resolve"}),
+                )
+                .await
+                .expect("execute should succeed once decided");
+            assert_eq!(third["terminated_by"].as_str(), Some("respond"));
+
+            let rec = checkpoint
+                .load(&tenant, "sess-approve__approval-graph")
+                .await
+                .expect("store accessible")
+                .expect("base run id must still be recorded");
+            assert_eq!(
+                rec.status,
+                RunStatus::Succeeded,
+                "the base run id must resolve once decided, not a forked one"
+            );
         }
 
         #[tokio::test]
@@ -1597,6 +1834,7 @@ mod aw {
                 agent,
                 tool_fn_ok(),
                 supervisor,
+                approval_fn_awaiting(),
             )
         }
 

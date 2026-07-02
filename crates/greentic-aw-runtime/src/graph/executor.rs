@@ -152,6 +152,54 @@ pub type SupervisorFn = Arc<
 >;
 
 // ---------------------------------------------------------------------------
+// Approval effect types
+// ---------------------------------------------------------------------------
+
+/// Request payload delivered to an injected approval closure.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Graph run id.
+    pub run_id: String,
+    /// Graph node id (the approval node).
+    pub node_id: String,
+    /// Tenant id the run belongs to.
+    pub tenant: String,
+    /// Human-readable title from the node's configuration.
+    pub title: String,
+    /// Gate mode: `"always"` | `"above_risk"` | `"above_confidence"`.
+    pub mode: String,
+    /// Risk threshold used when `mode == "above_risk"`.
+    pub risk_threshold: Option<f64>,
+    /// Confidence threshold used when `mode == "above_confidence"`.
+    pub confidence_threshold: Option<f64>,
+    /// Optional decision deadline, in milliseconds.
+    pub deadline_ms: Option<u64>,
+    /// Current run state at the time of the approval check.
+    pub state: GraphRunState,
+}
+
+/// Result returned by an injected approval closure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ApprovalOutcome {
+    /// No decision has arrived yet — the executor parks the run
+    /// (`RunStatus::AwaitingInput`) at this node without advancing the
+    /// cursor or recording a node visit.
+    Awaiting,
+    /// A human decision has arrived; `branch` selects the outgoing edge the
+    /// executor advances along (e.g. `"approved"`, `"denied"`, `"timeout"`).
+    Decided { branch: String },
+}
+
+/// One approval-gate check: the host wires this to its approval-request
+/// transport (e.g. the `greentic.approval.request.v1` / `.response.v1`
+/// NATS subjects) and reports whether a decision has arrived yet.
+pub type ApprovalFn = Arc<
+    dyn Fn(ApprovalRequest) -> BoxFut<'static, Result<ApprovalOutcome, GraphExecError>>
+        + Send
+        + Sync,
+>;
+
+// ---------------------------------------------------------------------------
 // GraphExecError
 // ---------------------------------------------------------------------------
 
@@ -313,6 +361,7 @@ pub struct GraphExecutor {
     agent_turn: AgentTurnFn,
     tool: ToolFn,
     supervisor: SupervisorFn,
+    approval: ApprovalFn,
 }
 
 impl GraphExecutor {
@@ -322,12 +371,14 @@ impl GraphExecutor {
         agent_turn: AgentTurnFn,
         tool: ToolFn,
         supervisor: SupervisorFn,
+        approval: ApprovalFn,
     ) -> Self {
         Self {
             store,
             agent_turn,
             tool,
             supervisor,
+            approval,
         }
     }
 
@@ -351,7 +402,13 @@ impl GraphExecutor {
         // Check if a record already exists.
         if let Some(existing) = self.store.load(tenant, run_id).await? {
             return match existing.status {
-                RunStatus::Running => {
+                // `AwaitingInput` means the run is parked at an approval
+                // node. Re-driving from the parked cursor is the correct
+                // resume path: the Approval arm re-asks the `ApprovalFn`
+                // closure, which re-parks (`Awaiting`) if still undecided or
+                // advances (`Decided`) once a decision has arrived — so
+                // `AwaitingInput` is handled identically to `Running` here.
+                RunStatus::Running | RunStatus::AwaitingInput => {
                     // Resume the in-flight run.
                     self.drive_from_record(tenant, run_id, existing).await
                 }
@@ -413,7 +470,12 @@ impl GraphExecutor {
                     trail,
                 })
             }
-            RunStatus::Running => self.drive_from_record(tenant, run_id, rec).await,
+            // Same rationale as `start` above — re-drive from the parked
+            // cursor; the Approval arm re-asks `ApprovalFn` and either
+            // re-parks or advances based on the current answer.
+            RunStatus::Running | RunStatus::AwaitingInput => {
+                self.drive_from_record(tenant, run_id, rec).await
+            }
         }
     }
 
@@ -769,6 +831,114 @@ impl GraphExecutor {
                          consumed by the parallel arm)"
                     );
                     cursor = next_linear(&cfg, &cursor)?;
+                }
+
+                // Human-in-the-loop approval gate. Ask the host's `ApprovalFn`
+                // whether a decision has arrived yet:
+                // - `Awaiting`: park the run (`RunStatus::AwaitingInput`) with
+                //   the cursor still AT this node (not advanced) and return
+                //   the outcome cleanly, without recording a node visit — the
+                //   next `drive` pass (via `resume`) re-asks the same
+                //   question.
+                // - `Decided { branch }`: select the outgoing edge whose
+                //   label matches `branch`, record the decision as this
+                //   node's visit, and advance the loop.
+                NodeKind::Approval {
+                    title,
+                    mode,
+                    risk_threshold,
+                    confidence_threshold,
+                    deadline_ms,
+                } => {
+                    let req = ApprovalRequest {
+                        run_id: run_id.to_string(),
+                        node_id: cursor.clone(),
+                        tenant: tenant.tenant_id.clone(),
+                        title: title.clone(),
+                        mode: mode.clone(),
+                        risk_threshold: *risk_threshold,
+                        confidence_threshold: *confidence_threshold,
+                        deadline_ms: *deadline_ms,
+                        state: state.clone(),
+                    };
+
+                    match (self.approval)(req).await? {
+                        ApprovalOutcome::Awaiting => {
+                            // Park: persist AwaitingInput with cursor still at
+                            // THIS node (not advanced). Do NOT record a node
+                            // visit for the park itself — only a `Decided`
+                            // outcome produces a ledgered visit.
+                            let rec = build_record(
+                                run_id,
+                                &serde_json::to_string(&cfg).map_err(CheckpointError::Serde)?,
+                                &cursor,
+                                &state,
+                                &visits,
+                                RunStatus::AwaitingInput,
+                            )?;
+                            self.store.save(tenant, &rec).await?;
+
+                            let reply = last_assistant_message(&state);
+                            return Ok(GraphRunOutcome {
+                                status: RunStatus::AwaitingInput,
+                                reply,
+                                trail,
+                            });
+                        }
+                        ApprovalOutcome::Decided { branch } => {
+                            // Select the outgoing edge whose label matches the
+                            // decided branch — same lookup idiom the
+                            // Supervisor arm uses for its branch label.
+                            let matching_edge = cfg
+                                .graph
+                                .edges_from(&cursor)
+                                .find(|e| e.branch.as_deref() == Some(branch.as_str()));
+                            let next_cursor = match matching_edge {
+                                Some(edge) => edge.to.clone(),
+                                None => {
+                                    return Err(GraphExecError::Graph(GraphError::Invalid(
+                                        format!(
+                                            "approval node '{}': decision branch '{}' does not \
+                                             match any outgoing edge",
+                                            cursor, branch
+                                        ),
+                                    )));
+                                }
+                            };
+
+                            let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
+                            self.store
+                                .record_node_visit(
+                                    tenant,
+                                    run_id,
+                                    &cursor,
+                                    attempt,
+                                    &serde_json::json!({"decision": branch}),
+                                )
+                                .await?;
+
+                            trail.push(serde_json::json!({
+                                "node": cursor,
+                                "kind": "approval",
+                                "attempt": attempt,
+                                "replayed": false,
+                                "branch": branch,
+                            }));
+
+                            visits.insert(cursor.clone(), attempt);
+                            cursor = next_cursor;
+
+                            let rec = build_record(
+                                run_id,
+                                &serde_json::to_string(&cfg).map_err(CheckpointError::Serde)?,
+                                &cursor,
+                                &state,
+                                &visits,
+                                RunStatus::Running,
+                            )?;
+                            self.store.save(tenant, &rec).await?;
+                        }
+                    }
                 }
             }
         }
@@ -1350,6 +1520,23 @@ impl GraphExecutor {
                             bc.cursor
                         ))));
                     }
+                    // Approval nodes inside a parallel branch are UNSUPPORTED
+                    // in v1: parking a single branch mid-fan-out would need
+                    // per-branch `AwaitingInput` semantics (which branch is
+                    // parked vs. running, how the frontier round-trips a
+                    // decision back into ONE slot) that the durable-frontier
+                    // design does not model yet. Rather than silently
+                    // mis-executing an approval gate (e.g. skipping it, or
+                    // parking the whole region), fail loudly so a malformed
+                    // graph is caught at drive time instead of producing a
+                    // wrong decision. Revisit if/when parallel-region
+                    // approval becomes a real requirement.
+                    NodeKind::Approval { .. } => {
+                        return Err(GraphExecError::Graph(GraphError::Invalid(format!(
+                            "approval node '{}' inside parallel branch '{}': not supported in v1 (parallel-branch approval parking is unimplemented)",
+                            bc.cursor, branch_label
+                        ))));
+                    }
                 }
 
                 // Durably persist this branch's progress after every node.
@@ -1649,6 +1836,25 @@ mod tests {
         })
     }
 
+    /// A trivial approval fn that always reports `Awaiting` — a safe default
+    /// for tests that never route through a `NodeKind::Approval` node.
+    fn approval_fn_awaiting() -> ApprovalFn {
+        Arc::new(|_req: ApprovalRequest| Box::pin(async move { Ok(ApprovalOutcome::Awaiting) }))
+    }
+
+    /// Build an approval fn that always reports `Decided { branch }`,
+    /// counting calls.
+    fn approval_fn_decides(counter: Arc<AtomicU32>, branch: &'static str) -> ApprovalFn {
+        Arc::new(move |_req: ApprovalRequest| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(ApprovalOutcome::Decided {
+                    branch: branch.to_string(),
+                })
+            })
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Test 1: happy path — resolves on first agent pass
     // -----------------------------------------------------------------------
@@ -1666,6 +1872,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(tool_count.clone()),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let outcome = exec
@@ -1702,6 +1909,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), u32::MAX),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let outcome = exec
@@ -1732,6 +1940,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(tool_count.clone()),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         // Drive to completion.
@@ -1786,6 +1995,7 @@ mod tests {
             agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), u32::MAX),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let err = exec
@@ -1853,6 +2063,7 @@ mod tests {
                 agent_phase1,
                 tool_fn_counting(tool_count.clone()),
                 supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
             );
 
             let err = exec
@@ -1900,6 +2111,7 @@ mod tests {
                 agent_phase2,
                 tool_fn_counting(tool_phase2_count.clone()),
                 supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
             );
 
             let outcome = exec2
@@ -1940,6 +2152,7 @@ mod tests {
             agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         exec.start(&tenant(), "run-dup", &triage_cfg(), "first")
@@ -1986,6 +2199,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_always_routes_to(sup_count.clone(), "billing"),
+            approval_fn_awaiting(),
         );
 
         let outcome = exec
@@ -2040,6 +2254,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_always_routes_to(sup_count.clone(), "tech"),
+            approval_fn_awaiting(),
         );
 
         let outcome = exec
@@ -2083,6 +2298,7 @@ mod tests {
             agent_fn_resolves_on(agent_count.clone(), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_always_routes_to(sup_count.clone(), "billing"),
+            approval_fn_awaiting(),
         );
 
         // Drive to completion.
@@ -2125,6 +2341,7 @@ mod tests {
             agent_fn_resolves_on(Arc::new(AtomicU32::new(0)), 1),
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_always_routes_to(sup_count.clone(), "tech"),
+            approval_fn_awaiting(),
         );
 
         let outcome = exec
@@ -2197,6 +2414,7 @@ mod tests {
             agent,
             Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
         exec.start(&tenant(), "run-provider-set", &cfg, "hi")
             .await
@@ -2236,6 +2454,7 @@ mod tests {
             agent,
             Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
         let cfg_json = serde_json::json!({
             "schemaVersion": 1,
@@ -2297,7 +2516,13 @@ mod tests {
             Box::pin(async move { Ok(serde_json::json!({"branch_b": "done"})) })
         });
 
-        let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            tool,
+            supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
+        );
 
         let outcome = exec
             .start(&tenant(), "run-par-happy", &parallel_cfg(), "go")
@@ -2371,7 +2596,13 @@ mod tests {
             Box::pin(async move { Ok(serde_json::json!({"branch_b": "done"})) })
         });
 
-        let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            tool,
+            supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
+        );
         exec.start(&tenant(), "run-par-iso", &parallel_cfg(), "go")
             .await
             .expect("run should succeed");
@@ -2409,7 +2640,13 @@ mod tests {
                 Box::pin(async move { Ok(serde_json::json!({"branch_b_fast": true})) })
             });
 
-            let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent,
+                tool,
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
             exec.start(&tenant(), "run-par-det", &parallel_cfg(), "go")
                 .await
                 .expect("run should succeed");
@@ -2481,6 +2718,7 @@ mod tests {
             agent,
             tool_fn_counting(Arc::new(AtomicU32::new(0))),
             supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
         );
 
         let err = exec
@@ -2520,7 +2758,13 @@ mod tests {
             Box::pin(async move { Ok(serde_json::json!({"branch_b": "ok"})) })
         });
 
-        let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            tool,
+            supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
+        );
         let err = exec
             .start(&tenant(), "run-par-err", &parallel_cfg(), "go")
             .await
@@ -2577,7 +2821,13 @@ mod tests {
             });
             let tool: ToolFn =
                 Arc::new(|_r| Box::pin(async move { Ok(serde_json::json!({"branch_b": "ok"})) }));
-            let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent,
+                tool,
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
             exec.start(&t, "run-par-resume", &parallel_cfg(), "go")
                 .await
                 .expect_err("phase 1 errors");
@@ -2600,7 +2850,13 @@ mod tests {
                 bcalls.fetch_add(1, Ordering::SeqCst);
                 Box::pin(async move { Ok(serde_json::json!({"branch_b": "ok"})) })
             });
-            let exec = GraphExecutor::new(store.clone(), agent, tool, supervisor_fn_unreachable());
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent,
+                tool,
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
             let outcome = exec
                 .resume(&t, "run-par-resume")
                 .await
@@ -2632,5 +2888,125 @@ mod tests {
             contents.iter().any(|c| c.contains("branch_b")),
             "branch b present: {contents:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval tests (Task C2)
+    // -----------------------------------------------------------------------
+    //
+    // approval_cfg topology: start(agent) → approval → respond
+    // (edge label "approved" on the approval node's only outgoing edge).
+
+    fn approval_json() -> String {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "entry": "start",
+            "nodes": [
+                {"id": "start", "kind": "agent", "systemPrompt": "greet the user", "model": "gpt-4o-mini"},
+                {"id": "approval", "kind": "approval", "title": "Approve refund?", "mode": "always"},
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [
+                {"from": "start", "to": "approval"},
+                {"from": "approval", "to": "respond", "branch": "approved"}
+            ]
+        })
+        .to_string()
+    }
+
+    fn approval_cfg() -> GraphConfig {
+        GraphConfig::from_json(&approval_json()).expect("approval fixture is valid")
+    }
+
+    /// Test 17: an approval node with an `Awaiting` `ApprovalFn` parks the run
+    /// (`RunStatus::AwaitingInput`, cursor at the approval node); resuming with
+    /// a `Decided` `ApprovalFn` advances along the matching edge to `respond`.
+    #[tokio::test]
+    async fn approval_parks_then_resumes() {
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let t = tenant();
+        let agent_count = Arc::new(AtomicU32::new(0));
+
+        // Phase 1: park.
+        {
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent_fn_resolves_on(agent_count.clone(), 1),
+                tool_fn_counting(Arc::new(AtomicU32::new(0))),
+                supervisor_fn_unreachable(),
+                approval_fn_awaiting(),
+            );
+
+            let outcome = exec
+                .start(&t, "run-approval", &approval_cfg(), "please approve this")
+                .await
+                .expect("start should return cleanly when parked, not error");
+
+            assert_eq!(
+                outcome.status,
+                RunStatus::AwaitingInput,
+                "start() outcome must report AwaitingInput"
+            );
+
+            let rec = store
+                .load(&t, "run-approval")
+                .await
+                .expect("store accessible")
+                .expect("record must exist");
+            assert_eq!(
+                rec.status,
+                RunStatus::AwaitingInput,
+                "persisted record must be AwaitingInput"
+            );
+            assert_eq!(
+                rec.cursor, "approval",
+                "cursor must stay at the approval node while parked"
+            );
+        }
+
+        // Phase 2: resume with a decision.
+        let decision_count = Arc::new(AtomicU32::new(0));
+        {
+            let exec = GraphExecutor::new(
+                store.clone(),
+                agent_fn_resolves_on(agent_count.clone(), 1),
+                tool_fn_counting(Arc::new(AtomicU32::new(0))),
+                supervisor_fn_unreachable(),
+                approval_fn_decides(decision_count.clone(), "approved"),
+            );
+
+            let outcome = exec
+                .resume(&t, "run-approval")
+                .await
+                .expect("resume with a decision should succeed");
+
+            assert_eq!(
+                outcome.status,
+                RunStatus::Succeeded,
+                "resumed run must reach Succeeded at respond"
+            );
+        }
+
+        assert_eq!(
+            decision_count.load(Ordering::SeqCst),
+            1,
+            "approval fn must be called exactly once on resume"
+        );
+
+        let rec = store
+            .load(&t, "run-approval")
+            .await
+            .unwrap()
+            .expect("record must exist after resume");
+        assert_eq!(rec.status, RunStatus::Succeeded);
+        assert_eq!(rec.cursor, "respond", "cursor must land on respond node");
+
+        // The visit ledger must have recorded the decision payload.
+        let visit = store
+            .load_node_visit(&t, "run-approval", "approval", 1)
+            .await
+            .unwrap()
+            .expect("approval node visit must be recorded");
+        assert_eq!(visit["decision"], "approved");
     }
 }

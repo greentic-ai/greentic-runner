@@ -17,8 +17,9 @@ pub use checkpoint::{
     RunStatus,
 };
 pub use executor::{
-    AgentTurnFn, AgentTurnRequest, AgentTurnResult, BoxFut, GraphExecError, GraphExecutor,
-    GraphRunOutcome, SupervisorFn, SupervisorRequest, SupervisorResult, ToolCallRequest, ToolFn,
+    AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome, ApprovalRequest,
+    BoxFut, GraphExecError, GraphExecutor, GraphRunOutcome, SupervisorFn, SupervisorRequest,
+    SupervisorResult, ToolCallRequest, ToolFn,
 };
 pub use http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use model::{
