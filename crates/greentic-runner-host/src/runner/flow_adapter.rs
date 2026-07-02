@@ -62,6 +62,7 @@ const NATIVE_OP_KEYS: &[&str] = &[
     "operala.call",
     "agentic.call",
     "telco-x.call",
+    "approval.call",
     "mcp",
 ];
 
@@ -249,5 +250,10 @@ mod tests {
         assert!(is_native_op_key("operala.call"));
         assert!(is_native_op_key("sorla.call"));
         assert!(!is_native_op_key("nope.call"));
+    }
+
+    #[test]
+    fn approval_call_is_a_recognized_native_op() {
+        assert!(is_native_op_key("approval.call"));
     }
 }

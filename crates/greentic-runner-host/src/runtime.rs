@@ -416,7 +416,7 @@ impl TenantRuntime {
                     &state_machine,
                 )),
             );
-            for runtime_name in ["sorla", "operala", "agentic", "telco-x"] {
+            for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
                 tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
                     client.clone(),
                     runtime_name.to_string(),
