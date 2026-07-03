@@ -661,7 +661,10 @@ mod aw {
         use greentic_aw_runtime::{OpenAiLlmBackend, RetryingLlmBackend};
         use std::time::Duration;
 
-        let store_resolved = override_key
+        // Only read under `greentic-llm-backend` (below); prefixed so the
+        // binding doesn't trip `unused_variables` when that feature is off
+        // (it isn't a default feature — see Cargo.toml).
+        let _store_resolved = override_key
             .as_ref()
             .map(|key| !key.trim().is_empty())
             .unwrap_or(false);
@@ -677,7 +680,7 @@ mod aw {
             if !api_key.trim().is_empty() {
                 let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
                 tracing::info!(
-                    store_resolved,
+                    store_resolved = _store_resolved,
                     "AW LLM via in-process greentic-llm (multi-provider)"
                 );
                 return Arc::new(RetryingLlmBackend::new(

@@ -363,6 +363,14 @@ impl TenantRuntime {
             Err(_) => None,
         };
 
+        // Clone the (possibly connected) client for the audit sink (EPIC-B
+        // B-2): threaded into `StateMachineRuntime::from_flow_engine` so
+        // `TraceRecorder` can publish best-effort audit events over NATS.
+        // Cloned BEFORE the response-listener loop below moves
+        // `dispatch_nats_client`. `None` when NATS is unset/unreachable,
+        // which keeps the audit sink off by default (zero behaviour change).
+        let audit_nats_client = dispatch_nats_client.clone();
+
         // Resolve how `dw.agent` nodes dispatch. When `GREENTIC_AW_DISPATCH=nats`
         // is set, the node is rerouted over the durable agentic NATS path instead
         // of the in-process handler. Must be wired while `engine` is still owned.
@@ -398,6 +406,7 @@ impl TenantRuntime {
                 state_host,
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
+                audit_nats_client,
             )
             .context("failed to initialise state machine runtime")?,
         );

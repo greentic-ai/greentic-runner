@@ -268,6 +268,7 @@ fn build_runtime(pack_path: &Path, config: Arc<HostConfig>) -> Result<Arc<StateM
         state_host,
         secrets,
         None,
+        None,
     )?;
     Ok(Arc::new(runtime))
 }
@@ -496,6 +497,7 @@ fn build_runtime_with_dispatch(
         session_store,
         state_host,
         secrets,
+        None,
         None,
     )?;
     Ok(Arc::new(runtime))
