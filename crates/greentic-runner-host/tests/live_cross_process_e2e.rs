@@ -330,6 +330,7 @@ async fn build_runtime_with_nats_dispatch(
         state_host,
         secrets,
         None,
+        None,
     )?;
     Ok((Arc::new(runtime), session_store))
 }
