@@ -419,7 +419,10 @@ fn hash_value(value: &Value) -> TraceHash {
 /// Generates a random hex id for the audit event's `id` field. No `uuid` dep
 /// exists in this crate; mirrors `runner::engine::generate_correlation_id`'s
 /// random-bytes-then-hex-encode pattern rather than adding one.
-fn generate_audit_event_id() -> String {
+///
+/// `pub(crate)` so `trace::agent_audit`'s `AgentAuditObserver` can reuse the
+/// same id source for agent-step audit events.
+pub(crate) fn generate_audit_event_id() -> String {
     let mut bytes = [0u8; 16];
     rng().fill(&mut bytes);
     hex::encode(bytes)

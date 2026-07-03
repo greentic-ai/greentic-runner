@@ -45,6 +45,45 @@ pub fn audit_subject(tenant: &str, event: &str) -> String {
     format!("audit.{tenant}.flow.{event}")
 }
 
+/// Builds the audit subject for an agentic-worker step event:
+/// `audit.<tenant>.agent.<event>` (e.g. `audit.t1.agent.tool_call`).
+pub fn agent_audit_subject(tenant: &str, event: &str) -> String {
+    format!("audit.{tenant}.agent.{event}")
+}
+
+/// Shared envelope construction core for [`build_audit_event`] and
+/// [`build_agent_audit_event`]. Both builders funnel through here so the
+/// `EventId` fallback and the common `EventEnvelope` fields stay in one
+/// place.
+#[allow(clippy::too_many_arguments)]
+fn base_event(
+    tenant: &TenantCtx,
+    ty: &str,
+    source: &str,
+    subject: String,
+    correlation_id: Option<String>,
+    payload: serde_json::Value,
+    time: DateTime<Utc>,
+    id: String,
+) -> EventEnvelope {
+    let event_id = EventId::new(&id).unwrap_or_else(|_| {
+        EventId::new(FALLBACK_EVENT_ID).expect("static fallback event id is a valid EventId")
+    });
+
+    EventEnvelope {
+        id: event_id,
+        topic: "runner.flow".to_string(),
+        r#type: ty.to_string(),
+        source: source.to_string(),
+        tenant: tenant.clone(),
+        subject: Some(subject),
+        time,
+        correlation_id,
+        payload,
+        metadata: Default::default(),
+    }
+}
+
 /// Constructs the audit `EventEnvelope` for one node's completion.
 ///
 /// `type` is `greentic.runner.flow.node_end` for `Outcome::Ok` and
@@ -75,22 +114,46 @@ pub fn build_audit_event(
         map.insert("error".to_string(), json!(error));
     }
 
-    let event_id = EventId::new(&id).unwrap_or_else(|_| {
-        EventId::new(FALLBACK_EVENT_ID).expect("static fallback event id is a valid EventId")
-    });
-
-    EventEnvelope {
-        id: event_id,
-        topic: "runner.flow".to_string(),
-        r#type: event_type,
-        source: "runner".to_string(),
-        tenant: rec.tenant.clone(),
-        subject: Some(format!("flow:{}/node:{}", rec.flow_id, rec.node_id)),
-        time: now,
-        correlation_id: Some(rec.session_id.to_string()),
+    base_event(
+        rec.tenant,
+        &event_type,
+        "runner",
+        format!("flow:{}/node:{}", rec.flow_id, rec.node_id),
+        Some(rec.session_id.to_string()),
         payload,
-        metadata: Default::default(),
-    }
+        now,
+        id,
+    )
+}
+
+/// Constructs the audit `EventEnvelope` for one agentic-worker step
+/// (tool call/result).
+///
+/// `type` is `greentic.runner.agent.<event>` (e.g.
+/// `greentic.runner.agent.tool_call`); `source` is always `"runner"`;
+/// `subject` is `agent:<agent_id>`; `correlation_id` carries the agent
+/// session id so the admin can thread agent-step events to a session.
+pub fn build_agent_audit_event(
+    tenant: &TenantCtx,
+    agent_id: &str,
+    session_id: &str,
+    event: &str,
+    payload: serde_json::Value,
+    now: DateTime<Utc>,
+    id: String,
+) -> EventEnvelope {
+    let event_type = format!("greentic.runner.agent.{event}");
+
+    base_event(
+        tenant,
+        &event_type,
+        "runner",
+        format!("agent:{agent_id}"),
+        Some(session_id.to_string()),
+        payload,
+        now,
+        id,
+    )
 }
 
 #[cfg(test)]
@@ -230,5 +293,45 @@ mod tests {
     #[test]
     fn subject_is_well_formed() {
         assert_eq!(audit_subject("t1", "node_end"), "audit.t1.flow.node_end");
+    }
+
+    #[test]
+    fn agent_subject_is_well_formed() {
+        assert_eq!(
+            agent_audit_subject("t1", "tool_call"),
+            "audit.t1.agent.tool_call"
+        );
+    }
+
+    #[test]
+    fn agent_event_decodes_under_admin_contract() {
+        let tenant = tenant_ctx();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let env = build_agent_audit_event(
+            &tenant,
+            "a1",
+            "s1",
+            "tool_call",
+            json!({"tool": "http", "call_id": "c1"}),
+            now,
+            "id1".to_string(),
+        );
+        let body = serde_json::to_value(&env).unwrap();
+
+        let (tenant, ty, source, subject, time, corr) = admin_decode(&body);
+        assert_eq!(tenant, "t1");
+        assert_eq!(ty, "greentic.runner.agent.tool_call");
+        assert_eq!(source, "runner");
+        assert_eq!(subject, "agent:a1");
+        assert!(time.starts_with("2026-07-03T00:00:00"));
+        assert_eq!(corr, "s1");
+        assert_eq!(
+            body.get("payload")
+                .and_then(|p| p.get("tool"))
+                .and_then(Value::as_str),
+            Some("http")
+        );
     }
 }

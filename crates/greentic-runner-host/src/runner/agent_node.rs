@@ -31,6 +31,7 @@ mod aw {
     use std::future::Future;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     use anyhow::Result;
@@ -38,8 +39,11 @@ mod aw {
     use greentic_aw_runtime::config_provider::ConfigProvider;
     use greentic_aw_runtime::error::{AgentError, ConfigError};
     use greentic_aw_runtime::guardrail::GuardrailDirection;
-    use greentic_aw_runtime::{AgentInput, AgentRuntime, AgentStep, TenantContext};
+    use greentic_aw_runtime::{AgentInput, AgentRuntime, AgentStep, StepObserver, TenantContext};
     use serde_json::{Value, json};
+
+    use crate::trace::agent_audit::AgentAuditObserver;
+    use crate::trace::audit_sink::AuditSink;
 
     use super::AgentNodeHandler;
 
@@ -167,13 +171,41 @@ mod aw {
     /// only ever sees this through the [`AgentNodeHandler`] trait object.
     pub struct RuntimeAgentNodeHandler {
         runtime: Arc<AgentRuntime>,
+        /// Best-effort agent-step audit sink (EPIC-B B-3). `None` — the
+        /// default when no NATS audit client is configured
+        /// (`GREENTIC_EVENTS_NATS_URL` unset/unreachable) — keeps `execute`
+        /// on the plain [`AgentRuntime::step`] path, byte-identical to the
+        /// behaviour before this observer existed.
+        audit_sink: Option<AuditSink>,
     }
 
     impl RuntimeAgentNodeHandler {
-        /// Wrap a shared [`AgentRuntime`] in a flow-node handler.
-        pub fn new(runtime: Arc<AgentRuntime>) -> Self {
-            Self { runtime }
+        /// Wrap a shared [`AgentRuntime`] in a flow-node handler. `audit_sink`
+        /// is `Some` only when a NATS audit client was configured; `execute`
+        /// then drives the step via [`AgentRuntime::step_with_observer`] with
+        /// an [`AgentAuditObserver`] so tool calls/results are published to
+        /// `audit.<tenant>.agent.<event>`. When `None`, `execute` uses
+        /// [`AgentRuntime::step`] directly (no observer, no behaviour change).
+        pub fn new(runtime: Arc<AgentRuntime>, audit_sink: Option<AuditSink>) -> Self {
+            Self {
+                runtime,
+                audit_sink,
+            }
         }
+    }
+
+    /// Build a [`greentic_types::TenantCtx`] for the agent-audit observer from
+    /// the flow node's plain `tenant_id`/`env_id` strings. Mirrors
+    /// `HostConfig::tenant_ctx`'s fallback-to-"local" pattern: an id that fails
+    /// the newtype's validation (which should not happen once a flow has been
+    /// routed to a tenant) still yields a well-formed `TenantCtx` rather than
+    /// panicking — the audit event is best-effort, never load-bearing.
+    fn tenant_ctx_for_audit(tenant_id: &str, env_id: &str) -> greentic_types::TenantCtx {
+        let env = greentic_types::EnvId::from_str(env_id)
+            .unwrap_or_else(|_| greentic_types::EnvId::new("local").expect("local env id"));
+        let tenant = greentic_types::TenantId::from_str(tenant_id)
+            .unwrap_or_else(|_| greentic_types::TenantId::new("local").expect("local tenant id"));
+        greentic_types::TenantCtx::new(env, tenant)
     }
 
     #[async_trait::async_trait]
@@ -194,7 +226,25 @@ mod aw {
             let tenant = TenantContext::new(tenant_id, env_id);
             let input = AgentInput { text: user_text };
 
-            match self.runtime.step(tenant, session_id, agent_id, input).await {
+            // Off by default: with no audit sink configured, this is exactly
+            // the pre-existing `self.runtime.step(...)` call — no observer is
+            // constructed and behaviour is byte-identical to before EPIC-B B-3.
+            let step_result = match &self.audit_sink {
+                Some(sink) => {
+                    let observer: Arc<dyn StepObserver> = Arc::new(AgentAuditObserver::new(
+                        sink.clone(),
+                        tenant_ctx_for_audit(tenant_id, env_id),
+                        agent_id.to_string(),
+                        session_id.to_string(),
+                    ));
+                    self.runtime
+                        .step_with_observer(tenant, session_id, agent_id, input, observer)
+                        .await
+                }
+                None => self.runtime.step(tenant, session_id, agent_id, input).await,
+            };
+
+            match step_result {
                 Ok(output) => Ok(json!({
                     "reply": output.reply,
                     "trail": output.trail,
@@ -761,6 +811,11 @@ mod aw {
     ///
     /// Returns `None` when the extension runtime fails to initialise (the only
     /// failure mode at this layer — store errors are handled by callers).
+    ///
+    /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
+    /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
+    /// plain [`AgentRuntime::step`] path.
+    #[allow(clippy::too_many_arguments)]
     async fn build_runtime_handler_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
@@ -769,6 +824,7 @@ mod aw {
         state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
+        audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use std::time::Duration;
 
@@ -872,7 +928,7 @@ mod aw {
         );
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
-        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime)))
+        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime, audit_sink)))
     }
 
     /// Build the production `DwAgent` handler if the environment is configured.
@@ -899,11 +955,18 @@ mod aw {
     /// reading global env vars. Callers without per-tenant context (e.g.
     /// `serve_agentic`) should use [`build_agent_runtime`] directly, which uses
     /// the env-keyed backend and accepts no secrets context.
+    ///
+    /// `audit_sink` (EPIC-B B-3) is threaded straight through to the
+    /// constructed [`RuntimeAgentNodeHandler`]; `None` (no NATS audit client
+    /// configured) keeps `dw.agent` execution on the plain
+    /// [`greentic_aw_runtime::AgentRuntime::step`] path — zero behaviour
+    /// change from before this parameter existed.
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use greentic_aw_runtime::RedisAgentStateStore;
         use greentic_aw_runtime::cost::RedisTokenMeter;
@@ -941,6 +1004,7 @@ mod aw {
             state_store,
             token_meter,
             ledger,
+            audit_sink,
         )
         .await
     }
@@ -959,6 +1023,7 @@ mod aw {
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
+        audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -994,6 +1059,7 @@ mod aw {
             state_store,
             token_meter,
             ledger,
+            audit_sink,
         )
         .await
     }
@@ -1342,7 +1408,7 @@ mod aw {
                 ledger,
                 None,
             ));
-            let handler = RuntimeAgentNodeHandler::new(runtime);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None);
 
             let output = handler
                 .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
@@ -1350,6 +1416,151 @@ mod aw {
                 .expect("execute should succeed");
 
             assert_eq!(output["reply"].as_str(), Some("pong"));
+        }
+
+        // -----------------------------------------------------------------------
+        // audit_sink enable/disable branch (EPIC-B B-3)
+        // -----------------------------------------------------------------------
+
+        /// Build an [`AgentRuntime`] scripted to make one `remember` (host
+        /// built-in short-term-memory) tool call before replying "done". The
+        /// host built-in path fires `StepObserver::on_tool_call`/`on_tool_result`
+        /// without needing a real WASM extension dispatch, so it is the
+        /// cheapest way to drive a genuine tool call through `execute`.
+        fn runtime_with_scripted_remember_call(tenant_id: &str, env_id: &str) -> Arc<AgentRuntime> {
+            use greentic_aw_runtime::state::ToolCallRecord;
+            use greentic_aw_runtime::{InMemoryMemoryProvider, MemoryProviderRef, MemorySettings};
+
+            let llm = Arc::new(MockLlmBackend::new(vec![
+                Ok(LlmResponse {
+                    content: None,
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "c1".into(),
+                        extension_id: "host".into(),
+                        tool_name: "remember".into(),
+                        args: json!({"key": "k", "value": "v"}),
+                    }],
+                    tokens_in: 1,
+                    tokens_out: 1,
+                }),
+                Ok(LlmResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    tokens_in: 1,
+                    tokens_out: 1,
+                }),
+            ]));
+            let store = Arc::new(MockAgentStateStore::new());
+            let telemetry = Arc::new(MockTelemetry::new());
+
+            let config_provider = MockConfigProvider::new();
+            let tenant = TenantContext::new(tenant_id, env_id);
+            let mut cfg = sample_agent_config("greeter");
+            cfg.memory = Some(MemorySettings {
+                short_term: Some(MemoryProviderRef {
+                    provider: "inmemory".into(),
+                    capability: "cap://memory/short-term".into(),
+                    params: Default::default(),
+                    credential_ref: None,
+                }),
+                long_term: None,
+            });
+            config_provider.insert(&tenant, "greeter", cfg);
+            let config_provider = Arc::new(config_provider);
+
+            let token_meter = Arc::new(MockTokenMeter::new(0));
+            let ledger = Arc::new(NoopToolLedger);
+            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+
+            Arc::new(
+                AgentRuntime::new(
+                    config_provider,
+                    store,
+                    ext_runtime,
+                    llm,
+                    telemetry,
+                    token_meter,
+                    ledger,
+                    None,
+                )
+                .with_short_term_memory(Arc::new(InMemoryMemoryProvider::new())),
+            )
+        }
+
+        #[tokio::test]
+        async fn execute_with_audit_sink_routes_through_step_with_observer_and_enqueues_events() {
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let sink = AuditSink::from_sender(tx);
+            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink));
+
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
+
+            let (subject, bytes) = rx.try_recv().expect("tool_call event enqueued");
+            assert_eq!(subject, "audit.t1.agent.tool_call");
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["payload"]["tool"], json!("remember"));
+            assert_eq!(value["payload"]["agent_id"], json!("greeter"));
+
+            let (subject, bytes) = rx.try_recv().expect("tool_result event enqueued");
+            assert_eq!(subject, "audit.t1.agent.tool_result");
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["payload"]["tool"], json!("remember"));
+
+            assert!(
+                rx.try_recv().is_err(),
+                "exactly two audit events enqueued (one tool_call, one tool_result)"
+            );
+        }
+
+        #[tokio::test]
+        async fn execute_without_audit_sink_uses_plain_step_path_unchanged() {
+            // Same scripted tool call as the audited test above, but the
+            // handler carries no audit sink at all — proves the "off" branch
+            // (self.runtime.step, no observer constructed) still dispatches
+            // the tool call and returns the same reply, exactly as it did
+            // before AgentAuditObserver existed.
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let handler = RuntimeAgentNodeHandler::new(runtime, None);
+
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
+        }
+
+        #[test]
+        fn tenant_ctx_for_audit_uses_real_ids_when_valid() {
+            let ctx = super::tenant_ctx_for_audit("acme", "prod");
+            assert_eq!(ctx.tenant.as_str(), "acme");
+            assert_eq!(ctx.env.as_str(), "prod");
+        }
+
+        #[test]
+        fn tenant_ctx_for_audit_falls_back_to_local_on_invalid_ids() {
+            // Empty strings fail the newtype validation; the helper must not
+            // panic and should fall back to "local" for both fields.
+            let ctx = super::tenant_ctx_for_audit("", "");
+            assert_eq!(ctx.tenant.as_str(), "local");
+            assert_eq!(ctx.env.as_str(), "local");
         }
 
         #[tokio::test]
@@ -1733,6 +1944,7 @@ mod aw {
                 "t1".to_string(),
                 secrets,
                 Vec::new(),
+                None,
             )
             .await;
             assert!(
