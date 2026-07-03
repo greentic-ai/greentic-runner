@@ -1,3 +1,4 @@
+pub mod audit_event;
 mod model;
 mod recorder;
 
