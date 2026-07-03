@@ -139,6 +139,28 @@ impl HostNode {
     }
 }
 
+#[cfg(test)]
+impl HostNode {
+    /// Test-only constructor. `HostNode`'s fields (and `NodeKind`/`Routing`
+    /// literals) are private to this module, so sibling-module unit tests
+    /// (e.g. `trace::recorder`) that need to build a `NodeEvent` for the
+    /// `ExecutionObserver` trait cannot construct one via struct literal.
+    /// This is additive test scaffolding only — no production behavior change.
+    pub(crate) fn for_test(component_id: &str, operation_name: Option<&str>) -> Self {
+        HostNode {
+            kind: NodeKind::Exec {
+                target_component: component_id.to_string(),
+            },
+            component: component_id.to_string(),
+            component_id: component_id.to_string(),
+            operation_name: operation_name.map(str::to_string),
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum NodeKind {
     Exec {
