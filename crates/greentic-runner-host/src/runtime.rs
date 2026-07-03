@@ -200,6 +200,52 @@ impl TenantRuntime {
         let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
             .context("failed to prime flow engine")?;
+
+        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
+        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
+        // so the dispatcher must be attached while `engine` is still owned and
+        // mutable. The response listener (which needs the post-build ingress
+        // handle) is spawned further below, after the runtime is constructed.
+        //
+        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
+        // disabled and existing behaviour is unchanged. When set but NATS cannot
+        // be reached we log a warning and continue (the engine simply has no
+        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
+        //
+        // Connected here (BEFORE the agentic-worker block below) rather than
+        // its original post-block position so the agent-node handler
+        // construction below can also thread the (possibly connected) client
+        // into an `AuditSink` for `dw.agent` step audit events (EPIC-B B-3);
+        // pure reordering, no behaviour change to the dispatch wiring itself.
+        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(nats_url) => match async_nats::connect(&nats_url).await {
+                Ok(client) => {
+                    engine.set_remote_dispatch_handler(Arc::new(
+                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
+                    ));
+                    Some(client)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        // Clone the (possibly connected) client for the audit sink (EPIC-B
+        // B-2/B-3): threaded into `StateMachineRuntime::from_flow_engine` so
+        // `TraceRecorder` can publish best-effort audit events over NATS, and
+        // (as an `AuditSink`) into the `dw.agent` node handler below so agent
+        // tool-call/tool-result steps are audited too. Cloned BEFORE the
+        // response-listener loop further below moves `dispatch_nats_client`.
+        // `None` when NATS is unset/unreachable, which keeps both audit paths
+        // off by default (zero behaviour change).
+        let audit_nats_client = dispatch_nats_client.clone();
+
         #[cfg(feature = "agentic-worker")]
         {
             use crate::runner::agent_node::{
@@ -261,12 +307,21 @@ impl TenantRuntime {
             let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
+            // Best-effort agent-step audit sink (EPIC-B B-3), built from the
+            // same (possibly connected) NATS client the flow-level audit sink
+            // (B-2) uses. `None` when NATS is unset/unreachable, which keeps
+            // `dw.agent` execution on the plain `AgentRuntime::step` path
+            // (zero behaviour change).
+            let agent_audit_sink = audit_nats_client
+                .clone()
+                .map(crate::trace::audit_sink::AuditSink::new);
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
                     pack_runtimes.clone(),
+                    agent_audit_sink.clone(),
                 )
                 .await
             } else {
@@ -277,6 +332,7 @@ impl TenantRuntime {
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
                         pack_runtimes.clone(),
+                        agent_audit_sink.clone(),
                     )
                     .await
                 }
@@ -287,6 +343,7 @@ impl TenantRuntime {
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
                         pack_runtimes.clone(),
+                        agent_audit_sink.clone(),
                     )
                     .await
                 }
@@ -334,42 +391,6 @@ impl TenantRuntime {
                 tracing::info!("DwAgentGraph runtime wired into FlowEngine");
             }
         }
-        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
-        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
-        // so the dispatcher must be attached while `engine` is still owned and
-        // mutable. The response listener (which needs the post-build ingress
-        // handle) is spawned further below, after the runtime is constructed.
-        //
-        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
-        // disabled and existing behaviour is unchanged. When set but NATS cannot
-        // be reached we log a warning and continue (the engine simply has no
-        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
-        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
-            Ok(nats_url) => match async_nats::connect(&nats_url).await {
-                Ok(client) => {
-                    engine.set_remote_dispatch_handler(Arc::new(
-                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
-                    ));
-                    Some(client)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        %error,
-                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
-                    );
-                    None
-                }
-            },
-            Err(_) => None,
-        };
-
-        // Clone the (possibly connected) client for the audit sink (EPIC-B
-        // B-2): threaded into `StateMachineRuntime::from_flow_engine` so
-        // `TraceRecorder` can publish best-effort audit events over NATS.
-        // Cloned BEFORE the response-listener loop below moves
-        // `dispatch_nats_client`. `None` when NATS is unset/unreachable,
-        // which keeps the audit sink off by default (zero behaviour change).
-        let audit_nats_client = dispatch_nats_client.clone();
 
         // Resolve how `dw.agent` nodes dispatch. When `GREENTIC_AW_DISPATCH=nats`
         // is set, the node is rerouted over the durable agentic NATS path instead
