@@ -1,4 +1,5 @@
 pub mod audit_event;
+pub mod audit_sink;
 mod model;
 mod recorder;
 
