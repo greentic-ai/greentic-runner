@@ -38,7 +38,7 @@ mod aw {
     use greentic_aw_runtime::HttpGraphProvider;
     use greentic_aw_runtime::ToolLedger;
     use greentic_aw_runtime::config_provider::InMemoryConfigProvider;
-    use greentic_aw_runtime::error::ConfigError;
+    use greentic_aw_runtime::error::{AgentError, ConfigError};
     use greentic_aw_runtime::graph::{
         AgentTurnFn, AgentTurnRequest, AgentTurnResult, ApprovalFn, ApprovalOutcome,
         ApprovalRequest, BoxFut, CheckpointError, CheckpointStore, GraphConfig, GraphExecError,
@@ -48,12 +48,13 @@ mod aw {
     use greentic_aw_runtime::state::{AgentStateStore, ChatMessage, ConversationState};
     use greentic_aw_runtime::tools::dispatch_tool_call;
     use greentic_aw_runtime::{
-        AgentConfig, AgentInput, AgentLimits, AgentRuntime, LlmBackend, LlmProviderRef, Telemetry,
-        TenantContext, TokenMeter,
+        AgentConfig, AgentInput, AgentLimits, AgentOutput, AgentRuntime, LlmBackend,
+        LlmProviderRef, StepObserver, Telemetry, TenantContext, TokenMeter,
     };
     use greentic_ext_runtime::ExtensionRuntime;
     use serde_json::{Value, json};
 
+    use crate::trace::agent_audit::AgentAuditObserver;
     use crate::trace::audit_sink::AuditSink;
 
     use super::GraphNodeHandler;
@@ -545,10 +546,9 @@ mod aw {
         approval: ApprovalFn,
         /// Best-effort agent-step audit sink (EPIC-B B-3b), threaded from
         /// [`build_graph_node_handler`]. `None` when no NATS audit client is
-        /// configured (`GREENTIC_EVENTS_NATS_URL` unset/unreachable) — kept
-        /// unused until Task 2 wires `AgentAuditObserver` into
-        /// `run_one_agent_turn`/`run_one_supervisor_turn`; today's `.step`
-        /// path stays byte-identical regardless of this field's value.
+        /// configured (`GREENTIC_EVENTS_NATS_URL` unset/unreachable) — the
+        /// `run_agent_step` seam then stays on the plain `.step()` path,
+        /// byte-identical regardless of this field's value.
         audit_sink: Option<AuditSink>,
     }
 
@@ -792,8 +792,9 @@ mod aw {
             // the synthetic `tenant` above, which is only ever `"graph"`/
             // `"run"` for per-visit AgentRuntime *state*). Rebuilt fresh on
             // every call — see `TurnEffectSource` — so the sink + real tenant
-            // reach `run_one_agent_turn`/`run_one_supervisor_turn`. Unused
-            // until Task 2 wires `AgentAuditObserver` in.
+            // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
+            // them into the shared `run_agent_step` seam that builds the
+            // `AgentAuditObserver` (EPIC-B B-3b Task 2).
             let real_tenant = tenant_ctx_for_audit(tenant_id, env_id);
             let agent_turn = self
                 .turn_source
@@ -957,13 +958,55 @@ mod aw {
         })
     }
 
+    /// Drive one graph-node agent step: [`AgentRuntime::step`] when no audit
+    /// sink is configured, or [`AgentRuntime::step_with_observer`] with an
+    /// [`AgentAuditObserver`] when one is (EPIC-B B-3b Task 2). Shared by
+    /// [`run_one_agent_turn`] and [`run_one_supervisor_turn`] so the
+    /// audit-injection seam is defined exactly once.
+    ///
+    /// `tenant`/`session_id`/`agent_id` are the per-visit SYNTHETIC state
+    /// identifiers (`TenantContext::new("graph", "run")` + the derived
+    /// session/agent ids) — unchanged by this wiring, since the
+    /// `AgentRuntime`'s state store must keep using them for per-visit
+    /// durability. `real_tenant` is used ONLY to build the audit observer's
+    /// `TenantCtx`, so audit events publish under the real tenant while turn
+    /// state stays keyed under "graph"/"run".
+    ///
+    /// Off by default: when `audit_sink` is `None` (no NATS audit client
+    /// configured), this is exactly `runtime.step(...)` — byte-identical to
+    /// the call before this observer existed.
+    async fn run_agent_step(
+        runtime: &AgentRuntime,
+        tenant: TenantContext,
+        session_id: &str,
+        agent_id: &str,
+        input: AgentInput,
+        audit_sink: Option<&AuditSink>,
+        real_tenant: &greentic_types::TenantCtx,
+    ) -> std::result::Result<AgentOutput, AgentError> {
+        match audit_sink {
+            Some(sink) => {
+                let observer: Arc<dyn StepObserver> = Arc::new(AgentAuditObserver::new(
+                    sink.clone(),
+                    real_tenant.clone(),
+                    agent_id.to_string(),
+                    session_id.to_string(),
+                ));
+                runtime
+                    .step_with_observer(tenant, session_id, agent_id, input, observer)
+                    .await
+            }
+            None => runtime.step(tenant, session_id, agent_id, input).await,
+        }
+    }
+
     /// Drive one [`AgentRuntime::step`] for an agent-node visit. Derives the
     /// agent/session ids, seeds conversation context, runs the step, and maps the
     /// reply's resolution sentinel.
     ///
-    /// `audit_sink`/`real_tenant` are threaded plumbing for EPIC-B B-3b Task 2
-    /// (`AgentAuditObserver` injection): unused today, so this stays on the
-    /// plain `.step()` path, byte-identical to before this field existed.
+    /// `audit_sink`/`real_tenant` are forwarded to [`run_agent_step`], which
+    /// injects an [`AgentAuditObserver`] built from `real_tenant` when a sink
+    /// is configured (EPIC-B B-3b Task 2).
     #[allow(clippy::too_many_arguments)]
     async fn run_one_agent_turn(
         req: AgentTurnRequest,
@@ -976,10 +1019,6 @@ mod aw {
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<AgentTurnResult, GraphExecError> {
-        // Threaded plumbing only (EPIC-B B-3b Task 1); Task 2 builds an
-        // `AgentAuditObserver` from these instead of discarding them.
-        let _ = (audit_sink, real_tenant);
-
         // The request carries no tenant/graph/session — they live on the
         // GraphRunState's seeded session. The executor seeds the run state with
         // the tenant-scoped messages, so we reconstruct a turn-scoped tenant +
@@ -1033,10 +1072,17 @@ mod aw {
             text: String::new(),
         };
 
-        let out = runtime
-            .step(tenant.clone(), &session_id, &agent_id, input)
-            .await
-            .map_err(|e| GraphExecError::AgentTurn(format!("agent step failed: {e}")))?;
+        let out = run_agent_step(
+            &runtime,
+            tenant.clone(),
+            &session_id,
+            &agent_id,
+            input,
+            audit_sink,
+            real_tenant,
+        )
+        .await
+        .map_err(|e| GraphExecError::AgentTurn(format!("agent step failed: {e}")))?;
 
         Ok(AgentTurnResult {
             resolved: detect_resolved(&out.reply),
@@ -1111,9 +1157,9 @@ mod aw {
     /// If the sentinel is absent or the branch does not match a declared route,
     /// the first route is used as fallback with a `tracing::warn!`.
     ///
-    /// `audit_sink`/`real_tenant` are threaded plumbing for EPIC-B B-3b Task 2
-    /// (`AgentAuditObserver` injection): unused today, so this stays on the
-    /// plain `.step()` path, byte-identical to before this field existed.
+    /// `audit_sink`/`real_tenant` are forwarded to [`run_agent_step`], which
+    /// injects an [`AgentAuditObserver`] built from `real_tenant` when a sink
+    /// is configured (EPIC-B B-3b Task 2).
     #[allow(clippy::too_many_arguments)]
     async fn run_one_supervisor_turn(
         req: SupervisorRequest,
@@ -1126,10 +1172,6 @@ mod aw {
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<SupervisorResult, GraphExecError> {
-        // Threaded plumbing only (EPIC-B B-3b Task 1); Task 2 builds an
-        // `AgentAuditObserver` from these instead of discarding them.
-        let _ = (audit_sink, real_tenant);
-
         let tenant = TenantContext::new("graph", "run");
         let session_id = format!("graph__{}_sup", req.node_id);
         let agent_id = format!("graph.{}.supervisor", req.node_id);
@@ -1185,10 +1227,17 @@ mod aw {
             text: String::new(),
         };
 
-        let out = runtime
-            .step(tenant.clone(), &session_id, &agent_id, input)
-            .await
-            .map_err(|e| GraphExecError::Supervisor(format!("supervisor step failed: {e}")))?;
+        let out = run_agent_step(
+            &runtime,
+            tenant.clone(),
+            &session_id,
+            &agent_id,
+            input,
+            audit_sink,
+            real_tenant,
+        )
+        .await
+        .map_err(|e| GraphExecError::Supervisor(format!("supervisor step failed: {e}")))?;
 
         // Parse [[ROUTE:<branch>]] from the reply (case-insensitive).
         // Do this BEFORE stripping so we read from the unmodified reply.
@@ -2270,6 +2319,382 @@ mod aw {
                 out["terminated_by"].as_str(),
                 Some("respond"),
                 "fallback path must still reach respond: {out:?}"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // EPIC-B B-3b Task 2: `AgentAuditObserver` injection at the graph
+        // turn `.step` seam (`run_agent_step`, shared by `run_one_agent_turn`
+        // and `run_one_supervisor_turn`).
+        // -------------------------------------------------------------------
+
+        fn real_tenant_ctx(tenant: &str, env: &str) -> greentic_types::TenantCtx {
+            greentic_types::TenantCtx::new(
+                greentic_types::EnvId::try_from(env).expect("valid env id"),
+                greentic_types::TenantId::try_from(tenant).expect("valid tenant id"),
+            )
+        }
+
+        /// Build an [`AgentRuntime`] scripted to make one `remember` (host
+        /// built-in short-term-memory) tool call before replying "done".
+        /// Mirrors `agent_node`'s `runtime_with_scripted_remember_call`
+        /// fixture — the host built-in path fires
+        /// `StepObserver::on_tool_call`/`on_tool_result` without needing a
+        /// real WASM extension dispatch, so it is the cheapest way to drive a
+        /// genuine tool call through the seam.
+        ///
+        /// `run_one_agent_turn`/`run_one_supervisor_turn` hardcode
+        /// `tools: vec![]` + `memory: None` on their ephemeral per-visit
+        /// `AgentConfig` (graph-node agents have no tool/memory access in v1
+        /// scope — see the `TODO(guardrail)` comment at each call site), so
+        /// no tool call can ever reach the observer through those two
+        /// functions today. This fixture instead drives the shared
+        /// `run_agent_step` seam directly with its own memory-enabled
+        /// config — the exact same `match audit_sink { .. }` code both turn
+        /// functions delegate to — so the real-tenant wiring is verified
+        /// against genuine tool-call traffic rather than asserted in the
+        /// abstract.
+        fn agent_runtime_with_scripted_remember_call(
+            tenant: &TenantContext,
+            agent_id: &str,
+        ) -> AgentRuntime {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::llm::LlmResponse;
+            use greentic_aw_runtime::mock::{MockLlmBackend, MockTelemetry, NoopToolLedger};
+            use greentic_aw_runtime::state::ToolCallRecord;
+            use greentic_aw_runtime::{InMemoryMemoryProvider, MemoryProviderRef, MemorySettings};
+
+            let llm = Arc::new(MockLlmBackend::new(vec![
+                Ok(LlmResponse {
+                    content: None,
+                    tool_calls: vec![ToolCallRecord {
+                        call_id: "c1".into(),
+                        extension_id: "host".into(),
+                        tool_name: "remember".into(),
+                        args: json!({"key": "k", "value": "v"}),
+                    }],
+                    tokens_in: 1,
+                    tokens_out: 1,
+                }),
+                Ok(LlmResponse {
+                    content: Some("done".into()),
+                    tool_calls: vec![],
+                    tokens_in: 1,
+                    tokens_out: 1,
+                }),
+            ]));
+
+            let cfg = AgentConfig {
+                agent_id: agent_id.to_string(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                guardrails: vec![],
+                llm: LlmProviderRef {
+                    provider: "openai".into(),
+                    model: "gpt-4o-mini".into(),
+                    credential_ref: None,
+                },
+                limits: AgentLimits::default(),
+                memory: Some(MemorySettings {
+                    short_term: Some(MemoryProviderRef {
+                        provider: "inmemory".into(),
+                        capability: "cap://memory/short-term".into(),
+                        params: Default::default(),
+                        credential_ref: None,
+                    }),
+                    long_term: None,
+                }),
+                knowledge: None,
+            };
+            let mut provider = InMemoryConfigProvider::new();
+            provider.insert(tenant, agent_id, cfg);
+
+            AgentRuntime::new(
+                Arc::new(provider),
+                Arc::new(MockAgentStateStore::new()),
+                Arc::new(ExtensionRuntime::for_test()),
+                llm,
+                Arc::new(MockTelemetry::new()),
+                Arc::new(MockTokenMeter::new(0)),
+                Arc::new(NoopToolLedger),
+                None,
+            )
+            .with_short_term_memory(Arc::new(InMemoryMemoryProvider::new()))
+        }
+
+        #[tokio::test]
+        async fn run_agent_step_with_audit_sink_enqueues_events_under_real_tenant_not_state_tenant()
+        {
+            // The SYNTHETIC state tenant every graph-node turn uses today —
+            // must NOT leak into the audit subject.
+            let state_tenant = TenantContext::new("graph", "run");
+            let agent_id = "graph.agent-1";
+            let session_id = "graph__agent-1";
+            let runtime = agent_runtime_with_scripted_remember_call(&state_tenant, agent_id);
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let sink = AuditSink::from_sender(tx);
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let input = AgentInput {
+                text: String::new(),
+            };
+            let out = run_agent_step(
+                &runtime,
+                state_tenant.clone(),
+                session_id,
+                agent_id,
+                input,
+                Some(&sink),
+                &real_tenant,
+            )
+            .await
+            .expect("step should succeed");
+            assert_eq!(out.reply, "done");
+
+            let (subject, bytes) = rx.try_recv().expect("tool_call audit event enqueued");
+            assert_eq!(
+                subject, "audit.acme.agent.tool_call",
+                "audit subject must carry the REAL tenant (\"acme\"), not the synthetic state tenant (\"graph\")"
+            );
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["payload"]["tool"], json!("remember"));
+            assert_eq!(value["payload"]["agent_id"], json!(agent_id));
+
+            let (subject, bytes) = rx.try_recv().expect("tool_result audit event enqueued");
+            assert_eq!(subject, "audit.acme.agent.tool_result");
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["payload"]["tool"], json!("remember"));
+
+            assert!(
+                rx.try_recv().is_err(),
+                "exactly two audit events enqueued (one tool_call, one tool_result)"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_agent_step_without_audit_sink_uses_plain_step_path_unchanged() {
+            // Same scripted tool call as the audited test above, but no audit
+            // sink at all — proves the "off" branch (runtime.step, no
+            // observer constructed) still dispatches the tool call and
+            // returns the same reply, exactly as it did before
+            // AgentAuditObserver existed.
+            let state_tenant = TenantContext::new("graph", "run");
+            let agent_id = "graph.agent-1";
+            let session_id = "graph__agent-1";
+            let runtime = agent_runtime_with_scripted_remember_call(&state_tenant, agent_id);
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let input = AgentInput {
+                text: String::new(),
+            };
+            let out = run_agent_step(
+                &runtime,
+                state_tenant.clone(),
+                session_id,
+                agent_id,
+                input,
+                None,
+                &real_tenant,
+            )
+            .await
+            .expect("step should succeed");
+
+            assert_eq!(out.reply, "done");
+        }
+
+        /// Minimal [`MockLlmBackend`] that always replies with `reply` and no
+        /// tool calls — enough to drive `run_one_agent_turn`/
+        /// `run_one_supervisor_turn` end to end without needing tool access
+        /// (which their hardcoded ephemeral `AgentConfig` does not grant).
+        fn plain_reply_llm(reply: &str) -> Arc<dyn LlmBackend> {
+            use greentic_aw_runtime::llm::LlmResponse;
+            use greentic_aw_runtime::mock::MockLlmBackend;
+
+            Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+                content: Some(reply.to_string()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            })]))
+        }
+
+        fn agent_turn_request(node_id: &str, system_prompt: &str) -> AgentTurnRequest {
+            AgentTurnRequest {
+                node_id: node_id.to_string(),
+                system_prompt: system_prompt.to_string(),
+                model: "gpt-4o-mini".to_string(),
+                state: GraphRunState::default(),
+                provider: None,
+            }
+        }
+
+        /// Shared effect Arcs for `run_one_agent_turn`/`run_one_supervisor_turn`
+        /// test calls: state store, ext runtime, telemetry, token meter, ledger.
+        type AgentTurnEffects = (
+            Arc<dyn AgentStateStore>,
+            Arc<ExtensionRuntime>,
+            Arc<dyn Telemetry>,
+            Arc<dyn TokenMeter>,
+            Arc<dyn ToolLedger>,
+        );
+
+        fn agent_turn_effects() -> AgentTurnEffects {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockTelemetry, NoopToolLedger};
+
+            (
+                Arc::new(MockAgentStateStore::new()),
+                Arc::new(ExtensionRuntime::for_test()),
+                Arc::new(MockTelemetry::new()),
+                Arc::new(MockTokenMeter::new(0)),
+                Arc::new(NoopToolLedger),
+            )
+        }
+
+        #[tokio::test]
+        async fn run_one_agent_turn_without_audit_sink_completes_unchanged() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let result = run_one_agent_turn(
+                agent_turn_request("agent", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("all good [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                &real_tenant,
+            )
+            .await
+            .expect("turn should succeed");
+
+            assert!(result.resolved);
+            assert_eq!(result.reply, "all good");
+        }
+
+        #[tokio::test]
+        async fn run_one_agent_turn_with_audit_sink_completes_same_reply_as_without() {
+            // No tool call fires on this path (graph-node agent turns are
+            // built with an empty tool list today), so no audit event is
+            // expected here either — this test guards that routing through
+            // `step_with_observer` does not change the turn's outcome.
+            // Genuine tool-call audit-under-real-tenant coverage lives in
+            // `run_agent_step_with_audit_sink_enqueues_events_under_real_tenant_not_state_tenant`.
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let sink = AuditSink::from_sender(tx);
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let result = run_one_agent_turn(
+                agent_turn_request("agent", "You triage."),
+                state_store,
+                ext_runtime,
+                plain_reply_llm("all good [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                Some(&sink),
+                &real_tenant,
+            )
+            .await
+            .expect("turn should succeed");
+
+            assert!(result.resolved);
+            assert_eq!(result.reply, "all good");
+            assert!(
+                rx.try_recv().is_err(),
+                "no tool call happens on this path, so no audit event is expected"
+            );
+        }
+
+        #[tokio::test]
+        async fn run_one_supervisor_turn_without_audit_sink_completes_unchanged() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let routes = vec![
+                SupervisorRoute {
+                    branch: "billing".into(),
+                    description: "Billing questions".into(),
+                },
+                SupervisorRoute {
+                    branch: "tech".into(),
+                    description: "Technical support".into(),
+                },
+            ];
+            let req = SupervisorRequest {
+                node_id: "router".to_string(),
+                system_prompt: "Route the user.".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                routes,
+                state: GraphRunState::default(),
+                provider: None,
+            };
+
+            // No [[ROUTE:..]] sentinel in the reply -> falls back to the
+            // first declared route.
+            let result = run_one_supervisor_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("I'm not sure, let me think."),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                &real_tenant,
+            )
+            .await
+            .expect("supervisor turn should succeed");
+
+            assert_eq!(result.branch, "billing");
+        }
+
+        #[tokio::test]
+        async fn run_one_supervisor_turn_with_audit_sink_completes_same_branch_as_without() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let sink = AuditSink::from_sender(tx);
+            let real_tenant = real_tenant_ctx("acme", "prod");
+            let routes = vec![
+                SupervisorRoute {
+                    branch: "billing".into(),
+                    description: "Billing questions".into(),
+                },
+                SupervisorRoute {
+                    branch: "tech".into(),
+                    description: "Technical support".into(),
+                },
+            ];
+            let req = SupervisorRequest {
+                node_id: "router".to_string(),
+                system_prompt: "Route the user.".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                routes,
+                state: GraphRunState::default(),
+                provider: None,
+            };
+
+            let result = run_one_supervisor_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("I'm not sure, let me think."),
+                telemetry,
+                token_meter,
+                ledger,
+                Some(&sink),
+                &real_tenant,
+            )
+            .await
+            .expect("supervisor turn should succeed");
+
+            assert_eq!(result.branch, "billing");
+            assert!(
+                rx.try_recv().is_err(),
+                "no tool call happens on this path, so no audit event is expected"
             );
         }
     }
