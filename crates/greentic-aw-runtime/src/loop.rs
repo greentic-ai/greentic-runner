@@ -452,6 +452,9 @@ pub async fn run_step(
                             call_id: call.call_id.clone(),
                             content: err_obs.clone(),
                         });
+                        // Surface the failure as a tool result too, so audit/stream
+                        // observers see a matching result instead of a dangling call.
+                        observer.on_tool_result(&call.tool_name, &call.call_id, &err_obs);
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
