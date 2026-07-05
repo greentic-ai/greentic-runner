@@ -385,7 +385,11 @@ impl TenantRuntime {
                 graphs.insert(graph_id, graph_config);
             }
 
-            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(graphs).await
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
+                graphs,
+                agent_audit_sink.clone(),
+            )
+            .await
             {
                 engine.set_graph_node_handler(handler);
                 tracing::info!("DwAgentGraph runtime wired into FlowEngine");
