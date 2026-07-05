@@ -788,9 +788,10 @@ mod aw {
                 }
             };
 
-            // The real tenant/env `execute` already received (as opposed to
-            // the synthetic `tenant` above, which is only ever `"graph"`/
-            // `"run"` for per-visit AgentRuntime *state*). Rebuilt fresh on
+            // The real tenant/env `execute` already received — the same one
+            // driving executor/checkpoint/run-id above. (The synthetic
+            // `"graph"`/`"run"` tenant is built *inside* the turn functions,
+            // for per-visit AgentRuntime *state* only.) Rebuilt fresh on
             // every call — see `TurnEffectSource` — so the sink + real tenant
             // reach `run_one_agent_turn`/`run_one_supervisor_turn`, which feed
             // them into the shared `run_agent_step` seam that builds the
