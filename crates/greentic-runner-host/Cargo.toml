@@ -76,7 +76,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.2.0-research", features = ["serve"], optional = true }
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.1", features = ["serve"], optional = true }
 greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
@@ -173,7 +173,7 @@ proptest.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
 wiremock = "0.6"
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.2.0-research", features = ["test-mock"] }
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.1", features = ["test-mock"] }
 
 [[bench]]
 name = "perf"

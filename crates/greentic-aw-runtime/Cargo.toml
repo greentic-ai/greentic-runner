@@ -4,7 +4,6 @@ version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
-publish     = false
 
 [features]
 default   = []
@@ -30,7 +29,7 @@ required-features = ["serve", "test-mock"]
 anyhow              = { workspace = true }
 async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
 async-nats          = { version = "0.46", optional = true }
-aw-event-bridge     = { path = "../aw-event-bridge", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", version = "=1.1.1", optional = true }
 # Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
 # signature on its describe.json, extract extension.wasm into the local cache.
 # Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
@@ -42,22 +41,22 @@ zip                 = { workspace = true }
 chrono              = { version = "0.4", features = ["serde"] }
 dashmap             = { workspace = true }
 futures             = { workspace = true }
-greentic-dw-manifest = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research" }
+greentic-dw-manifest = "=1.1.0"
 # Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
 # the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
 # the runner-host edge, never compiled into this runtime crate.
-greentic-dw-memory-long-term = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research" }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "c47a0738be662844faab9c16da7ce85d9bb4af97" }
-greentic-extension-sdk-contract = "=1.2.19-research"
+greentic-dw-memory-long-term = "=1.1.0"
+greentic-ext-runtime = "=1.2.24"
+greentic-extension-sdk-contract = "=1.1.2"
 # Multi-provider LLM door (rig-core under the hood). Optional — see the
 # `greentic-llm-backend` feature.
-greentic-llm = { git = "https://github.com/greenticai/greentic-llm", tag = "v1.2.6-research", optional = true }
+greentic-llm = { version = "=1.2.6-research", optional = true }
 greentic-secrets-lib = { workspace = true }
 greentic-types       = { workspace = true }
 # MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
 greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 # Local (in-process) wasix:mcp executor for the local-wasm transport (Task 3).
-greentic-mcp-exec = { version = "=1.2.0-research.0" }
+greentic-mcp-exec = { version = "=1.1.1" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
