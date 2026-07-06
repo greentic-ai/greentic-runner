@@ -147,6 +147,11 @@ pub struct HostNode {
     operation_in_mapping: Option<String>,
     payload_expr: Value,
     routing: Routing,
+    /// Per-node implicit output bindings: after this node runs, each entry
+    /// `{ varName: template }` is rendered against a context where `prev` is
+    /// the node's own output payload, and the result is written to
+    /// `ExecutionState.vars[varName]`.
+    vars_out: Option<JsonMap<String, Value>>,
 }
 
 impl HostNode {
@@ -181,6 +186,7 @@ impl HostNode {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         }
     }
 }
@@ -822,6 +828,23 @@ impl FlowEngine {
 
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
+            // Apply per-node vars_out bindings: render each template against a
+            // context where `prev` is this node's own output payload (already
+            // stored in state.last_output above), then write into state.vars.
+            if let Some(bindings) = node.vars_out.as_ref() {
+                let ctx = template_context(&state, output.payload.clone());
+                for (var_name, template) in bindings.iter() {
+                    let rendered = render_template_value(
+                        template,
+                        &ctx,
+                        TemplateOptions {
+                            allow_pointer: true,
+                        },
+                    )
+                    .with_context(|| format!("failed to render vars_out binding `{var_name}`"))?;
+                    state.vars.insert(var_name.clone(), rendered);
+                }
+            }
             if let Some(observer) = step_ctx.observer {
                 observer.on_node_end(&event, &output.payload);
             }
@@ -2968,6 +2991,15 @@ impl From<Node> for HostNode {
         } else {
             raw_operation.clone()
         };
+        // Extract per-node output bindings before the mapping is consumed by
+        // `payload_expr`. Stored as raw (unrendered) templates so they can be
+        // applied after the node runs, using the node's own output as `prev`.
+        let vars_out = node
+            .input
+            .mapping
+            .get("vars_out")
+            .and_then(Value::as_object)
+            .cloned();
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
             _ => node.input.mapping.clone(),
@@ -2984,6 +3016,7 @@ impl From<Node> for HostNode {
             operation_in_mapping,
             payload_expr,
             routing: node.routing,
+            vars_out,
         }
     }
 }
@@ -4616,6 +4649,7 @@ mod tests {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -4682,6 +4716,7 @@ mod tests {
             operation_in_mapping: Some("render".into()),
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -7058,6 +7093,319 @@ mod tests {
             ends[1].get("message"),
             Some(&json!(1)),
             "vars.copy must preserve the JSON number type from vars.counter"
+        );
+    }
+
+    // ── vars_out tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: emit.log (with vars_out) → emit.log.
+    ///
+    /// `emit1_input` is the raw input mapping for the first emit.log node
+    /// (should include the `vars_out` binding).
+    /// `emit2_input` is the input mapping for the second emit.log node
+    /// (reads from `vars.*` to prove bindings were applied).
+    fn vars_out_flow(emit1_input: Value, emit2_input: Value) -> Flow {
+        let emit1_id = NodeId::from_str("emit1").unwrap();
+        let emit2_id = NodeId::from_str("emit2").unwrap();
+
+        let emit1_node = Node {
+            id: emit1_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit1_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit2_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit2_node = Node {
+            id: emit2_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit2_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(emit1_id.clone(), emit1_node);
+        nodes.insert(emit2_id.clone(), emit2_node);
+
+        // Reuse the same flow_id as var_set_flow so we can pass it directly to
+        // `run_var_set_flow`, which registers the flow under that key.
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(emit1_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_out_binds_node_output_into_vars() {
+        // `emit.log` outputs its rendered payload directly. Node 1 emits
+        // `{ message: "hello" }` and declares `vars_out = { lastReply:
+        // "{{prev.message}}" }`. After it runs, `state.vars["lastReply"]`
+        // must equal "hello". Node 2 reads that var so the assertion is driven
+        // from the second node's output rather than internal state.
+        let flow = vars_out_flow(
+            json!({
+                "message": "hello",
+                "vars_out": { "lastReply": "{{prev.message}}" }
+            }),
+            json!({ "message": "{{vars.lastReply}}" }),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // Node 2's message must equal the value captured by vars_out in node 1.
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hello"),
+            "vars_out binding from node 1 must be readable in node 2"
+        );
+    }
+
+    /// Build a three-node flow: var_set → session.wait → emit.log.
+    /// `vars_init` seeds `counter = 1`; `var_set` writes `greeting = "hello"`.
+    /// The wait parks the flow; resume runs emit.log which reads both vars.
+    fn vars_survive_flow() -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let wait_id = NodeId::from_str("wait1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hello" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: wait_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let wait_node = Node {
+            id: wait_id.clone(),
+            component: FlowComponentRef {
+                id: "session.wait".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: Value::Null,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "greeting": "{{vars.greeting}}",
+                    "counter": "{{vars.counter}}"
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(wait_id.clone(), wait_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.survive.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "counter": { "type": "number", "default": 1 }
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_survive_park_and_resume_end_to_end() {
+        // vars_init seeds counter=1; var_set writes greeting="hello"; the flow
+        // parks at session.wait; resume drives emit.log which reads both vars.
+        let flow = vars_survive_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "vars.survive.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        // First execution: must park at session.wait after var_set fires.
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after session.wait, got {other:?}"),
+        };
+
+        // Both vars must be present in the snapshot before resume.
+        assert_eq!(
+            snapshot.state.vars.get("greeting"),
+            Some(&json!("hello")),
+            "greeting var must be in snapshot"
+        );
+        assert_eq!(
+            snapshot.state.vars.get("counter"),
+            Some(&json!(1)),
+            "counter var (from vars_init) must be in snapshot"
+        );
+
+        // Resume: emit.log must read both vars from the restored state.
+        let observer2 = CountingObserver::new();
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer2),
+            mocks: None,
+        };
+        let result2 = rt
+            .block_on(engine.resume(ctx2, snapshot, Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "flow must complete after resume"
+        );
+        let ends2 = observer2.ends.lock().unwrap().clone();
+        assert_eq!(ends2.len(), 1, "only emit.log fires after resume");
+        assert_eq!(
+            ends2[0].get("greeting").and_then(Value::as_str),
+            Some("hello"),
+            "vars.greeting must survive the park/resume"
+        );
+        assert_eq!(
+            ends2[0].get("counter"),
+            Some(&json!(1)),
+            "vars.counter (vars_init) must survive the park/resume"
         );
     }
 }
