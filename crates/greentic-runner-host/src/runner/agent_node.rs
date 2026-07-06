@@ -383,7 +383,7 @@ mod aw {
     /// opt-out or when either credential is missing/empty.
     ///
     /// [`McpToolSource`]: greentic_aw_runtime::McpToolSource
-    fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+    pub(crate) fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
         if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
             tracing::info!("GREENTIC_AW_MCP=0; MCP tool source disabled");
             return None;
@@ -2212,4 +2212,4 @@ pub use aw::{
 pub use aw::build_agent_node_handler_ephemeral;
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend};
+pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend, mcp_source_from_env};

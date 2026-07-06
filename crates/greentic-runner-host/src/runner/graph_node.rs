@@ -466,6 +466,10 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        /// MCP tool source, built ONCE (mirrors the other Arcs) so its 5-min
+        /// TTL catalog cache + warmed HTTP client are reused across every
+        /// graph-agent visit rather than rebuilt (empty-cache) per turn.
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
     }
 
     impl TurnEffectSource for RuntimeTurnSource {
@@ -481,6 +485,7 @@ mod aw {
                 self.telemetry.clone(),
                 self.token_meter.clone(),
                 self.ledger.clone(),
+                self.mcp_source.clone(),
                 audit_sink,
                 real_tenant,
             )
@@ -577,6 +582,9 @@ mod aw {
             audit_sink: Option<AuditSink>,
         ) -> Self {
             let tool = build_tool(ext_runtime.clone());
+            // Built once here (like the other Arcs) so the MCP catalog cache +
+            // HTTP client are reused across every graph-agent turn.
+            let mcp_source = super::super::agent_node::mcp_source_from_env();
             let turn_source: Arc<dyn TurnEffectSource> = Arc::new(RuntimeTurnSource {
                 state_store: state_store.clone(),
                 ext_runtime,
@@ -584,6 +592,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                mcp_source,
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -930,6 +939,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
     ) -> AgentTurnFn {
@@ -940,6 +950,7 @@ mod aw {
             let telemetry = telemetry.clone();
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
+            let mcp_source = mcp_source.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
             Box::pin(async move {
@@ -951,6 +962,7 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    mcp_source,
                     audit_sink.as_ref(),
                     &real_tenant,
                 )
@@ -1050,6 +1062,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<AgentTurnResult, GraphExecError> {
@@ -1087,6 +1100,10 @@ mod aw {
         provider.insert(&tenant, &agent_id, cfg);
 
         // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
+        // MCP tool source: mirror the `dw.agent` path so a graph agent declaring an
+        // `mcp:<server>/<tool>` ref resolves it against the tenant's registered MCP
+        // servers (same double-authorization: tenant registers the server + the node's
+        // tool allowlist must reference it). `None` unless the admin creds are set.
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
@@ -1095,7 +1112,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            None,
+            mcp_source,
         );
 
         // The latest user turn is the most recent user message in the seeded log
@@ -2654,6 +2671,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                None,
                 &real_tenant,
             )
             .await
@@ -2684,6 +2702,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
                 Some(&sink),
                 &real_tenant,
             )
@@ -2722,6 +2741,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                None,
                 None,
                 &real_tenant,
             )
