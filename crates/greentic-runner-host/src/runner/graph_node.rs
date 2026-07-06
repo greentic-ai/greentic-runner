@@ -337,6 +337,7 @@ mod aw {
     pub async fn build_graph_node_handler(
         graphs: HashMap<String, GraphConfig>,
         audit_sink: Option<AuditSink>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
         use greentic_aw_runtime::cost::RedisTokenMeter;
         use greentic_aw_runtime::graph::RedisCheckpointStore;
@@ -409,6 +410,7 @@ mod aw {
             token_meter,
             ledger,
             audit_sink,
+            packs,
         );
 
         tracing::info!(graph_count, "AW graph runtime constructed");
@@ -470,6 +472,12 @@ mod aw {
         /// TTL catalog cache + warmed HTTP client are reused across every
         /// graph-agent visit rather than rebuilt (empty-cache) per turn.
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        /// The tenant's loaded packs, used to build a fresh, tenant-scoped
+        /// [`greentic_aw_runtime::ComponentToolSource`] on EVERY turn (unlike
+        /// `mcp_source`, this is NOT built once — the component source is
+        /// tenant-pinned, and building it per turn from the in-memory pack
+        /// list is cheap; see [`run_one_agent_turn`]).
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
     }
 
     impl TurnEffectSource for RuntimeTurnSource {
@@ -486,6 +494,7 @@ mod aw {
                 self.token_meter.clone(),
                 self.ledger.clone(),
                 self.mcp_source.clone(),
+                self.packs.clone(),
                 audit_sink,
                 real_tenant,
             )
@@ -580,6 +589,7 @@ mod aw {
             token_meter: Arc<dyn TokenMeter>,
             ledger: Arc<dyn ToolLedger>,
             audit_sink: Option<AuditSink>,
+            packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         ) -> Self {
             let tool = build_tool(ext_runtime.clone());
             // Built once here (like the other Arcs) so the MCP catalog cache +
@@ -593,6 +603,7 @@ mod aw {
                 token_meter,
                 ledger,
                 mcp_source,
+                packs,
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -940,6 +951,7 @@ mod aw {
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
     ) -> AgentTurnFn {
@@ -951,6 +963,7 @@ mod aw {
             let token_meter = token_meter.clone();
             let ledger = ledger.clone();
             let mcp_source = mcp_source.clone();
+            let packs = packs.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
             Box::pin(async move {
@@ -963,6 +976,7 @@ mod aw {
                     token_meter,
                     ledger,
                     mcp_source,
+                    packs,
                     audit_sink.as_ref(),
                     &real_tenant,
                 )
@@ -1063,6 +1077,7 @@ mod aw {
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+        packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<AgentTurnResult, GraphExecError> {
@@ -1104,6 +1119,16 @@ mod aw {
         // `mcp:<server>/<tool>` ref resolves it against the tenant's registered MCP
         // servers (same double-authorization: tenant registers the server + the node's
         // tool allowlist must reference it). `None` unless the admin creds are set.
+        //
+        // Component tool source: unlike `mcp_source` (built once, reused across
+        // every graph-agent visit), the component source is tenant-pinned, so it
+        // is rebuilt PER TURN from the in-memory `packs` list — cheap, and keeps
+        // a `component:<ref>` tool ref scoped to the real tenant rather than the
+        // synthetic "graph"/"run" state tenant used above.
+        let component_source = super::super::agent_node::component_source_from_packs(
+            &packs,
+            real_tenant.tenant_id.as_str(),
+        );
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
@@ -1113,7 +1138,8 @@ mod aw {
             token_meter,
             ledger,
             mcp_source,
-        );
+        )
+        .with_component_source(component_source);
 
         // The latest user turn is the most recent user message in the seeded log
         // (the executor pushes the initial user message and re-seeds it here);
@@ -2671,6 +2697,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                Arc::new(vec![]),
                 None,
                 &real_tenant,
             )
@@ -2703,6 +2730,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                Arc::new(vec![]),
                 Some(&sink),
                 &real_tenant,
             )
@@ -2742,6 +2770,7 @@ mod aw {
                 token_meter,
                 ledger,
                 None,
+                Arc::new(vec![]),
                 None,
                 &real_tenant,
             )

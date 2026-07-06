@@ -388,6 +388,7 @@ impl TenantRuntime {
             if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
                 graphs,
                 agent_audit_sink.clone(),
+                Arc::new(pack_runtimes.clone()),
             )
             .await
             {

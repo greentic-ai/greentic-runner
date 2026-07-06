@@ -405,7 +405,7 @@ mod aw {
     /// when disabled or when no packs are loaded, so `component:` tool refs then
     /// resolve to nothing. Mirrors [`mcp_source_from_env`] but discovers tools
     /// from in-pack components rather than a remote admin.
-    fn component_source_from_packs(
+    pub(crate) fn component_source_from_packs(
         packs: &[Arc<crate::pack::PackRuntime>],
         tenant: &str,
     ) -> Option<Arc<greentic_aw_runtime::ComponentToolSource>> {
@@ -2212,4 +2212,7 @@ pub use aw::{
 pub use aw::build_agent_node_handler_ephemeral;
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend, mcp_source_from_env};
+pub(crate) use aw::{
+    EnvSecretsBackend, build_ext_runtime, build_llm_backend, component_source_from_packs,
+    mcp_source_from_env,
+};
