@@ -156,6 +156,47 @@ pub fn build_agent_audit_event(
     )
 }
 
+/// Builds the metering subject for one agentic-worker run completion:
+/// `audit.<tenant>.metering.agent_run`.
+pub fn metering_subject(tenant: &str) -> String {
+    format!("audit.{tenant}.metering.agent_run")
+}
+
+/// Constructs the metering `EventEnvelope` for one completed agentic-worker
+/// run.
+///
+/// `type` is always `greentic.runner.metering.agent_run`; `source` is always
+/// `"runner"`; `subject` is `agent:<agent_id>`; the payload is the billing
+/// unit record: `{"unit":"agent_run","quantity":1,"agent_id":<agent_id>,
+/// "steps":<steps>}`. Emitted once per successful `dw.agent` run, alongside
+/// (not instead of) the per-step agent-audit events from
+/// [`build_agent_audit_event`].
+pub fn build_agent_run_metering_event(
+    tenant: &TenantCtx,
+    agent_id: &str,
+    steps: usize,
+    now: DateTime<Utc>,
+    id: String,
+) -> EventEnvelope {
+    let payload = json!({
+        "unit": "agent_run",
+        "quantity": 1,
+        "agent_id": agent_id,
+        "steps": steps,
+    });
+
+    base_event(
+        tenant,
+        "greentic.runner.metering.agent_run",
+        "runner",
+        format!("agent:{agent_id}"),
+        None,
+        payload,
+        now,
+        id,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +341,49 @@ mod tests {
         assert_eq!(
             agent_audit_subject("t1", "tool_call"),
             "audit.t1.agent.tool_call"
+        );
+    }
+
+    #[test]
+    fn metering_subject_is_well_formed() {
+        assert_eq!(metering_subject("t1"), "audit.t1.metering.agent_run");
+    }
+
+    #[test]
+    fn agent_run_metering_event_has_expected_type_subject_and_payload() {
+        let tenant = tenant_ctx();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let env = build_agent_run_metering_event(&tenant, "agent1", 3, now, "id1".to_string());
+        let body = serde_json::to_value(&env).unwrap();
+
+        assert_eq!(
+            body.get("type").and_then(Value::as_str),
+            Some("greentic.runner.metering.agent_run")
+        );
+        assert_eq!(body.get("source").and_then(Value::as_str), Some("runner"));
+        assert_eq!(
+            body.get("subject").and_then(Value::as_str),
+            Some("agent:agent1")
+        );
+        assert_eq!(
+            body.get("tenant")
+                .and_then(|t| t.get("tenant"))
+                .and_then(Value::as_str),
+            Some("t1")
+        );
+
+        let payload = body.get("payload").unwrap();
+        assert_eq!(
+            payload.get("unit").and_then(Value::as_str),
+            Some("agent_run")
+        );
+        assert_eq!(payload.get("quantity").and_then(Value::as_u64), Some(1));
+        assert_eq!(payload.get("steps").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            payload.get("agent_id").and_then(Value::as_str),
+            Some("agent1")
         );
     }
 

@@ -6,4 +6,5 @@ mod model;
 mod recorder;
 
 pub use model::{TraceEnvelope, TraceError, TraceFlow, TraceHash, TracePack, TraceStep};
+pub(crate) use recorder::generate_audit_event_id;
 pub use recorder::{PackTraceInfo, TraceConfig, TraceContext, TraceMode, TraceRecorder};

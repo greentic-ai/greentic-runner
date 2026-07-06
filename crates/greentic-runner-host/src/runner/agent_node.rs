@@ -43,7 +43,9 @@ mod aw {
     use serde_json::{Value, json};
 
     use crate::trace::agent_audit::AgentAuditObserver;
+    use crate::trace::audit_event::{build_agent_run_metering_event, metering_subject};
     use crate::trace::audit_sink::AuditSink;
+    use crate::trace::generate_audit_event_id;
 
     use super::AgentNodeHandler;
 
@@ -245,11 +247,33 @@ mod aw {
             };
 
             match step_result {
-                Ok(output) => Ok(json!({
-                    "reply": output.reply,
-                    "trail": output.trail,
-                    "terminated_by": output.terminated_by,
-                })),
+                Ok(output) => {
+                    // Best-effort per-run metering event (EPIC-D D-1), emitted
+                    // alongside (never instead of) the per-step agent-audit
+                    // events above. Off by default: with no audit sink
+                    // configured, no metering event is built or sent — this
+                    // mirrors the audit-sink "off" branch's byte-identical
+                    // behaviour above.
+                    if let Some(sink) = &self.audit_sink {
+                        let tenant_ctx = tenant_ctx_for_audit(tenant_id, env_id);
+                        sink.emit(
+                            metering_subject(tenant_id),
+                            &build_agent_run_metering_event(
+                                &tenant_ctx,
+                                agent_id,
+                                output.trail.len(),
+                                chrono::Utc::now(),
+                                generate_audit_event_id(),
+                            ),
+                        );
+                    }
+
+                    Ok(json!({
+                        "reply": output.reply,
+                        "trail": output.trail,
+                        "terminated_by": output.terminated_by,
+                    }))
+                }
                 Err(AgentError::GuardrailDenied {
                     direction,
                     code,
@@ -1518,9 +1542,23 @@ mod aw {
             let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
             assert_eq!(value["payload"]["tool"], json!("remember"));
 
+            // EPIC-D D-1: a per-run metering event follows the per-step
+            // agent-audit events once the run completes successfully.
+            let (subject, bytes) = rx.try_recv().expect("metering event enqueued");
+            assert_eq!(subject, "audit.t1.metering.agent_run");
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value["type"], json!("greentic.runner.metering.agent_run"));
+            assert_eq!(value["payload"]["unit"], json!("agent_run"));
+            assert_eq!(value["payload"]["quantity"], json!(1));
+            assert_eq!(value["payload"]["agent_id"], json!("greeter"));
+            assert_eq!(
+                value["payload"]["steps"],
+                json!(output["trail"].as_array().expect("trail is an array").len())
+            );
+
             assert!(
                 rx.try_recv().is_err(),
-                "exactly two audit events enqueued (one tool_call, one tool_result)"
+                "exactly three audit events enqueued (tool_call, tool_result, metering.agent_run)"
             );
         }
 
