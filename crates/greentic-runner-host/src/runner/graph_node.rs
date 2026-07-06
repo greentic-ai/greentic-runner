@@ -49,7 +49,7 @@ mod aw {
     use greentic_aw_runtime::tools::dispatch_tool_call;
     use greentic_aw_runtime::{
         AgentConfig, AgentInput, AgentLimits, AgentOutput, AgentRuntime, LlmBackend,
-        LlmProviderRef, StepObserver, Telemetry, TenantContext, TokenMeter,
+        LlmProviderRef, StepObserver, Telemetry, TenantContext, TokenMeter, ToolRef,
     };
     use greentic_ext_runtime::ExtensionRuntime;
     use serde_json::{Value, json};
@@ -1001,6 +1001,39 @@ mod aw {
         }
     }
 
+    /// Parse a graph node's declared tool reference string into a [`ToolRef`].
+    ///
+    /// Format convention: `"<extension_id>/<tool_name>"`, split on the LAST
+    /// `/` (so an `extension_id` that itself contains `/`, e.g.
+    /// `"component:owner/repo"`, is preserved intact). Returns `None` — with a
+    /// `tracing::warn!` naming the skipped string — when there is no `/`, or
+    /// when either side of the split is empty. Never panics: this runs against
+    /// node-authored config, not host-controlled input.
+    fn parse_tool_ref(s: &str) -> Option<ToolRef> {
+        match s.rsplit_once('/') {
+            Some((extension_id, tool_name))
+                if !extension_id.is_empty() && !tool_name.is_empty() =>
+            {
+                Some(ToolRef {
+                    extension_id: extension_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                })
+            }
+            _ => {
+                tracing::warn!(tool_ref = %s, "skipping malformed graph-node tool ref (expected \"<extension_id>/<tool_name>\")");
+                None
+            }
+        }
+    }
+
+    /// Map a graph node's declared `tools: Vec<String>` (see
+    /// [`AgentTurnRequest::tools`]) to the `Vec<ToolRef>` the ephemeral
+    /// per-visit [`AgentConfig`] expects. Malformed entries are dropped by
+    /// [`parse_tool_ref`] (warned, never fatal) rather than failing the turn.
+    fn map_tool_refs(tools: &[String]) -> Vec<ToolRef> {
+        tools.iter().filter_map(|t| parse_tool_ref(t)).collect()
+    }
+
     /// Drive one [`AgentRuntime::step`] for an agent-node visit. Derives the
     /// agent/session ids, seeds conversation context, runs the step, and maps the
     /// reply's resolution sentinel.
@@ -1039,7 +1072,7 @@ mod aw {
         let cfg = AgentConfig {
             agent_id: agent_id.clone(),
             system_prompt: req.system_prompt.clone(),
-            tools: vec![],
+            tools: map_tool_refs(&req.tools),
             guardrails: vec![],
             llm: LlmProviderRef {
                 provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
@@ -1525,6 +1558,59 @@ mod aw {
                 supervisor_fn_noop(),
                 approval_fn_awaiting(),
             )
+        }
+
+        // -------------------------------------------------------------------
+        // parse_tool_ref / map_tool_refs tests
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn parse_tool_ref_splits_on_last_slash() {
+            assert_eq!(
+                super::parse_tool_ref("myext/dothing"),
+                Some(ToolRef {
+                    extension_id: "myext".into(),
+                    tool_name: "dothing".into(),
+                })
+            );
+            assert_eq!(
+                super::parse_tool_ref("component:owner/repo/list"),
+                Some(ToolRef {
+                    extension_id: "component:owner/repo".into(),
+                    tool_name: "list".into(),
+                })
+            );
+            assert_eq!(super::parse_tool_ref("noslash"), None);
+            assert_eq!(super::parse_tool_ref("trailing/"), None);
+        }
+
+        #[test]
+        fn parse_tool_ref_rejects_leading_slash() {
+            // Empty extension_id half — also malformed, never panics.
+            assert_eq!(super::parse_tool_ref("/dothing"), None);
+        }
+
+        #[test]
+        fn map_tool_refs_drops_malformed_entries_and_keeps_valid_ones() {
+            let tools = vec![
+                "myext/dothing".to_string(),
+                "noslash".to_string(),
+                "other/thing".to_string(),
+            ];
+            let refs = super::map_tool_refs(&tools);
+            assert_eq!(
+                refs,
+                vec![
+                    ToolRef {
+                        extension_id: "myext".into(),
+                        tool_name: "dothing".into(),
+                    },
+                    ToolRef {
+                        extension_id: "other".into(),
+                        tool_name: "thing".into(),
+                    },
+                ]
+            );
         }
 
         // -------------------------------------------------------------------
@@ -2527,6 +2613,7 @@ mod aw {
                 model: "gpt-4o-mini".to_string(),
                 state: GraphRunState::default(),
                 provider: None,
+                tools: vec![],
             }
         }
 
@@ -2578,11 +2665,11 @@ mod aw {
 
         #[tokio::test]
         async fn run_one_agent_turn_with_audit_sink_completes_same_reply_as_without() {
-            // No tool call fires on this path (graph-node agent turns are
-            // built with an empty tool list today), so no audit event is
-            // expected here either — this test guards that routing through
-            // `step_with_observer` does not change the turn's outcome.
-            // Genuine tool-call audit-under-real-tenant coverage lives in
+            // `agent_turn_request` declares no tools, and the mock LLM never
+            // emits tool calls, so no audit event is expected here either —
+            // this test guards that routing through `step_with_observer` does
+            // not change the turn's outcome. Genuine tool-call
+            // audit-under-real-tenant coverage lives in
             // `run_agent_step_with_audit_sink_enqueues_events_under_real_tenant_not_state_tenant`.
             let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
@@ -2609,6 +2696,40 @@ mod aw {
                 rx.try_recv().is_err(),
                 "no tool call happens on this path, so no audit event is expected"
             );
+        }
+
+        /// Wiring assertion (Task 2): a request whose `tools` field declares a
+        /// well-formed ref reaches the ephemeral per-visit `AgentConfig`
+        /// unharmed — the turn still completes (the runtime only warns, never
+        /// fails, on tools that don't resolve against the test `ExtensionRuntime`
+        /// — see `preflight_warn_tools`/`missing_tools` in `greentic-aw-runtime`).
+        /// `map_tool_refs`/`parse_tool_ref` above cover the mapping itself;
+        /// this proves `run_one_agent_turn` actually calls it instead of the
+        /// old hardcoded `tools: vec![]`.
+        #[tokio::test]
+        async fn run_one_agent_turn_with_declared_tools_still_completes() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let real_tenant = real_tenant_ctx("acme", "prod");
+
+            let mut req = agent_turn_request("agent", "You triage.");
+            req.tools = vec!["myext/dothing".to_string()];
+
+            let result = run_one_agent_turn(
+                req,
+                state_store,
+                ext_runtime,
+                plain_reply_llm("all good [[RESOLVED]]"),
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                &real_tenant,
+            )
+            .await
+            .expect("turn should succeed even with a declared-but-unregistered tool");
+
+            assert!(result.resolved);
+            assert_eq!(result.reply, "all good");
         }
 
         #[tokio::test]
