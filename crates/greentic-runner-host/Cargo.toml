@@ -52,7 +52,7 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.2", features = ["serve"], optional = true }
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.3", features = ["serve"], optional = true }
 # Pulled only to enable its `pack-manifest-agents` feature (see the
 # long-term-chronicle feature). The crate is otherwise a transitive dep of the
 # openai-compatible providers above.
@@ -137,7 +137,7 @@ proptest.workspace = true
 tower.workspace = true
 http-body-util = "0.1"
 wiremock = "0.6"
-greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.2", features = ["test-mock"] }
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.3", features = ["test-mock"] }
 
 [[bench]]
 name = "perf"
