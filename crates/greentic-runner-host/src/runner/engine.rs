@@ -2390,6 +2390,7 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("prev".into(), prev);
     ctx.insert("node".into(), Value::Object(state.outputs_map()));
     ctx.insert("state".into(), state.context());
+    ctx.insert("vars".into(), Value::Object(state.vars.clone()));
     Value::Object(ctx)
 }
 
@@ -5275,6 +5276,41 @@ mod tests {
         let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
         let decoded: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
         assert!(decoded.vars.is_empty());
+    }
+
+    #[test]
+    fn template_context_exposes_vars_namespace_typed() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.vars.insert("count".into(), serde_json::json!(5));
+        st.vars.insert("name".into(), serde_json::json!("aws"));
+
+        let ctx = template_context(&st, serde_json::Value::Null);
+        // {{vars.count}} must resolve to the JSON number 5, not the string "5".
+        let rendered_num = render_template_value(
+            &serde_json::json!("{{vars.count}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render num");
+        assert_eq!(rendered_num, serde_json::json!(5));
+
+        let rendered_str = render_template_value(
+            &serde_json::json!("prefix-{{vars.name}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render str");
+        assert_eq!(rendered_str, serde_json::json!("prefix-aws"));
+    }
+
+    #[test]
+    fn vars_namespace_does_not_shadow_existing_namespaces() {
+        let st = ExecutionState::new(serde_json::json!({"user": {"id": 7}}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+        let obj = ctx.as_object().expect("ctx object");
+        for key in ["entry", "in", "prev", "node", "state", "vars"] {
+            assert!(obj.contains_key(key), "context must expose `{key}`");
+        }
     }
 }
 
