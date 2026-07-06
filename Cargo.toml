@@ -36,7 +36,7 @@ greentic-state = ">=1.1.0-dev, <1.2.0-0"
 greentic-config = ">=1.1.0-dev, <1.2.0-0"
 greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 greentic-deploy-spec = ">=0.1.0-0, <0.2.0-0"
-greentic-secrets-lib = ">=1.1.0-dev, <1.2.0-0"
+greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -119,30 +119,30 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-distributor-client]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 features = [
     "dist-client",
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-x-runtime]
 version = "0.4.20"
@@ -151,10 +151,10 @@ version = "0.4.20"
 version = "0.4.20"
 
 [workspace.dependencies.greentic-oauth-sdk]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-oauth-host]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
