@@ -134,6 +134,7 @@ struct HostFlow {
     /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
     /// Injected into slot-extractor component invocations at dispatch time (Phase D).
     slot_schema: Option<Value>,
+    vars_init: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -693,7 +694,10 @@ impl FlowEngine {
 
     async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
-        let state = ExecutionState::new(input);
+        let mut state = ExecutionState::new(input);
+        for (name, default) in flow_ir.vars_init.iter() {
+            state.vars.entry(name.clone()).or_insert_with(|| default.clone());
+        }
         self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
             .await
     }
@@ -2751,11 +2755,26 @@ impl From<Flow> for HostFlow {
             .get(SLOT_SCHEMA_METADATA_KEY)
             .filter(|v| !v.is_null())
             .cloned();
+        let vars_init = value
+            .metadata
+            .extra
+            .get("vars_init")
+            .and_then(|v| v.as_object())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .filter_map(|(name, decl)| {
+                        decl.get("default").map(|d| (name.clone(), d.clone()))
+                    })
+                    .collect::<JsonMap<String, Value>>()
+            })
+            .unwrap_or_default();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
             slot_schema,
+            vars_init,
         }
     }
 }
@@ -3952,8 +3971,8 @@ mod tests {
     }
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
-        Flow, FlowComponentRef, FlowId, FlowKind, InputMapping, Node, NodeId, OutputMapping,
-        Routing, TelemetryHints,
+        Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,
+        OutputMapping, Routing, TelemetryHints,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap as StdHashMap};
@@ -5608,6 +5627,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -6063,6 +6083,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6096,6 +6117,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6151,6 +6173,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6237,6 +6260,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6651,6 +6675,161 @@ mod tests {
         for key in ["entry", "in", "prev", "node", "state", "vars"] {
             assert!(obj.contains_key(key), "context must expose `{key}`");
         }
+    }
+
+    // ── vars_init tests ────────────────────────────────────────────────────
+
+    /// Build a minimal flow with the given free-form `metadata.extra` value.
+    /// Mirrors the construction used by neighbouring engine tests: a schema-1.0
+    /// Messaging flow with no nodes and no entrypoints, only the metadata set.
+    fn flow_with_extra(extra: serde_json::Value) -> Flow {
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: indexmap::IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    #[test]
+    fn from_flow_extracts_vars_init() {
+        let flow = flow_with_extra(serde_json::json!({
+            "vars_init": {
+                "region":  { "type": "string", "default": "us-east-1" },
+                "counter": { "type": "number", "default": 0 }
+            }
+        }));
+        let host: HostFlow = HostFlow::from(flow);
+        assert_eq!(
+            host.vars_init.get("region"),
+            Some(&serde_json::json!("us-east-1"))
+        );
+        assert_eq!(
+            host.vars_init.get("counter"),
+            Some(&serde_json::json!(0))
+        );
+    }
+
+    #[test]
+    fn from_flow_vars_init_absent() {
+        let flow = flow_with_extra(serde_json::json!({}));
+        let host: HostFlow = HostFlow::from(flow);
+        assert!(host.vars_init.is_empty());
+    }
+
+    #[test]
+    fn execute_once_seeds_declared_vars() {
+        // A flow with vars_init seeds state.vars before the first node runs.
+        // We verify this by using an emit.log node whose message template
+        // references {{vars.region}}: if the var is seeded, the rendered
+        // output will contain "us-east-1".
+        let node_id = NodeId::from_str("n1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "{{vars.region}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "region": { "type": "string", "default": "us-east-1" }
+                    }
+                }),
+            },
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "vars.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "vars.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        assert!(matches!(result.status, FlowStatus::Completed));
+
+        let ends = observer.ends.lock().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(
+            ends[0].get("message").and_then(Value::as_str),
+            Some("us-east-1"),
+            "vars.region must be seeded to its default and rendered in the node payload"
+        );
     }
 }
 
