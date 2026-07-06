@@ -162,6 +162,10 @@ fn replay_host_config() -> HostConfig {
         validation: greentic_runner_host::validate::ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 

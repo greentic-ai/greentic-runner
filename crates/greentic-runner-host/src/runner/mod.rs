@@ -1,13 +1,28 @@
 pub mod adapt_events_email;
 pub mod adapt_timer;
+pub mod agent_node;
+pub mod component_invoker;
 pub mod contract_cache;
 pub mod contract_introspection;
+pub mod dispatch_listener;
 pub mod engine;
 pub mod flow_adapter;
+pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
+#[cfg(feature = "knowledge-chronicle")]
+pub mod knowledge_corpus;
+#[cfg(feature = "knowledge-chronicle")]
+pub mod knowledge_mount;
+#[cfg(feature = "long-term-chronicle")]
+pub mod long_term_memory;
+pub mod mcp_node;
+#[cfg(feature = "agentic-worker")]
+pub mod mcp_warm_listener;
 pub mod mocks;
 pub mod operator;
+pub mod remote_dispatch;
+pub mod runtime_session_resumer;
 pub mod schema_validator;
 pub mod templating;
 
@@ -19,9 +34,11 @@ use axum::routing::{get, post};
 use axum::{Router, serve};
 use tokio::net::TcpListener;
 
+use crate::host::RunnerHost;
 use crate::http::{self, admin, auth::AdminAuth, health::HealthState};
 use crate::routing::TenantRouting;
 use crate::runtime::ActivePacks;
+use crate::sql::SqlGateway;
 use crate::watcher::PackReloadHandle;
 
 pub struct HostServer {
@@ -38,20 +55,50 @@ impl HostServer {
         health: Arc<HealthState>,
         reload: Option<PackReloadHandle>,
         admin: AdminAuth,
+        host: Arc<RunnerHost>,
+    ) -> Result<Self> {
+        Self::with_sql(port, active, routing, health, reload, admin, host, None)
+    }
+
+    /// Like [`HostServer::new`] but wires an optional [`SqlGateway`] into the
+    /// server state.  When `sql_gateway` is `None` the server uses an empty
+    /// gateway that returns 404/401 for all `/sql` routes — safe by default.
+    // Builder param set mirrors the existing fields plus `host`; a config-struct
+    // refactor is deferred. See B0 plan.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_sql(
+        port: u16,
+        active: Arc<ActivePacks>,
+        routing: TenantRouting,
+        health: Arc<HealthState>,
+        reload: Option<PackReloadHandle>,
+        admin: AdminAuth,
+        host: Arc<RunnerHost>,
+        sql_gateway: Option<SqlGateway>,
     ) -> Result<Self> {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        let sql = sql_gateway
+            .unwrap_or_else(|| SqlGateway::new(std::collections::HashMap::new(), String::new()));
         let state = ServerState {
             active,
             routing,
             health,
             reload,
             admin,
+            host,
+            sql,
         };
         let router = Router::new()
             .route("/operator/op/invoke", post(operator::invoke))
             .route("/healthz", get(http::health::handler))
             .route("/admin/packs/status", get(admin::status))
             .route("/admin/packs/reload", post(admin::reload))
+            .route("/agent/chat", post(crate::http::agent_chat::agent_chat))
+            .route(
+                "/sql/{conn}/schema",
+                get(crate::sql::routes::schema_handler),
+            )
+            .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
             .with_state(state.clone());
         Ok(Self {
             addr,
@@ -80,4 +127,17 @@ pub struct ServerState {
     pub health: Arc<HealthState>,
     pub reload: Option<PackReloadHandle>,
     pub admin: AdminAuth,
+    /// The runner host instance used by the `POST /agent/chat` handler to
+    /// dispatch activity turns to loaded worker packs.
+    pub host: Arc<RunnerHost>,
+    /// SQL gateway for `/sql/{conn}/schema` and `/sql/{conn}/query`.
+    /// Defaults to an empty gateway (returns 404/401 for all connections)
+    /// when no SQL connections are configured.
+    pub sql: SqlGateway,
+}
+
+impl axum::extract::FromRef<ServerState> for SqlGateway {
+    fn from_ref(state: &ServerState) -> Self {
+        state.sql.clone()
+    }
 }

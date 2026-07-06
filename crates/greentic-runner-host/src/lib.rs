@@ -29,6 +29,7 @@ pub mod cache;
 pub mod component_api;
 pub mod config;
 pub mod engine;
+pub mod extension_provider;
 pub mod fault;
 #[cfg(feature = "greentic-x-provider")]
 pub mod greentic_x_provider;
@@ -48,6 +49,8 @@ pub mod runtime;
 pub mod runtime_refs;
 pub mod runtime_wasmtime;
 pub mod secrets;
+pub(crate) mod secrets_broker;
+pub mod sql;
 pub mod storage;
 pub mod telemetry;
 pub mod telemetry_scan;
@@ -403,6 +406,53 @@ fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     })
 }
 
+/// Spawn the in-process agentic-worker NATS service once, when opted in.
+///
+/// Gated on `GREENTIC_AGENTIC_SERVE_INPROC` (truthy) AND `GREENTIC_EVENTS_NATS_URL`
+/// (set) via [`runner::agent_node::should_serve_agentic_inproc`]. Loads
+/// process-level base agent configs from `GREENTIC_AGENT_MANIFESTS_DIR`
+/// (`<agent_id>.json` full [`greentic_aw_runtime::AgentConfig`] files) — the only
+/// process-level agent source, since pack-embedded and per-tenant `HostConfig`
+/// agents only exist inside `TenantRuntime::from_packs`.
+///
+/// Skips with a warning (continuing normal startup) when no agents are
+/// configured; [`serve_agentic`] itself further degrades gracefully when the
+/// runtime cannot be built (no `GREENTIC_AW_REDIS_URL` / LLM key). The spawned
+/// task owns the subscriber for the lifetime of the process.
+#[cfg(feature = "agentic-worker")]
+fn maybe_spawn_inproc_agentic_serve() {
+    use crate::runner::agent_node::{
+        load_process_agent_configs, serve_agentic, should_serve_agentic_inproc,
+    };
+
+    if !should_serve_agentic_inproc(|key| std::env::var(key).ok()) {
+        return;
+    }
+
+    // Both env vars are guaranteed present/non-empty by the gate above.
+    let nats_url = std::env::var("GREENTIC_EVENTS_NATS_URL").unwrap_or_default();
+    let agents = load_process_agent_configs();
+    if agents.is_empty() {
+        tracing::warn!(
+            "GREENTIC_AGENTIC_SERVE_INPROC set but no process-level agents found in \
+             GREENTIC_AGENT_MANIFESTS_DIR; in-process agentic serve skipped"
+        );
+        return;
+    }
+
+    let agent_count = agents.len();
+    tracing::info!(
+        agent_count,
+        nats_url = %nats_url,
+        "starting in-process agentic serve (GREENTIC_AGENTIC_SERVE_INPROC)"
+    );
+    tokio::spawn(async move {
+        if let Err(error) = serve_agentic(&nats_url, agents).await {
+            tracing::warn!(error = %error, "in-process agentic serve stopped with error");
+        }
+    });
+}
+
 /// Run the unified Greentic runner host until shutdown.
 pub async fn run(cfg: RunnerConfig) -> Result<()> {
     let RunnerConfig {
@@ -441,6 +491,14 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
     let host = Arc::new(builder.build()?);
     host.start().await?;
 
+    // Opt-in, once-per-process co-host of the agentic-worker NATS service.
+    // Default OFF: distributed deploys run a standalone `aw-serve` so the
+    // service scales independently. When enabled, this spawns a SINGLE
+    // subscriber for the whole process (NOT per-tenant — multiple subscribers
+    // on `greentic.agentic.request.v1` would each handle every request).
+    #[cfg(feature = "agentic-worker")]
+    maybe_spawn_inproc_agentic_serve();
+
     let (watcher, reload_handle) =
         watcher::start_pack_watcher(Arc::clone(&host), pack.clone(), refresh_interval).await?;
 
@@ -452,6 +510,7 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         host.health_state(),
         Some(reload_handle),
         admin.clone(),
+        Arc::clone(&host),
     )?;
 
     tokio::select! {

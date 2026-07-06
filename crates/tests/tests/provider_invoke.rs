@@ -79,6 +79,7 @@ async fn provider_invoke_echoes_payload() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        reply_scope: None,
     };
 
     let input = json!({"message": "hello world"});
@@ -180,6 +181,7 @@ async fn provider_invoke_supports_messaging_secrets_events() -> Result<()> {
             attempt: 1,
             observer: None,
             mocks: None,
+            reply_scope: None,
         };
 
         let execution = engine.execute(ctx, input).await?;
@@ -261,6 +263,7 @@ async fn component_exec_carries_operation_from_flow() -> Result<()> {
         attempt: 1,
         observer: None,
         mocks: None,
+        reply_scope: None,
     };
 
     let execution = engine.execute(ctx, json!({})).await?;

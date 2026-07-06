@@ -58,6 +58,10 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 
@@ -84,7 +88,14 @@ fn build_pack(pack_path: &Path) -> Result<()> {
                 profiles: ComponentProfiles::default(),
                 capabilities: ComponentCapabilities::default(),
                 configurators: None,
-                operations: Vec::new(),
+                operations: vec![greentic_types::ComponentOperation {
+                    name: "process".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }),
+                    output_schema: json!({ "type": "object" }),
+                }],
                 config_schema: None,
                 resources: ResourceHints::default(),
                 dev_flows: BTreeMap::new(),
@@ -163,7 +174,14 @@ fn build_pack_with_component_sources(
                 profiles: ComponentProfiles::default(),
                 capabilities: ComponentCapabilities::default(),
                 configurators: None,
-                operations: Vec::new(),
+                operations: vec![greentic_types::ComponentOperation {
+                    name: "process".into(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }),
+                    output_schema: json!({ "type": "object" }),
+                }],
                 config_schema: None,
                 resources: ResourceHints::default(),
                 dev_flows: BTreeMap::new(),
@@ -1009,5 +1027,65 @@ fn gtpack_legacy_artifacts_are_ignored() -> Result<()> {
     assert_eq!(runtime.metadata().pack_id, manifest.pack_id.as_str());
     let flows = rt.block_on(runtime.list_flows())?;
     assert!(flows.is_empty());
+    Ok(())
+}
+
+/// End-to-end proof that an agentic worker's component tool seam invokes a real
+/// WASM component: `PackRuntimeComponentInvoker` enumerates the pack's component
+/// operations and dispatches one through `PackRuntime::invoke_component`,
+/// returning the component's actual output. This is the runtime verification of
+/// the `component:` tool kind that unit tests (with a fake invoker) cannot give.
+#[cfg(feature = "agentic-worker")]
+#[test]
+fn agentic_worker_component_invoker_lists_and_invokes() -> Result<()> {
+    use greentic_aw_runtime::ComponentInvoker;
+    use greentic_runner_host::runner::component_invoker::PackRuntimeComponentInvoker;
+
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let gtpack = temp.path().join("runner-components.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+    build_pack(&gtpack)?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let pack = Arc::new(rt.block_on(PackRuntime::load(
+        &gtpack,
+        Arc::clone(&config),
+        None,
+        None,
+        None,
+        None,
+        Arc::new(RunnerWasiPolicy::new()),
+        greentic_runner_host::secrets::default_manager()?,
+        None,
+        false,
+        ComponentResolution::default(),
+    ))?);
+
+    let invoker = PackRuntimeComponentInvoker::new(vec![Arc::clone(&pack)], "demo".into());
+
+    // (a) Operations declared by the pack's component manifests are enumerated
+    // as tools.
+    let ops = invoker.list_operations();
+    assert!(
+        ops.iter()
+            .any(|o| o.component_ref == "qa.process" && o.operation == "process"),
+        "qa.process/process must be listed; got: {ops:?}"
+    );
+
+    // (b) A real WASM component is invoked and its output flows back. The args
+    // are wrapped in an invocation envelope by the invoker; the host's
+    // envelope_v0_6 unwraps the payload, so the echo component returns it.
+    let out = rt.block_on(invoker.invoke("qa.process", "process", r#"{"text":"hello"}"#));
+    assert_eq!(out, Ok(json!({ "text": "hello" })), "got: {out:?}");
+
+    // (c) An unknown component fails as an Err (the catalog layer wraps it to an
+    // error value for the LLM; never a panic).
+    let missing = rt.block_on(invoker.invoke("does.not.exist", "process", "{}"));
+    assert!(
+        missing.is_err(),
+        "unknown component must error; got: {missing:?}"
+    );
     Ok(())
 }

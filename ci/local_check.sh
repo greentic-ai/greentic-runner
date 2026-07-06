@@ -62,6 +62,24 @@ run_dependency_sanity() {
   fi
 }
 
+run_wit_sync() {
+  echo "==> verify vendored extension-provider WIT matches pinned upstream revs"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "curl not found; skipping WIT sync check"
+    return 0
+  fi
+  # The check fetches raw.githubusercontent.com. Offline (or upstream
+  # unreachable) it is a soft-skip so the rest of local CI still runs; CI with
+  # network enforces it.
+  if ! ./scripts/verify-wit-sync.sh; then
+    if [[ "${CI:-}" == "1" || "${CI:-}" == "true" ]]; then
+      echo "WIT sync check failed in CI"
+      return 1
+    fi
+    echo "WIT sync check failed (possibly offline); continuing local run"
+  fi
+}
+
 run_clippy() {
   echo "==> cargo clippy (all targets, all features)"
   cargo clippy --all-targets --all-features -- -D warnings
@@ -129,7 +147,7 @@ run_package() {
   fi
 }
 
-default_steps=("fmt" "dependency_sanity" "clippy" "host_smoke" "crate_tests" "workspace_tests" "conformance" "package")
+default_steps=("fmt" "dependency_sanity" "wit_sync" "clippy" "host_smoke" "crate_tests" "workspace_tests" "conformance" "package")
 if [[ -n "${LOCAL_CHECK_STEPS:-}" ]]; then
   steps_list="${LOCAL_CHECK_STEPS//,/ }"
   read -r -a steps <<< "$steps_list"
@@ -141,6 +159,7 @@ for step in "${steps[@]}"; do
   case "$step" in
     fmt) run_fmt ;;
     dependency_sanity) run_dependency_sanity ;;
+    wit_sync) run_wit_sync ;;
     clippy) run_clippy ;;
     host_smoke) run_host_smoke ;;
     crate_tests) run_crate_tests ;;

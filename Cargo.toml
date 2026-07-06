@@ -3,6 +3,9 @@ members = [
     "crates/greentic-runner",
     "crates/greentic-runner-host",
     "crates/greentic-runner-desktop",
+    "crates/greentic-aw-runtime",
+    "crates/aw-event-bridge",
+    "crates/telco-x-event-bridge",
     "crates/tests",
     "crates/runner-core",
     "tests/fixtures/packs/secrets_store_smoke/components",
@@ -20,7 +23,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.1.0"
+version = "1.1.4"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -258,3 +261,8 @@ features = [
 [profile.release.package.echo-secret]
 opt-level = "z"
 strip = true
+
+# SDK 1.2.4-research is git-tagged only (the SDK repo's research line is
+# intentionally not republished to crates.io). Redirect the crates.io
+# requirement from greentic-ext-runtime v1.2.13-research onto the git
+# tag so the workspace can adopt it without waiting on a registry release.

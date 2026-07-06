@@ -11,7 +11,7 @@ use crate::component_api::{
     self, node::ExecCtx as ComponentExecCtx, node::InvokeResult, node::NodeError,
 };
 use crate::identify_hint::IdentifyInstanceHint;
-use crate::oauth::{OAuthBrokerConfig, OAuthBrokerHost, OAuthHostContext};
+use crate::oauth::{OAuthBrokerConfig, ResourceTokenRequest};
 use crate::provider::{ProviderBinding, ProviderRegistry};
 use crate::provider_core::{
     schema_core::SchemaCorePre as LegacySchemaCorePre,
@@ -28,6 +28,7 @@ use greentic_distributor_client::dist::{
 };
 use greentic_interfaces_wasmtime::host_helpers::v1::{
     self as host_v1, HostFns, add_all_v1_to_linker,
+    oauth_broker::OAuthBrokerHost as OAuthBrokerHostTrait,
     runner_host_http::RunnerHostHttp,
     runner_host_kv::RunnerHostKv,
     runtime_config::{ConfigError, RuntimeConfigHost},
@@ -87,7 +88,7 @@ use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsVi
 use zip::ZipArchive;
 
 use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
-use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow};
+use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
@@ -316,7 +317,6 @@ pub struct HostState {
     mocks: Option<Arc<MockLayer>>,
     secrets: DynSecretsManager,
     oauth_config: Option<OAuthBrokerConfig>,
-    oauth_host: OAuthBrokerHost,
     exec_ctx: Option<ComponentExecCtx>,
     component_ref: Option<String>,
     provider_core_component: bool,
@@ -333,7 +333,6 @@ pub struct HostState {
 }
 
 impl HostState {
-    #[allow(clippy::default_constructed_unit_structs)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         pack_id: String,
@@ -361,7 +360,6 @@ impl HostState {
             mocks,
             secrets,
             oauth_config,
-            oauth_host: OAuthBrokerHost::default(),
             exec_ctx,
             component_ref,
             provider_core_component,
@@ -1206,6 +1204,70 @@ impl RunnerHostKv for HostState {
     fn put(&mut self, _ns: String, _key: String, _val: String) {}
 }
 
+impl OAuthBrokerHostTrait for HostState {
+    /// Returns an access-token JSON string (`{"access_token":…,"expires_at":…}`) for the given
+    /// provider and scopes, or an empty string on error.
+    ///
+    /// `subject` is informational for MVP — tenant, env, and team are taken from the host context
+    /// (config + default_env + oauth_config.team), NOT derived from `subject`.
+    fn get_token(
+        &mut self,
+        provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        scopes: wasmtime::component::__internal::Vec<wasmtime::component::__internal::String>,
+    ) -> wasmtime::component::__internal::String {
+        let Some(cfg) = self.oauth_config.clone() else {
+            return String::new();
+        };
+        let req = ResourceTokenRequest {
+            http_base_url: cfg.http_base_url,
+            env: self.default_env.clone(),
+            tenant: self.config.tenant.clone(),
+            team: cfg.team.clone(),
+            resource_id: provider_id.to_string(),
+            scopes: scopes.into_iter().collect(),
+        };
+        match crate::oauth::request_resource_token_blocking(
+            &self.http_client,
+            &req,
+            cfg.shared_secret.as_deref(),
+        ) {
+            Ok(resp) => serde_json::to_string(&resp).unwrap_or_default(),
+            Err(e) => {
+                tracing::warn!(
+                    provider = %provider_id,
+                    error = %e,
+                    "oauth get-token proxy failed"
+                );
+                String::new()
+            }
+        }
+    }
+
+    /// Operator-time only — OAuth consent URL generation happens in the admin UI, not at runtime.
+    fn get_consent_url(
+        &mut self,
+        _provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        _scopes: wasmtime::component::__internal::Vec<wasmtime::component::__internal::String>,
+        _redirect_path: wasmtime::component::__internal::String,
+        _extra_json: wasmtime::component::__internal::String,
+    ) -> wasmtime::component::__internal::String {
+        String::new()
+    }
+
+    /// Operator-time only — OAuth code exchange happens in the admin UI, not at runtime.
+    fn exchange_code(
+        &mut self,
+        _provider_id: wasmtime::component::__internal::String,
+        _subject: wasmtime::component::__internal::String,
+        _code: wasmtime::component::__internal::String,
+        _redirect_path: wasmtime::component::__internal::String,
+    ) -> wasmtime::component::__internal::String {
+        String::new()
+    }
+}
+
 enum ManifestLoad {
     New {
         manifest: Box<greentic_types::PackManifest>,
@@ -1534,6 +1596,8 @@ mod register_identity_probe_tests {
 }
 
 pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool) -> Result<()> {
+    install_default_crypto_provider();
+
     add_wasi_to_linker(linker)?;
 
     // Add wasi-tls types and turn on the feature in linker
@@ -1549,7 +1613,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
         HostFns {
             http_client_v1_1: Some(|state: &mut ComponentState| state.host_mut()),
             http_client: Some(|state: &mut ComponentState| state.host_mut()),
-            oauth_broker: None,
+            oauth_broker: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_http: Some(|state: &mut ComponentState| state.host_mut()),
             runner_host_kv: Some(|state: &mut ComponentState| state.host_mut()),
             telemetry_logger: Some(|state: &mut ComponentState| state.host_mut()),
@@ -1694,24 +1758,6 @@ fn alias_error_from_host(
     http_client_client_alias::HostError {
         code: err.code,
         message: err.message,
-    }
-}
-
-impl OAuthHostContext for ComponentState {
-    fn tenant_id(&self) -> &str {
-        &self.host.config.tenant
-    }
-
-    fn env(&self) -> &str {
-        &self.host.default_env
-    }
-
-    fn oauth_broker_host(&mut self) -> &mut OAuthBrokerHost {
-        &mut self.host.oauth_host
-    }
-
-    fn oauth_config(&self) -> Option<&OAuthBrokerConfig> {
-        self.host.oauth_config.as_ref()
     }
 }
 
@@ -2185,6 +2231,7 @@ impl PackRuntime {
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -2371,6 +2418,37 @@ impl PackRuntime {
             )?;
             let store_state = ComponentState::new(host_state, wasi_policy)?;
             let mut store = wasmtime::Store::new(&engine, store_state);
+
+            // Extension-provider worlds (greentic:extension-provider@0.2.0 /
+            // @0.1.0) are introspection surfaces (list-channels,
+            // describe-channel, *-schema, dry-run-encode) and deliberately do
+            // NOT export a generic `invoke(op, input)` data-plane call. If a
+            // pack declares such a world for the runtime data plane, dispatch
+            // here would otherwise fall through to the legacy schema-core
+            // bindings and fail with an opaque "no exported instance" wasmtime
+            // error. Detect it up front (declared-world fast path, confirmed by
+            // an instance-level probe) and surface a typed, downcastable
+            // `ProviderInvokeError` instead. The data-plane routing for these
+            // worlds is an open design question (see PR body NEEDS_DECISION);
+            // legacy schema-core remains the default path below.
+            if world.contains("extension-provider") {
+                let pre_instance = linker.instantiate_pre(component.as_ref())?;
+                let instance =
+                    block_on(async { pre_instance.instantiate_async(&mut store).await })?;
+                let detected =
+                    crate::extension_provider::probe_provider_world(&mut store, &instance);
+                let version = detected
+                    .map(|w| w.version())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let typed = crate::extension_provider::ProviderInvokeError::Internal(format!(
+                    "extension-provider@{version} world exposes no data-plane invoke; \
+                     operation '{op_owned}' has no extension-provider equivalent (introspection \
+                     surface only)"
+                ));
+                return Err(crate::extension_provider::into_anyhow(typed));
+            }
+
             let use_schema_core_schema = world.contains("provider-schema-core");
             let use_schema_core_path = world.contains("provider/schema-core");
             let result = if use_schema_core_schema {
@@ -2858,6 +2936,142 @@ impl PackRuntime {
 
     pub fn component_manifest(&self, component_ref: &str) -> Option<&ComponentManifest> {
         self.component_manifests.get(component_ref)
+    }
+
+    /// Iterate every `(component_ref, manifest)` this pack holds. Used by the
+    /// agentic-worker component tool source to enumerate the operations a
+    /// worker may call as tools without exposing the internal manifest map.
+    pub fn component_manifest_entries(&self) -> impl Iterator<Item = (&str, &ComponentManifest)> {
+        self.component_manifests
+            .iter()
+            .map(|(component_ref, manifest)| (component_ref.as_str(), manifest))
+    }
+
+    /// Returns the raw agent config blobs embedded in this pack's manifest.
+    ///
+    /// Only present on the New (`greentic_types::PackManifest`) path; Legacy
+    /// packs do not carry agent config and return an empty map. Callers
+    /// (e.g. `TenantRuntime::from_packs`) deserialize these blobs into
+    /// concrete `AgentConfig` structs via
+    /// `agent_node::agent_configs_from_manifest`.
+    pub fn manifest_agent_blobs(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.manifest
+            .as_ref()
+            .map(|m| m.agents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Read the optional `agent-graph.json` sidecar embedded at the pack root.
+    ///
+    /// Returns the raw bytes when present, or `None` when the pack carries no
+    /// sidecar (the common case). Tries the materialized pack directory first,
+    /// then the `.gtpack` archive — mirroring [`load_schema_json`]'s resolution.
+    /// IO/zip errors are logged and treated as "absent" so a damaged or
+    /// unreadable sidecar never aborts pack loading; the caller
+    /// (`graph_node::graph_config_from_sidecar`) then validates the bytes.
+    ///
+    /// [`load_schema_json`]: PackRuntime::load_schema_json
+    pub fn read_agent_graph_sidecar(&self) -> Option<Vec<u8>> {
+        self.read_pack_file("agent-graph.json")
+    }
+
+    /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
+    ///
+    /// Designer-built packs (old greentic-pack, which cannot populate
+    /// `manifest.agents`) embed their `AgentConfig` map here. Returns an empty
+    /// map when the sidecar is absent or unparseable (lenient, mirroring
+    /// [`PackRuntime::manifest_agent_blobs`]) so a damaged sidecar never aborts
+    /// pack loading. `manifest.agents` remains authoritative; callers fill only
+    /// the agent_ids the manifest did not carry.
+    pub fn dw_agents_sidecar_blobs(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        let Some(bytes) = self.read_pack_file("dw-agents.json") else {
+            return std::collections::BTreeMap::new();
+        };
+        match serde_json::from_slice::<std::collections::BTreeMap<String, serde_json::Value>>(
+            &bytes,
+        ) {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::warn!(error = %error, "ignoring malformed dw-agents.json sidecar");
+                std::collections::BTreeMap::new()
+            }
+        }
+    }
+
+    /// Read a single named file from the pack by its archive-relative path,
+    /// trying the materialized pack directory first and the `.gtpack` archive as
+    /// a fallback. Returns `None` when the file is absent (or on a read error,
+    /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
+    /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
+    pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
+        // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
+        if self.path.is_dir() {
+            let candidate = self.path.join(name);
+            if candidate.exists() {
+                match std::fs::read(&candidate) {
+                    Ok(bytes) => return Some(bytes),
+                    Err(error) => {
+                        tracing::warn!(
+                            path = %candidate.display(),
+                            error = %error,
+                            "failed to read {name} from pack directory"
+                        );
+                        return None;
+                    }
+                }
+            }
+        }
+
+        // `.gtpack` archive.
+        let archive_path = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))?;
+        let file = match File::open(archive_path) {
+            Ok(file) => file,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to open pack archive while reading {name}"
+                );
+                return None;
+            }
+        };
+        let mut archive = match ZipArchive::new(file) {
+            Ok(archive) => archive,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read pack archive while reading {name}"
+                );
+                return None;
+            }
+        };
+        match archive.by_name(name) {
+            Ok(mut entry) => {
+                let mut bytes = Vec::new();
+                if let Err(error) = entry.read_to_end(&mut bytes) {
+                    tracing::warn!(
+                        path = %archive_path.display(),
+                        error = %error,
+                        "failed to extract {name} from pack archive"
+                    );
+                    return None;
+                }
+                Some(bytes)
+            }
+            Err(zip::result::ZipError::FileNotFound) => None,
+            Err(error) => {
+                tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "error reading {name} from pack archive"
+                );
+                None
+            }
+        }
     }
 
     pub fn describe_component_contract_v0_6(&self, component_ref: &str) -> Result<Option<Value>> {
@@ -3663,7 +3877,13 @@ fn normalize_flow_doc(mut doc: FlowDoc) -> FlowDoc {
         else {
             continue;
         };
-        if component_ref.starts_with("emit.") {
+        // Runner-native op-keys (`emit.*`, `mcp`, `dw.agent`, `sorla.call`, …)
+        // are dispatched by the engine directly off the `component` string, so
+        // they must survive verbatim — wrapping them in a `component.exec` node
+        // would misclassify them as `NodeKind::Exec`. The runtime-flow load
+        // path (`flow_doc_to_ir`) already preserves them; mirror that here for
+        // the legacy flow-JSON path using the shared op-key predicate.
+        if is_native_op_key(&component_ref) {
             node.operation = Some(component_ref);
             node.payload = payload;
             node.raw.clear();
@@ -5055,6 +5275,105 @@ mod tests {
     use indexmap::IndexMap;
     use serde_json::json;
 
+    /// Build a minimal `PackRuntime` rooted at `dir` so that `read_pack_file`
+    /// resolves files from that directory via `self.path.is_dir()`.
+    /// Mirrors the `for_component_test` constructor but sets `path` to the
+    /// caller-supplied directory instead of `PathBuf::new()`.
+    fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
+        let engine = Engine::default();
+        let engine_profile =
+            EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
+        let cache = CacheManager::new(CacheConfig::default(), engine_profile);
+        let config = Arc::new(crate::config::HostConfig {
+            tenant: "test-tenant".to_string(),
+            bindings_path: std::path::PathBuf::from("/tmp/bindings.yaml"),
+            flow_type_bindings: HashMap::new(),
+            rate_limits: crate::config::RateLimits::default(),
+            retry: crate::config::FlowRetryConfig::default(),
+            http_enabled: false,
+            secrets_policy: crate::config::SecretsPolicy::allow_all(),
+            state_store_policy: crate::config::StateStorePolicy::default(),
+            webhook_policy: crate::config::WebhookPolicy::default(),
+            timers: Vec::new(),
+            oauth: None,
+            mocks: None,
+            pack_bindings: Vec::new(),
+            env_passthrough: Vec::new(),
+            trace: crate::trace::TraceConfig::from_env(),
+            validation: crate::validate::ValidationConfig::from_env(),
+            operator_policy: crate::config::OperatorPolicy::allow_all(),
+            fast2flow: Default::default(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
+        });
+        PackRuntime {
+            path: dir.to_path_buf(),
+            archive_path: None,
+            config,
+            engine,
+            metadata: PackMetadata {
+                pack_id: "test-pack".to_string(),
+                version: "0.0.0".to_string(),
+                entry_flows: Vec::new(),
+                secret_requirements: Vec::new(),
+            },
+            manifest: None,
+            legacy_manifest: None,
+            component_manifests: HashMap::new(),
+            mocks: None,
+            flows: None,
+            components: HashMap::new(),
+            http_client: Arc::clone(&HTTP_CLIENT),
+            pre_cache: Mutex::new(HashMap::new()),
+            session_store: None,
+            state_store: None,
+            wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
+            assets_tempdir: None,
+            provider_registry: RwLock::new(None),
+            identify_hint_cache: RwLock::new(HashMap::new()),
+            secrets: crate::secrets::default_manager().expect("default secrets manager"),
+            oauth_config: None,
+            runtime_config_non_secret: None,
+            runtime_refs: None,
+            cache,
+        }
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_reads_map_from_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = serde_json::json!({
+            "greeter": { "agent_id": "greeter", "system_prompt": "hi", "tools": [],
+                         "llm": { "provider": "openai", "model": "gpt-4o-mini" } }
+        });
+        std::fs::write(
+            dir.path().join("dw-agents.json"),
+            serde_json::to_vec(&agents).unwrap(),
+        )
+        .unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        let blobs = pack.dw_agents_sidecar_blobs();
+        assert!(blobs.contains_key("greeter"));
+        assert_eq!(blobs["greeter"]["agent_id"], "greeter");
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_absent_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.dw_agents_sidecar_blobs().is_empty());
+    }
+
+    #[test]
+    fn dw_agents_sidecar_blobs_malformed_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dw-agents.json"), b"not json").unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.dw_agents_sidecar_blobs().is_empty());
+    }
+
     #[test]
     fn normalizes_raw_component_to_component_exec() {
         let mut nodes = IndexMap::new();
@@ -5284,6 +5603,10 @@ mod identify_endpoints_pack_tests {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
             fast2flow: Default::default(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 
@@ -5329,6 +5652,109 @@ mod identify_endpoints_pack_tests {
             .await
             .expect("empty types fast path");
         assert!(result.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod legacy_flow_normalize_tests {
+    use super::*;
+    use greentic_flow::model::{FlowDoc, NodeDoc};
+    use indexmap::IndexMap;
+    use serde_json::{Value, json};
+
+    /// Build a single-node `FlowDoc` whose only node carries the raw-YGTC
+    /// op-key `op_key` with `payload`, mirroring the legacy flow-JSON shape the
+    /// loader feeds into `normalize_flow_doc` -> `flow_doc_to_ir`.
+    fn single_node_doc(op_key: &str, payload: Value) -> FlowDoc {
+        let mut raw = IndexMap::new();
+        raw.insert(op_key.to_string(), payload);
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            "node".into(),
+            NodeDoc {
+                raw,
+                routing: json!([{ "out": true }]),
+                ..Default::default()
+            },
+        );
+        FlowDoc {
+            id: "legacy".into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some("node".into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema: None,
+            nodes,
+        }
+    }
+
+    /// REGRESSION: the legacy flow-JSON load path (`normalize_flow_doc` ->
+    /// `flow_doc_to_ir`) must preserve a raw-YGTC `{ mcp: { ... }, routing }`
+    /// node VERBATIM as `component == "mcp"` with its payload intact, exactly
+    /// like the runtime-flow (packc) path. Before the fix `normalize_flow_doc`
+    /// rewrote every non-`emit.*` op-key into a `component.exec` node, so the
+    /// engine saw `NodeKind::Exec` instead of the MCP dispatch arm.
+    #[test]
+    fn normalize_preserves_mcp_op_key_through_legacy_path() {
+        let doc = single_node_doc(
+            "mcp",
+            json!({
+                "server": "github",
+                "tool": "get_issue",
+                "arguments": { "id": "{{ entry.issue_id }}" },
+                "output": "issue"
+            }),
+        );
+
+        let normalized = normalize_flow_doc(doc);
+        let node = normalized.nodes.get("node").expect("node exists");
+        // NOT rewritten into a `component.exec` wrapper.
+        assert_eq!(
+            node.operation.as_deref(),
+            Some("mcp"),
+            "the `mcp` op-key must survive normalization verbatim, not become component.exec"
+        );
+        assert!(node.raw.is_empty(), "raw op-key should be lowered");
+
+        // Lowering through the real adapter yields `component == "mcp"` with
+        // the LOCKED ENCODING v2 payload (server/tool/arguments/output) intact.
+        let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+        let lowered = ir.nodes.get("node").expect("lowered node exists");
+        assert_eq!(lowered.component, "mcp");
+        assert_eq!(lowered.payload_expr["server"], json!("github"));
+        assert_eq!(lowered.payload_expr["tool"], json!("get_issue"));
+        assert_eq!(
+            lowered.payload_expr["arguments"]["id"],
+            json!("{{ entry.issue_id }}")
+        );
+        assert_eq!(lowered.payload_expr["output"], json!("issue"));
+    }
+
+    /// No regression to the passthrough set: the other native op-keys-with-
+    /// payload (`dw.agent`, `sorla.call`) must also survive `normalize_flow_doc`
+    /// verbatim rather than being wrapped in `component.exec`.
+    #[test]
+    fn normalize_preserves_dw_agent_and_sorla_call_op_keys() {
+        for op_key in ["dw.agent", "sorla.call"] {
+            let doc = single_node_doc(op_key, json!({ "input": { "x": 1 } }));
+            let normalized = normalize_flow_doc(doc);
+            let node = normalized.nodes.get("node").expect("node exists");
+            assert_eq!(
+                node.operation.as_deref(),
+                Some(op_key),
+                "`{op_key}` must survive normalization verbatim, not become component.exec"
+            );
+            assert!(node.raw.is_empty());
+
+            let ir = flow_doc_to_ir(normalized).expect("flow_doc_to_ir");
+            let lowered = ir.nodes.get("node").expect("lowered node exists");
+            assert_eq!(lowered.component, op_key);
+        }
     }
 }
 

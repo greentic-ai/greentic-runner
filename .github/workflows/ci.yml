@@ -20,10 +20,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    uses: greenticai/.github/.github/workflows/pr-ci.yml@main
-    with:
-      variant: host
+  # NOTE: this repo does NOT use the shared greenticai/.github pr-ci.yml for
+  # clippy/test. Those jobs build the workspace, and cargo clones EVERY git
+  # dependency during resolution to read its manifest — including the optional,
+  # default-OFF `knowledge-chronicle` deps (chronicle-core / chronicle-driver-*)
+  # that live in the CROSS-ORG private repo `greentic-biz/greentic-chronicle-ext`.
+  # PR CI only has `greenticai`-org credentials, so the clone fails auth and the
+  # job dies at dependency-fetch before compiling — on every PR, regardless of
+  # features. Until a cross-org deploy-key/PAT is provisioned for that repo, we
+  # run fmt + toolchain-check here and rely on local `ci/local_check.sh` (which
+  # has cross-org credentials) for clippy/test coverage.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  toolchain-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check toolchain drift (warning-only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/greenticai/.github/main/toolchain"
+          curl -sL "${BASE}/host/rust-toolchain.toml" -o /tmp/canonical-toolchain.toml
+          curl -sL "${BASE}/rustfmt.toml" -o /tmp/canonical-rustfmt.toml
+          if ! diff -q rust-toolchain.toml /tmp/canonical-toolchain.toml >/dev/null 2>&1; then
+            echo "::warning::rust-toolchain.toml differs from canonical host variant"
+            diff rust-toolchain.toml /tmp/canonical-toolchain.toml || true
+          fi
+          if ! diff -q rustfmt.toml /tmp/canonical-rustfmt.toml >/dev/null 2>&1; then
+            echo "::warning::rustfmt.toml differs from canonical"
+            diff rustfmt.toml /tmp/canonical-rustfmt.toml || true
+          fi
 
   heavy_wasm:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_heavy_wasm == true)

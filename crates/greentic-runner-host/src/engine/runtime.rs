@@ -32,6 +32,7 @@ use crate::runner::engine::{FlowContext, FlowEngine, FlowSnapshot, FlowStatus, F
 use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
+use crate::trace::audit_sink::AuditSink;
 use crate::trace::{PackTraceInfo, TraceContext, TraceMode, TraceRecorder};
 
 const DEFAULT_ENV: &str = "local";
@@ -568,6 +569,7 @@ impl StateMachineRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
         mocks: Option<Arc<MockLayer>>,
+        audit_nats_client: Option<async_nats::Client>,
     ) -> Result<Self> {
         let policy = Arc::new(config.secrets_policy.clone());
         let tenant_ctx = config.tenant_ctx();
@@ -588,6 +590,7 @@ impl StateMachineRuntime {
                 pack_trace,
                 resume_store,
                 mocks,
+                audit_nats_client,
             )),
         );
 
@@ -710,6 +713,10 @@ struct PackFlowAdapter {
     pack_trace: HashMap<String, PackTraceInfo>,
     resume: FlowResumeStore,
     mocks: Option<Arc<MockLayer>>,
+    /// NATS client backing the per-node audit-event sink; `None` (the
+    /// default, off path) when `GREENTIC_EVENTS_NATS_URL` is unset or NATS
+    /// could not be reached — see `docs/superpowers/specs/2026-07-03-runner-audit-emitter-design.md`.
+    audit_nats_client: Option<async_nats::Client>,
 }
 
 impl PackFlowAdapter {
@@ -719,6 +726,7 @@ impl PackFlowAdapter {
         pack_trace: HashMap<String, PackTraceInfo>,
         resume: FlowResumeStore,
         mocks: Option<Arc<MockLayer>>,
+        audit_nats_client: Option<async_nats::Client>,
     ) -> Self {
         Self {
             tenant: config.tenant.clone(),
@@ -727,6 +735,7 @@ impl PackFlowAdapter {
             pack_trace,
             resume,
             mocks,
+            audit_nats_client,
         }
     }
 }
@@ -810,7 +819,21 @@ impl Adapter for PackFlowAdapter {
         let trace = if trace_config.mode == TraceMode::Off {
             None
         } else {
-            Some(TraceRecorder::new(trace_config, trace_ctx))
+            // Build the best-effort audit sink from the threaded NATS client
+            // (EPIC-B B-2). `audit_tenant` is derived from the same
+            // condition as the sink so the two stay coupled: both `Some`
+            // (audit enabled) or both `None` (default, file-trace-only path,
+            // zero behaviour change). `TraceRecorder` construction happens
+            // on the async execution path, so `AuditSink::new`'s
+            // `tokio::spawn` runs inside a live tokio runtime context.
+            let sink = self.audit_nats_client.clone().map(AuditSink::new);
+            let audit_tenant = sink.is_some().then(|| envelope.tenant_ctx());
+            Some(TraceRecorder::new_with_audit(
+                trace_config,
+                trace_ctx,
+                sink,
+                audit_tenant,
+            ))
         };
 
         let mocks = self.mocks.as_deref();
@@ -823,6 +846,10 @@ impl Adapter for PackFlowAdapter {
             action: action_owned.as_deref(),
             session_id: Some(session_owned.as_str()),
             provider_id: provider_owned.as_deref(),
+            // Carry the inbound reply scope so async-dispatch nodes can encode
+            // the originating thread/reply_to into the dispatch correlation id
+            // (so a threaded wait can be re-keyed on resume).
+            reply_scope: envelope.reply_scope.as_ref(),
             retry_config,
             attempt: 1,
             observer: trace

@@ -646,6 +646,59 @@ impl RunnerHost {
         self.configs.clone()
     }
 
+    /// Build a minimal `RunnerHost` suitable for unit tests. The host has no
+    /// packs loaded into `active`, so `handle_activity` for any tenant will
+    /// return a "not loaded" error — which is exactly the error path the
+    /// `POST /agent/chat` handler tests exercise.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Arc<Self> {
+        use crate::config::{
+            FlowRetryConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
+            WebhookPolicy,
+        };
+        let config = Arc::new(HostConfig {
+            tenant: "test".into(),
+            bindings_path: std::path::PathBuf::from("<test>"),
+            flow_type_bindings: std::collections::HashMap::new(),
+            rate_limits: RateLimits::default(),
+            retry: FlowRetryConfig::default(),
+            http_enabled: false,
+            secrets_policy: SecretsPolicy::allow_all(),
+            state_store_policy: StateStorePolicy::default(),
+            webhook_policy: WebhookPolicy::default(),
+            timers: Vec::new(),
+            oauth: None,
+            mocks: None,
+            pack_bindings: Vec::new(),
+            env_passthrough: Vec::new(),
+            trace: crate::trace::TraceConfig::from_env(),
+            validation: crate::validate::ValidationConfig::from_env(),
+            operator_policy: OperatorPolicy::allow_all(),
+            fast2flow: Default::default(),
+            #[cfg(feature = "agentic-worker")]
+            agents: std::collections::HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: std::collections::HashMap::new(),
+        });
+        let session_store = new_session_store();
+        let session_host = session_host_from(Arc::clone(&session_store));
+        let state_store = new_state_store();
+        let state_host = state_host_from(Arc::clone(&state_store));
+        let secrets_manager = default_manager().expect("test secrets manager");
+        Arc::new(Self {
+            configs: std::collections::HashMap::from([("test".to_string(), config)]),
+            active: Arc::new(ActivePacks::new()),
+            health: Arc::new(HealthState::new()),
+            session_store,
+            state_store,
+            session_host,
+            state_host,
+            wasi_policy: Arc::new(RunnerWasiPolicy::default()),
+            secrets_manager,
+            telemetry: None,
+        })
+    }
+
     async fn prepare_runtime(
         &self,
         tenant: &str,

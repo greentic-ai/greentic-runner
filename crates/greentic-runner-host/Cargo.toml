@@ -11,7 +11,7 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify"]
+default = ["verify", "agentic-worker"]
 verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
@@ -21,8 +21,20 @@ component-v0-6-introspection = []
 # activates explicit span annotation (greentic-telemetry is always linked).
 telemetry = []
 greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
+# Gates the agentic-worker (DwAgent) node implementation and its deps
+# (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
+# produce a lean, publishable build that lacks DwAgent node support.
+agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
+# routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
+greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
+# Adds the ephemeral (in-memory) agent builder for desktop/local runs.
+# Enables the test-mock types from greentic-aw-runtime; must NOT be enabled
+# in the server binary — the server always uses the Redis path.
+desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock", "greentic-aw-runtime?/dev-allow-unsigned"]
 
 [dependencies]
+async-nats = "0.46"
 async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
@@ -30,6 +42,15 @@ axum.workspace = true
 base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.1.0-0, <1.2.0-0", features = ["serve"], optional = true }
+# Pulled only to enable its `pack-manifest-agents` feature (see the
+# long-term-chronicle feature). The crate is otherwise a transitive dep of the
+# openai-compatible providers above.
+# Knowledge (document-RAG / W4) tier. The chronicle provider + its core trait/DTOs
+# come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
+# from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
+# here). All optional, gated by the `knowledge-chronicle` feature.
+greentic-ext-runtime = { version = "=1.2.24", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
@@ -79,6 +100,15 @@ handlebars.workspace = true
 dashmap.workspace = true
 wasmtime-environ.workspace = true
 jsonschema.workspace = true
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "chrono",
+    "json",
+] }
+subtle = "2"
 
 # External stack components
 wasmtime = { workspace = true }
@@ -100,6 +130,10 @@ opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+tower.workspace = true
+http-body-util = "0.1"
+wiremock = "0.6"
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.1.0-0, <1.2.0-0", features = ["test-mock"] }
 
 [[bench]]
 name = "perf"

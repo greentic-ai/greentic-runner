@@ -1,3 +1,8 @@
+// The knowledge-chronicle build pulls deeply-nested async futures (Chronicle +
+// SurrealDB), pushing the type-layout query depth past the default 128 when
+// computing `cli::conformance::run()`'s layout. Raise the limit for the binary.
+#![recursion_limit = "512"]
+
 use clap::{Parser, Subcommand, ValueEnum};
 mod cli;
 // Also compiled by the lib crate (`greentic_runner::info`) so unit tests run
@@ -728,6 +733,10 @@ async fn load_pack_runtime_for_contract(path: &Path) -> Result<PackRuntime> {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     });
     PackRuntime::load(
         path,

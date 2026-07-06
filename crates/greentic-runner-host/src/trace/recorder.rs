@@ -5,12 +5,17 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use greentic_types::TenantCtx;
 use parking_lot::Mutex;
+use rand::{RngExt, rng};
 use serde_json::Value;
 
 use crate::runner::engine::{ExecutionObserver, NodeEvent};
 use crate::validate::ValidationIssue;
 
+use super::audit_event::{NodeAuditRecord, Outcome, audit_subject, build_audit_event};
+use super::audit_sink::AuditSink;
 use super::model::{TraceEnvelope, TraceError, TraceFlow, TraceHash, TracePack, TraceStep};
 
 const DEFAULT_TRACE_FILE: &str = "trace.json";
@@ -77,6 +82,15 @@ pub struct TraceRecorder {
     config: TraceConfig,
     context: TraceContext,
     state: Mutex<TraceState>,
+    /// Best-effort audit publisher; `None` when no NATS client is available
+    /// (the default, off path — see `docs/superpowers/specs/2026-07-03-runner-audit-emitter-design.md`).
+    audit_sink: Option<AuditSink>,
+    /// The flow's `TenantCtx`, captured at construction time. The per-node
+    /// `NodeEvent.context.tenant` seen in `on_node_end`/`on_node_error` is a
+    /// bare `&str` (no env), so the full context needed to build the audit
+    /// `EventEnvelope.tenant` field is threaded in here instead, from the
+    /// construction site where it is already in scope (`src/engine/runtime.rs`).
+    audit_tenant: Option<TenantCtx>,
 }
 
 struct TraceState {
@@ -97,6 +111,20 @@ struct InFlightStep {
 
 impl TraceRecorder {
     pub fn new(config: TraceConfig, context: TraceContext) -> Self {
+        Self::new_with_audit(config, context, None, None)
+    }
+
+    /// Constructs a recorder that additionally fans out a best-effort audit
+    /// `EventEnvelope` to `audit_sink` on `on_node_end`/`on_node_error`, in
+    /// addition to the existing file-buffering (which is unchanged). Pass
+    /// `None` for both `audit_sink` and `audit_tenant` to keep the exact
+    /// existing (file-only) behavior — this is what `new` delegates to.
+    pub fn new_with_audit(
+        config: TraceConfig,
+        context: TraceContext,
+        audit_sink: Option<AuditSink>,
+        audit_tenant: Option<TenantCtx>,
+    ) -> Self {
         Self {
             config,
             context,
@@ -105,6 +133,8 @@ impl TraceRecorder {
                 in_flight: None,
                 flushed: false,
             }),
+            audit_sink,
+            audit_tenant,
         }
     }
 
@@ -205,6 +235,33 @@ impl TraceRecorder {
             steps,
         }
     }
+
+    /// Best-effort audit fan-out for one completed node execution. No-op
+    /// when audit is disabled (`audit_sink`/`audit_tenant` are `None`), and
+    /// never blocks or fails execution — `AuditSink::emit` itself never
+    /// errors or panics.
+    fn emit_audit(&self, event: &NodeEvent<'_>, step: &TraceStep, outcome: Outcome) {
+        let (Some(sink), Some(tenant)) = (&self.audit_sink, &self.audit_tenant) else {
+            return;
+        };
+        let event_name = match outcome {
+            Outcome::Ok => "node_end",
+            Outcome::Error => "node_error",
+        };
+        let rec = NodeAuditRecord {
+            tenant,
+            flow_id: event.context.flow_id,
+            node_id: event.node_id,
+            component_id: &step.component_id,
+            operation: &step.operation,
+            session_id: event.context.session_id.unwrap_or_default(),
+            duration_ms: step.duration_ms,
+            outcome,
+            error: step.error.as_ref().map(|e| e.message.as_str()),
+        };
+        let envelope = build_audit_event(&rec, Utc::now(), generate_audit_event_id());
+        sink.emit(audit_subject(tenant.tenant.as_str(), event_name), &envelope);
+    }
 }
 
 impl ExecutionObserver for TraceRecorder {
@@ -275,6 +332,7 @@ impl ExecutionObserver for TraceRecorder {
                 error: None,
             }
         };
+        self.emit_audit(event, &step, Outcome::Ok);
         state.buffer.push_back(step);
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
@@ -327,6 +385,7 @@ impl ExecutionObserver for TraceRecorder {
                 }),
             }
         };
+        self.emit_audit(event, &step, Outcome::Error);
         state.buffer.push_back(step);
         while state.buffer.len() > self.config.buffer_size {
             state.buffer.pop_front();
@@ -355,6 +414,18 @@ fn hash_value(value: &Value) -> TraceHash {
         algorithm: HASH_ALGORITHM.to_string(),
         value: digest,
     }
+}
+
+/// Generates a random hex id for the audit event's `id` field. No `uuid` dep
+/// exists in this crate; mirrors `runner::engine::generate_correlation_id`'s
+/// random-bytes-then-hex-encode pattern rather than adding one.
+///
+/// `pub(crate)` so `trace::agent_audit`'s `AgentAuditObserver` can reuse the
+/// same id source for agent-step audit events.
+pub(crate) fn generate_audit_event_id() -> String {
+    let mut bytes = [0u8; 16];
+    rng().fill(&mut bytes);
+    hex::encode(bytes)
 }
 
 fn build_invocation(event: &NodeEvent<'_>, component_id: &str) -> Value {
@@ -393,4 +464,220 @@ fn git_sha() -> Option<String> {
         .or_else(|| env::var("GITHUB_SHA").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runner::engine::{FlowContext, HostNode, RetryConfig};
+    use greentic_types::{EnvId, TenantId};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    fn tenant_ctx() -> TenantCtx {
+        TenantCtx::new(
+            EnvId::try_from("prod").expect("valid env id"),
+            TenantId::try_from("t1").expect("valid tenant id"),
+        )
+    }
+
+    fn trace_config(out_path: PathBuf) -> TraceConfig {
+        TraceConfig {
+            mode: TraceMode::Always,
+            out_path,
+            buffer_size: 20,
+            capture_inputs: false,
+        }
+    }
+
+    fn trace_context() -> TraceContext {
+        TraceContext {
+            pack_ref: "pack1".to_string(),
+            resolved_digest: None,
+            flow_id: "flow1".to_string(),
+            flow_version: "1".to_string(),
+        }
+    }
+
+    fn flow_context(session_id: Option<&str>) -> FlowContext<'_> {
+        FlowContext {
+            tenant: "t1",
+            pack_id: "pack1",
+            flow_id: "flow1",
+            node_id: Some("n1"),
+            tool: None,
+            action: None,
+            session_id,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    fn audit_sink() -> (AuditSink, mpsc::Receiver<(String, Vec<u8>)>) {
+        let (tx, rx) = mpsc::channel::<(String, Vec<u8>)>(8);
+        (AuditSink::from_sender(tx), rx)
+    }
+
+    #[test]
+    fn on_node_end_emits_exactly_one_audit_event_with_correct_subject() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, mut rx) = audit_sink();
+        let recorder = TraceRecorder::new_with_audit(
+            trace_config(dir.path().join("trace.json")),
+            trace_context(),
+            Some(sink),
+            Some(tenant_ctx()),
+        );
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        recorder.on_node_start(&event);
+        recorder.on_node_end(&event, &json!({"ok": true}));
+
+        let (subject, bytes) = rx.try_recv().expect("exactly one audit event enqueued");
+        assert_eq!(subject, "audit.t1.flow.node_end");
+        let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(
+            value.get("type").and_then(Value::as_str),
+            Some("greentic.runner.flow.node_end")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "expected exactly one audit event, found a second"
+        );
+    }
+
+    #[test]
+    fn on_node_start_emits_no_audit_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, mut rx) = audit_sink();
+        let recorder = TraceRecorder::new_with_audit(
+            trace_config(dir.path().join("trace.json")),
+            trace_context(),
+            Some(sink),
+            Some(tenant_ctx()),
+        );
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        recorder.on_node_start(&event);
+
+        assert!(
+            rx.try_recv().is_err(),
+            "on_node_start must never emit an audit event"
+        );
+    }
+
+    #[test]
+    fn on_node_error_emits_one_audit_event_with_error_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (sink, mut rx) = audit_sink();
+        let recorder = TraceRecorder::new_with_audit(
+            trace_config(dir.path().join("trace.json")),
+            trace_context(),
+            Some(sink),
+            Some(tenant_ctx()),
+        );
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        recorder.on_node_start(&event);
+        let err = anyhow::anyhow!("boom");
+        recorder.on_node_error(&event, err.as_ref());
+
+        let (subject, bytes) = rx.try_recv().expect("one audit error event enqueued");
+        assert_eq!(subject, "audit.t1.flow.node_error");
+        let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(
+            value.get("type").and_then(Value::as_str),
+            Some("greentic.runner.flow.node_error")
+        );
+        assert_eq!(
+            value
+                .get("payload")
+                .and_then(|p| p.get("error"))
+                .and_then(Value::as_str),
+            Some("boom")
+        );
+    }
+
+    #[test]
+    fn without_audit_sink_file_trace_still_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("trace.json");
+        let recorder = TraceRecorder::new(trace_config(out_path.clone()), trace_context());
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        recorder.on_node_start(&event);
+        recorder.on_node_end(&event, &json!({"ok": true}));
+        recorder.flush_success().expect("flush should succeed");
+
+        let written = fs::read_to_string(&out_path).expect("trace file was written");
+        assert!(written.contains("\"node_id\": \"n1\""));
+    }
+
+    #[test]
+    fn file_buffering_is_unchanged_with_audit_sink_attached() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("trace.json");
+        let (sink, _rx) = audit_sink();
+        let recorder = TraceRecorder::new_with_audit(
+            trace_config(out_path.clone()),
+            trace_context(),
+            Some(sink),
+            Some(tenant_ctx()),
+        );
+
+        let ctx = flow_context(Some("s1"));
+        let node = HostNode::for_test("greentic:http", Some("call"));
+        let payload = json!({"foo": "bar"});
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "n1",
+            node: &node,
+            payload: &payload,
+        };
+        recorder.on_node_start(&event);
+        recorder.on_node_end(&event, &json!({"ok": true}));
+        recorder.flush_success().expect("flush should succeed");
+
+        let written = fs::read_to_string(&out_path).expect("trace file was written");
+        assert!(written.contains("\"node_id\": \"n1\""));
+    }
 }

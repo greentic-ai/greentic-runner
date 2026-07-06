@@ -632,12 +632,232 @@ impl TenantRuntime {
                 },
             );
         }
-        let engine = Arc::new(
-            FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
+        let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+            .await
+            .context("failed to prime flow engine")?
+            .with_rollout_ids(rollout);
+
+        // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
+        // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
+        // so the dispatcher must be attached while `engine` is still owned and
+        // mutable. The response listener (which needs the post-build ingress
+        // handle) is spawned further below, after the runtime is constructed.
+        //
+        // Gated on `GREENTIC_EVENTS_NATS_URL`: when unset, `sorla.call` stays
+        // disabled and existing behaviour is unchanged. When set but NATS cannot
+        // be reached we log a warning and continue (the engine simply has no
+        // dispatch handler, so `sorla.call` nodes fail fast at execution time).
+        //
+        // Connected here (BEFORE the agentic-worker block below) rather than
+        // its original post-block position so the agent-node handler
+        // construction below can also thread the (possibly connected) client
+        // into an `AuditSink` for `dw.agent` step audit events (EPIC-B B-3);
+        // pure reordering, no behaviour change to the dispatch wiring itself.
+        let dispatch_nats_client = match std::env::var("GREENTIC_EVENTS_NATS_URL") {
+            Ok(nats_url) => match async_nats::connect(&nats_url).await {
+                Ok(client) => {
+                    engine.set_remote_dispatch_handler(Arc::new(
+                        crate::runner::remote_dispatch::NatsDispatcher::new(client.clone()),
+                    ));
+                    Some(client)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "GREENTIC_EVENTS_NATS_URL set but NATS connect failed; sorla.call disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+
+        // Clone the (possibly connected) client for the audit sink (EPIC-B
+        // B-2/B-3): threaded into `StateMachineRuntime::from_flow_engine` so
+        // `TraceRecorder` can publish best-effort audit events over NATS, and
+        // (as an `AuditSink`) into the `dw.agent` node handler below so agent
+        // tool-call/tool-result steps are audited too. Cloned BEFORE the
+        // response-listener loop further below moves `dispatch_nats_client`.
+        // `None` when NATS is unset/unreachable, which keeps both audit paths
+        // off by default (zero behaviour change).
+        let audit_nats_client = dispatch_nats_client.clone();
+
+        #[cfg(feature = "agentic-worker")]
+        {
+            use crate::runner::agent_node::{
+                agent_configs_from_manifest, merge_agent_sources, merge_sidecar_into,
+            };
+            use std::collections::HashMap;
+
+            // Collect agent configs from all New-manifest packs. When the same
+            // agent_id appears in multiple packs the last pack wins (packs are
+            // ordered: first = primary, rest = overlays). Collisions are logged
+            // so operators can audit cross-pack conflicts.
+            let mut pack_agents: HashMap<String, greentic_aw_runtime::AgentConfig> = HashMap::new();
+            for pack in &pack_runtimes {
+                let mut blobs = pack.manifest_agent_blobs();
+                // Bridge: designer-built packs cannot populate `manifest.agents`
+                // (old greentic-pack); they embed a `dw-agents.json` sidecar.
+                // Fill any agent_id the manifest lacked (manifest stays authoritative).
+                merge_sidecar_into(&mut blobs, pack.dw_agents_sidecar_blobs());
+                if blobs.is_empty() {
+                    continue;
+                }
+                let pack_id = pack.metadata().pack_id.clone();
+                let configs = agent_configs_from_manifest(&pack_id, &blobs);
+                for (agent_id, agent_config) in configs {
+                    if let Some(existing) = pack_agents.get(&agent_id) {
+                        tracing::warn!(
+                            agent_id,
+                            prior_pack = existing.agent_id.as_str(),
+                            new_pack = pack_id.as_str(),
+                            "agent_id collision across packs; last pack wins"
+                        );
+                    }
+                    pack_agents.insert(agent_id, agent_config);
+                }
+            }
+
+            // Operator config overrides pack-provided agents on collision.
+            let merged_agents = merge_agent_sources(pack_agents, config.agents.clone());
+
+            // First-boot ingest of any pack-baked knowledge corpus (W4 4c). Runs
+            // BEFORE the agent runtime mounts its serving knowledge connection:
+            // embedded SurrealDB allows one handle per store directory, so the
+            // temporary ingest connection must open and drop before the serving
+            // mount (inside build_agent_node_handler) opens its own. No-op without
+            // the `knowledge-chronicle` feature or when no pack carries a corpus.
+            #[cfg(feature = "knowledge-chronicle")]
+            {
+                let corpus = crate::runner::knowledge_corpus::collect(&pack_runtimes);
+                crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
+            }
+
+            // DwAgent state-store selection. With GREENTIC_AW_REDIS_URL set, use the
+            // Redis-backed stores (production multi-process default). Without it, when
+            // built with `desktop-agent-ephemeral`, fall back to the process-global
+            // in-memory stores so a single-process runner (e.g. the designer's
+            // loopback test-chat sidecar) runs agentic-worker turns with NO external
+            // infra. Otherwise DwAgent nodes stay disabled — unchanged server
+            // behaviour (build_agent_node_handler returns None when Redis is unset).
+            let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            // Best-effort agent-step audit sink (EPIC-B B-3), built from the
+            // same (possibly connected) NATS client the flow-level audit sink
+            // (B-2) uses. `None` when NATS is unset/unreachable, which keeps
+            // `dw.agent` execution on the plain `AgentRuntime::step` path
+            // (zero behaviour change).
+            let agent_audit_sink = audit_nats_client
+                .clone()
+                .map(crate::trace::audit_sink::AuditSink::new);
+            let agent_handler = if redis_set {
+                crate::runner::agent_node::build_agent_node_handler(
+                    merged_agents,
+                    config.tenant.clone(),
+                    Arc::clone(&secrets_manager),
+                    pack_runtimes.clone(),
+                    agent_audit_sink.clone(),
+                )
                 .await
-                .context("failed to prime flow engine")?
-                .with_rollout_ids(rollout),
-        );
+            } else {
+                #[cfg(feature = "desktop-agent-ephemeral")]
+                {
+                    crate::runner::agent_node::build_agent_node_handler_ephemeral(
+                        merged_agents,
+                        config.tenant.clone(),
+                        Arc::clone(&secrets_manager),
+                        pack_runtimes.clone(),
+                        agent_audit_sink.clone(),
+                    )
+                    .await
+                }
+                #[cfg(not(feature = "desktop-agent-ephemeral"))]
+                {
+                    crate::runner::agent_node::build_agent_node_handler(
+                        merged_agents,
+                        config.tenant.clone(),
+                        Arc::clone(&secrets_manager),
+                        pack_runtimes.clone(),
+                        agent_audit_sink.clone(),
+                    )
+                    .await
+                }
+            };
+            if let Some(handler) = agent_handler {
+                engine.set_agent_node_handler(handler);
+                tracing::info!("DwAgent runtime wired into FlowEngine");
+            }
+
+            // Collect agent-graph sidecars from each pack. Unlike agents (a
+            // manifest.cbor map), graphs arrive as a pack FILE (`agent-graph.json`)
+            // — one sidecar per pack — so the graph is keyed by `pack_id`. A
+            // sidecar that fails UTF-8 / JSON / schema validation is logged and
+            // skipped (lenient, mirroring `agent_configs_from_manifest`) so a bad
+            // graph never blocks the rest of pack loading. When the same pack_id
+            // appears twice (overlay), the last pack wins.
+            let mut graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig> =
+                HashMap::new();
+            for pack in &pack_runtimes {
+                let Some(bytes) = pack.read_agent_graph_sidecar() else {
+                    continue;
+                };
+                let pack_id = pack.metadata().pack_id.clone();
+                if let Some(config) =
+                    crate::runner::graph_node::graph_config_from_sidecar(&pack_id, &bytes)
+                    && graphs.insert(pack_id.clone(), config).is_some()
+                {
+                    tracing::warn!(
+                        pack_id = pack_id.as_str(),
+                        "agent-graph sidecar for pack_id seen twice; last pack wins"
+                    );
+                }
+            }
+
+            // Producer/operator-declared graphs (HostConfig.graphs) override
+            // pack-sidecar graphs on `graph_id` collision — mirroring the
+            // operator-wins merge for agents.
+            for (graph_id, graph_config) in config.graphs.clone() {
+                graphs.insert(graph_id, graph_config);
+            }
+
+            if let Some(handler) = crate::runner::graph_node::build_graph_node_handler(
+                graphs,
+                agent_audit_sink.clone(),
+            )
+            .await
+            {
+                engine.set_graph_node_handler(handler);
+                tracing::info!("DwAgentGraph runtime wired into FlowEngine");
+            }
+        }
+
+        // Resolve how `dw.agent` nodes dispatch. When `GREENTIC_AW_DISPATCH=nats`
+        // is set, the node is rerouted over the durable agentic NATS path instead
+        // of the in-process handler. Must be wired while `engine` is still owned.
+        #[cfg(feature = "agentic-worker")]
+        {
+            let dw_dispatch =
+                crate::runner::agent_node::dw_agent_dispatch_mode(|k| std::env::var(k).ok());
+            engine.set_dw_agent_dispatch(dw_dispatch);
+            if matches!(
+                dw_dispatch,
+                crate::runner::agent_node::DwAgentDispatch::Nats
+            ) && std::env::var("GREENTIC_EVENTS_NATS_URL")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                tracing::warn!(
+                    "GREENTIC_AW_DISPATCH=nats but GREENTIC_EVENTS_NATS_URL is unset; \
+                     dw.agent nodes will fail (no remote dispatch handler). \
+                     Set the NATS URL or unset the flag."
+                );
+            }
+        }
+
+        let engine = Arc::new(engine);
         let state_machine = Arc::new(
             StateMachineRuntime::from_flow_engine(
                 Arc::clone(&config),
@@ -648,9 +868,45 @@ impl TenantRuntime {
                 state_host,
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
+                audit_nats_client,
             )
             .context("failed to initialise state machine runtime")?,
         );
+
+        // Spawn the response listeners now that the ingress handle
+        // (`state_machine`) exists. Each listener resumes paused flows by feeding
+        // a synthesized ingress envelope through `StateMachineRuntime::handle`
+        // (see `RuntimeSessionResumer`). The resumer is runtime-agnostic (it
+        // resumes by correlation id), so one shared resumer serves all runtimes;
+        // we run one listener per runtime so every `*.call` node's responses
+        // (`greentic.<runtime>.response.v1`) are consumed. Only started when the
+        // dispatcher above connected successfully.
+        if let Some(client) = dispatch_nats_client {
+            let resumer = Arc::new(
+                crate::runner::runtime_session_resumer::RuntimeSessionResumer::new(Arc::clone(
+                    &state_machine,
+                )),
+            );
+            for runtime_name in ["sorla", "operala", "agentic", "telco-x", "approval"] {
+                tokio::spawn(crate::runner::dispatch_listener::run_response_listener(
+                    client.clone(),
+                    runtime_name.to_string(),
+                    Arc::clone(&resumer)
+                        as Arc<dyn crate::runner::dispatch_listener::SessionResumer>,
+                ));
+            }
+            // Eagerly pre-cache local-wasm MCP components when the admin publishes
+            // a warm event. Feature-gated behind `agentic-worker` because
+            // `mcp_store_pull` lives in `greentic-aw-runtime` which is only
+            // present when that feature is enabled.
+            #[cfg(feature = "agentic-worker")]
+            tokio::spawn(crate::runner::mcp_warm_listener::run_mcp_warm_listener(
+                client.clone(),
+            ));
+            tracing::info!(
+                "Remote-dispatch (NATS) wired into runtime: sorla.call / operala.call / agentic.call / telco-x.call"
+            );
+        }
         let http_client = Client::builder().build()?;
         Ok(Arc::new(Self {
             tenant: config.tenant.clone(),
