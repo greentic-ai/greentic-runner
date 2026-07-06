@@ -139,6 +139,10 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 
@@ -515,6 +519,7 @@ nodes:
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,
@@ -595,6 +600,7 @@ nodes:
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,
@@ -728,6 +734,7 @@ timers: []\n",
             action: None,
             session_id: None,
             provider_id: None,
+            reply_scope: None,
             retry_config,
             attempt: 1,
             observer: None,
@@ -865,6 +872,7 @@ nodes:
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,
@@ -946,6 +954,7 @@ fn runtime_extension_flow_overrides_manifest_flow() -> Result<()> {
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,

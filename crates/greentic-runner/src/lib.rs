@@ -70,6 +70,10 @@ mod tests {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
             fast2flow: Default::default(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 

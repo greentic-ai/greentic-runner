@@ -82,6 +82,10 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     }
 }
 
@@ -236,6 +240,7 @@ fn runtime_extension_preserves_component_config_for_direct_component_nodes() -> 
         action: None,
         session_id: None,
         provider_id: None,
+        reply_scope: None,
         retry_config,
         attempt: 1,
         observer: None,

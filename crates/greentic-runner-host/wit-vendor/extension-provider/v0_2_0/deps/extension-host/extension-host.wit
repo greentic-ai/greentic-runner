@@ -1,0 +1,87 @@
+package greentic:extension-host@0.1.0;
+
+interface logging {
+  enum level {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+  }
+  log: func(level: level, target: string, message: string);
+  log-kv: func(level: level, target: string, message: string,
+               fields: list<tuple<string, string>>);
+}
+
+interface i18n {
+  t: func(key: string) -> string;
+  tf: func(key: string, args: list<tuple<string, string>>) -> string;
+}
+
+interface secrets {
+  get: func(uri: string) -> result<string, string>;
+}
+
+interface broker {
+  call-extension: func(
+    kind: string,
+    target-id: string,
+    function: string,
+    args-json: string
+  ) -> result<string, string>;
+}
+
+interface http {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+  }
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+  fetch: func(req: request) -> result<response, string>;
+}
+
+/// Host interface for invoking tenant-configured LLM providers.
+interface llm {
+  record llm-message {
+    /// Message role: "system", "user", or "assistant".
+    role: string,
+    content: string,
+  }
+  variant response-format {
+    text,
+    json,
+    /// Constrain output to a serialized JSON Schema document.
+    json-schema(string),
+  }
+  record llm-request {
+    /// LLM role wire name as declared in the extension's
+    /// `describe.runtime.permissions.llmRoles` list. Pass `none` when the
+    /// extension declares exactly one role (the host selects it); required
+    /// when multiple roles are declared. Roles outside the declared list
+    /// are rejected.
+    role-hint: option<string>,
+    system-prompt: string,
+    messages: list<llm-message>,
+    response-format: option<response-format>,
+  }
+  record llm-response {
+    content: string,
+    total-tokens: option<u32>,
+  }
+  complete: func(request: llm-request) -> result<llm-response, string>;
+}
+
+world extension-host-world {
+  import logging;
+  import i18n;
+  import secrets;
+  import broker;
+  import http;
+  import llm;
+}
