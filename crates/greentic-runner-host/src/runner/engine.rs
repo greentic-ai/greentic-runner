@@ -111,6 +111,7 @@ struct HostFlow {
     id: String,
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
+    vars_init: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +124,11 @@ pub struct HostNode {
     operation_in_mapping: Option<String>,
     payload_expr: Value,
     routing: Routing,
+    /// Per-node implicit output bindings: after this node runs, each entry
+    /// `{ varName: template }` is rendered against a context where `prev` is
+    /// the node's own output payload, and the result is written to
+    /// `ExecutionState.vars[varName]`.
+    vars_out: Option<JsonMap<String, Value>>,
 }
 
 impl HostNode {
@@ -157,6 +163,7 @@ impl HostNode {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         }
     }
 }
@@ -176,6 +183,13 @@ enum NodeKind {
     },
     BuiltinStateGet,
     BuiltinStateSet,
+    /// Session-scoped variable write: renders `value` against the current
+    /// template context and inserts into `ExecutionState.vars[name]`.
+    /// Config shape: `{ name: String, value: any }`.
+    VarSet {
+        name: String,
+        value: Value,
+    },
     Wait,
     DwAgent {
         agent_id: String,
@@ -582,7 +596,13 @@ impl FlowEngine {
 
     async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
-        let state = ExecutionState::new(input);
+        let mut state = ExecutionState::new(input);
+        for (name, default) in flow_ir.vars_init.iter() {
+            state
+                .vars
+                .entry(name.clone())
+                .or_insert_with(|| default.clone());
+        }
         self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
             .await
     }
@@ -680,6 +700,23 @@ impl FlowEngine {
 
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
+            // Apply per-node vars_out bindings: render each template against a
+            // context where `prev` is this node's own output payload (already
+            // stored in state.last_output above), then write into state.vars.
+            if let Some(bindings) = node.vars_out.as_ref() {
+                let ctx = template_context(&state, output.payload.clone());
+                for (var_name, template) in bindings.iter() {
+                    let rendered = render_template_value(
+                        template,
+                        &ctx,
+                        TemplateOptions {
+                            allow_pointer: true,
+                        },
+                    )
+                    .with_context(|| format!("failed to render vars_out binding `{var_name}`"))?;
+                    state.vars.insert(var_name.clone(), rendered);
+                }
+            }
             if let Some(observer) = step_ctx.observer {
                 observer.on_node_end(&event, &output.payload);
             }
@@ -861,6 +898,31 @@ impl FlowEngine {
                 .execute_state_set(ctx, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::VarSet { name, value } => {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        "var_set node has an empty variable name; skipping write"
+                    );
+                    return Ok(DispatchOutcome::complete(NodeOutput::new(
+                        serde_json::json!({ "ok": true }),
+                    )));
+                }
+                let prev = state.last_output.clone().unwrap_or(Value::Null);
+                let ctx_val = template_context(state, prev);
+                let rendered = render_template_value(
+                    value,
+                    &ctx_val,
+                    TemplateOptions {
+                        allow_pointer: true,
+                    },
+                )
+                .context("failed to render var_set value")?;
+                state.vars.insert(name.clone(), rendered);
+                Ok(DispatchOutcome::complete(NodeOutput::new(
+                    serde_json::json!({ "ok": true }),
+                )))
+            }
             NodeKind::Wait => {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
@@ -1973,6 +2035,8 @@ pub struct ExecutionState {
     last_output: Option<Value>,
     #[serde(default)]
     redirect_count: u32,
+    #[serde(default)]
+    vars: JsonMap<String, Value>,
 }
 
 impl ExecutionState {
@@ -1984,6 +2048,7 @@ impl ExecutionState {
             egress: Vec::new(),
             last_output: None,
             redirect_count: 0,
+            vars: JsonMap::new(),
         }
     }
 
@@ -2387,6 +2452,7 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("prev".into(), prev);
     ctx.insert("node".into(), Value::Object(state.outputs_map()));
     ctx.insert("state".into(), state.context());
+    ctx.insert("vars".into(), Value::Object(state.vars.clone()));
     Value::Object(ctx)
 }
 
@@ -2402,10 +2468,25 @@ impl From<Flow> for HostFlow {
             .and_then(Value::as_str)
             .and_then(|id| NodeId::from_str(id).ok())
             .or_else(|| nodes.keys().next().cloned());
+        let vars_init = value
+            .metadata
+            .extra
+            .get("vars_init")
+            .and_then(|v| v.as_object())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .filter_map(|(name, decl)| {
+                        decl.get("default").map(|d| (name.clone(), d.clone()))
+                    })
+                    .collect::<JsonMap<String, Value>>()
+            })
+            .unwrap_or_default();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
+            vars_init,
         }
     }
 }
@@ -2424,6 +2505,7 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
             || full_ref.starts_with("agentic.")
+            || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
@@ -2479,6 +2561,22 @@ impl From<Node> for HostNode {
                 "session.wait" => NodeKind::Wait,
                 "state.get" => NodeKind::BuiltinStateGet,
                 "state.set" => NodeKind::BuiltinStateSet,
+                "var.set" => {
+                    let name = node
+                        .input
+                        .mapping
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let value = node
+                        .input
+                        .mapping
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    NodeKind::VarSet { name, value }
+                }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
                 },
@@ -2531,6 +2629,7 @@ impl From<Node> for HostNode {
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
             NodeKind::BuiltinStateGet => "state.get".to_string(),
             NodeKind::BuiltinStateSet => "state.set".to_string(),
+            NodeKind::VarSet { .. } => "var.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
@@ -2546,9 +2645,30 @@ impl From<Node> for HostNode {
         } else {
             raw_operation.clone()
         };
+        // Extract per-node output bindings before the mapping is consumed by
+        // `payload_expr`. Stored as raw (unrendered) templates so they can be
+        // applied after the node runs, using the node's own output as `prev`.
+        let vars_out = node
+            .input
+            .mapping
+            .get("vars_out")
+            .and_then(Value::as_object)
+            .cloned();
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
-            _ => node.input.mapping.clone(),
+            // VarSet dispatch re-reads name/value from NodeKind::VarSet directly;
+            // the payload render is redundant and must not be forwarded as node input.
+            NodeKind::VarSet { .. } => Value::Null,
+            _ => {
+                // Strip the internal `vars_out` meta-key so it is never
+                // forwarded as an input field to wasm components or other
+                // non-emit node kinds (which may have strict schemas).
+                let mut mapping = node.input.mapping.clone();
+                if let Some(obj) = mapping.as_object_mut() {
+                    obj.remove("vars_out");
+                }
+                mapping
+            }
         };
         Self {
             kind,
@@ -2562,6 +2682,7 @@ impl From<Node> for HostNode {
             operation_in_mapping,
             payload_expr,
             routing: node.routing,
+            vars_out,
         }
     }
 }
@@ -3428,8 +3549,8 @@ mod tests {
     use super::*;
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
-        Flow, FlowComponentRef, FlowId, FlowKind, InputMapping, Node, NodeId, OutputMapping,
-        Routing, TelemetryHints,
+        Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,
+        OutputMapping, Routing, TelemetryHints,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap as StdHashMap};
@@ -3780,6 +3901,7 @@ mod tests {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -3846,6 +3968,7 @@ mod tests {
             operation_in_mapping: Some("render".into()),
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -4683,6 +4806,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -4724,6 +4848,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -4756,6 +4881,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -4810,6 +4936,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -4895,6 +5022,7 @@ mod tests {
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -5249,6 +5377,893 @@ mod tests {
         eprintln!(
             "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
             output["output"]["reply"]
+        );
+    }
+
+    #[test]
+    fn execution_state_vars_survive_serde_round_trip() {
+        // vars must persist across a park/resume, which is a serde round-trip of ExecutionState.
+        let mut st = ExecutionState::new(json!({}));
+        st.vars.insert("counter".into(), json!(3));
+        st.vars.insert("region".into(), json!("us-east-1"));
+
+        let encoded = serde_json::to_string(&st).expect("serialize");
+        let decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+
+        assert_eq!(decoded.vars.get("counter"), Some(&json!(3)));
+        assert_eq!(decoded.vars.get("region"), Some(&json!("us-east-1")));
+    }
+
+    #[test]
+    fn execution_state_vars_default_empty_for_old_snapshots() {
+        // A snapshot serialized before `vars` existed (no `vars` key) must still load.
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let decoded: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(decoded.vars.is_empty());
+    }
+
+    #[test]
+    fn template_context_exposes_vars_namespace_typed() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.vars.insert("count".into(), serde_json::json!(5));
+        st.vars.insert("name".into(), serde_json::json!("aws"));
+
+        let ctx = template_context(&st, serde_json::Value::Null);
+        // {{vars.count}} must resolve to the JSON number 5, not the string "5".
+        let rendered_num = render_template_value(
+            &serde_json::json!("{{vars.count}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render num");
+        assert_eq!(rendered_num, serde_json::json!(5));
+
+        let rendered_str = render_template_value(
+            &serde_json::json!("prefix-{{vars.name}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render str");
+        assert_eq!(rendered_str, serde_json::json!("prefix-aws"));
+    }
+
+    #[test]
+    fn vars_namespace_does_not_shadow_existing_namespaces() {
+        let st = ExecutionState::new(serde_json::json!({"user": {"id": 7}}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+        let obj = ctx.as_object().expect("ctx object");
+        for key in ["entry", "in", "prev", "node", "state", "vars"] {
+            assert!(obj.contains_key(key), "context must expose `{key}`");
+        }
+    }
+
+    // ── vars_init tests ────────────────────────────────────────────────────
+
+    /// Build a minimal flow with the given free-form `metadata.extra` value.
+    /// Mirrors the construction used by neighbouring engine tests: a schema-1.0
+    /// Messaging flow with no nodes and no entrypoints, only the metadata set.
+    fn flow_with_extra(extra: serde_json::Value) -> Flow {
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: indexmap::IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    #[test]
+    fn from_flow_extracts_vars_init() {
+        let flow = flow_with_extra(serde_json::json!({
+            "vars_init": {
+                "region":  { "type": "string", "default": "us-east-1" },
+                "counter": { "type": "number", "default": 0 }
+            }
+        }));
+        let host: HostFlow = HostFlow::from(flow);
+        assert_eq!(
+            host.vars_init.get("region"),
+            Some(&serde_json::json!("us-east-1"))
+        );
+        assert_eq!(host.vars_init.get("counter"), Some(&serde_json::json!(0)));
+    }
+
+    #[test]
+    fn from_flow_vars_init_absent() {
+        let flow = flow_with_extra(serde_json::json!({}));
+        let host: HostFlow = HostFlow::from(flow);
+        assert!(host.vars_init.is_empty());
+    }
+
+    #[test]
+    fn execute_once_seeds_declared_vars() {
+        // A flow with vars_init seeds state.vars before the first node runs.
+        // We verify this by using an emit.log node whose message template
+        // references {{vars.region}}: if the var is seeded, the rendered
+        // output will contain "us-east-1".
+        let node_id = NodeId::from_str("n1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "{{vars.region}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "region": { "type": "string", "default": "us-east-1" }
+                    }
+                }),
+            },
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "vars.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "vars.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        assert!(matches!(result.status, FlowStatus::Completed));
+
+        let ends = observer.ends.lock().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(
+            ends[0].get("message").and_then(Value::as_str),
+            Some("us-east-1"),
+            "vars.region must be seeded to its default and rendered in the node payload"
+        );
+    }
+
+    // ── var_set tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: var_set → emit.log, with optional vars_init.
+    ///
+    /// `var_set_input` is the raw input mapping for the var.set node,
+    /// e.g. `json!({ "name": "greeting", "value": "hi" })`.
+    /// `emit_input` is the input mapping for the emit.log node.
+    /// `vars_init_extra` is optional flow-level vars_init metadata.
+    fn var_set_flow(
+        var_set_input: Value,
+        emit_input: Value,
+        vars_init_extra: Option<Value>,
+    ) -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: var_set_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        let extra = vars_init_extra.unwrap_or(serde_json::json!({}));
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
+        let host_flow = HostFlow::from(flow);
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "var.set.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        let ends = observer.ends.lock().unwrap().clone();
+        (result.status, ends)
+    }
+
+    #[test]
+    fn var_set_node_writes_literal_value_into_vars() {
+        // A var_set node with a literal value: greeting="hi".
+        // The following emit.log node uses {{vars.greeting}} and its output
+        // proves the var was written.
+        let flow = var_set_flow(
+            json!({ "name": "greeting", "value": "hi" }),
+            json!({ "message": "{{vars.greeting}}" }),
+            None,
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // var_set node output
+        assert_eq!(ends[0].get("ok"), Some(&json!(true)), "var_set output ok");
+        // emit.log node output: vars.greeting was written
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hi"),
+            "vars.greeting must be written and renderable in the next node"
+        );
+    }
+
+    #[test]
+    fn var_set_node_writes_templated_value_with_type_preserved() {
+        // vars_init seeds counter=1 (a number).
+        // var_set copies it into "copy" via {{vars.counter}}.
+        // The emit.log node uses {{vars.copy}} as the sole message template;
+        // render_template_value returns the typed JSON number, not a string.
+        let flow = var_set_flow(
+            json!({ "name": "copy", "value": "{{vars.counter}}" }),
+            json!({ "message": "{{vars.copy}}" }),
+            Some(json!({
+                "vars_init": {
+                    "counter": { "type": "number", "default": 1 }
+                }
+            })),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // emit.log message must be the typed number 1, not the string "1"
+        assert_eq!(
+            ends[1].get("message"),
+            Some(&json!(1)),
+            "vars.copy must preserve the JSON number type from vars.counter"
+        );
+    }
+
+    #[test]
+    fn var_set_empty_name_is_skipped_not_written() {
+        // A var_set node with an empty (or whitespace-only) name must complete
+        // without panic and must NOT insert a "" key into state.vars.
+        let engine = minimal_engine();
+        let rt = Runtime::new().unwrap();
+        let retry_config = RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 1,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: Some("set1"),
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config,
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let node = HostNode {
+            kind: NodeKind::VarSet {
+                name: "".to_string(),
+                value: json!("garbage"),
+            },
+            component: "var.set".into(),
+            component_id: "var.set".into(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        };
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = Value::Null;
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "set1",
+            node: &node,
+            payload: &payload,
+        };
+
+        let outcome = rt
+            .block_on(engine.dispatch_node(
+                &ctx,
+                "set1",
+                &node,
+                &mut state,
+                payload.clone(),
+                &event,
+            ))
+            .expect("dispatch_node must not error on empty var name");
+
+        // Must return {ok: true} (not an error).
+        assert_eq!(
+            outcome.output.payload,
+            json!({ "ok": true }),
+            "dispatch must return ok:true even when name is empty"
+        );
+        // Must NOT have inserted a \"\" key into state.vars.
+        assert!(
+            state.vars.get("").is_none(),
+            "empty var name must not create a \"\" key in state.vars"
+        );
+    }
+
+    #[test]
+    fn var_set_node_has_empty_payload_expr() {
+        // Lowering a var.set Node must yield a HostNode whose payload_expr is
+        // Value::Null. The VarSet dispatch arm reads name/value directly from
+        // NodeKind::VarSet, so forwarding the mapping as payload_expr is redundant.
+        let node_id = NodeId::from_str("set1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let host_node = HostNode::from(node);
+
+        // payload_expr must be Null.
+        assert_eq!(
+            host_node.payload_expr,
+            Value::Null,
+            "var.set node must have Null payload_expr after lowering"
+        );
+        // NodeKind::VarSet must still carry the original name and value.
+        match &host_node.kind {
+            NodeKind::VarSet { name, value } => {
+                assert_eq!(name.as_str(), "greeting", "name must be preserved in kind");
+                assert_eq!(value, &json!("hi"), "value must be preserved in kind");
+            }
+            other => panic!("expected NodeKind::VarSet, got {other:?}"),
+        }
+    }
+
+    // ── vars_out tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: emit.log (with vars_out) → emit.log.
+    ///
+    /// `emit1_input` is the raw input mapping for the first emit.log node
+    /// (should include the `vars_out` binding).
+    /// `emit2_input` is the input mapping for the second emit.log node
+    /// (reads from `vars.*` to prove bindings were applied).
+    fn vars_out_flow(emit1_input: Value, emit2_input: Value) -> Flow {
+        let emit1_id = NodeId::from_str("emit1").unwrap();
+        let emit2_id = NodeId::from_str("emit2").unwrap();
+
+        let emit1_node = Node {
+            id: emit1_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit1_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit2_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit2_node = Node {
+            id: emit2_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit2_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(emit1_id.clone(), emit1_node);
+        nodes.insert(emit2_id.clone(), emit2_node);
+
+        // Reuse the same flow_id as var_set_flow so we can pass it directly to
+        // `run_var_set_flow`, which registers the flow under that key.
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(emit1_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_out_binds_node_output_into_vars() {
+        // `emit.log` outputs its rendered payload directly. Node 1 emits
+        // `{ message: "hello" }` and declares `vars_out = { lastReply:
+        // "{{prev.message}}" }`. After it runs, `state.vars["lastReply"]`
+        // must equal "hello". Node 2 reads that var so the assertion is driven
+        // from the second node's output rather than internal state.
+        let flow = vars_out_flow(
+            json!({
+                "message": "hello",
+                "vars_out": { "lastReply": "{{prev.message}}" }
+            }),
+            json!({ "message": "{{vars.lastReply}}" }),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // Node 2's message must equal the value captured by vars_out in node 1.
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hello"),
+            "vars_out binding from node 1 must be readable in node 2"
+        );
+    }
+
+    #[test]
+    fn vars_out_is_stripped_from_component_node_payload() {
+        // A component (non-emit) node whose input.mapping contains both a
+        // real field ("message") and the internal "vars_out" meta-key must NOT
+        // forward "vars_out" as part of its payload_expr. This prevents the key
+        // from leaking into wasm components with strict additionalProperties schemas.
+        //
+        // We use a PackComponent-style node (component ref = "my.component") so
+        // the non-emit arm of `impl From<Node> for HostNode` is exercised.
+        let node_id = NodeId::from_str("comp1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "my.component".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "message": "hello",
+                    "vars_out": { "lastReply": "{{prev.message}}" }
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let host_node = HostNode::from(node);
+
+        // The vars_out binding must be preserved on the HostNode itself.
+        assert!(
+            host_node.vars_out.is_some(),
+            "vars_out binding must be carried on the HostNode"
+        );
+        assert!(
+            host_node
+                .vars_out
+                .as_ref()
+                .unwrap()
+                .contains_key("lastReply"),
+            "vars_out must contain the declared binding"
+        );
+
+        // The payload_expr must NOT contain the "vars_out" key.
+        assert!(
+            host_node.payload_expr.get("vars_out").is_none(),
+            "vars_out must not appear in payload_expr (would leak to wasm component input)"
+        );
+
+        // The real input field must still be present in the payload_expr.
+        assert_eq!(
+            host_node
+                .payload_expr
+                .get("message")
+                .and_then(Value::as_str),
+            Some("hello"),
+            "real input fields must remain in payload_expr"
+        );
+    }
+
+    /// Build a three-node flow: var_set → session.wait → emit.log.
+    /// `vars_init` seeds `counter = 1`; `var_set` writes `greeting = "hello"`.
+    /// The wait parks the flow; resume runs emit.log which reads both vars.
+    fn vars_survive_flow() -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let wait_id = NodeId::from_str("wait1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hello" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: wait_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let wait_node = Node {
+            id: wait_id.clone(),
+            component: FlowComponentRef {
+                id: "session.wait".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: Value::Null,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "greeting": "{{vars.greeting}}",
+                    "counter": "{{vars.counter}}"
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(wait_id.clone(), wait_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.survive.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "counter": { "type": "number", "default": 1 }
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_survive_park_and_resume_end_to_end() {
+        // vars_init seeds counter=1; var_set writes greeting="hello"; the flow
+        // parks at session.wait; resume drives emit.log which reads both vars.
+        let flow = vars_survive_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "vars.survive.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        // First execution: must park at session.wait after var_set fires.
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after session.wait, got {other:?}"),
+        };
+
+        // Both vars must be present in the snapshot before resume.
+        assert_eq!(
+            snapshot.state.vars.get("greeting"),
+            Some(&json!("hello")),
+            "greeting var must be in snapshot"
+        );
+        assert_eq!(
+            snapshot.state.vars.get("counter"),
+            Some(&json!(1)),
+            "counter var (from vars_init) must be in snapshot"
+        );
+
+        // Resume: emit.log must read both vars from the restored state.
+        let observer2 = CountingObserver::new();
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer2),
+            mocks: None,
+        };
+        let result2 = rt
+            .block_on(engine.resume(ctx2, snapshot, Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "flow must complete after resume"
+        );
+        let ends2 = observer2.ends.lock().unwrap().clone();
+        assert_eq!(ends2.len(), 1, "only emit.log fires after resume");
+        assert_eq!(
+            ends2[0].get("greeting").and_then(Value::as_str),
+            Some("hello"),
+            "vars.greeting must survive the park/resume"
+        );
+        assert_eq!(
+            ends2[0].get("counter"),
+            Some(&json!(1)),
+            "vars.counter (vars_init) must survive the park/resume"
         );
     }
 }
