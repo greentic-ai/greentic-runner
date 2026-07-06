@@ -177,6 +177,13 @@ enum NodeKind {
     },
     BuiltinStateGet,
     BuiltinStateSet,
+    /// Session-scoped variable write: renders `value` against the current
+    /// template context and inserts into `ExecutionState.vars[name]`.
+    /// Config shape: `{ name: String, value: any }`.
+    VarSet {
+        name: String,
+        value: Value,
+    },
     Wait,
     DwAgent {
         agent_id: String,
@@ -585,7 +592,10 @@ impl FlowEngine {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
         for (name, default) in flow_ir.vars_init.iter() {
-            state.vars.entry(name.clone()).or_insert_with(|| default.clone());
+            state
+                .vars
+                .entry(name.clone())
+                .or_insert_with(|| default.clone());
         }
         self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
             .await
@@ -865,6 +875,22 @@ impl FlowEngine {
                 .execute_state_set(ctx, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::VarSet { name, value } => {
+                let prev = state.last_output.clone().unwrap_or(Value::Null);
+                let ctx_val = template_context(state, prev);
+                let rendered = render_template_value(
+                    value,
+                    &ctx_val,
+                    TemplateOptions {
+                        allow_pointer: true,
+                    },
+                )
+                .context("failed to render var_set value")?;
+                state.vars.insert(name.clone(), rendered);
+                Ok(DispatchOutcome::complete(NodeOutput::new(
+                    serde_json::json!({ "ok": true }),
+                )))
+            }
             NodeKind::Wait => {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
@@ -2447,6 +2473,7 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
             || full_ref.starts_with("agentic.")
+            || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
@@ -2502,6 +2529,22 @@ impl From<Node> for HostNode {
                 "session.wait" => NodeKind::Wait,
                 "state.get" => NodeKind::BuiltinStateGet,
                 "state.set" => NodeKind::BuiltinStateSet,
+                "var.set" => {
+                    let name = node
+                        .input
+                        .mapping
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let value = node
+                        .input
+                        .mapping
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    NodeKind::VarSet { name, value }
+                }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
                 },
@@ -2554,6 +2597,7 @@ impl From<Node> for HostNode {
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
             NodeKind::BuiltinStateGet => "state.get".to_string(),
             NodeKind::BuiltinStateSet => "state.set".to_string(),
+            NodeKind::VarSet { .. } => "var.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
@@ -5371,10 +5415,7 @@ mod tests {
             host.vars_init.get("region"),
             Some(&serde_json::json!("us-east-1"))
         );
-        assert_eq!(
-            host.vars_init.get("counter"),
-            Some(&serde_json::json!(0))
-        );
+        assert_eq!(host.vars_init.get("counter"), Some(&serde_json::json!(0)));
     }
 
     #[test]
@@ -5489,6 +5530,194 @@ mod tests {
             ends[0].get("message").and_then(Value::as_str),
             Some("us-east-1"),
             "vars.region must be seeded to its default and rendered in the node payload"
+        );
+    }
+
+    // ── var_set tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: var_set → emit.log, with optional vars_init.
+    ///
+    /// `var_set_input` is the raw input mapping for the var.set node,
+    /// e.g. `json!({ "name": "greeting", "value": "hi" })`.
+    /// `emit_input` is the input mapping for the emit.log node.
+    /// `vars_init_extra` is optional flow-level vars_init metadata.
+    fn var_set_flow(
+        var_set_input: Value,
+        emit_input: Value,
+        vars_init_extra: Option<Value>,
+    ) -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: var_set_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        let extra = vars_init_extra.unwrap_or(serde_json::json!({}));
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
+        let host_flow = HostFlow::from(flow);
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "var.set.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        let ends = observer.ends.lock().unwrap().clone();
+        (result.status, ends)
+    }
+
+    #[test]
+    fn var_set_node_writes_literal_value_into_vars() {
+        // A var_set node with a literal value: greeting="hi".
+        // The following emit.log node uses {{vars.greeting}} and its output
+        // proves the var was written.
+        let flow = var_set_flow(
+            json!({ "name": "greeting", "value": "hi" }),
+            json!({ "message": "{{vars.greeting}}" }),
+            None,
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // var_set node output
+        assert_eq!(ends[0].get("ok"), Some(&json!(true)), "var_set output ok");
+        // emit.log node output: vars.greeting was written
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hi"),
+            "vars.greeting must be written and renderable in the next node"
+        );
+    }
+
+    #[test]
+    fn var_set_node_writes_templated_value_with_type_preserved() {
+        // vars_init seeds counter=1 (a number).
+        // var_set copies it into "copy" via {{vars.counter}}.
+        // The emit.log node uses {{vars.copy}} as the sole message template;
+        // render_template_value returns the typed JSON number, not a string.
+        let flow = var_set_flow(
+            json!({ "name": "copy", "value": "{{vars.counter}}" }),
+            json!({ "message": "{{vars.copy}}" }),
+            Some(json!({
+                "vars_init": {
+                    "counter": { "type": "number", "default": 1 }
+                }
+            })),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // emit.log message must be the typed number 1, not the string "1"
+        assert_eq!(
+            ends[1].get("message"),
+            Some(&json!(1)),
+            "vars.copy must preserve the JSON number type from vars.counter"
         );
     }
 }
