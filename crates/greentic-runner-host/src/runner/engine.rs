@@ -2236,6 +2236,8 @@ pub struct ExecutionState {
     last_output: Option<Value>,
     #[serde(default)]
     redirect_count: u32,
+    #[serde(default)]
+    vars: JsonMap<String, Value>,
 }
 
 impl ExecutionState {
@@ -2247,6 +2249,7 @@ impl ExecutionState {
             egress: Vec::new(),
             last_output: None,
             redirect_count: 0,
+            vars: JsonMap::new(),
         }
     }
 
@@ -6590,6 +6593,28 @@ mod tests {
             "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
             output["output"]["reply"]
         );
+    }
+
+    #[test]
+    fn execution_state_vars_survive_serde_round_trip() {
+        // vars must persist across a park/resume, which is a serde round-trip of ExecutionState.
+        let mut st = ExecutionState::new(json!({}));
+        st.vars.insert("counter".into(), json!(3));
+        st.vars.insert("region".into(), json!("us-east-1"));
+
+        let encoded = serde_json::to_string(&st).expect("serialize");
+        let decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+
+        assert_eq!(decoded.vars.get("counter"), Some(&json!(3)));
+        assert_eq!(decoded.vars.get("region"), Some(&json!("us-east-1")));
+    }
+
+    #[test]
+    fn execution_state_vars_default_empty_for_old_snapshots() {
+        // A snapshot serialized before `vars` existed (no `vars` key) must still load.
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let decoded: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(decoded.vars.is_empty());
     }
 }
 
