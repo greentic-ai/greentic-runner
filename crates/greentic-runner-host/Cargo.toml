@@ -34,18 +34,6 @@ desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock", "
 # endpoints via GREENTIC_CHRONICLE_* env vars; chronicle is driven through the
 # provider-neutral DW LLM/embedding families (any OpenAI-compatible endpoint —
 # no single-provider lock). Absent the env, long-term stays disabled.
-long-term-chronicle = [
-    "agentic-worker",
-    "dep:greentic-dw-memory-chronicle",
-    "dep:greentic-dw-llm",
-    "dep:greentic-dw-llm-openai-compatible",
-    "dep:greentic-dw-embedding",
-    "dep:greentic-dw-embedding-openai-compatible",
-    # Turns on greentic-dw-providers-common's `pack-manifest-agents` feature so it
-    # emits PackManifest.agents against the greentic-types rev we pin (where that
-    # field is required). Without it the transitive common copy fails to compile.
-    "dep:greentic-dw-providers-common",
-]
 # Wires an operator-configured native Chronicle knowledge (document-RAG / W4)
 # backend into the agentic worker for auto pre-retrieval. Separate tier from
 # long-term-chronicle (own capability + own embedded store) but the same heavy
@@ -54,18 +42,6 @@ long-term-chronicle = [
 # (defaults to embedded SurrealDB — no external graph server). Absent the embedding
 # env, knowledge stays disabled. The runner-host edge builds the SurrealDB driver
 # here (where bindgen / RocksDB live) and injects it into the provider.
-knowledge-chronicle = [
-    "agentic-worker",
-    "dep:greentic-dw-knowledge-chronicle",
-    "dep:greentic-dw-knowledge",
-    "dep:chronicle-core",
-    "dep:chronicle-driver-surreal",
-    "dep:chronicle-driver-neo4j",
-    "dep:chronicle-driver-falkor",
-    # Same greentic-types `agents` skew as long-term-chronicle (the knowledge
-    # crates transitively pull greentic-dw-providers-common).
-    "dep:greentic-dw-providers-common",
-]
 
 [dependencies]
 async-nats = "0.46"
@@ -77,26 +53,14 @@ base64.workspace = true
 chrono.workspace = true
 cron.workspace = true
 greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.1.1", features = ["serve"], optional = true }
-greentic-dw-memory-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-llm = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-llm-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-embedding = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-embedding-openai-compatible = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
 # Pulled only to enable its `pack-manifest-agents` feature (see the
 # long-term-chronicle feature). The crate is otherwise a transitive dep of the
 # openai-compatible providers above.
-greentic-dw-providers-common = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true, features = ["pack-manifest-agents"] }
 # Knowledge (document-RAG / W4) tier. The chronicle provider + its core trait/DTOs
 # come from greentic-dw-providers; the SurrealDB driver + GraphDriver trait come
 # from greentic-chronicle-ext and are built at this edge (bindgen / RocksDB live
 # here). All optional, gated by the `knowledge-chronicle` feature.
-greentic-dw-knowledge-chronicle = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-providers.git", branch = "research", optional = true }
-chronicle-core = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-surreal = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-neo4j = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-chronicle-driver-falkor = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "c47a0738be662844faab9c16da7ce85d9bb4af97", optional = true }
+greentic-ext-runtime = { version = "=1.2.24", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
