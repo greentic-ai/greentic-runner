@@ -899,6 +899,15 @@ impl FlowEngine {
                 .await
                 .map(DispatchOutcome::complete),
             NodeKind::VarSet { name, value } => {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        "var_set node has an empty variable name; skipping write"
+                    );
+                    return Ok(DispatchOutcome::complete(NodeOutput::new(
+                        serde_json::json!({ "ok": true }),
+                    )));
+                }
                 let prev = state.last_output.clone().unwrap_or(Value::Null);
                 let ctx_val = template_context(state, prev);
                 let rendered = render_template_value(
@@ -2647,6 +2656,9 @@ impl From<Node> for HostNode {
             .cloned();
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
+            // VarSet dispatch re-reads name/value from NodeKind::VarSet directly;
+            // the payload render is redundant and must not be forwarded as node input.
+            NodeKind::VarSet { .. } => Value::Null,
             _ => {
                 // Strip the internal `vars_out` meta-key so it is never
                 // forwarded as an input field to wasm components or other
@@ -5763,6 +5775,119 @@ mod tests {
             Some(&json!(1)),
             "vars.copy must preserve the JSON number type from vars.counter"
         );
+    }
+
+    #[test]
+    fn var_set_empty_name_is_skipped_not_written() {
+        // A var_set node with an empty (or whitespace-only) name must complete
+        // without panic and must NOT insert a "" key into state.vars.
+        let engine = minimal_engine();
+        let rt = Runtime::new().unwrap();
+        let retry_config = RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 1,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: Some("set1"),
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config,
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let node = HostNode {
+            kind: NodeKind::VarSet {
+                name: "".to_string(),
+                value: json!("garbage"),
+            },
+            component: "var.set".into(),
+            component_id: "var.set".into(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        };
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = Value::Null;
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "set1",
+            node: &node,
+            payload: &payload,
+        };
+
+        let outcome = rt
+            .block_on(engine.dispatch_node(
+                &ctx,
+                "set1",
+                &node,
+                &mut state,
+                payload.clone(),
+                &event,
+            ))
+            .expect("dispatch_node must not error on empty var name");
+
+        // Must return {ok: true} (not an error).
+        assert_eq!(
+            outcome.output.payload,
+            json!({ "ok": true }),
+            "dispatch must return ok:true even when name is empty"
+        );
+        // Must NOT have inserted a \"\" key into state.vars.
+        assert!(
+            state.vars.get("").is_none(),
+            "empty var name must not create a \"\" key in state.vars"
+        );
+    }
+
+    #[test]
+    fn var_set_node_has_empty_payload_expr() {
+        // Lowering a var.set Node must yield a HostNode whose payload_expr is
+        // Value::Null. The VarSet dispatch arm reads name/value directly from
+        // NodeKind::VarSet, so forwarding the mapping as payload_expr is redundant.
+        let node_id = NodeId::from_str("set1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let host_node = HostNode::from(node);
+
+        // payload_expr must be Null.
+        assert_eq!(
+            host_node.payload_expr,
+            Value::Null,
+            "var.set node must have Null payload_expr after lowering"
+        );
+        // NodeKind::VarSet must still carry the original name and value.
+        match &host_node.kind {
+            NodeKind::VarSet { name, value } => {
+                assert_eq!(name.as_str(), "greeting", "name must be preserved in kind");
+                assert_eq!(value, &json!("hi"), "value must be preserved in kind");
+            }
+            other => panic!("expected NodeKind::VarSet, got {other:?}"),
+        }
     }
 
     // ── vars_out tests ──────────────────────────────────────────────────────
