@@ -149,7 +149,7 @@ version = "=1.1.1"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = "=1.1.1"
+version = "=1.1.2"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
