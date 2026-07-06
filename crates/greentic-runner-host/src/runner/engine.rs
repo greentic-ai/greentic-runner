@@ -5917,16 +5917,16 @@ mod tests {
 
         // The payload_expr must NOT contain the "vars_out" key.
         assert!(
-            host_node
-                .payload_expr
-                .get("vars_out")
-                .is_none(),
+            host_node.payload_expr.get("vars_out").is_none(),
             "vars_out must not appear in payload_expr (would leak to wasm component input)"
         );
 
         // The real input field must still be present in the payload_expr.
         assert_eq!(
-            host_node.payload_expr.get("message").and_then(Value::as_str),
+            host_node
+                .payload_expr
+                .get("message")
+                .and_then(Value::as_str),
             Some("hello"),
             "real input fields must remain in payload_expr"
         );
