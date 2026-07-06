@@ -2647,7 +2647,16 @@ impl From<Node> for HostNode {
             .cloned();
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
-            _ => node.input.mapping.clone(),
+            _ => {
+                // Strip the internal `vars_out` meta-key so it is never
+                // forwarded as an input field to wasm components or other
+                // non-emit node kinds (which may have strict schemas).
+                let mut mapping = node.input.mapping.clone();
+                if let Some(obj) = mapping.as_object_mut() {
+                    obj.remove("vars_out");
+                }
+                mapping
+            }
         };
         Self {
             kind,
@@ -5856,6 +5865,70 @@ mod tests {
             ends[1].get("message").and_then(Value::as_str),
             Some("hello"),
             "vars_out binding from node 1 must be readable in node 2"
+        );
+    }
+
+    #[test]
+    fn vars_out_is_stripped_from_component_node_payload() {
+        // A component (non-emit) node whose input.mapping contains both a
+        // real field ("message") and the internal "vars_out" meta-key must NOT
+        // forward "vars_out" as part of its payload_expr. This prevents the key
+        // from leaking into wasm components with strict additionalProperties schemas.
+        //
+        // We use a PackComponent-style node (component ref = "my.component") so
+        // the non-emit arm of `impl From<Node> for HostNode` is exercised.
+        let node_id = NodeId::from_str("comp1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "my.component".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "message": "hello",
+                    "vars_out": { "lastReply": "{{prev.message}}" }
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+
+        let host_node = HostNode::from(node);
+
+        // The vars_out binding must be preserved on the HostNode itself.
+        assert!(
+            host_node.vars_out.is_some(),
+            "vars_out binding must be carried on the HostNode"
+        );
+        assert!(
+            host_node
+                .vars_out
+                .as_ref()
+                .unwrap()
+                .contains_key("lastReply"),
+            "vars_out must contain the declared binding"
+        );
+
+        // The payload_expr must NOT contain the "vars_out" key.
+        assert!(
+            host_node
+                .payload_expr
+                .get("vars_out")
+                .is_none(),
+            "vars_out must not appear in payload_expr (would leak to wasm component input)"
+        );
+
+        // The real input field must still be present in the payload_expr.
+        assert_eq!(
+            host_node.payload_expr.get("message").and_then(Value::as_str),
+            Some("hello"),
+            "real input fields must remain in payload_expr"
         );
     }
 
