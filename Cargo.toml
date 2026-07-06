@@ -20,7 +20,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.1.0"
+version = "1.1.1-dev.0"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -30,11 +30,11 @@ base64 = "0.22"
 futures = "0.3"
 # Floor pinned to the version that introduced `greentic_flow::SLOT_SCHEMA_METADATA_KEY`,
 # consumed by the runner's `HostFlow::from(Flow)` conversion.
-greentic-flow = ">=1.1.0-0, <1.2.0-0"
-greentic-session = ">=1.1.0-0, <1.2.0-0"
-greentic-state = ">=1.1.0-0, <1.2.0-0"
-greentic-config = ">=1.1.0-0, <1.2.0-0"
-greentic-config-types = ">=1.1.0-0, <1.2.0-0"
+greentic-flow = ">=1.1.0-dev, <1.2.0-0"
+greentic-session = ">=1.1.0-dev, <1.2.0-0"
+greentic-state = ">=1.1.0-dev, <1.2.0-0"
+greentic-config = ">=1.1.0-dev, <1.2.0-0"
+greentic-config-types = ">=1.1.0-dev, <1.2.0-0"
 greentic-deploy-spec = ">=0.1.0-0, <0.2.0-0"
 greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
 hex = "0.4"
@@ -67,7 +67,7 @@ serial_test = "3"
 toml = "1"
 # Floor pinned to the C5.1 publish: `TelemetryCtx::kv()` must include
 # `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
-greentic-telemetry = ">=1.1.0-0, <1.2.0-0"
+greentic-telemetry = ">=1.1.0-dev, <1.2.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "45"
 wasmtime-wasi-tls = "45"
@@ -108,7 +108,7 @@ features = [
 # (incl. M1.1a) lack the const, so `tenant_ctx()` in
 # `engine::runtime::IngressEnvelope` would fail to compile.
 [workspace.dependencies.greentic-types]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.1.0-dev, <1.2.0-0"
 default-features = false
 features = [
     "std",
@@ -158,15 +158,15 @@ version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.1.1-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.1.1-dev, <1.2.0-0"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.1.1-dev, <1.2.0-0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
