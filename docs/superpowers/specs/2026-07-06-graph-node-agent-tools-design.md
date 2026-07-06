@@ -28,7 +28,7 @@ The graph schema declares tools as flat `Vec<String>`, but `ToolRef` is `{extens
 
 **Out (v1, documented follow-ups):**
 - `run_one_supervisor_turn` (`graph_node.rs:1199`) keeps `tools: vec![]` — supervisor nodes have no `tools` in their schema (correct, not a gap).
-- `mcp: None` on the graph runtime (`graph_node.rs:1065`) stays — **design-extension** tools resolve (real `ext_runtime` present), but `mcp:`/`component:`-prefixed tools would need an `McpToolSource` wired like the `dw.agent` path. Deferred; if a graph author declares an `mcp:` tool it warn+drops (documented).
+- No `McpToolSource` is attached to the graph runtime (the graph handler passes `None` for the MCP source) — **design-extension** tools resolve (real `ext_runtime` present), but `mcp:`/`component:`-prefixed tools would need an `McpToolSource` wired like the `dw.agent` path. Deferred; such a ref parses fine but warn+drops at resolution inside the runtime (documented). (`AgentConfig` itself has no `mcp` field — the tool source is a separate `AgentRuntime` argument.)
 - **Designer emitting `tools` on graph agent nodes** — the designer currently emits `"tools": []` for graph nodes (`graph_to_flow.rs:102`). This slice makes the runner *honor* declared tools; a hand-authored `.ygtc` or a future designer change can populate them. Designer UX is a separate follow-up.
 
 ## 5. Testing (offline)
