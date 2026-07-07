@@ -680,3 +680,94 @@ async fn recall_missing_key_returns_null() {
         "expected null value for missing key, got: {recall_result}"
     );
 }
+
+#[tokio::test]
+async fn conversational_agent_is_offered_end_conversation_tool() {
+    // conversational = true → the LLM request must carry the `end_conversation`
+    // tool and the system prompt must carry the accompanying note.
+    let llm = Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))]));
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", c);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    );
+    let out = rt
+        .step(
+            tc,
+            "sess-conv",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply); // no tool called here
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        tools[0].iter().any(|t| t == "end_conversation"),
+        "expected 'end_conversation' in tool list: {:?}",
+        tools[0]
+    );
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(
+        prompts[0].contains("end_conversation"),
+        "expected system prompt to mention 'end_conversation': {:?}",
+        prompts[0]
+    );
+}
+
+#[tokio::test]
+async fn non_conversational_agent_has_no_end_conversation_tool() {
+    // conversational defaults to false → neither the tool nor the note appear.
+    let llm = Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))]));
+    let c = cfg(4, 5_000, vec![], None);
+    let cp = MockConfigProvider::new();
+    let tc = TenantContext::new("acme", "prod");
+    cp.insert(&tc, "a", c);
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let rt = AgentRuntime::new(
+        Arc::new(cp),
+        Arc::new(MockAgentStateStore::new()),
+        ext,
+        llm.clone(),
+        Arc::new(MockTelemetry::new()),
+        Arc::new(MockTokenMeter::new(0)),
+        Arc::new(NoopToolLedger),
+        None,
+    );
+    let _ = rt
+        .step(
+            tc,
+            "sess-conv",
+            "a",
+            AgentInput {
+                text: "hello".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let tools = llm.seen_tool_names.lock().unwrap();
+    assert!(
+        !tools[0].iter().any(|t| t == "end_conversation"),
+        "unexpected 'end_conversation' in tool list: {:?}",
+        tools[0]
+    );
+    let prompts = llm.seen_system_prompts.lock().unwrap();
+    assert!(
+        !prompts[0].contains("end_conversation"),
+        "unexpected 'end_conversation' note in system prompt: {:?}",
+        prompts[0]
+    );
+}

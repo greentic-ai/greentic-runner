@@ -174,6 +174,9 @@ pub async fn run_step(
     // wired + the agent's binding enabled). Drives `remember`/`recall` tools.
     let st_active =
         crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
+    // Whether the `end_conversation` tool + system-prompt note are offered
+    // this turn. Only conversational agents get either.
+    let conv_active = crate::end_conversation::conversational_active(&config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -209,6 +212,14 @@ pub async fn run_step(
             .await
             .unwrap_or_default();
         crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+    } else {
+        system_prompt
+    };
+
+    // --- Conversational note: tell the model the `end_conversation` tool
+    // exists and when to call it. Applied only for conversational agents. ---
+    let system_prompt = if conv_active {
+        crate::end_conversation::augment_system_prompt(&system_prompt)
     } else {
         system_prompt
     };
@@ -287,6 +298,9 @@ pub async fn run_step(
         if st_active {
             tools_schema.push(crate::short_term::remember_tool_schema());
             tools_schema.push(crate::short_term::recall_tool_schema());
+        }
+        if conv_active {
+            tools_schema.push(crate::end_conversation::end_conversation_tool_schema());
         }
         let request = LlmRequest {
             system_prompt: system_prompt.clone(),
