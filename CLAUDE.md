@@ -89,6 +89,15 @@ Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPEN
 Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
 
+An agent may be marked `conversational` (`AgentConfig.conversational`, default false).
+Conversational agents are offered a host built-in `end_conversation` tool (reserved `host`
+extension id) plus a system-prompt note; when the model calls it, the loop terminates the
+turn with `TerminationReason::ConversationEnded` and the closing message (`final_message`
+arg, else the accompanying reply) becomes the final reply — routed through the same
+outbound-guardrail/save path as a normal `FinalReply`. This is SP1 of the in-flow
+conversational chat-segment epic (`docs/superpowers/specs/2026-07-07-conversational-agent-chat-segment-epic-design.md`);
+the flow park-and-loop reaction to `ConversationEnded` is SP2 (runner engine).
+
 ### Async runtime dispatch (`sorla.call` node)
 
 A native flow node `sorla.call` (component `sorla.call`, operation = the sorx target)

@@ -174,6 +174,9 @@ pub async fn run_step(
     // wired + the agent's binding enabled). Drives `remember`/`recall` tools.
     let st_active =
         crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
+    // Whether the `end_conversation` tool + system-prompt note are offered
+    // this turn. Only conversational agents get either.
+    let conv_active = crate::end_conversation::conversational_active(&config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -209,6 +212,14 @@ pub async fn run_step(
             .await
             .unwrap_or_default();
         crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+    } else {
+        system_prompt
+    };
+
+    // --- Conversational note: tell the model the `end_conversation` tool
+    // exists and when to call it. Applied only for conversational agents. ---
+    let system_prompt = if conv_active {
+        crate::end_conversation::augment_system_prompt(&system_prompt)
     } else {
         system_prompt
     };
@@ -288,6 +299,9 @@ pub async fn run_step(
             tools_schema.push(crate::short_term::remember_tool_schema());
             tools_schema.push(crate::short_term::recall_tool_schema());
         }
+        if conv_active {
+            tools_schema.push(crate::end_conversation::end_conversation_tool_schema());
+        }
         let request = LlmRequest {
             system_prompt: system_prompt.clone(),
             history: state.messages.clone(),
@@ -344,6 +358,38 @@ pub async fn run_step(
 
         // --- Mixed text + tool_calls: tool_calls win (spec Decision 12) ---
         if !response.tool_calls.is_empty() {
+            // --- Host built-in: `end_conversation` (conversational agents) ---
+            // Agent-driven exit signal (SP1). Short-circuit BEFORE recording the
+            // multi-tool assistant message so saved history carries no dangling
+            // tool_call. Any co-occurring tool calls are ignored — the agent
+            // chose to end the conversation.
+            if conv_active
+                && let Some(end_call) = response
+                    .tool_calls
+                    .iter()
+                    .find(|c| c.tool_name == crate::end_conversation::END_CONVERSATION_TOOL)
+            {
+                observer.on_tool_call(&end_call.tool_name, &end_call.call_id);
+                let closing = end_call
+                    .args
+                    .get("final_message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| response.content.clone())
+                    .unwrap_or_default();
+                let ok = serde_json::json!({ "ok": true });
+                observer.on_tool_result(&end_call.tool_name, &end_call.call_id, &ok);
+                trail.push(AgentStep::ToolCall {
+                    name: end_call.tool_name.clone(),
+                    call_id: end_call.call_id.clone(),
+                    result: ok,
+                });
+                reply = closing;
+                terminated_by = TerminationReason::ConversationEnded;
+                break;
+            }
+
             // Record the assistant's tool-call turn BEFORE the tool results.
             // OpenAI requires every `tool` message to follow an assistant
             // message carrying the matching `tool_calls`; without this the next
@@ -516,7 +562,10 @@ pub async fn run_step(
     // Only a real final reply (where the LLM produced content) is subject to
     // outbound policy; the assistant message and audit trail are written only
     // after this check passes, so saved state reflects the guarded reply.
-    if terminated_by == TerminationReason::FinalReply {
+    if matches!(
+        terminated_by,
+        TerminationReason::FinalReply | TerminationReason::ConversationEnded
+    ) {
         let reply = match crate::guardrail::run_chain(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Outbound,
@@ -740,6 +789,7 @@ mod tests {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
         }
     }
 

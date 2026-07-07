@@ -384,6 +384,7 @@ fn build_full_runtime(
         },
         memory: None,
         knowledge: None,
+        conversational: false,
     };
 
     let cp = MockConfigProvider::new();

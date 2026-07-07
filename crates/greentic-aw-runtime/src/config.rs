@@ -116,6 +116,12 @@ pub struct AgentConfig {
     pub memory: Option<MemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<KnowledgeSettings>,
+    /// Opt-in: when true this agent is a multi-turn conversation segment and is
+    /// offered the host built-in `end_conversation` tool (SP1). Threaded from the
+    /// flow node's `conversational` flag by SP2/SP3. Default false = today's
+    /// one-shot behaviour.
+    #[serde(default)]
+    pub conversational: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,6 +335,7 @@ mod tests {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -348,6 +355,18 @@ mod tests {
         }"#;
         let cfg: AgentConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.guardrails.is_empty());
+    }
+
+    #[test]
+    fn conversational_defaults_false_when_absent() {
+        let json = r#"{
+            "agent_id": "a",
+            "system_prompt": "s",
+            "tools": [],
+            "llm": { "provider": "openai", "model": "m" }
+        }"#;
+        let cfg: AgentConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.conversational);
     }
 
     #[test]
