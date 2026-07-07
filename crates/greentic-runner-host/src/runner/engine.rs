@@ -193,6 +193,9 @@ enum NodeKind {
     Wait,
     DwAgent {
         agent_id: String,
+        /// SP2: opt into multi-turn conversation-segment park-loop behaviour.
+        /// SP3 will populate this from the flow doc; the loader defaults it false.
+        conversational: bool,
     },
     DwAgentGraph {
         graph_id: String,
@@ -927,7 +930,10 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
-            NodeKind::DwAgent { agent_id } => {
+            NodeKind::DwAgent {
+                agent_id,
+                conversational: _,
+            } => {
                 #[cfg(feature = "agentic-worker")]
                 match self.dw_agent_dispatch {
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
@@ -2579,6 +2585,7 @@ impl From<Node> for HostNode {
                 }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
+                    conversational: false, // SP3 will populate from the flow doc
                 },
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
