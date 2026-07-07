@@ -452,6 +452,30 @@ mod aw {
         )))
     }
 
+    /// Build the flow tool source from the operator's loaded packs, gated by
+    /// `GREENTIC_AW_FLOW_TOOLS` (set to "0" to disable). Returns `None` when
+    /// disabled or when no packs are loaded, so `flow:` tool refs then resolve
+    /// to nothing. Mirrors [`component_source_from_packs`] but discovers tools
+    /// from in-pack flows rather than in-pack components.
+    pub(crate) fn flow_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+    ) -> Option<Arc<greentic_aw_runtime::FlowToolSource>> {
+        if std::env::var("GREENTIC_AW_FLOW_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_FLOW_TOOLS=0; flow tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+        let invoker = Arc::new(crate::runner::flow_invoker::PackRuntimeFlowInvoker::new(
+            packs.to_vec(),
+            tenant.to_string(),
+        ));
+        tracing::info!(tenant = %tenant, packs = packs.len(), "flow tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::FlowToolSource::new(invoker)))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -948,7 +972,8 @@ mod aw {
                 ledger,
                 mcp_source_from_env(),
             )
-            .with_component_source(component_source_from_packs(&packs, &tenant)),
+            .with_component_source(component_source_from_packs(&packs, &tenant))
+            .with_flow_source(flow_source_from_packs(&packs, &tenant)),
         );
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
@@ -2108,6 +2133,28 @@ mod aw {
             assert_eq!(blobs["b"]["from"], "sidecar"); // gap filled
             assert_eq!(blobs.len(), 2);
         }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn flow_source_disabled_by_env_and_empty_packs() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_FLOW_TOOLS", "0");
+            }
+            assert!(
+                super::flow_source_from_packs(&[], "acme").is_none(),
+                "GREENTIC_AW_FLOW_TOOLS=0 must disable the flow tool source"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_FLOW_TOOLS");
+            }
+            assert!(
+                super::flow_source_from_packs(&[], "acme").is_none(),
+                "empty packs => None even when gate is unset"
+            );
+        }
     }
 }
 
@@ -2254,3 +2301,6 @@ pub(crate) use aw::{
     EnvSecretsBackend, build_ext_runtime, build_llm_backend, component_source_from_packs,
     mcp_source_from_env,
 };
+
+// flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores
+// + tests) so it stays pub(crate) there without a top-level re-export.
