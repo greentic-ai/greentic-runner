@@ -15,6 +15,7 @@
 
 pub mod billing;
 pub mod component_source;
+pub mod flow_source;
 pub mod config;
 pub mod config_provider;
 pub mod cost;
@@ -58,6 +59,7 @@ pub use component_source::{
     ComponentInvoker, ComponentOperation, ComponentToolCatalog, ComponentToolEntry,
     ComponentToolSource,
 };
+pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use config::{
     AgentConfig, AgentLimits, LlmProviderRef, MemoryProviderRef, MemorySettings, ToolRef,
 };
