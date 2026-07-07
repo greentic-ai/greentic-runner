@@ -101,16 +101,25 @@ pub fn list_tools_for_llm(
             continue;
         }
         if let Some(flow_ref) = t.extension_id.strip_prefix("flow:") {
-            match flows.and_then(|c| c.tool_entry(flow_ref)) {
-                Some(entry) => out.push(LlmToolSchema {
+            let entry = flows.and_then(|c| c.tool_entry(flow_ref));
+            let description = t
+                .description
+                .clone()
+                .or_else(|| entry.map(|e| e.description.clone()));
+            let parameters = t
+                .input_schema
+                .clone()
+                .or_else(|| entry.map(|e| e.parameters.clone()));
+            match (description, parameters) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: entry.description.clone(),
-                    parameters: entry.parameters.clone(),
+                    description,
+                    parameters,
                 }),
-                None => tracing::warn!(
+                _ => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
-                    "flow tool not found in catalog; dropping from LLM tool list"
+                    "flow tool has neither an author contract nor a catalog entry; dropping from LLM tool list"
                 ),
             }
             continue;
@@ -827,6 +836,59 @@ mod tests {
                 }
             })
         }
+    }
+
+    fn ext_runtime_stub() -> ExtensionRuntime {
+        ExtensionRuntime::for_test()
+    }
+
+    fn test_flow_invoker() -> FakeFlowInvoker {
+        FakeFlowInvoker
+    }
+
+    #[test]
+    fn flow_tool_prefers_author_contract_over_catalog() {
+        // Catalog has flow "lookup" with its own description + parameters.
+        // ToolRef carries author overrides — these must win.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: Some("Author description".into()),
+            input_schema: Some(
+                serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
+            ),
+        }];
+        let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
+        let s = schemas
+            .iter()
+            .find(|s| s.extension_id == "flow:lookup")
+            .expect("flow tool listed");
+        assert_eq!(
+            s.description, "Author description",
+            "override description must win over catalog"
+        );
+        assert_eq!(
+            s.parameters["properties"]["q"]["type"], "string",
+            "override schema must win over catalog"
+        );
+    }
+
+    #[test]
+    fn flow_tool_falls_back_to_catalog_when_no_override() {
+        // ToolRef has no override — the catalog entry must be used.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
+        }];
+        let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
+        assert!(
+            schemas.iter().any(|s| s.extension_id == "flow:lookup"),
+            "with no override the catalog entry must still be used to list the tool"
+        );
     }
 
     #[tokio::test]
