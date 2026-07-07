@@ -258,8 +258,14 @@ mod tool_ref_author_contract_tests {
             input_schema: None,
         };
         let json = serde_json::to_string(&t).unwrap();
-        assert!(!json.contains("description"), "None description must be omitted: {json}");
-        assert!(!json.contains("input_schema"), "None input_schema must be omitted: {json}");
+        assert!(
+            !json.contains("description"),
+            "None description must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("input_schema"),
+            "None input_schema must be omitted: {json}"
+        );
     }
 
     #[test]
@@ -268,7 +274,9 @@ mod tool_ref_author_contract_tests {
             extension_id: "flow:refund".into(),
             tool_name: "refund_lookup".into(),
             description: Some("Look up a refund".into()),
-            input_schema: Some(serde_json::json!({"type":"object","properties":{"order_id":{"type":"string"}}})),
+            input_schema: Some(
+                serde_json::json!({"type":"object","properties":{"order_id":{"type":"string"}}}),
+            ),
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: ToolRef = serde_json::from_str(&json).unwrap();
