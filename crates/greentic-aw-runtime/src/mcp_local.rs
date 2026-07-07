@@ -205,4 +205,59 @@ mod tests {
         let out = local_call_tool("nope", "echo", &serde_json::json!({})).await;
         assert!(out.to_string().contains("error"), "got: {out}");
     }
+
+    #[test]
+    #[serial_test::serial]
+    fn cache_dir_uses_extensions_dir_fallback() {
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::set_var("GREENTIC_EXTENSIONS_DIR", "/tmp/ext");
+        }
+        assert_eq!(cache_dir(), PathBuf::from("/tmp/ext/mcp-local"));
+        unsafe { std::env::remove_var("GREENTIC_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cache_dir_defaults_to_dot_mcp_local() {
+        unsafe {
+            std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR");
+            std::env::remove_var("GREENTIC_EXTENSIONS_DIR");
+        }
+        assert_eq!(cache_dir(), PathBuf::from(".mcp-local"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exec_config_verified_when_sidecar_present() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
+        // Write a sidecar digest file for "mycomp.wasm.sha256".
+        let sidecar = dir.path().join("mycomp.wasm.sha256");
+        std::fs::write(&sidecar, "abcdef1234567890").unwrap();
+        let config = exec_config_for("mycomp");
+        assert!(
+            !config.security.allow_unverified,
+            "sidecar present → allow_unverified must be false"
+        );
+        assert_eq!(
+            config.security.required_digests.get("mycomp"),
+            Some(&"abcdef1234567890".to_string()),
+        );
+        unsafe { std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR") };
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exec_config_unverified_without_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("GREENTIC_MCP_LOCAL_CACHE_DIR", dir.path()) };
+        let config = exec_config_for("nosidecar");
+        assert!(
+            config.security.allow_unverified,
+            "no sidecar → allow_unverified must be true"
+        );
+        assert!(config.security.required_digests.is_empty());
+        unsafe { std::env::remove_var("GREENTIC_MCP_LOCAL_CACHE_DIR") };
+    }
 }
