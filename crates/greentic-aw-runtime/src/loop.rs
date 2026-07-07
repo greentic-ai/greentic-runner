@@ -230,6 +230,14 @@ pub async fn run_step(
         None => None,
     };
 
+    // Resolve the per-tenant flow tool catalog once per step (mirrors the
+    // component catalog above). Infallible + TTL-cached; `None` source → no
+    // `flow:` tools at all.
+    let flow_catalog = match runtime.flows.as_ref() {
+        Some(src) => Some(src.catalog(&tenant).await),
+        None => None,
+    };
+
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
     // agent runs with a smaller — or empty — tool set, then hallucinates tool
@@ -240,6 +248,7 @@ pub async fn run_step(
             &runtime.ext_runtime,
             mcp_catalog.as_deref(),
             component_catalog.as_deref(),
+            flow_catalog.as_deref(),
             &config.tools,
         ),
         config.tools.len(),
@@ -269,6 +278,7 @@ pub async fn run_step(
             &runtime.ext_runtime,
             mcp_catalog.as_deref(),
             component_catalog.as_deref(),
+            flow_catalog.as_deref(),
             &config.tools,
         );
         if lt_active {
@@ -436,6 +446,7 @@ pub async fn run_step(
                     runtime.ext_runtime.clone(),
                     mcp_catalog.clone(),
                     component_catalog.clone(),
+                    flow_catalog.clone(),
                     call.clone(),
                     &tenant,
                 )
