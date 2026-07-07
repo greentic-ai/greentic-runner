@@ -69,10 +69,14 @@ fn maps_agentic_worker_tools_to_tool_refs() {
             ToolRef {
                 extension_id: "greentic.http".to_string(),
                 tool_name: "fetch".to_string(),
+                description: None,
+                input_schema: None,
             },
             ToolRef {
                 extension_id: "greentic.cards".to_string(),
                 tool_name: "validate".to_string(),
+                description: None,
+                input_schema: None,
             },
         ]
     );
@@ -92,6 +96,8 @@ fn skips_tools_without_agentic_worker_capability() {
         vec![ToolRef {
             extension_id: "greentic.http".to_string(),
             tool_name: "fetch".to_string(),
+            description: None,
+            input_schema: None,
         }]
     );
 }
@@ -118,10 +124,14 @@ fn deduplicates_exact_pairs_keeping_first() {
             ToolRef {
                 extension_id: "greentic.http".to_string(),
                 tool_name: "fetch".to_string(),
+                description: None,
+                input_schema: None,
             },
             ToolRef {
                 extension_id: "greentic.http".to_string(),
                 tool_name: "post".to_string(),
+                description: None,
+                input_schema: None,
             },
         ]
     );

@@ -1877,7 +1877,9 @@ mod aw {
                 cfg.tools,
                 vec![ToolRef {
                     extension_id: "greentic.tavily".into(),
-                    tool_name: "web_search".into()
+                    tool_name: "web_search".into(),
+                    description: None,
+                    input_schema: None,
                 }]
             );
         }

@@ -32,6 +32,8 @@ async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
     let allowed = vec![ToolRef {
         extension_id: "greentic.absent".into(),
         tool_name: "nope".into(),
+        description: None,
+        input_schema: None,
     }];
 
     // A tool whose extension isn't loaded never reaches the LLM's tool list.

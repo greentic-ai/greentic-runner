@@ -173,6 +173,8 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
     let allowed = vec![ToolRef {
         extension_id: "http".into(),
         tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
     }];
     let script = vec![
         Ok(tool_call("c1", "http", "fetch")),
@@ -216,6 +218,8 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
     let allowed = vec![ToolRef {
         extension_id: "http".into(),
         tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
     }];
     let mixed = LlmResponse {
         content: Some("internal reasoning".into()),
