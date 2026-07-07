@@ -193,6 +193,9 @@ enum NodeKind {
     Wait,
     DwAgent {
         agent_id: String,
+        /// SP2: opt into multi-turn conversation-segment park-loop behaviour.
+        /// SP3 will populate this from the flow doc; the loader defaults it false.
+        conversational: bool,
     },
     DwAgentGraph {
         graph_id: String,
@@ -820,6 +823,27 @@ impl FlowEngine {
                         FlowWait { reason, snapshot },
                     ));
                 }
+                NodeControl::LoopHere { reason } => {
+                    // Conversational dw.agent: park and re-enter THIS node so the
+                    // next user message drives the next turn. Render the reply
+                    // (finalize_with Some) — unlike NodeControl::Wait, which
+                    // resumes at the successor and finalizes with None.
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(),
+                        state: snapshot_state,
+                    };
+                    let output_value = state.finalize_with(Some(output.payload.clone()));
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                    ));
+                }
                 NodeControl::Jump(jump) => {
                     let jump_target = self.apply_jump(&step_ctx, &mut state, jump).await?;
                     flow_ir = jump_target.flow;
@@ -927,7 +951,10 @@ impl FlowEngine {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
             }
-            NodeKind::DwAgent { agent_id } => {
+            NodeKind::DwAgent {
+                agent_id,
+                conversational,
+            } => {
                 #[cfg(feature = "agentic-worker")]
                 match self.dw_agent_dispatch {
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
@@ -939,15 +966,38 @@ impl FlowEngine {
                         self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
                             .await
                     }
-                    crate::runner::agent_node::DwAgentDispatch::InProcess => self
-                        .execute_dw_agent(ctx, agent_id, payload)
-                        .await
-                        .map(DispatchOutcome::complete),
+                    crate::runner::agent_node::DwAgentDispatch::InProcess => {
+                        let output = self.execute_dw_agent(ctx, agent_id, payload).await?;
+                        if *conversational {
+                            let ended = output
+                                .payload
+                                .get("terminated_by")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("conversation_ended");
+                            if ended {
+                                Ok(DispatchOutcome::complete(output))
+                            } else {
+                                Ok(DispatchOutcome::with_control(
+                                    output,
+                                    NodeControl::LoopHere {
+                                        reason: Some(format!(
+                                            "conversational dw.agent `{agent_id}` awaiting next user message"
+                                        )),
+                                    },
+                                ))
+                            }
+                        } else {
+                            Ok(DispatchOutcome::complete(output))
+                        }
+                    }
                 }
                 #[cfg(not(feature = "agentic-worker"))]
-                self.execute_dw_agent(ctx, agent_id, payload)
-                    .await
-                    .map(DispatchOutcome::complete)
+                {
+                    let _ = conversational;
+                    self.execute_dw_agent(ctx, agent_id, payload)
+                        .await
+                        .map(DispatchOutcome::complete)
+                }
             }
             NodeKind::DwAgentGraph { graph_id } => self
                 .execute_dw_agent_graph(ctx, graph_id, payload)
@@ -2173,6 +2223,14 @@ enum NodeControl {
     Wait {
         reason: Option<String>,
     },
+    /// Park the flow and RE-ENTER this same node on the next inbound activity
+    /// (conversational `dw.agent` loop), rendering the node output first.
+    /// Unlike `Wait` (which resumes at the routing successor and renders
+    /// nothing), `LoopHere` sets the resume target to the current node and
+    /// renders the reply.
+    LoopHere {
+        reason: Option<String>,
+    },
     Jump(JumpControl),
     Respond {
         text: Option<String>,
@@ -2579,6 +2637,7 @@ impl From<Node> for HostNode {
                 }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
+                    conversational: false, // SP3 will populate from the flow doc
                 },
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
@@ -6266,6 +6325,192 @@ mod tests {
             Some(&json!(1)),
             "vars.counter (vars_init) must survive the park/resume"
         );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    struct StubAgentHandler {
+        payload: serde_json::Value,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for StubAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a 2-node flow: a `dw.agent` node (id "agent", conversational as
+    /// given) routing to an emit "thanks" node that ends the flow.
+    #[cfg(feature = "agentic-worker")]
+    fn conversational_dw_flow(conversational: bool) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let agent_id = NodeId::from_str("agent").unwrap();
+        let thanks_id = NodeId::from_str("thanks").unwrap();
+        nodes.insert(
+            agent_id.clone(),
+            HostNode {
+                kind: NodeKind::DwAgent {
+                    agent_id: "a".to_string(),
+                    conversational,
+                },
+                component: "dw.agent".to_string(),
+                component_id: "dw.agent".to_string(),
+                operation_name: Some("a".to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "user_text": "hi" }),
+                routing: Routing::Next {
+                    node_id: thanks_id.clone(),
+                },
+                vars_out: None,
+            },
+        );
+        nodes.insert(
+            thanks_id.clone(),
+            HostNode {
+                kind: NodeKind::BuiltinEmit {
+                    kind: EmitKind::Response,
+                },
+                component: "emit.response".to_string(),
+                component_id: "emit.response".to_string(),
+                operation_name: None,
+                operation_in_mapping: None,
+                payload_expr: json!({ "text": "thanks" }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            id: "conv.flow".to_string(),
+            start: Some(agent_id),
+            nodes,
+            vars_init: JsonMap::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with a stub agent handler returning `payload`.
+    /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
+        FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn conv_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "conv.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-conv"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_parks_and_loops_on_normal_reply() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (park-loop), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "must re-enter the dw.agent node itself"
+        );
+        // The reply is rendered in the parked output.
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent reply must be rendered before parking: {:?}",
+            result.output
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_advances_on_conversation_ended() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended must advance to the successor and complete, got {:?}",
+            result.status
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn non_conversational_dw_agent_never_loops() {
+        // Even with terminated_by == conversation_ended, a non-conversational
+        // node just routes onward (today's one-shot behaviour) — never parks.
+        for tb in ["final_reply", "conversation_ended"] {
+            let engine = conv_engine(
+                conversational_dw_flow(false),
+                json!({ "reply": "x", "trail": [], "terminated_by": tb }),
+            );
+            let rt = Runtime::new().unwrap();
+            let result = rt
+                .block_on(engine.execute(conv_ctx(), Value::Null))
+                .unwrap();
+            assert!(
+                matches!(result.status, FlowStatus::Completed),
+                "non-conversational must complete (route onward) for terminated_by={tb}, got {:?}",
+                result.status
+            );
+        }
     }
 }
 
