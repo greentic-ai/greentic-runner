@@ -366,7 +366,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aw-event-bridge"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2248,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-aw-runtime"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -2336,9 +2336,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-deploy-spec"
-version = "0.1.28777598365"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72015bf24e28c0d3474111d30e96008d4919413dbe9861a18aba1404f3a5e0f3"
+checksum = "af3bebc7c97381be7b1f52855d9a5281e4ef4058827fdb56881cc92a2ca7373f"
 dependencies = [
  "chrono",
  "greentic-config-types",
@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2755,7 +2755,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-desktop"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2781,7 +2781,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-tests"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5599,7 +5599,7 @@ dependencies = [
 
 [[package]]
 name = "runner-core"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6621,7 +6621,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "telco-x-event-bridge"
-version = "1.1.4"
+version = "1.1.5"
 dependencies = [
  "anyhow",
  "async-nats",
