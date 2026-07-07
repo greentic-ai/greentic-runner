@@ -124,6 +124,7 @@ fn build_agent_config(allowed_tools: Vec<ToolRef>) -> AgentConfig {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
     }
 }
 

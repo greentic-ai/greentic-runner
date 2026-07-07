@@ -56,6 +56,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         },
         memory: None,
         knowledge: None,
+        conversational: false,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -153,6 +154,7 @@ async fn no_mandatory_guardrails_passes_through() {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -295,6 +297,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
     };
 
     let cp = greentic_aw_runtime::mock::MockConfigProvider::new();

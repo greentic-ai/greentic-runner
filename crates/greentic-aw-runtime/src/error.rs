@@ -163,6 +163,7 @@ mod tests {
             },
             memory: None,
             knowledge: None,
+            conversational: false,
         }
     }
 
