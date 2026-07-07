@@ -1045,6 +1045,8 @@ mod aw {
                 Some(ToolRef {
                     extension_id: extension_id.to_string(),
                     tool_name: tool_name.to_string(),
+                    description: None,
+                    input_schema: None,
                 })
             }
             _ => {
@@ -1616,6 +1618,8 @@ mod aw {
                 Some(ToolRef {
                     extension_id: "myext".into(),
                     tool_name: "dothing".into(),
+                    description: None,
+                    input_schema: None,
                 })
             );
             assert_eq!(
@@ -1623,6 +1627,8 @@ mod aw {
                 Some(ToolRef {
                     extension_id: "component:owner/repo".into(),
                     tool_name: "list".into(),
+                    description: None,
+                    input_schema: None,
                 })
             );
             assert_eq!(super::parse_tool_ref("noslash"), None);
@@ -1649,10 +1655,14 @@ mod aw {
                     ToolRef {
                         extension_id: "myext".into(),
                         tool_name: "dothing".into(),
+                        description: None,
+                        input_schema: None,
                     },
                     ToolRef {
                         extension_id: "other".into(),
                         tool_name: "thing".into(),
+                        description: None,
+                        input_schema: None,
                     },
                 ]
             );
