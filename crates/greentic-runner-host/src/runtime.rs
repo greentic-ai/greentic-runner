@@ -120,6 +120,7 @@ impl TenantRuntime {
         state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
     ) -> Result<Arc<Self>> {
         let oauth_config = config.oauth_broker_config();
         let pack = Arc::new(
@@ -154,6 +155,8 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
         )
         .await
     }
@@ -168,6 +171,7 @@ impl TenantRuntime {
         _state_store: DynStateStore,
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -320,6 +324,7 @@ impl TenantRuntime {
                     merged_agents,
                     config.tenant.clone(),
                     Arc::clone(&secrets_manager),
+                    ext_llm_port.clone(),
                     pack_runtimes.clone(),
                     agent_audit_sink.clone(),
                 )
@@ -331,6 +336,7 @@ impl TenantRuntime {
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
                     )
@@ -342,6 +348,7 @@ impl TenantRuntime {
                         merged_agents,
                         config.tenant.clone(),
                         Arc::clone(&secrets_manager),
+                        ext_llm_port.clone(),
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
                     )

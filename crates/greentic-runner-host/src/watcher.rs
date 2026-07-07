@@ -62,6 +62,8 @@ pub async fn start_pack_watcher(
     let state_host = host.state_host();
     let wasi_policy = host.wasi_policy();
     let secrets_manager = host.secrets_manager();
+    #[cfg(feature = "agentic-worker")]
+    let ext_llm_port = host.ext_llm_port();
 
     reload_once(
         configs.as_ref(),
@@ -75,6 +77,8 @@ pub async fn start_pack_watcher(
         state_host.clone(),
         Arc::clone(&wasi_policy),
         secrets_manager.clone(),
+        #[cfg(feature = "agentic-worker")]
+        ext_llm_port.clone(),
     )
     .await?;
 
@@ -87,6 +91,8 @@ pub async fn start_pack_watcher(
     let state_store_clone = Arc::clone(&state_store);
     let wasi_policy_clone = Arc::clone(&wasi_policy);
     let secrets_manager_clone = secrets_manager.clone();
+    #[cfg(feature = "agentic-worker")]
+    let ext_llm_port_clone = ext_llm_port.clone();
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
         loop {
@@ -110,6 +116,8 @@ pub async fn start_pack_watcher(
                 state_host.clone(),
                 Arc::clone(&wasi_policy_clone),
                 secrets_manager_clone.clone(),
+                #[cfg(feature = "agentic-worker")]
+                ext_llm_port_clone.clone(),
             )
             .await
             {
@@ -137,6 +145,7 @@ async fn reload_once(
     state_host: Arc<dyn StateHost>,
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
+    #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
 ) -> Result<()> {
     let index = Index::load(&cfg.index_location)?;
     let resolved = manager.resolve_all_for_index(&index)?;
@@ -202,6 +211,8 @@ async fn reload_once(
             Arc::clone(&state_store),
             Arc::clone(&state_host),
             Arc::clone(&secrets_manager),
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port.clone(),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
