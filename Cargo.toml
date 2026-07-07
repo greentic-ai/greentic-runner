@@ -23,7 +23,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.2.0-research"
+version = "1.3.0-research.0"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -31,12 +31,12 @@ async-trait = "0.1"
 anyhow = "1"
 base64 = "0.22"
 futures = "0.3"
-greentic-flow = "=1.2.0-research.0"
-greentic-session = "=1.2.0-research.0"
-greentic-state = "=1.2.0-research.0"
-greentic-config = "=1.2.0-research.0"
-greentic-config-types = "=1.2.0-research.0"
-greentic-secrets-lib = "=1.2.0-research.0"
+greentic-flow = "=1.3.0-research.0"
+greentic-session = "=1.3.0-research.0"
+greentic-state = "=1.3.0-research.0"
+greentic-config = "=1.3.0-research.0"
+greentic-config-types = "=1.3.0-research.0"
+greentic-secrets-lib = "=1.3.0-research.0"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -101,7 +101,7 @@ features = [
 ]
 
 [workspace.dependencies.greentic-types]
-version = "=1.2.0-research.1"
+version = "=1.3.0-research.0"
 default-features = false
 features = [
     "std",
@@ -112,30 +112,30 @@ features = [
 
 [workspace.dependencies.greentic_pack]
 package = "greentic-pack-lib"
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.1"
 
 [workspace.dependencies.greentic-distributor-client]
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.0"
 features = [
     "dist-client",
 ]
 
 [workspace.dependencies.greentic-interfaces]
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.0"
 default-features = false
 features = [
     "bindings-rust",
 ]
 
 [workspace.dependencies.greentic-interfaces-guest]
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.0"
 default-features = false
 
 [workspace.dependencies.greentic-interfaces-host]
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.0"
 
 [workspace.dependencies.greentic-interfaces-wasmtime]
-version = "=1.2.0-research.0"
+version = "=1.3.0-research.0"
 
 [workspace.dependencies.greentic-oauth-sdk]
 version = ">=1.1.0-dev, <1.2.0-0"
@@ -145,15 +145,15 @@ version = ">=1.1.0-dev, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
-version = "=1.2.0-research"
+version = "=1.3.0-research.0"
 
 [workspace.dependencies.greentic-runner-desktop]
 path = "crates/greentic-runner-desktop"
-version = "=1.2.0-research"
+version = "=1.3.0-research.0"
 
 [workspace.dependencies.runner-core]
 path = "crates/runner-core"
-version = "=1.2.0-research"
+version = "=1.3.0-research.0"
 
 [workspace.dependencies.reqwest]
 version = "0.13"
@@ -246,9 +246,8 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.2.19-research" }
-# greentic-mcp-exec's `list_tools` (used by the local-wasm MCP transport) is not
-# yet on a published dev build; redirect onto the greentic-mcp branch commit that
-# carries it until it is published to crates.io (mirrors the greentic-types patch
-# above). CI fetches greenticai git deps over https, so this is reproducible.
-greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "f0d2f02b002b49612ce25a6af1901a5280757605" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.0" }
+# greentic-mcp-exec's `list_tools`/`ToolDef` (used by the local-wasm MCP
+# transport) are not on the published greentic-mcp research crate; redirect onto
+# the greentic-mcp branch commit that carries them.
+greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "1f353b4b494354e8923ed40409970f3eb865f69a" }
