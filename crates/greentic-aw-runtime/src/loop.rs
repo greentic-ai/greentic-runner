@@ -536,6 +536,34 @@ pub async fn run_step(
             warn!(error = %e, "state save failed at end of step");
         }
 
+        // --- Long-term ingest (fire-and-forget): persist this turn as an episode.
+        // Runs on the FinalReply path — the only path with a non-empty reply. It
+        // previously sat after this branch's early return and so never executed. ---
+        if !reply.is_empty()
+            && lt_active
+            && let Some(memory) = runtime.long_term_memory.clone()
+        {
+            match crate::long_term::to_types_tenant(&tenant) {
+                Ok(ctx) => {
+                    let episode = crate::long_term::EpisodeIngest {
+                        name: format!("{session_id}:turn"),
+                        body: format!("{user_message}\n\n{reply}"),
+                        source: crate::long_term::EpisodeSource::Message,
+                        source_description: Some("agentic-worker turn".into()),
+                        reference_time: chrono::Utc::now(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = memory.ingest_episode(&ctx, episode).await {
+                            warn!(error = %e, "background long-term ingest failed");
+                        }
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
+                }
+            }
+        }
+
         runtime.telemetry.record_step(&StepTelemetryCtx {
             tenant_id: tenant.tenant_id.clone(),
             env_id: tenant.env_id.clone(),
@@ -557,32 +585,6 @@ pub async fn run_step(
     state.truncate_history(config.limits.max_history_turns);
     if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
         warn!(error = %e, "state save failed at end of step");
-    }
-
-    // --- Long-term ingest: persist this turn as an episode (fire-and-forget) ---
-    if !reply.is_empty()
-        && lt_active
-        && let Some(memory) = runtime.long_term_memory.clone()
-    {
-        match crate::long_term::to_types_tenant(&tenant) {
-            Ok(ctx) => {
-                let episode = crate::long_term::EpisodeIngest {
-                    name: format!("{session_id}:turn"),
-                    body: format!("{user_message}\n\n{reply}"),
-                    source: crate::long_term::EpisodeSource::Message,
-                    source_description: Some("agentic-worker turn".into()),
-                    reference_time: chrono::Utc::now(),
-                };
-                tokio::spawn(async move {
-                    if let Err(e) = memory.ingest_episode(&ctx, episode).await {
-                        warn!(error = %e, "background long-term ingest failed");
-                    }
-                });
-            }
-            Err(e) => {
-                warn!(error = %e, "long-term ingest skipped: tenant conversion failed");
-            }
-        }
     }
 
     runtime.telemetry.record_step(&StepTelemetryCtx {

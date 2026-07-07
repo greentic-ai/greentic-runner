@@ -1,0 +1,7 @@
+# Bound hung tests so a single wedged test can't stall the whole run (notably
+# the nightly `cargo llvm-cov nextest` coverage job, which otherwise hangs
+# indefinitely). A test still running after `period * terminate-after` is
+# killed and reported as a failure — tolerated by the coverage job's
+# `--ignore-run-fail` so the run completes and the policy is still evaluated.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 3 }

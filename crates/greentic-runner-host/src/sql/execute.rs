@@ -472,4 +472,54 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("mismatch"));
     }
+
+    #[tokio::test]
+    async fn sqlite_query_maps_float_and_blob() {
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (val REAL, data BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO t VALUES (3.14, X'48454C4C4F')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cp = ConnectionPool::Sqlite(pool);
+        let result = run(Engine::Sqlite, &cp, "SELECT val, data FROM t", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert!(result.rows[0][0].is_number(), "REAL should map to a number");
+        // BLOB X'48454C4C4F' is valid UTF-8 ("HELLO"), rendered as string.
+        assert_eq!(result.rows[0][1], serde_json::json!("HELLO"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_query_maps_invalid_utf8_blob_as_base64() {
+        let pool = sqlx::sqlite::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE t (data BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // 0xFF 0xFE is not valid UTF-8.
+        sqlx::query("INSERT INTO t VALUES (X'FFFE')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let cp = ConnectionPool::Sqlite(pool);
+        let result = run(Engine::Sqlite, &cp, "SELECT data FROM t", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        // Invalid UTF-8 must be base64-encoded.
+        assert_eq!(result.rows[0][0], serde_json::json!("//4="));
+    }
 }

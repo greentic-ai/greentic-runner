@@ -300,7 +300,7 @@ impl BillingMeter for HttpBillingMeter {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
 mod tests {
     use super::*;
     use crate::tenant::TenantContext;
@@ -351,5 +351,192 @@ mod tests {
         );
         assert_eq!(by("llm_input_tokens").metadata["agent_id"], "agent-1");
         assert_eq!(by("llm_input_tokens").metadata["env_id"], "prod");
+    }
+
+    #[test]
+    fn builds_zero_token_batch() {
+        let batch = build_worker_batch("t", "e", 0, 0, "a", "base");
+        let by = |m: &str| batch.events.iter().find(|e| e.meter == m).unwrap();
+        assert_eq!(by("llm_input_tokens").quantity, 0);
+        assert_eq!(by("llm_output_tokens").quantity, 0);
+        assert_eq!(by("llm_total_tokens").quantity, 0);
+    }
+
+    // ── HttpBillingMeter tests ──────────────────────────────────────────────
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_from_env_returns_none_when_unset() {
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+        assert!(HttpBillingMeter::from_env().is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_from_env_returns_none_when_blank() {
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", "  ");
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        assert!(HttpBillingMeter::from_env().is_none());
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_from_env_returns_some_when_configured() {
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", "http://127.0.0.1:19999");
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        assert!(HttpBillingMeter::from_env().is_some());
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_emit_fires_and_forgets() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/v1/metering/events/batch"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        let meter = HttpBillingMeter::from_env().unwrap();
+        let t = TenantContext::new("acme", "prod");
+        let result = meter.emit(&t, 100, 50, "agent-1").await;
+        assert!(result.is_ok());
+        // Give the spawned fire-and-forget task time to deliver.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_over_budget_fail_open_on_unreachable() {
+        // Point at a port that is not listening; fail-open must return false.
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", "http://127.0.0.1:1");
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        let meter = HttpBillingMeter::from_env().unwrap();
+        let t = TenantContext::new("acme", "prod");
+        assert!(
+            !meter.over_budget(&t).await,
+            "must fail-open when server is unreachable"
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_over_budget_positive_available() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"available": "100"})),
+            )
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        let meter = HttpBillingMeter::from_env().unwrap();
+        let t = TenantContext::new("acme", "prod");
+        assert!(
+            !meter.over_budget(&t).await,
+            "available=100 must not be over budget"
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_over_budget_zero_available() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"available": "0"})),
+            )
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        let meter = HttpBillingMeter::from_env().unwrap();
+        let t = TenantContext::new("acme", "prod");
+        assert!(
+            meter.over_budget(&t).await,
+            "available=0 must be over budget"
+        );
+
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn http_billing_meter_over_budget_caches_result() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/v1/tenants/acme/wallet"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"available": "500"})),
+            )
+            .expect(1) // Only one HTTP call; second is served from cache.
+            .mount(&server)
+            .await;
+
+        unsafe {
+            std::env::set_var("GREENTIC_BILLING_BASE_URL", server.uri());
+            std::env::set_var("GREENTIC_BILLING_SERVICE_SECRET", "secret");
+        }
+        let meter = HttpBillingMeter::from_env().unwrap();
+        let t = TenantContext::new("acme", "prod");
+        assert!(!meter.over_budget(&t).await);
+        // Second call within BUDGET_TTL must hit cache (no extra HTTP request).
+        assert!(!meter.over_budget(&t).await);
+
+        unsafe {
+            std::env::remove_var("GREENTIC_BILLING_BASE_URL");
+            std::env::remove_var("GREENTIC_BILLING_SERVICE_SECRET");
+        }
     }
 }
