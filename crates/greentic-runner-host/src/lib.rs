@@ -136,6 +136,8 @@ timers: []
             Arc::clone(&state_store),
             state_host,
             secrets,
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await?;
         Ok((workspace, runtime))

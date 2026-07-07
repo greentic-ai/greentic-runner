@@ -624,8 +624,159 @@ mod aw {
         out.trim_matches('_').to_string()
     }
 
+    /// Env-keyed [`LlmPort`](greentic_ext_runtime::host_ports::LlmPort) for the
+    /// extension runtime.
+    ///
+    /// Tool extensions that call `host.llm.complete()` internally (e.g. the
+    /// adaptive-cards `generate_card` / `data_to_card` tools) route through this
+    /// port. Without it wired the ext-runtime returns `"llm not configured for
+    /// this runtime"`. It reuses the same env-keyed multi-provider backend the
+    /// agent's OWN reasoning LLM uses ([`GreenticLlmBackend`]), so a single
+    /// `GREENTIC_LLM_API_KEY` powers both the agent and its tools.
+    ///
+    /// Provider resolution is deliberately env-global (single key), mirroring the
+    /// agent's in-process backend: `ctx`, `role`, and `extension_id` do not select
+    /// a provider here (per-role/per-tenant resolution is the designer-admin's job,
+    /// not the in-process runner's). The synchronous `complete` drives the async
+    /// backend on a dedicated OS thread with its own current-thread runtime — the
+    /// same bridge [`StoreToolSecretsBackend::get`] uses — because the ext-runtime
+    /// may invoke it from within the async runner, where a nested `block_on`
+    /// would panic.
+    #[cfg(feature = "greentic-llm-backend")]
+    pub(crate) struct EnvLlmPort {
+        backend: Arc<greentic_aw_runtime::GreenticLlmBackend>,
+        provider: String,
+        model: String,
+    }
+
+    #[cfg(feature = "greentic-llm-backend")]
+    impl EnvLlmPort {
+        /// Default provider when `GREENTIC_LLM_PROVIDER` is unset. Mirrors the
+        /// runner's DeepSeek-first posture for the in-process worker.
+        const DEFAULT_PROVIDER: &'static str = "deepseek";
+        /// Default model when `GREENTIC_LLM_MODEL` is unset (DeepSeek's chat model,
+        /// matching `GreenticLlmBackend`'s live-test default).
+        const DEFAULT_MODEL: &'static str = "deepseek-chat";
+
+        /// Build an [`EnvLlmPort`] from the environment, or `None` when no LLM key
+        /// is present. Reads `GREENTIC_LLM_API_KEY` (fallback `OPENAI_API_KEY`),
+        /// `GREENTIC_LLM_PROVIDER` (default `deepseek`), `GREENTIC_LLM_MODEL`
+        /// (default `deepseek-chat`), and `GREENTIC_LLM_BASE_URL` — the SAME env
+        /// contract as [`in_process_llm_backend_with_key`], so the agent and its
+        /// tools never resolve to different credentials.
+        pub(crate) fn from_env() -> Option<Self> {
+            let api_key = std::env::var("GREENTIC_LLM_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::env::var("OPENAI_API_KEY")
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })?;
+            let provider = std::env::var("GREENTIC_LLM_PROVIDER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_PROVIDER.to_string());
+            let model = std::env::var("GREENTIC_LLM_MODEL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| Self::DEFAULT_MODEL.to_string());
+            let base_url = std::env::var("GREENTIC_LLM_BASE_URL").ok();
+            Some(Self {
+                backend: Arc::new(greentic_aw_runtime::GreenticLlmBackend::new(
+                    api_key, base_url,
+                )),
+                provider,
+                model,
+            })
+        }
+
+        /// Map the port request into an AW [`LlmRequest`]. Tool-calling is not
+        /// exposed to extension-internal completions, so `tools` is empty; the
+        /// port's `response_format` has no greentic-llm counterpart at this layer
+        /// (JSON coercion, when requested, is the extension's own concern), so it
+        /// is not forwarded.
+        fn to_llm_request(
+            &self,
+            request: greentic_ext_runtime::host_ports::LlmPortRequest,
+        ) -> greentic_aw_runtime::llm::LlmRequest {
+            use greentic_aw_runtime::state::ChatMessage;
+
+            let history = request
+                .messages
+                .into_iter()
+                .map(|(role, content)| match role.as_str() {
+                    "assistant" => ChatMessage::Assistant {
+                        content,
+                        tool_calls: Vec::new(),
+                    },
+                    "system" => ChatMessage::System { content },
+                    // Any non-assistant/non-system role (notably "user") maps to a
+                    // user turn — the safe default for a chat completion.
+                    _ => ChatMessage::User { content },
+                })
+                .collect();
+            greentic_aw_runtime::llm::LlmRequest {
+                system_prompt: request.system_prompt,
+                history,
+                tools: Vec::new(),
+                provider: greentic_aw_runtime::config::LlmProviderRef {
+                    provider: self.provider.clone(),
+                    model: self.model.clone(),
+                    credential_ref: None,
+                },
+            }
+        }
+    }
+
+    #[cfg(feature = "greentic-llm-backend")]
+    impl greentic_ext_runtime::host_ports::LlmPort for EnvLlmPort {
+        fn complete(
+            &self,
+            _extension_id: &str,
+            _ctx: &greentic_ext_runtime::host_ports::HostCallContext,
+            _role: &str,
+            request: greentic_ext_runtime::host_ports::LlmPortRequest,
+        ) -> Result<
+            greentic_ext_runtime::host_ports::LlmPortResponse,
+            greentic_ext_runtime::host_ports::LlmPortError,
+        > {
+            use greentic_aw_runtime::llm::LlmBackend;
+            use greentic_ext_runtime::host_ports::{LlmPortError, LlmPortResponse};
+
+            let llm_request = self.to_llm_request(request);
+            let backend = self.backend.clone();
+            // Drive the async completion on a dedicated OS thread with its own
+            // current-thread runtime: the ext-runtime may call this from inside the
+            // async runner, where a nested `block_on` panics. Same bridge as
+            // `StoreToolSecretsBackend::get`.
+            let result = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| LlmPortError::Backend(error.to_string()))?;
+                runtime
+                    .block_on(backend.complete(llm_request))
+                    .map_err(|error| LlmPortError::Backend(error.to_string()))
+            })
+            .join()
+            .map_err(|_| LlmPortError::Backend("llm completion thread panicked".to_string()))??;
+
+            let content = result.content.unwrap_or_default();
+            let total_tokens = result
+                .tokens_in
+                .checked_add(result.tokens_out)
+                .filter(|&total| total > 0);
+            Ok(LlmPortResponse {
+                content,
+                total_tokens,
+            })
+        }
+    }
+
     pub(crate) fn build_ext_runtime(
         secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
+        host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
             DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
@@ -639,9 +790,56 @@ mod aw {
         // silently breaks any AW tool that needs either (e.g. tavily_search).
         // The per-tenant path passes a store-backed backend (zero-env); the
         // process-level serve paths pass the env-only backend.
+        //
+        // `llm_port` powers tool extensions that call `host.llm.complete()`
+        // internally (e.g. adaptive-cards `generate_card`). Resolution order:
+        //   1. A `host_llm_port` injected by the embedding host (e.g. the
+        //      designer demo) — its own per-tenant, admin-backed path. NOT
+        //      feature-gated: a host can inject a port regardless of features.
+        //   2. Otherwise, the env-keyed `EnvLlmPort` (standalone runners), only
+        //      when the `greentic-llm-backend` feature is on AND an LLM key is
+        //      present in env.
+        //   3. Otherwise `None`, so the ext-runtime keeps returning "llm not
+        //      configured for this runtime" (unchanged no-key behaviour).
+        let llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>> =
+            match host_llm_port {
+                Some(port) => {
+                    tracing::info!("extension runtime LLM port wired (host-provided ext LLM)");
+                    Some(port)
+                }
+                None => {
+                    #[cfg(feature = "greentic-llm-backend")]
+                    {
+                        match EnvLlmPort::from_env() {
+                            Some(port) => {
+                                tracing::info!(
+                                    "extension runtime LLM port wired (env ext LLM, env-keyed greentic-llm)"
+                                );
+                                Some(Arc::new(port)
+                                    as Arc<dyn greentic_ext_runtime::host_ports::LlmPort>)
+                            }
+                            None => {
+                                tracing::info!(
+                                    "extension runtime LLM port not configured (no host port, no env key)"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "greentic-llm-backend"))]
+                    {
+                        tracing::info!(
+                            "extension runtime LLM port not configured (no host port; greentic-llm-backend off)"
+                        );
+                        None
+                    }
+                }
+            };
+
         let overrides = HostOverrides {
             secrets_backend,
             http_client: shared_blocking_http_client(),
+            llm_port,
             ..HostOverrides::default()
         };
         let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
@@ -868,6 +1066,7 @@ mod aw {
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
@@ -889,7 +1088,7 @@ mod aw {
         let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
             StoreToolSecretsBackend::new(secrets.clone(), tenant.clone()),
         );
-        let ext_runtime = build_ext_runtime(secrets_backend)?;
+        let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port)?;
 
         // When the LLM bridge extension is configured, resolve credentials
         // per-tenant from the secrets broker rather than from global env vars.
@@ -1014,6 +1213,7 @@ mod aw {
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
@@ -1049,6 +1249,7 @@ mod aw {
             merged_agents,
             tenant,
             secrets,
+            ext_llm_port,
             packs,
             state_store,
             token_meter,
@@ -1071,6 +1272,7 @@ mod aw {
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
@@ -1104,6 +1306,7 @@ mod aw {
             merged_agents,
             tenant,
             secrets,
+            ext_llm_port,
             packs,
             state_store,
             token_meter,
@@ -1160,8 +1363,9 @@ mod aw {
         let ledger = Arc::new(RedisToolLedger::new(manager));
 
         // Process-level serve path has no per-tenant secrets context, so tool
-        // secrets resolve from the env only.
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend))?;
+        // secrets resolve from the env only. It likewise has no embedding host,
+        // so the ext LLM port falls back to the env-keyed `EnvLlmPort`.
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None)?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.
@@ -2006,6 +2210,7 @@ mod aw {
                 agents,
                 "t1".to_string(),
                 secrets,
+                None,
                 Vec::new(),
                 None,
             )
@@ -2154,6 +2359,133 @@ mod aw {
                 super::flow_source_from_packs(&[], "acme").is_none(),
                 "empty packs => None even when gate is unset"
             );
+        }
+
+        /// The LLM-key env vars `EnvLlmPort::from_env` reads. Process-global, so
+        /// these tests serialize and restore them to avoid cross-test bleed.
+        #[cfg(feature = "greentic-llm-backend")]
+        const LLM_ENV_VARS: &[&str] = &[
+            "GREENTIC_LLM_API_KEY",
+            "OPENAI_API_KEY",
+            "GREENTIC_LLM_PROVIDER",
+            "GREENTIC_LLM_MODEL",
+            "GREENTIC_LLM_BASE_URL",
+        ];
+
+        /// Run `body` with every LLM env var cleared, restoring prior values
+        /// afterwards. Keeps the `EnvLlmPort` tests hermetic and side-effect-free.
+        #[cfg(feature = "greentic-llm-backend")]
+        #[allow(unsafe_code)]
+        fn with_clean_llm_env(body: impl FnOnce()) {
+            let saved: Vec<(&str, Option<String>)> = LLM_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect();
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars restored at the end.
+            unsafe {
+                for name in LLM_ENV_VARS {
+                    std::env::remove_var(name);
+                }
+            }
+            body();
+            unsafe {
+                for (name, value) in saved {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        fn env_llm_port_none_without_key() {
+            with_clean_llm_env(|| {
+                assert!(
+                    super::EnvLlmPort::from_env().is_none(),
+                    "no LLM key in env => no port (ext-runtime stays 'llm not configured')"
+                );
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_some_with_key_and_defaults() {
+            with_clean_llm_env(|| {
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("GREENTIC_LLM_API_KEY", "sk-test-key");
+                }
+                let port = super::EnvLlmPort::from_env().expect("key present => port");
+                // Provider/model fall back to the DeepSeek-first defaults.
+                assert_eq!(port.provider, super::EnvLlmPort::DEFAULT_PROVIDER);
+                assert_eq!(port.model, super::EnvLlmPort::DEFAULT_MODEL);
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_honours_provider_and_model_overrides() {
+            with_clean_llm_env(|| {
+                // OPENAI_API_KEY is the documented fallback for the key.
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("OPENAI_API_KEY", "sk-openai");
+                    std::env::set_var("GREENTIC_LLM_PROVIDER", "openai");
+                    std::env::set_var("GREENTIC_LLM_MODEL", "gpt-4o-mini");
+                }
+                let port = super::EnvLlmPort::from_env().expect("fallback key present => port");
+                assert_eq!(port.provider, "openai");
+                assert_eq!(port.model, "gpt-4o-mini");
+            });
+        }
+
+        #[cfg(feature = "greentic-llm-backend")]
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn env_llm_port_maps_request_without_network() {
+            use greentic_aw_runtime::state::ChatMessage;
+            use greentic_ext_runtime::host_ports::{LlmPortRequest, LlmPortResponseFormat};
+
+            with_clean_llm_env(|| {
+                // SAFETY: within `with_clean_llm_env` under #[serial].
+                unsafe {
+                    std::env::set_var("GREENTIC_LLM_API_KEY", "sk-test-key");
+                }
+                let port = super::EnvLlmPort::from_env().expect("key present => port");
+                let request = LlmPortRequest {
+                    system_prompt: "be a card generator".into(),
+                    messages: vec![
+                        ("user".into(), "hello".into()),
+                        ("assistant".into(), "hi".into()),
+                        ("system".into(), "note".into()),
+                        ("weird".into(), "fallback-to-user".into()),
+                    ],
+                    response_format: LlmPortResponseFormat::Json,
+                };
+                // Pure mapping — no provider is built, no network call.
+                let llm_request = port.to_llm_request(request);
+                assert_eq!(llm_request.system_prompt, "be a card generator");
+                assert!(llm_request.tools.is_empty(), "tools not exposed to ext LLM");
+                assert_eq!(llm_request.provider.provider, "deepseek");
+                assert_eq!(llm_request.history.len(), 4);
+                assert!(matches!(llm_request.history[0], ChatMessage::User { .. }));
+                assert!(matches!(
+                    llm_request.history[1],
+                    ChatMessage::Assistant { .. }
+                ));
+                assert!(matches!(llm_request.history[2], ChatMessage::System { .. }));
+                // Unknown role falls back to a user turn.
+                assert!(matches!(llm_request.history[3], ChatMessage::User { .. }));
+            });
         }
     }
 }

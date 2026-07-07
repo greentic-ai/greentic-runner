@@ -372,10 +372,12 @@ mod aw {
         let ledger = Arc::new(RedisToolLedger::new(manager));
 
         // Process-level graph serve path has no per-tenant secrets context;
-        // tool secrets resolve from the env only.
-        let ext_runtime = super::super::agent_node::build_ext_runtime(std::sync::Arc::new(
-            super::super::agent_node::EnvSecretsBackend,
-        ))?;
+        // tool secrets resolve from the env only. It likewise has no embedding
+        // host, so the ext LLM port falls back to the env-keyed `EnvLlmPort`.
+        let ext_runtime = super::super::agent_node::build_ext_runtime(
+            std::sync::Arc::new(super::super::agent_node::EnvSecretsBackend),
+            None,
+        )?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
         let telemetry = Arc::new(OtelTelemetry);
 

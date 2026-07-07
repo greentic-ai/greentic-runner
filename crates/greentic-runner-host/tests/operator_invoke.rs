@@ -580,6 +580,8 @@ async fn setup_runtime_with_state(
         Arc::clone(&state_store),
         state_host,
         secrets,
+        #[cfg(feature = "agentic-worker")]
+        None,
     )
     .await?;
     Ok((runtime, state_store))

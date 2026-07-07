@@ -456,12 +456,20 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
             let handler = if redis_set {
-                build_agent_node_handler(merged, tenant, sm, vec![Arc::clone(&pack)], None).await
+                build_agent_node_handler(merged, tenant, sm, None, vec![Arc::clone(&pack)], None)
+                    .await
             } else {
                 #[cfg(feature = "desktop-agent-ephemeral")]
                 {
-                    build_agent_node_handler_ephemeral(merged, tenant, sm, vec![Arc::clone(&pack)])
-                        .await
+                    build_agent_node_handler_ephemeral(
+                        merged,
+                        tenant,
+                        sm,
+                        None,
+                        vec![Arc::clone(&pack)],
+                        None,
+                    )
+                    .await
                 }
                 #[cfg(not(feature = "desktop-agent-ephemeral"))]
                 {

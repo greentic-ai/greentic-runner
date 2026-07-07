@@ -32,6 +32,14 @@ pub struct TelemetryCfg {
 #[derive(Clone, Debug)]
 pub struct TelemetryCfg;
 
+/// An LLM port an embedding host can inject so in-process tool extensions that
+/// call `host.llm.complete()` (e.g. adaptive-cards `generate_card`) resolve the
+/// LLM via the host's own per-tenant, admin-backed path instead of the env-only
+/// fallback. Only meaningful with the agentic-worker runtime, so the type — and
+/// everything that threads it — is gated behind that feature.
+#[cfg(feature = "agentic-worker")]
+pub type ExtLlmPort = Arc<dyn greentic_ext_runtime::host_ports::LlmPort>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -39,6 +47,8 @@ pub struct HostBuilder {
     telemetry: Option<TelemetryCfg>,
     wasi_policy: RunnerWasiPolicy,
     secrets: Option<DynSecretsManager>,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
 }
 
 impl HostBuilder {
@@ -49,6 +59,8 @@ impl HostBuilder {
             telemetry: None,
             wasi_policy: RunnerWasiPolicy::default(),
             secrets: None,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
         }
     }
 
@@ -70,6 +82,19 @@ impl HostBuilder {
 
     pub fn with_secrets_manager(mut self, manager: DynSecretsManager) -> Self {
         self.secrets = Some(manager);
+        self
+    }
+
+    /// Inject a host-provided LLM port for the in-process extension runtime.
+    ///
+    /// When `Some`, tool extensions that call `host.llm.complete()` resolve the
+    /// LLM through this port (the embedding host's per-tenant, admin-backed
+    /// path) instead of the env-only fallback. When `None`, the extension
+    /// runtime falls back to the env-keyed `EnvLlmPort` (standalone runners) —
+    /// so leaving this unset preserves the prior behaviour exactly.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_ext_llm_port(mut self, port: Option<ExtLlmPort>) -> Self {
+        self.ext_llm_port = port;
         self
     }
 
@@ -101,6 +126,8 @@ impl HostBuilder {
             state_host,
             wasi_policy,
             secrets_manager: secrets,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: self.ext_llm_port,
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry,
         })
@@ -124,6 +151,8 @@ pub struct RunnerHost {
     state_host: Arc<dyn StateHost>,
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
+    #[cfg(feature = "agentic-worker")]
+    ext_llm_port: Option<ExtLlmPort>,
     #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
 }
@@ -254,6 +283,13 @@ impl RunnerHost {
         Arc::clone(&self.secrets_manager)
     }
 
+    /// The host-injected extension LLM port, if any. `None` for standalone
+    /// runners, in which case the extension runtime uses its env-keyed fallback.
+    #[cfg(feature = "agentic-worker")]
+    pub fn ext_llm_port(&self) -> Option<ExtLlmPort> {
+        self.ext_llm_port.clone()
+    }
+
     pub fn tenant_configs(&self) -> HashMap<String, Arc<HostConfig>> {
         self.configs.clone()
     }
@@ -306,6 +342,8 @@ impl RunnerHost {
             state_host,
             wasi_policy: Arc::new(RunnerWasiPolicy::default()),
             secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port: None,
             #[cfg(feature = "telemetry")]
             telemetry: None,
         })
@@ -340,6 +378,8 @@ impl RunnerHost {
             self.state_store(),
             self.state_host(),
             self.secrets_manager(),
+            #[cfg(feature = "agentic-worker")]
+            self.ext_llm_port(),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
