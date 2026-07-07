@@ -2637,7 +2637,9 @@ impl From<Node> for HostNode {
                 }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
-                    conversational: false, // SP3 will populate from the flow doc
+                    // SP3: honour the flow-doc `conversational` flag (greentic-flow
+                    // parses it into `greentic_types::Node.conversational`).
+                    conversational: node.conversational,
                 },
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
