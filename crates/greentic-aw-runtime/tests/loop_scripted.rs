@@ -771,3 +771,98 @@ async fn non_conversational_agent_has_no_end_conversation_tool() {
         prompts[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// `end_conversation` short-circuit termination (SP1, Task 5)
+// ---------------------------------------------------------------------------
+
+/// Build an `end_conversation` tool-call `LlmResponse`, mirroring `tool_call(...)`.
+/// `final_message` becomes the tool's `args.final_message` (omitted when `None`);
+/// `content` is the accompanying assistant text (the fallback source when
+/// `final_message` is absent/empty).
+fn end_conversation_call(
+    call_id: &str,
+    final_message: Option<&str>,
+    content: Option<&str>,
+) -> LlmResponse {
+    let args = match final_message {
+        Some(m) => serde_json::json!({ "final_message": m }),
+        None => serde_json::json!({}),
+    };
+    LlmResponse {
+        content: content.map(str::to_string),
+        tool_calls: vec![ToolCallRecord {
+            call_id: call_id.into(),
+            extension_id: "host".into(),
+            tool_name: "end_conversation".into(),
+            args,
+        }],
+        tokens_in: 5,
+        tokens_out: 5,
+    }
+}
+
+#[tokio::test]
+async fn end_conversation_terminates_with_final_message() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(
+        vec![Ok(end_conversation_call("c1", Some("Goodbye!"), None))],
+        c,
+        0,
+    );
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Goodbye!");
+}
+
+#[tokio::test]
+async fn end_conversation_falls_back_to_accompanying_content() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(
+        vec![Ok(end_conversation_call("c1", None, Some("Take care.")))],
+        c,
+        0,
+    );
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Take care.");
+}
+
+#[tokio::test]
+async fn end_conversation_empty_reply_when_neither_present() {
+    let mut c = cfg(4, 5_000, vec![], None);
+    c.conversational = true;
+    let (rt, _tel, tc) = build_runtime(vec![Ok(end_conversation_call("c1", None, None))], c, 0);
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "");
+}
+
+#[tokio::test]
+async fn end_conversation_ignored_when_not_conversational() {
+    // Non-conversational agent: the tool is not intercepted. The model's call
+    // is not in the (empty) allow-list, so it is blocked (not terminated); the
+    // second scripted response is the real final reply.
+    let script = vec![
+        Ok(end_conversation_call("c1", Some("nope"), None)),
+        Ok(final_reply("real reply")),
+    ];
+    let (rt, _tel, tc) = build_runtime(script, cfg(4, 5_000, vec![], None), 0); // conversational = false
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+    assert_eq!(out.reply, "real reply");
+}
