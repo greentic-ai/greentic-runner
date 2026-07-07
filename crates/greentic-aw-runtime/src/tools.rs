@@ -821,7 +821,9 @@ mod tests {
         }];
         let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), &allowed);
         assert!(
-            schemas.iter().any(|s| s.extension_id == "flow:lookup" && s.tool_name == "look_up"),
+            schemas
+                .iter()
+                .any(|s| s.extension_id == "flow:lookup" && s.tool_name == "look_up"),
             "flow: tool must appear in listed schemas"
         );
 
@@ -836,7 +838,10 @@ mod tests {
         let out = dispatch_tool_call(rt_arc, None, None, Some(flows), call, &tc)
             .await
             .expect("flow dispatch must not return Err");
-        assert!(out.get("error").is_none(), "known flow must dispatch, got {out}");
+        assert!(
+            out.get("error").is_none(),
+            "known flow must dispatch, got {out}"
+        );
     }
 
     #[test]

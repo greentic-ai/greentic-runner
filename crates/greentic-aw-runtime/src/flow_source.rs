@@ -222,7 +222,10 @@ mod tests {
     async fn dispatch_missing_flow_returns_error_value_not_err() {
         let cat = FlowToolCatalog::from_invoker(Arc::new(FakeInvoker));
         let out = cat.dispatch("nope", "{}").await;
-        assert!(out.get("error").is_some(), "missing flow must yield an error value");
+        assert!(
+            out.get("error").is_some(),
+            "missing flow must yield an error value"
+        );
     }
 
     #[tokio::test]
@@ -231,7 +234,10 @@ mod tests {
         let tenant = TenantContext::new("acme", "prod");
         let first = source.catalog(&tenant).await;
         let second = source.catalog(&tenant).await;
-        assert!(Arc::ptr_eq(&first, &second), "second call must hit TTL cache");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second call must hit TTL cache"
+        );
     }
 
     #[tokio::test]
@@ -242,14 +248,20 @@ mod tests {
         let staging = TenantContext::new("acme", "staging");
         let prod_cat = source.catalog(&prod).await;
         let staging_cat = source.catalog(&staging).await;
-        assert!(!Arc::ptr_eq(&prod_cat, &staging_cat), "different envs must have independent catalogs");
+        assert!(
+            !Arc::ptr_eq(&prod_cat, &staging_cat),
+            "different envs must have independent catalogs"
+        );
     }
 
     #[tokio::test]
     async fn dispatch_unknown_flow_errors_without_invoking() {
         let cat = FlowToolCatalog::from_invoker(Arc::new(FakeInvoker));
         let out = cat.dispatch("no_such_flow", "{}").await;
-        assert!(out.get("error").is_some(), "unknown flow must yield an error value");
+        assert!(
+            out.get("error").is_some(),
+            "unknown flow must yield an error value"
+        );
         assert!(
             out["error"].as_str().unwrap_or("").contains("no_such_flow"),
             "error message must name the flow, got: {out}"
