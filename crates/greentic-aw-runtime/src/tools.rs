@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
+use crate::flow_source::FlowToolCatalog;
 use crate::llm::LlmToolSchema;
 use crate::mcp_source::McpToolCatalog;
 use crate::state::ToolCallRecord;
@@ -54,10 +55,17 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// is the `component_ref` and `tool_name` the operation, and the catalog
 /// supplies the operation's `description`/`parameters`. A `component:` ref with
 /// no matching catalog entry (or no catalog) is likewise logged and dropped.
+///
+/// Tools whose `extension_id` starts with `"flow:"` are resolved from the
+/// per-tenant [`FlowToolCatalog`] (`flows`): the suffix after `"flow:"` is the
+/// `flow_ref`, which is the sole key (no operation). The catalog supplies the
+/// LLM-facing `description`/`parameters`. A `flow:` ref with no matching catalog
+/// entry (or no catalog) is likewise logged and dropped.
 pub fn list_tools_for_llm(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
+    flows: Option<&FlowToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<LlmToolSchema> {
     let mut out = Vec::with_capacity(allowed.len());
@@ -88,6 +96,21 @@ pub fn list_tools_for_llm(
                 None => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
                     "component tool not found in catalog; dropping from LLM tool list"
+                ),
+            }
+            continue;
+        }
+        if let Some(flow_ref) = t.extension_id.strip_prefix("flow:") {
+            match flows.and_then(|c| c.tool_entry(flow_ref)) {
+                Some(entry) => out.push(LlmToolSchema {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    description: entry.description.clone(),
+                    parameters: entry.parameters.clone(),
+                }),
+                None => tracing::warn!(
+                    extension = %t.extension_id, tool = %t.tool_name,
+                    "flow tool not found in catalog; dropping from LLM tool list"
                 ),
             }
             continue;
@@ -143,6 +166,7 @@ pub fn missing_tools(
     ext_runtime: &ExtensionRuntime,
     mcp: Option<&McpToolCatalog>,
     components: Option<&ComponentToolCatalog>,
+    flows: Option<&FlowToolCatalog>,
     allowed: &[ToolRef],
 ) -> Vec<MissingTool> {
     let mut missing = Vec::new();
@@ -169,6 +193,16 @@ pub fn missing_tools(
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
                     reason: "component tool not found in the catalog".to_string(),
+                });
+            }
+            continue;
+        }
+        if let Some(flow_ref) = t.extension_id.strip_prefix("flow:") {
+            if flows.and_then(|c| c.tool_entry(flow_ref)).is_none() {
+                missing.push(MissingTool {
+                    extension_id: t.extension_id.clone(),
+                    tool_name: t.tool_name.clone(),
+                    reason: "flow tool not found in the catalog".to_string(),
                 });
             }
             continue;
@@ -233,6 +267,7 @@ pub async fn dispatch_tool_call(
     ext_runtime: Arc<ExtensionRuntime>,
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
+    flows: Option<Arc<FlowToolCatalog>>,
     call: ToolCallRecord,
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
@@ -277,6 +312,17 @@ pub async fn dispatch_tool_call(
                         component_ref, call.tool_name
                     )
                 })
+            }
+        };
+        return Ok(value);
+    }
+
+    if let Some(flow_ref) = call.extension_id.strip_prefix("flow:") {
+        let value = match flows.as_deref() {
+            Some(cat) => cat.dispatch(flow_ref, &call.args.to_string()).await,
+            None => {
+                tracing::warn!(flow = %flow_ref, "flow call has no catalog wired; returning error value");
+                serde_json::json!({ "error": format!("unknown flow tool '{flow_ref}'") })
             }
         };
         return Ok(value);
@@ -469,7 +515,7 @@ mod tests {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
         }];
-        let schemas = list_tools_for_llm(&rt, None, None, &allowed);
+        let schemas = list_tools_for_llm(&rt, None, None, None, &allowed);
         assert!(schemas.is_empty());
     }
 
@@ -483,7 +529,7 @@ mod tests {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
         }];
-        let missing = missing_tools(&rt, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].extension_id, "greentic.hubspot");
         assert_eq!(missing[0].tool_name, "hubspot_contacts");
@@ -502,7 +548,7 @@ mod tests {
             tool_name: "create_issue".into(),
         }];
         // No catalog provided → the mcp tool is unresolvable.
-        let missing = missing_tools(&rt, None, None, &allowed);
+        let missing = missing_tools(&rt, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
         assert!(
             missing[0].reason.contains("MCP tool not found"),
@@ -613,7 +659,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "mcp:s1");
@@ -645,7 +691,7 @@ mod tests {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
         }];
-        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, &allowed);
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-mcp ref still goes through ext_runtime (unloaded → dropped)"
@@ -700,7 +746,7 @@ mod tests {
             args: serde_json::json!({}),
         };
         let tc = TenantContext::new("t", "e");
-        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, call, &tc)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog.clone()), None, None, call, &tc)
             .await
             .expect("mcp dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "ok": 1 }), "got: {out}");
@@ -712,7 +758,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, missing, &tc)
+        let out = dispatch_tool_call(rt.clone(), Some(catalog), None, None, missing, &tc)
             .await
             .expect("missing mcp route still returns Ok");
         assert_eq!(
@@ -728,7 +774,7 @@ mod tests {
             tool_name: "nope".into(),
             args: serde_json::json!({}),
         };
-        let res = dispatch_tool_call(rt, None, None, non_mcp, &tc).await;
+        let res = dispatch_tool_call(rt, None, None, None, non_mcp, &tc).await;
         assert!(
             res.is_err(),
             "non-mcp dispatch against an unloaded extension must error"
@@ -737,6 +783,66 @@ mod tests {
 
     use crate::component_source::ComponentToolCatalog;
     use crate::component_source::test_support::{FakeInvoker, one_tool};
+    use crate::flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog};
+
+    struct FakeFlowInvoker;
+    impl FlowInvoker for FakeFlowInvoker {
+        fn list_flows(&self) -> Vec<FlowOperation> {
+            vec![FlowOperation {
+                flow_ref: "lookup".into(),
+                description: "Look things up".into(),
+                parameters: serde_json::json!({ "type": "object", "properties": { "q": { "type": "integer" } } }),
+            }]
+        }
+        fn invoke<'a>(
+            &'a self,
+            flow_ref: &'a str,
+            args_json: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                if flow_ref == "lookup" {
+                    Ok(serde_json::json!({ "echoed": args_json }))
+                } else {
+                    Err(format!("flow '{flow_ref}' not found"))
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn flow_prefixed_tool_is_listed_and_dispatched() {
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(FakeFlowInvoker)));
+        let rt = ExtensionRuntime::for_test();
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+        }];
+        let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), &allowed);
+        assert!(
+            schemas
+                .iter()
+                .any(|s| s.extension_id == "flow:lookup" && s.tool_name == "look_up"),
+            "flow: tool must appear in listed schemas"
+        );
+
+        let call = ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            args: serde_json::json!({ "q": 1 }),
+        };
+        let rt_arc = Arc::new(ExtensionRuntime::for_test());
+        let tc = TenantContext::new("t", "e");
+        let out = dispatch_tool_call(rt_arc, None, None, Some(flows), call, &tc)
+            .await
+            .expect("flow dispatch must not return Err");
+        assert!(
+            out.get("error").is_none(),
+            "known flow must dispatch, got {out}"
+        );
+    }
 
     #[test]
     fn component_ref_listed_from_catalog() {
@@ -770,7 +876,7 @@ mod tests {
             },
         ];
 
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, &allowed);
         assert_eq!(schemas.len(), 1, "only the catalog-backed ref is emitted");
         let s = &schemas[0];
         assert_eq!(s.extension_id, "component:greentic.refund");
@@ -800,7 +906,7 @@ mod tests {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
         }];
-        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), &allowed);
+        let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, &allowed);
         assert!(
             schemas.is_empty(),
             "non-component ref still goes through ext_runtime (unloaded → dropped)"
@@ -832,7 +938,7 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), call, &tc)
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog.clone()), None, call, &tc)
             .await
             .expect("component dispatch never returns Err");
         assert_eq!(out, serde_json::json!({ "refund_id": "r-1" }), "got: {out}");
@@ -844,7 +950,7 @@ mod tests {
             tool_name: "no_such".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), missing, &tc)
+        let out = dispatch_tool_call(rt.clone(), None, Some(catalog), None, missing, &tc)
             .await
             .expect("missing component op still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
@@ -857,7 +963,7 @@ mod tests {
             tool_name: "issue_refund".into(),
             args: serde_json::json!({}),
         };
-        let out = dispatch_tool_call(rt, None, None, no_cat, &tc)
+        let out = dispatch_tool_call(rt, None, None, None, no_cat, &tc)
             .await
             .expect("component dispatch with no catalog still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");

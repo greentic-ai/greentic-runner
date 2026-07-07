@@ -21,6 +21,7 @@ pub mod cost;
 pub mod dispatch_ledger;
 pub mod dw;
 pub mod error;
+pub mod flow_source;
 pub mod graph;
 pub mod guardrail;
 pub mod guardrail_provider;
@@ -67,6 +68,7 @@ pub use cost::MockTokenMeter;
 pub use cost::{RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
+pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
 pub use layered_provider::LayeredConfigProvider;
@@ -165,6 +167,12 @@ pub struct AgentRuntime {
     /// invoker (over the runner-host `PackRuntime` component host) is injected
     /// at the runner-host edge, never compiled in.
     pub(crate) components: Option<Arc<crate::component_source::ComponentToolSource>>,
+    /// Per-tenant agentic-worker flow tool source. `None` disables flow tools
+    /// entirely (`flow:`-prefixed tool refs then resolve to nothing). Set via
+    /// [`AgentRuntime::with_flow_source`]; the concrete invoker (over the
+    /// runner-host pack flow runtime) is injected at the runner-host edge, never
+    /// compiled in.
+    pub(crate) flows: Option<Arc<crate::flow_source::FlowToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -209,6 +217,7 @@ impl AgentRuntime {
             guardrail_policy: Arc::new(crate::guardrail::NoMandatoryGuardrails),
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
+            flows: None,
             long_term_memory: None,
             knowledge: None,
             short_term_memory: None,
@@ -250,6 +259,18 @@ impl AgentRuntime {
         components: Option<Arc<crate::component_source::ComponentToolSource>>,
     ) -> Self {
         self.components = components;
+        self
+    }
+
+    /// Wire the flow tool source so `flow:`-prefixed tool refs resolve to pack
+    /// flows invoked over the host flow runtime. Coexists with the
+    /// MCP/extension/component tool surfaces; defaults off when not set.
+    #[must_use]
+    pub fn with_flow_source(
+        mut self,
+        flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    ) -> Self {
+        self.flows = flows;
         self
     }
 

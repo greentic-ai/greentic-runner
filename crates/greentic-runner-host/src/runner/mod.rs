@@ -7,6 +7,8 @@ pub mod contract_introspection;
 pub mod dispatch_listener;
 pub mod engine;
 pub mod flow_adapter;
+#[cfg(feature = "agentic-worker")]
+pub mod flow_invoker;
 pub mod graph_node;
 pub mod i18n;
 pub mod invocation;
