@@ -11,10 +11,19 @@ use std::time::Duration;
 /// Composer extensions emit short names; runner-host derives full IDs
 /// (extension_id + tool_name) via `ExtensionRuntime::list_tools` before
 /// constructing the `AgentConfig` (see runner-host Phase 4).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// `Eq` deliberately omitted: `input_schema` holds `serde_json::Value`, which is not `Eq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ToolRef {
     pub extension_id: String,
     pub tool_name: String,
+    /// Author-defined LLM description (flow tools only). `None` falls back to
+    /// the runtime catalog. Ignored by the component/MCP tool branches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Author-defined JSON-schema for the tool's input (flow tools only).
+    /// `None` falls back to the runtime catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +235,49 @@ mod limits_serde_tests {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tool_ref_author_contract_tests {
+    use super::*;
+
+    #[test]
+    fn tool_ref_deserializes_without_author_contract_fields() {
+        // Old payload: no description / input_schema keys.
+        let json = r#"{"extension_id":"flow:lookup","tool_name":"look_up"}"#;
+        let t: ToolRef = serde_json::from_str(json).expect("old ToolRef must still deserialize");
+        assert_eq!(t.extension_id, "flow:lookup");
+        assert_eq!(t.tool_name, "look_up");
+        assert!(t.description.is_none());
+        assert!(t.input_schema.is_none());
+    }
+
+    #[test]
+    fn tool_ref_omits_none_author_contract_fields_on_serialize() {
+        let t = ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(!json.contains("description"), "None description must be omitted: {json}");
+        assert!(!json.contains("input_schema"), "None input_schema must be omitted: {json}");
+    }
+
+    #[test]
+    fn tool_ref_round_trips_with_author_contract() {
+        let t = ToolRef {
+            extension_id: "flow:refund".into(),
+            tool_name: "refund_lookup".into(),
+            description: Some("Look up a refund".into()),
+            input_schema: Some(serde_json::json!({"type":"object","properties":{"order_id":{"type":"string"}}})),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        let back: ToolRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, t);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -257,6 +309,8 @@ mod tests {
             tools: vec![ToolRef {
                 extension_id: "http".into(),
                 tool_name: "fetch".into(),
+                description: None,
+                input_schema: None,
             }],
             guardrails: vec![],
             llm: LlmProviderRef {

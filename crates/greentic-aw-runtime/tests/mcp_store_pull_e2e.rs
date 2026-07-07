@@ -361,6 +361,8 @@ async fn verified_store_pull_tool_offered_and_result_in_trail() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -478,6 +480,8 @@ async fn tampered_digest_degrades_tool_not_offered() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),

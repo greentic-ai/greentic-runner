@@ -233,6 +233,8 @@ async fn mcp_tool_offered_called_and_result_in_trail() {
     let allowed = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "get_issue".into(),
+        description: None,
+        input_schema: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
@@ -287,6 +289,8 @@ async fn mcp_unreachable_server_degrades_no_tool_offered() {
     let allowed = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "get_issue".into(),
+        description: None,
+        input_schema: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 

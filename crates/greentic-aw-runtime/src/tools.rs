@@ -474,6 +474,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -489,6 +491,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -514,6 +518,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
+            description: None,
+            input_schema: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, None, &allowed);
         assert!(schemas.is_empty());
@@ -528,6 +534,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
+            description: None,
+            input_schema: None,
         }];
         let missing = missing_tools(&rt, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
@@ -546,6 +554,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "mcp:github".into(),
             tool_name: "create_issue".into(),
+            description: None,
+            input_schema: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
         let missing = missing_tools(&rt, None, None, None, &allowed);
@@ -651,11 +661,15 @@ mod tests {
             ToolRef {
                 extension_id: "mcp:s1".into(),
                 tool_name: "get_issue".into(),
+                description: None,
+                input_schema: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
                 extension_id: "mcp:s1".into(),
                 tool_name: "missing".into(),
+                description: None,
+                input_schema: None,
             },
         ];
 
@@ -690,6 +704,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
+            description: None,
+            input_schema: None,
         }];
         let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, &allowed);
         assert!(
@@ -704,6 +720,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "mcp:s1".into(),
             tool_name: "get_issue".into(),
+            description: None,
+            input_schema: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -818,6 +836,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "flow:lookup".into(),
             tool_name: "look_up".into(),
+            description: None,
+            input_schema: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), &allowed);
         assert!(
@@ -868,11 +888,15 @@ mod tests {
             ToolRef {
                 extension_id: "component:greentic.refund".into(),
                 tool_name: "issue_refund".into(),
+                description: None,
+                input_schema: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
                 extension_id: "component:greentic.refund".into(),
                 tool_name: "missing".into(),
+                description: None,
+                input_schema: None,
             },
         ];
 
@@ -905,6 +929,8 @@ mod tests {
         let allowed = vec![ToolRef {
             extension_id: "greentic.tavily".into(),
             tool_name: "search".into(),
+            description: None,
+            input_schema: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, &allowed);
         assert!(

@@ -185,6 +185,8 @@ async fn component_tool_offered_called_and_result_in_trail() {
     let allowed = vec![ToolRef {
         extension_id: "component:greentic.refund".into(),
         tool_name: "issue_refund".into(),
+        description: None,
+        input_schema: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
@@ -235,6 +237,8 @@ async fn empty_component_source_offers_no_tool() {
     let allowed = vec![ToolRef {
         extension_id: "component:greentic.refund".into(),
         tool_name: "issue_refund".into(),
+        description: None,
+        input_schema: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
