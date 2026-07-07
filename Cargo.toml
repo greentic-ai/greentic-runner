@@ -23,7 +23,7 @@ exclude = [
 [workspace.package]
 edition = "2024"
 license = "MIT"
-version = "1.1.4"
+version = "1.1.5"
 
 [workspace.dependencies]
 arc-swap = "1"
@@ -38,7 +38,14 @@ greentic-session = ">=1.1.0-0, <1.2.0-0"
 greentic-state = ">=1.1.0-0, <1.2.0-0"
 greentic-config = ">=1.1.0-0, <1.2.0-0"
 greentic-config-types = ">=1.1.0-0, <1.2.0-0"
-greentic-deploy-spec = ">=0.1.0-0, <0.2.0-0"
+# Bumped to the deploy-spec 0.2 line (deployer#432 minor bump so the deployer
+# stable crate publish could escape dev-lane 0.1.<runid> pollution). runner-host
+# only uses `greentic_deploy_spec::ids::*` (RevisionId/BundleId), which are
+# unchanged across 0.1->0.2, but the whole runtime tree must share ONE
+# deploy-spec copy: greentic-start crosses deploy-spec types with runner-host
+# AND greentic-deployer (now 0.2.x), so runner-host must be on 0.2.x too or the
+# two copies collide (E0308).
+greentic-deploy-spec = ">=0.2.1, <0.3.0-0"
 greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
 hex = "0.4"
 humantime = "2.1"
