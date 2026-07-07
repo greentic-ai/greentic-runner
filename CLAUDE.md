@@ -95,8 +95,15 @@ extension id) plus a system-prompt note; when the model calls it, the loop termi
 turn with `TerminationReason::ConversationEnded` and the closing message (`final_message`
 arg, else the accompanying reply) becomes the final reply — routed through the same
 outbound-guardrail/save path as a normal `FinalReply`. This is SP1 of the in-flow
-conversational chat-segment epic (`docs/superpowers/specs/2026-07-07-conversational-agent-chat-segment-epic-design.md`);
-the flow park-and-loop reaction to `ConversationEnded` is SP2 (runner engine).
+conversational chat-segment epic (`docs/superpowers/specs/2026-07-07-conversational-agent-chat-segment-epic-design.md`).
+
+A conversational `dw.agent` node (`NodeKind::DwAgent.conversational`, default false) is a
+multi-turn segment: after each agent turn the engine parks and re-enters the same node
+(`NodeControl::LoopHere`) on the next inbound message, until the agent's output carries
+`terminated_by == "conversation_ended"`, at which point the flow advances to the node's
+successor (SP2). Non-conversational `dw.agent` is unchanged (one-shot). The flow-doc
+`conversational` flag wiring is SP3; the out-of-process (Nats) dispatch path and a
+`max_turns` safety cap are deferred follow-ups.
 
 ### Async runtime dispatch (`sorla.call` node)
 
