@@ -2,6 +2,8 @@ pub mod adapt_events_email;
 pub mod adapt_timer;
 pub mod agent_node;
 pub mod component_invoker;
+#[cfg(feature = "agentic-worker")]
+pub mod flow_invoker;
 pub mod contract_cache;
 pub mod contract_introspection;
 pub mod dispatch_listener;

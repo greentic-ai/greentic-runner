@@ -1450,7 +1450,7 @@ mod aw {
         // use a no-op placeholder so the extension's host-LLM port receives an
         // empty context (equivalent to the previous `invoke_tool` default).
         let tenant = TenantContext::new("", "");
-        dispatch_tool_call(ext_runtime, None, None, call, &tenant)
+        dispatch_tool_call(ext_runtime, None, None, None, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }
