@@ -68,7 +68,7 @@ pub use config::{
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
-pub use cost::{RedisTokenMeter, TokenMeter};
+pub use cost::{KvTokenMeter, RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
