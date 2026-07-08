@@ -5,6 +5,13 @@
 //! executor is synchronous, so every entry point hops onto `spawn_blocking`.
 //! Both functions are infallible by the rail's contract: list degrades to empty
 //! with a `warn`; call returns `{"error": ...}` on any failure.
+//!
+//! `greentic_mcp_exec::ExecError` is a large enum, so the `spawn_blocking`
+//! closures that return `Result<_, ExecError>` trip `clippy::result_large_err`.
+//! Both entry points immediately collapse that `Result` to a degraded value
+//! (empty list / error JSON) and never propagate the error up a hot path, so
+//! boxing it buys nothing here — allow the lint for this module.
+#![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
