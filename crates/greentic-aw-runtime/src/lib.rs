@@ -100,7 +100,7 @@ pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
-pub use tools::{RedisToolLedger, ToolLedger};
+pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
