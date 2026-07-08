@@ -46,6 +46,7 @@ pub mod mcp_store_pull;
 pub mod memory;
 pub mod short_term;
 pub mod state;
+pub mod state_kv;
 pub mod state_redis;
 pub mod telemetry;
 pub mod tenant;
@@ -95,6 +96,7 @@ pub use mcp_source::{
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
+pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
