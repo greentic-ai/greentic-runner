@@ -100,18 +100,74 @@ pub(crate) async fn build_aw_backends() -> Option<AwBackends> {
             None
         }
         StateBackendChoice::Redis(url) => build_redis_backends(&url).await,
-        StateBackendChoice::Memory => {
+        choice @ (StateBackendChoice::Memory | StateBackendChoice::Disk(_)) => {
+            Some(backends_from_kv(shared_kv(&choice)))
+        }
+    }
+}
+
+/// Process-global KV backend for the non-Redis paths. Built exactly once so that
+/// every AW handler (agent build, graph build, in-proc serve) shares one store.
+static SHARED_AW_KV: std::sync::OnceLock<Arc<dyn greentic_aw_runtime::AwKv>> =
+    std::sync::OnceLock::new();
+
+/// Return the process-global memory/disk KV, constructing it on first use.
+///
+/// First-call-wins is correct here because the backend choice derives from
+/// process-wide env, so every caller resolves the same choice. Building once is
+/// also what makes `disk` durable: redb refuses a second open of the same file
+/// within one process (`DatabaseAlreadyOpen`), so a per-call open would silently
+/// fall back to ephemeral memory. Sharing the single `MemoryKv`/redb handle also
+/// keeps token budgets metered once and session locks coordinated across the
+/// agent and graph handlers instead of each holding a private map.
+fn shared_kv(choice: &StateBackendChoice) -> Arc<dyn greentic_aw_runtime::AwKv> {
+    SHARED_AW_KV.get_or_init(|| build_shared_kv(choice)).clone()
+}
+
+/// Construct the shared KV backend once. Only `Memory` and `Disk` reach here
+/// (Redis and Disabled are handled by the caller before `shared_kv`); any other
+/// choice conservatively falls back to ephemeral memory.
+fn build_shared_kv(choice: &StateBackendChoice) -> Arc<dyn greentic_aw_runtime::AwKv> {
+    match choice {
+        StateBackendChoice::Disk(path) => build_shared_disk_kv(path),
+        _ => {
             tracing::warn!(
                 "AW state backend is in-memory (ephemeral): state, budgets, and \
                  idempotency are NOT persisted across restarts. Set GREENTIC_AW_REDIS_URL \
                  or GREENTIC_AW_STATE_BACKEND=disk for durability."
             );
-            Some(backends_from_kv(Arc::new(
-                greentic_aw_runtime::MemoryKv::new(),
-            )))
+            Arc::new(greentic_aw_runtime::MemoryKv::new())
         }
-        StateBackendChoice::Disk(path) => Some(build_disk_backends(path)),
     }
+}
+
+/// Open the on-disk (redb) KV, falling back to ephemeral memory on any failure
+/// or when the `state-disk` feature is compiled out.
+fn build_shared_disk_kv(path: &std::path::Path) -> Arc<dyn greentic_aw_runtime::AwKv> {
+    #[cfg(feature = "state-disk")]
+    {
+        match greentic_aw_runtime::kv::open_disk(path) {
+            Ok(kv) => {
+                tracing::info!(path = %path.display(), "AW state backend: on-disk (redb)");
+                return kv;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(), error = %error,
+                    "AW disk backend open failed; falling back to in-memory (ephemeral)"
+                );
+            }
+        }
+    }
+    #[cfg(not(feature = "state-disk"))]
+    {
+        let _ = path;
+        tracing::warn!(
+            "GREENTIC_AW_STATE_BACKEND=disk but this build lacks the state-disk feature; \
+             falling back to in-memory (ephemeral)"
+        );
+    }
+    Arc::new(greentic_aw_runtime::MemoryKv::new())
 }
 
 async fn build_redis_backends(url: &str) -> Option<AwBackends> {
@@ -134,33 +190,6 @@ async fn build_redis_backends(url: &str) -> Option<AwBackends> {
         tool_ledger: Arc::new(RedisToolLedger::new(manager.clone())),
         checkpoint_store: Arc::new(RedisCheckpointStore::new(manager)),
     })
-}
-
-fn build_disk_backends(path: PathBuf) -> AwBackends {
-    #[cfg(feature = "state-disk")]
-    {
-        match greentic_aw_runtime::kv::open_disk(&path) {
-            Ok(kv) => {
-                tracing::info!(path = %path.display(), "AW state backend: on-disk (redb)");
-                return backends_from_kv(kv);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(), error = %error,
-                    "AW disk backend open failed; falling back to in-memory (ephemeral)"
-                );
-            }
-        }
-    }
-    #[cfg(not(feature = "state-disk"))]
-    {
-        let _ = &path;
-        tracing::warn!(
-            "GREENTIC_AW_STATE_BACKEND=disk but this build lacks the state-disk feature; \
-             falling back to in-memory (ephemeral)"
-        );
-    }
-    backends_from_kv(Arc::new(greentic_aw_runtime::MemoryKv::new()))
 }
 
 /// Assemble the four adapters over a single shared KV backend.
@@ -269,6 +298,58 @@ mod build_tests {
             backends.is_some(),
             "memory backend must build without Redis"
         );
+        unset(ENV_BACKEND);
+    }
+
+    /// Two separate `build_aw_backends()` calls (as the agent and graph handlers
+    /// do) must share ONE underlying KV store, not each get a private map.
+    /// Proof: state saved via the first set of backends is visible through the
+    /// second. `SHARED_AW_KV` is a process-global `OnceLock`, so this holds
+    /// regardless of which memory-backed test ran first in this binary.
+    #[tokio::test]
+    #[serial]
+    async fn memory_backends_share_one_store_across_calls() {
+        use greentic_aw_runtime::state::{ChatMessage, ConversationState};
+        use greentic_aw_runtime::tenant::TenantContext;
+
+        unset(ENV_REDIS_URL);
+        unset(ENV_STATE_PATH);
+        set(ENV_BACKEND, "memory");
+
+        let backends1 = build_aw_backends().await.unwrap();
+        let backends2 = build_aw_backends().await.unwrap();
+
+        let tenant = TenantContext::new("tenant-share", "env-share");
+        let session_id = "share-session";
+        let mut state = ConversationState::empty(&tenant, session_id);
+        state.messages.push(ChatMessage::User {
+            content: "hello from handler one".to_string(),
+        });
+
+        backends1
+            .state_store
+            .save(&tenant, session_id, &state)
+            .await
+            .unwrap();
+
+        let loaded = backends2
+            .state_store
+            .load(&tenant, session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            loaded.messages.len(),
+            1,
+            "message saved via first backend must be visible via second (shared store)"
+        );
+        match &loaded.messages[0] {
+            ChatMessage::User { content } => {
+                assert_eq!(content, "hello from handler one");
+            }
+            other => panic!("unexpected message variant: {other:?}"),
+        }
+
         unset(ENV_BACKEND);
     }
 }

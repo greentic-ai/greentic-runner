@@ -25,9 +25,15 @@ impl MemoryKv {
         Self::default()
     }
 
-    /// Lock the map, evicting the touched key first if it has expired. Returns
-    /// a `StateError::Redis` on mutex poisoning (kept as `Redis` so the loop's
-    /// existing error handling is unchanged).
+    /// Lock the map and run `f` with the current instant.
+    ///
+    /// Expiry is handled lazily per key: each accessor treats a touched key
+    /// whose `expires_at` has passed as absent and removes just that key. There
+    /// is no global sweep (that was O(n) on every op), so an untouched but
+    /// expired key may linger until it is next accessed — an accepted tradeoff
+    /// for this ephemeral in-process backend. Returns a `StateError::Redis` on
+    /// mutex poisoning (kept as `Redis` so the loop's existing error handling is
+    /// unchanged).
     fn with_map<R>(
         &self,
         f: impl FnOnce(&mut HashMap<String, Entry>, Instant) -> R,
@@ -37,15 +43,23 @@ impl MemoryKv {
             .map
             .lock()
             .map_err(|e| crate::error::StateError::Redis(format!("memory kv poisoned: {e}")))?;
-        // Opportunistic sweep of expired entries keeps the map bounded.
-        guard.retain(|_, entry| entry.expires_at > now);
         Ok(f(&mut guard, now))
     }
 }
 
 impl AwKv for MemoryKv {
     fn get<'a>(&'a self, key: &'a str) -> KvFut<'a, Option<Vec<u8>>> {
-        Box::pin(async move { self.with_map(|map, _now| map.get(key).map(|e| e.bytes.clone())) })
+        Box::pin(async move {
+            self.with_map(|map, now| match map.get(key) {
+                Some(entry) if entry.expires_at > now => Some(entry.bytes.clone()),
+                Some(_) => {
+                    // Expired: evict lazily and report absent.
+                    map.remove(key);
+                    None
+                }
+                None => None,
+            })
+        })
     }
 
     fn set_ex<'a>(&'a self, key: &'a str, val: Vec<u8>, ttl: Duration) -> KvFut<'a, ()> {
@@ -73,7 +87,9 @@ impl AwKv for MemoryKv {
     fn set_nx<'a>(&'a self, key: &'a str, val: Vec<u8>, ttl: Duration) -> KvFut<'a, bool> {
         Box::pin(async move {
             self.with_map(|map, now| {
-                if map.contains_key(key) {
+                // An expired entry counts as absent, so a new lock may be taken.
+                let occupied = map.get(key).is_some_and(|entry| entry.expires_at > now);
+                if occupied {
                     false
                 } else {
                     map.insert(
@@ -96,24 +112,39 @@ impl AwKv for MemoryKv {
         ttl: Duration,
     ) -> KvFut<'a, bool> {
         Box::pin(async move {
-            self.with_map(|map, now| match map.get_mut(key) {
-                Some(entry) if entry.bytes == expected => {
-                    entry.expires_at = now + ttl;
-                    true
+            self.with_map(|map, now| {
+                let (expired, matches) = match map.get(key) {
+                    Some(entry) => (entry.expires_at <= now, entry.bytes == expected),
+                    None => return false,
+                };
+                if expired {
+                    map.remove(key);
+                    return false;
                 }
-                _ => false,
+                if matches {
+                    if let Some(entry) = map.get_mut(key) {
+                        entry.expires_at = now + ttl;
+                    }
+                    true
+                } else {
+                    false
+                }
             })
         })
     }
 
     fn compare_del<'a>(&'a self, key: &'a str, expected: &'a [u8]) -> KvFut<'a, bool> {
         Box::pin(async move {
-            self.with_map(|map, _now| match map.get(key) {
-                Some(entry) if entry.bytes == expected => {
+            self.with_map(|map, now| {
+                let (expired, matches) = match map.get(key) {
+                    Some(entry) => (entry.expires_at <= now, entry.bytes == expected),
+                    None => return false,
+                };
+                // Either way the key leaves the map; only an owner match succeeds.
+                if expired || matches {
                     map.remove(key);
-                    true
                 }
-                _ => false,
+                !expired && matches
             })
         })
     }
@@ -123,6 +154,7 @@ impl AwKv for MemoryKv {
             self.with_map(|map, now| {
                 let current = map
                     .get(key)
+                    .filter(|e| e.expires_at > now)
                     .and_then(|e| e.bytes.as_slice().try_into().ok())
                     .map(u64::from_be_bytes)
                     .unwrap_or(0);

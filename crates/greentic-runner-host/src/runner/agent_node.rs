@@ -1452,9 +1452,18 @@ mod aw {
                 let redis_url = std::env::var("GREENTIC_AW_REDIS_URL")
                     .ok()
                     .filter(|url| !url.is_empty());
-                let backend_is_redis = std::env::var("GREENTIC_AW_STATE_BACKEND")
-                    .map(|backend| backend == "redis" || backend.is_empty())
-                    .unwrap_or(true);
+                // Derive "is Redis" from the SAME selector the backends use, so an
+                // unusual value (e.g. `GREENTIC_AW_STATE_BACKEND=cassandra` with a
+                // URL) can't disagree between the state store and the ledger gate.
+                let backend_env = std::env::var("GREENTIC_AW_STATE_BACKEND").ok();
+                let backend_is_redis = matches!(
+                    crate::runner::aw_backends::select_state_backend(
+                        backend_env.as_deref(),
+                        redis_url.as_deref(),
+                        None,
+                    ),
+                    crate::runner::aw_backends::StateBackendChoice::Redis(_)
+                );
                 let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) = match redis_url {
                     Some(url) if backend_is_redis => {
                         match RedisAgentStateStore::connect(&url).await {
