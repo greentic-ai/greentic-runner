@@ -1217,33 +1217,18 @@ mod aw {
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
-        use greentic_aw_runtime::RedisAgentStateStore;
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::tools::RedisToolLedger;
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
         if merged_agents.is_empty() {
             return None;
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let manager = state_store.manager();
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: _,
+        } = build_aw_backends().await?;
 
         build_runtime_handler_with_stores(
             merged_agents,
@@ -1329,38 +1314,22 @@ mod aw {
     pub async fn build_agent_runtime(
         merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<AgentRuntime>> {
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
         use greentic_aw_runtime::LayeredConfigProvider;
         use greentic_aw_runtime::ManifestToolOverlayProvider;
+        use greentic_aw_runtime::OtelTelemetry;
         use greentic_aw_runtime::config_provider::CachingConfigProvider;
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::tools::RedisToolLedger;
-        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
 
         if merged_agents.is_empty() {
             return None; // nothing to serve
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgent nodes disabled");
-                return None;
-            }
-        };
-
-        // The connection manager is cheap to clone (multiplexed, ref-counted);
-        // share it with the token meter and idempotency ledger.
-        let manager = state_store.manager();
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: _,
+        } = build_aw_backends().await?;
 
         // Process-level serve path has no per-tenant secrets context, so tool
         // secrets resolve from the env only. It likewise has no embedding host,
@@ -1475,28 +1444,44 @@ mod aw {
 
         match build_agent_runtime(merged_agents).await {
             Some(runtime) => {
-                // Activate dispatch idempotency when Redis is reachable for the
-                // ledger. Best-effort: a connect failure disables idempotency
-                // but never blocks serving.
-                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) =
-                    match std::env::var("GREENTIC_AW_REDIS_URL") {
-                        Ok(url) if !url.is_empty() => {
-                            match RedisAgentStateStore::connect(&url).await {
-                                Ok(store) => {
-                                    (Arc::new(RedisDispatchLedger::new(store.manager())), true)
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %error,
-                                        "dispatch ledger Redis connect failed; \
-                                         idempotency disabled"
-                                    );
-                                    (Arc::new(NoopDispatchLedger), false)
-                                }
+                // Dispatch idempotency ledger: only Redis provides cross-redelivery
+                // caching, so it is wired only when the resolved state backend is
+                // Redis (URL present AND backend redis/unset). Memory/disk backends
+                // use the no-op ledger (at-least-once). Best-effort: a connect
+                // failure disables idempotency but never blocks serving.
+                let redis_url = std::env::var("GREENTIC_AW_REDIS_URL")
+                    .ok()
+                    .filter(|url| !url.is_empty());
+                // Derive "is Redis" from the SAME selector the backends use, so an
+                // unusual value (e.g. `GREENTIC_AW_STATE_BACKEND=cassandra` with a
+                // URL) can't disagree between the state store and the ledger gate.
+                let backend_env = std::env::var("GREENTIC_AW_STATE_BACKEND").ok();
+                let backend_is_redis = matches!(
+                    crate::runner::aw_backends::select_state_backend(
+                        backend_env.as_deref(),
+                        redis_url.as_deref(),
+                        None,
+                    ),
+                    crate::runner::aw_backends::StateBackendChoice::Redis(_)
+                );
+                let (ledger, ledger_active): (Arc<dyn DispatchLedger>, bool) = match redis_url {
+                    Some(url) if backend_is_redis => {
+                        match RedisAgentStateStore::connect(&url).await {
+                            Ok(store) => {
+                                (Arc::new(RedisDispatchLedger::new(store.manager())), true)
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "dispatch ledger Redis connect failed; \
+                                     idempotency disabled"
+                                );
+                                (Arc::new(NoopDispatchLedger), false)
                             }
                         }
-                        _ => (Arc::new(NoopDispatchLedger), false),
-                    };
+                    }
+                    _ => (Arc::new(NoopDispatchLedger), false),
+                };
 
                 tracing::info!(
                     nats_url,

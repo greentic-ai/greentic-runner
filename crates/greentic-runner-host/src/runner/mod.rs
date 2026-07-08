@@ -1,6 +1,8 @@
 pub mod adapt_events_email;
 pub mod adapt_timer;
 pub mod agent_node;
+#[cfg(feature = "agentic-worker")]
+pub(crate) mod aw_backends;
 pub mod component_invoker;
 pub mod contract_cache;
 pub mod contract_introspection;

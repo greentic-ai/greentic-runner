@@ -5,13 +5,6 @@
 //! executor is synchronous, so every entry point hops onto `spawn_blocking`.
 //! Both functions are infallible by the rail's contract: list degrades to empty
 //! with a `warn`; call returns `{"error": ...}` on any failure.
-//!
-//! `greentic_mcp_exec::ExecError` is a large enum, so the `spawn_blocking`
-//! closures that return `Result<_, ExecError>` trip `clippy::result_large_err`.
-//! Both entry points immediately collapse that `Result` to a degraded value
-//! (empty list / error JSON) and never propagate the error up a hot path, so
-//! boxing it buys nothing here — allow the lint for this module.
-#![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -126,6 +119,10 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 }
 
 /// List a local component's tools. Returns an empty vec and emits a `warn` on any failure.
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a warn here); boxing
+// it would touch `list_tools`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
     let config = exec_config_for(component_ref);
@@ -152,6 +149,10 @@ pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
 }
 
 /// Call a local component's tool. Returns `{"error": ...}` on any failure; never panics.
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a JSON error here);
+// boxing it would touch `exec`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
 pub async fn local_call_tool(component_ref: &str, tool: &str, args: &Value) -> Value {
     let component = component_ref.to_string();
     let action = tool.to_string();

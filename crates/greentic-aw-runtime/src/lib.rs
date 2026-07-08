@@ -28,6 +28,7 @@ pub mod guardrail;
 pub mod guardrail_provider;
 pub mod http_provider;
 pub mod knowledge;
+pub mod kv;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
@@ -45,6 +46,7 @@ pub mod mcp_store_pull;
 pub mod memory;
 pub mod short_term;
 pub mod state;
+pub mod state_kv;
 pub mod state_redis;
 pub mod telemetry;
 pub mod tenant;
@@ -66,12 +68,15 @@ pub use config::{
 pub use config_provider::{CachingConfigProvider, ConfigProvider, InMemoryConfigProvider};
 #[cfg(feature = "test-mock")]
 pub use cost::MockTokenMeter;
-pub use cost::{RedisTokenMeter, TokenMeter};
+pub use cost::{KvTokenMeter, RedisTokenMeter, TokenMeter};
 pub use dispatch_ledger::{DispatchLedger, NoopDispatchLedger, RedisDispatchLedger};
 pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, TerminationReason};
 pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
+#[cfg(feature = "state-disk")]
+pub use kv::RedbKv;
+pub use kv::{AwKv, MemoryKv};
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
@@ -91,10 +96,11 @@ pub use mcp_source::{
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
+pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
-pub use tools::{RedisToolLedger, ToolLedger};
+pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
 
