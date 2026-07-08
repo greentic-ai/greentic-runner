@@ -73,6 +73,8 @@ pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, Term
 pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
+#[cfg(feature = "state-disk")]
+pub use kv::RedbKv;
 pub use kv::{AwKv, MemoryKv};
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};

@@ -10,8 +10,12 @@ use std::time::Duration;
 use crate::error::StateError;
 
 pub mod memory;
+#[cfg(feature = "state-disk")]
+pub mod redb;
 
 pub use memory::MemoryKv;
+#[cfg(feature = "state-disk")]
+pub use redb::RedbKv;
 
 /// Boxed, `Send` future returned by every [`AwKv`] method (object-safe:
 /// mirrors the `AgentStateStore` / `CheckpointStore` convention in this crate).
