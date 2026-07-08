@@ -520,6 +520,7 @@ fn build_flow(flow_id: &str, flow_kind: FlowKind, in_map: Value, out_map: Value)
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         },
     );
 
@@ -557,6 +558,7 @@ fn build_component_exec_flow(flow_id: &str, message: &str) -> Result<Flow> {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         },
     );
 
