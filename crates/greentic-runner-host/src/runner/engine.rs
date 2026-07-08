@@ -2637,7 +2637,9 @@ impl From<Node> for HostNode {
                 }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
-                    conversational: false, // SP3 will populate from the flow doc
+                    // SP3: honour the flow-doc `conversational` flag (greentic-flow
+                    // parses it into `greentic_types::Node.conversational`).
+                    conversational: node.conversational,
                 },
                 "dw.agent_graph" => NodeKind::DwAgentGraph {
                     graph_id: raw_operation.clone().unwrap_or_default(),
@@ -4106,6 +4108,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -4262,6 +4265,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -4402,6 +4406,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -4553,6 +4558,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -4570,6 +4576,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), agent_node);
@@ -4686,6 +4693,7 @@ mod tests {
                 err_map: None,
                 routing: Routing::End,
                 telemetry: TelemetryHints::default(),
+                conversational: false,
             };
             nodes.insert(id, node);
         }
@@ -5214,6 +5222,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -5231,6 +5240,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(agent_node_id.clone(), agent_node);
@@ -5564,6 +5574,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -5683,6 +5694,7 @@ mod tests {
                 node_id: emit_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit_node = Node {
@@ -5701,6 +5713,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();
@@ -5930,6 +5943,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let host_node = HostNode::from(node);
@@ -5980,6 +5994,7 @@ mod tests {
                 node_id: emit2_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit2_node = Node {
@@ -5998,6 +6013,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();
@@ -6082,6 +6098,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let host_node = HostNode::from(node);
@@ -6143,6 +6160,7 @@ mod tests {
                 node_id: wait_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let wait_node = Node {
@@ -6163,6 +6181,7 @@ mod tests {
                 node_id: emit_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit_node = Node {
@@ -6184,6 +6203,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();

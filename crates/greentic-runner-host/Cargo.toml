@@ -101,7 +101,7 @@ chronicle-core = { git = "https://github.com/greentic-biz/greentic-chronicle-ext
 chronicle-driver-surreal = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 chronicle-driver-neo4j = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
 chronicle-driver-falkor = { git = "https://github.com/greentic-biz/greentic-chronicle-ext.git", branch = "research", optional = true }
-greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "eb9041ccc3d3c49450e82f58e4654b69c10555e9", optional = true }
+greentic-ext-runtime = { git = "https://github.com/greentic-biz/greentic-designer-extensions", rev = "82d1bb24d1f05d0302ab0c2ca45a38e015e05f75", optional = true }
 greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true

@@ -2954,6 +2954,10 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 err_map: None,
                 routing,
                 telemetry,
+                // Pack-manifest component nodes are not conversational chat
+                // segments; the SP3 flag flows via the flow-doc parse path
+                // (greentic_flow -> types::Node.conversational).
+                conversational: false,
             },
         );
     }
