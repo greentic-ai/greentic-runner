@@ -28,6 +28,7 @@ pub mod guardrail;
 pub mod guardrail_provider;
 pub mod http_provider;
 pub mod knowledge;
+pub mod kv;
 pub mod layered_provider;
 pub mod llm;
 pub mod llm_credential;
@@ -72,6 +73,7 @@ pub use error::{AgentError, ConfigError, LlmError, MemoryError, StateError, Term
 pub use flow_source::{FlowInvoker, FlowOperation, FlowToolCatalog, FlowToolEntry, FlowToolSource};
 pub use graph::http_provider::{CachingGraphProvider, HttpGraphProvider};
 pub use http_provider::HttpConfigProvider;
+pub use kv::{AwKv, MemoryKv};
 pub use layered_provider::LayeredConfigProvider;
 pub use llm::{LlmBackend, LlmRequest, LlmResponse, RetryingLlmBackend};
 pub use llm_extension::{
