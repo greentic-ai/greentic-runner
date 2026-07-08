@@ -11,7 +11,7 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify", "agentic-worker"]
+default = ["verify", "agentic-worker", "state-disk"]
 telemetry = ["dep:greentic-telemetry"]
 verify = []
 session-redis = ["greentic-session/redis"]
@@ -21,6 +21,11 @@ component-v0-6-introspection = []
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
 agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
+# On-disk AW state backend (redb) — forwarded to greentic-aw-runtime. Purely a
+# passthrough so the runner-host-side `#[cfg(feature = "state-disk")]` gate
+# resolves; greentic-aw-runtime's own `state-disk` default is already active
+# transitively since it's pulled without `default-features = false`.
+state-disk = ["greentic-aw-runtime?/state-disk"]
 # Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
 # routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
 greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]

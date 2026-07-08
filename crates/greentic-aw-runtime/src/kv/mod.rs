@@ -17,6 +17,13 @@ pub use memory::MemoryKv;
 #[cfg(feature = "state-disk")]
 pub use redb::RedbKv;
 
+/// Open an on-disk redb backend as a boxed `AwKv`. Feature-gated helper so
+/// callers don't need to name `RedbKv` behind `#[cfg]`.
+#[cfg(feature = "state-disk")]
+pub fn open_disk(path: &std::path::Path) -> Result<std::sync::Arc<dyn AwKv>, StateError> {
+    Ok(std::sync::Arc::new(RedbKv::open(path)?))
+}
+
 /// Boxed, `Send` future returned by every [`AwKv`] method (object-safe:
 /// mirrors the `AgentStateStore` / `CheckpointStore` convention in this crate).
 pub type KvFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, StateError>> + Send + 'a>>;
