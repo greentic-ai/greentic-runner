@@ -24,6 +24,7 @@ use crate::component_source::ComponentToolCatalog;
 use crate::config::ToolRef;
 use crate::error::{AgentError, StateError};
 use crate::flow_source::FlowToolCatalog;
+use crate::kv::AwKv;
 use crate::llm::LlmToolSchema;
 use crate::mcp_source::McpToolCatalog;
 use crate::state::ToolCallRecord;
@@ -447,6 +448,57 @@ impl ToolLedger for RedisToolLedger {
                 .await
                 .map_err(|e| StateError::Redis(format!("ledger set_ex: {e}")))?;
             Ok(())
+        })
+    }
+}
+
+const KV_LEDGER_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Tool-call idempotency ledger over [`AwKv`] (Redis-free). Same key format
+/// and 7-day TTL as [`RedisToolLedger`].
+pub struct KvToolLedger {
+    kv: Arc<dyn AwKv>,
+}
+
+impl KvToolLedger {
+    pub fn new(kv: Arc<dyn AwKv>) -> Self {
+        Self { kv }
+    }
+}
+
+impl ToolLedger for KvToolLedger {
+    fn get<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<serde_json::Value>, StateError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            match self.kv.get(&key).await? {
+                Some(bytes) => {
+                    let entry: ToolLedgerEntry = serde_json::from_slice(&bytes)
+                        .map_err(|e| StateError::Decode(format!("ledger decode: {e}")))?;
+                    Ok(Some(entry.result))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    fn record<'a>(
+        &'a self,
+        tenant: &'a TenantContext,
+        session_id: &'a str,
+        call_id: &'a str,
+        result: serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let key = ledger_key(tenant, session_id, call_id);
+            let bytes = serde_json::to_vec(&ToolLedgerEntry { result })
+                .map_err(|e| StateError::Decode(format!("ledger encode: {e}")))?;
+            self.kv.set_ex(&key, bytes, KV_LEDGER_TTL).await
         })
     }
 }
@@ -1055,5 +1107,26 @@ mod tests {
             .await
             .expect("component dispatch with no catalog still returns Ok");
         assert!(out.to_string().contains("error"), "got: {out}");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod kv_ledger_tests {
+    use super::*;
+    use crate::kv::MemoryKv;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn record_then_get_replays_result() {
+        let ledger = KvToolLedger::new(Arc::new(MemoryKv::new()));
+        let t = TenantContext::new("acme", "prod");
+        assert!(ledger.get(&t, "sess", "call1").await.unwrap().is_none());
+        ledger
+            .record(&t, "sess", "call1", serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        let got = ledger.get(&t, "sess", "call1").await.unwrap();
+        assert_eq!(got, Some(serde_json::json!({"ok": true})));
     }
 }

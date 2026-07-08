@@ -85,7 +85,11 @@ loop). Gated behind the `agentic-worker` feature (default-on). Tools come from
 `.gtxpack` design-extensions loaded from `GREENTIC_EXTENSIONS_DIR/design/` at boot
 (`agent_node::build_ext_runtime` scans + registers them) and from per-tenant MCP servers;
 the OpenAI backend encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
-Needs `GREENTIC_AW_REDIS_URL` (state) + an LLM key (`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`).
+Needs a state backend — `memory` (default, ephemeral) / `disk` (redb) / `redis` (durable +
+multi-instance), selected via `GREENTIC_AW_STATE_BACKEND` — plus an LLM key
+(`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`). When nothing is set the runtime auto-selects an
+in-memory backend, so `dw.agent` runs with no Redis; multi-instance HA still requires `redis`
+(the `memory`/`disk` backends give single-process locking only).
 Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplied via pack
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
 
@@ -160,7 +164,9 @@ gate is the pure `agent_node::should_serve_agentic_inproc`; the spawn is
 by `agent_node::load_process_agent_configs`) — pack-embedded and per-tenant
 `HostConfig.agents` are not visible at process startup. Skips with a warning (and
 the runner continues normally) when no agents are configured, or when the runtime
-cannot be built (no `GREENTIC_AW_REDIS_URL` / no LLM key).
+cannot be built (no usable state backend — e.g. `GREENTIC_AW_STATE_BACKEND=redis` with no
+`GREENTIC_AW_REDIS_URL`, or a Redis connect failure — or no LLM key). With no backend env set
+it defaults to the in-memory backend, so the runtime builds without Redis.
 
 ### WASM Component Model
 
@@ -236,7 +242,9 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`operala.call`/`agentic.call`/`telco-x.call` dispatch + in-proc agentic serve. The runner registers response listeners for `sorla`/`operala`/`agentic`/`telco-x`; the `telco-x-event-bridge` crate serves `greentic.telco-x.request.v1` (Phase 2 transport scaffold). A credit-free `telco-x-serve` bin runs the bridge with the built-in `EchoInvoker` (`cargo run -p telco-x-event-bridge --bin telco-x-serve`); real Telco-X operations need a production `TelcoXDispatchInvoker` impl. Until then `telco-x.call` only echoes. See `docs/superpowers/specs/2026-06-21-telco-x-runtime-dispatch-design.md` in the workspace root |
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
-| `GREENTIC_AW_REDIS_URL` | Agentic-worker state store (required for `dw.agent` + in-proc serve runtime) |
+| `GREENTIC_AW_STATE_BACKEND` | AW state backend selector: `redis` \| `memory` \| `disk`. Unset → `redis` if `GREENTIC_AW_REDIS_URL` is set, else `memory` (ephemeral, in-process). `memory`/`disk` give single-process locking only — multi-instance HA needs `redis`. |
+| `GREENTIC_AW_STATE_PATH` | On-disk (redb) file path when `GREENTIC_AW_STATE_BACKEND=disk` (default `~/.greentic/aw-state.redb`, falling back to `/var/lib/greentic/aw-state.redb`). |
+| `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |
 
 Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `TELEGRAM_BOT_TOKEN`.
 
