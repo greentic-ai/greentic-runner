@@ -339,37 +339,19 @@ mod aw {
         audit_sink: Option<AuditSink>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
-        use greentic_aw_runtime::cost::RedisTokenMeter;
-        use greentic_aw_runtime::graph::RedisCheckpointStore;
-        use greentic_aw_runtime::tools::RedisToolLedger;
-        use greentic_aw_runtime::{OtelTelemetry, RedisAgentStateStore};
+        use crate::runner::aw_backends::{AwBackends, build_aw_backends};
+        use greentic_aw_runtime::OtelTelemetry;
 
         if graphs.is_empty() {
             return None; // nothing to serve
         }
 
-        let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
-            Ok(url) if !url.is_empty() => url,
-            _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgentGraph nodes disabled");
-                return None;
-            }
-        };
-
-        let state_store = match RedisAgentStateStore::connect(&redis_url).await {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                tracing::warn!(error = %error, "AW Redis connect failed; DwAgentGraph nodes disabled");
-                return None;
-            }
-        };
-
-        // Share the multiplexed connection manager across all Redis-backed
-        // stores (state, checkpoint, token meter, idempotency ledger).
-        let manager = state_store.manager();
-        let checkpoint = Arc::new(RedisCheckpointStore::new(manager.clone()));
-        let token_meter = Arc::new(RedisTokenMeter::new(manager.clone()));
-        let ledger = Arc::new(RedisToolLedger::new(manager));
+        let AwBackends {
+            state_store,
+            token_meter,
+            tool_ledger: ledger,
+            checkpoint_store: checkpoint,
+        } = build_aw_backends().await?;
 
         // Process-level graph serve path has no per-tenant secrets context;
         // tool secrets resolve from the env only. It likewise has no embedding

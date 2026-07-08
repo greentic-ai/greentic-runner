@@ -71,7 +71,6 @@ fn auto_select(url: Option<&str>) -> StateBackendChoice {
 }
 
 /// The four state backends the AW runtime needs, resolved once per builder.
-#[allow(dead_code)] // fields consumed by Task 8 (runner call-site wiring)
 pub(crate) struct AwBackends {
     pub state_store: Arc<dyn AgentStateStore>,
     pub token_meter: Arc<dyn TokenMeter>,
@@ -83,7 +82,6 @@ pub(crate) struct AwBackends {
 /// the worker must be disabled (explicit `redis` with no URL, or a Redis
 /// connect failure). Memory/disk paths always succeed (disk falls back to
 /// memory on open failure).
-#[allow(dead_code)] // consumed by Task 8 (runner call-site wiring)
 pub(crate) async fn build_aw_backends() -> Option<AwBackends> {
     let backend = std::env::var(ENV_BACKEND).ok();
     let redis_url = std::env::var(ENV_REDIS_URL).ok();
@@ -238,5 +236,39 @@ mod tests {
             select_state_backend(Some("cassandra"), None, None),
             StateBackendChoice::Memory
         );
+    }
+}
+
+#[cfg(test)]
+mod build_tests {
+    use super::*;
+    use serial_test::serial;
+
+    // The crate denies unsafe, but `std::env::set_var`/`remove_var` are `unsafe`
+    // as of edition 2024. These helpers are only reachable from `#[serial]`
+    // tests, so no other thread observes the environment mid-mutation.
+    #[allow(unsafe_code)]
+    fn set(key: &str, val: &str) {
+        // SAFETY: env-mutating tests are serialized via `#[serial]`.
+        unsafe { std::env::set_var(key, val) };
+    }
+    #[allow(unsafe_code)]
+    fn unset(key: &str) {
+        // SAFETY: env-mutating tests are serialized via `#[serial]`.
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn builds_memory_backend_with_no_redis() {
+        unset(ENV_REDIS_URL);
+        unset(ENV_STATE_PATH);
+        set(ENV_BACKEND, "memory");
+        let backends = build_aw_backends().await;
+        assert!(
+            backends.is_some(),
+            "memory backend must build without Redis"
+        );
+        unset(ENV_BACKEND);
     }
 }
