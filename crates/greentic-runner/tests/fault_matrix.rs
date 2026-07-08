@@ -201,9 +201,9 @@ fn ensure_state_store_component() -> Result<PathBuf> {
     }
 
     let crate_dir = crates_root.join(crate_name);
-    let status = Command::new("cargo")
-        .env("CARGO_NET_OFFLINE", "true")
-        .env("CARGO_TARGET_DIR", &target_root)
+    let offline = env::var("CARGO_NET_OFFLINE").ok();
+    let mut cmd = Command::new("cargo");
+    cmd.env("CARGO_TARGET_DIR", &target_root)
         // wasm32-wasip2 has no `profiler_builtins`; strip any inherited
         // coverage instrumentation flags so the spawned build does not try
         // to link it under `cargo llvm-cov`.
@@ -213,13 +213,18 @@ fn ensure_state_store_component() -> Result<PathBuf> {
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("LLVM_PROFILE_FILE")
         .current_dir(&crate_dir)
-        .args([
-            "build",
-            "--offline",
-            "--target",
-            "wasm32-wasip2",
-            "--release",
-        ])
+        .args(["build", "--target", "wasm32-wasip2", "--release"]);
+    // Honour `CARGO_NET_OFFLINE` instead of forcing it, matching the sibling
+    // fixture builders in `conformance.rs` and `snapshots.rs`. The fixture
+    // workspace resolves crates the outer build never fetches, so a hardcoded
+    // `--offline` can only ever succeed against a stale local cache.
+    if matches!(offline.as_deref(), Some("true")) {
+        cmd.arg("--offline");
+    }
+    if let Some(val) = &offline {
+        cmd.env("CARGO_NET_OFFLINE", val);
+    }
+    let status = cmd
         .status()
         .with_context(|| format!("failed to build component crate {crate_name}"))?;
     if !status.success() {
