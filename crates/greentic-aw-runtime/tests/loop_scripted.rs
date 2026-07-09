@@ -680,3 +680,77 @@ async fn recall_missing_key_returns_null() {
         "expected null value for missing key, got: {recall_result}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// end_conversation (conversational-segment exit) loop tests
+// ---------------------------------------------------------------------------
+
+/// Return an `AgentConfig` with `conversational = true` so `conversational_active()`
+/// is true and the `end_conversation` tool is advertised + intercepted.
+fn cfg_conversational(max_iter: u32) -> AgentConfig {
+    let mut c = cfg(max_iter, 60_000, vec![], None);
+    c.conversational = true;
+    c
+}
+
+#[tokio::test]
+async fn end_conversation_tool_terminates_with_conversation_ended() {
+    // Agent's single turn: assistant text (the goodbye) + an end_conversation call.
+    let closing = LlmResponse {
+        content: Some("Thanks, all done! Goodbye.".into()),
+        tool_calls: vec![ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "host".into(),
+            tool_name: "end_conversation".into(),
+            args: serde_json::json!({}),
+        }],
+        tokens_in: 0,
+        tokens_out: 0,
+    };
+    let (rt, _tel, tc) = build_runtime(vec![Ok(closing)], cfg_conversational(8), 0);
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Thanks, all done! Goodbye.");
+}
+
+#[tokio::test]
+async fn end_conversation_uses_note_when_no_assistant_text() {
+    let closing = LlmResponse {
+        content: None,
+        tool_calls: vec![ToolCallRecord {
+            call_id: "c1".into(),
+            extension_id: "host".into(),
+            tool_name: "end_conversation".into(),
+            args: serde_json::json!({ "note": "Take care!" }),
+        }],
+        tokens_in: 0,
+        tokens_out: 0,
+    };
+    let (rt, _tel, tc) = build_runtime(vec![Ok(closing)], cfg_conversational(8), 0);
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+    assert_eq!(out.reply, "Take care!");
+}
+
+#[tokio::test]
+async fn non_conversational_agent_ignores_end_conversation_variant() {
+    // Regression: a normal (conversational: false) agent producing a plain
+    // final reply still terminates FinalReply — unchanged behaviour.
+    let (rt, _tel, tc) = build_runtime(
+        vec![Ok(final_reply("hello"))],
+        cfg(8, 60_000, vec![], None),
+        0,
+    );
+    let out = rt
+        .step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .await
+        .unwrap();
+    assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+    assert_eq!(out.reply, "hello");
+}

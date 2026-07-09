@@ -174,6 +174,9 @@ pub async fn run_step(
     // wired + the agent's binding enabled). Drives `remember`/`recall` tools.
     let st_active =
         crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
+    // Whether this node is a conversational segment (opt-in). Drives the
+    // `end_conversation` tool + `ConversationEnded` termination.
+    let conv_active = crate::conversation::conversational_active(&config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -209,6 +212,12 @@ pub async fn run_step(
             .await
             .unwrap_or_default();
         crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
+    } else {
+        system_prompt
+    };
+
+    let system_prompt = if conv_active {
+        crate::conversation::augment_system_prompt(&system_prompt)
     } else {
         system_prompt
     };
@@ -260,7 +269,7 @@ pub async fn run_step(
     let mut iterations: u32 = 0;
     let mut reply = String::new();
 
-    for iter in 0..config.limits.max_iter {
+    'turns: for iter in 0..config.limits.max_iter {
         iterations = iter + 1;
 
         // Extend the lock TTL each iteration; losing the extension is
@@ -287,6 +296,9 @@ pub async fn run_step(
         if st_active {
             tools_schema.push(crate::short_term::remember_tool_schema());
             tools_schema.push(crate::short_term::recall_tool_schema());
+        }
+        if conv_active {
+            tools_schema.push(crate::conversation::end_conversation_tool_schema());
         }
         let request = LlmRequest {
             system_prompt: system_prompt.clone(),
@@ -349,8 +361,9 @@ pub async fn run_step(
             // message carrying the matching `tool_calls`; without this the next
             // turn 400s ("messages with role 'tool' must be a response to a
             // preceeding message with 'tool_calls'").
+            let assistant_text = response.content.clone().unwrap_or_default();
             state.messages.push(ChatMessage::Assistant {
-                content: response.content.clone().unwrap_or_default(),
+                content: assistant_text.clone(),
                 tool_calls: response.tool_calls.clone(),
             });
             for call in response.tool_calls {
@@ -404,6 +417,37 @@ pub async fn run_step(
                         result,
                     });
                     continue;
+                }
+                // --- Host built-in: `end_conversation` (conversational exit) ---
+                // Intercepted before the allow-list + WASM dispatch. Terminates
+                // the segment: the same-turn assistant text (or the tool's `note`)
+                // becomes the closing reply; the flow advances (SP2).
+                if conv_active && call.tool_name == crate::conversation::END_CONVERSATION_TOOL {
+                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    let note = call
+                        .args
+                        .get("note")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let ack = serde_json::json!({ "status": "conversation_ended" });
+                    observer.on_tool_result(&call.tool_name, &call.call_id, &ack);
+                    state.messages.push(ChatMessage::Tool {
+                        call_id: call.call_id.clone(),
+                        content: ack.clone(),
+                    });
+                    trail.push(AgentStep::ToolCall {
+                        name: call.tool_name.clone(),
+                        call_id: call.call_id.clone(),
+                        result: ack,
+                    });
+                    reply = if assistant_text.is_empty() {
+                        note
+                    } else {
+                        assistant_text.clone()
+                    };
+                    terminated_by = TerminationReason::ConversationEnded;
+                    break 'turns;
                 }
                 if !is_tool_allowed(&call, &config.tools) {
                     state.messages.push(ChatMessage::Tool {
@@ -508,15 +552,19 @@ pub async fn run_step(
         break;
     }
 
-    // --- Outbound guardrail hook (FinalReply only) ---
+    // --- Outbound guardrail hook (FinalReply / ConversationEnded only) ---
     // The outbound chain is intentionally skipped when the loop terminated via
     // Timeout or MaxIterations: in those cases `reply` is an empty string, and
     // running an outbound guardrail against an empty string could trigger a
     // policy deny that masks the true termination reason from the caller.
-    // Only a real final reply (where the LLM produced content) is subject to
+    // Only a real final reply (where the LLM produced content, or the
+    // conversational segment closed via `end_conversation`) is subject to
     // outbound policy; the assistant message and audit trail are written only
     // after this check passes, so saved state reflects the guarded reply.
-    if terminated_by == TerminationReason::FinalReply {
+    if matches!(
+        terminated_by,
+        TerminationReason::FinalReply | TerminationReason::ConversationEnded
+    ) {
         let reply = match crate::guardrail::run_chain(
             &guardrail_chain,
             crate::guardrail::GuardrailDirection::Outbound,
