@@ -17,6 +17,7 @@ pub mod billing;
 pub mod component_source;
 pub mod config;
 pub mod config_provider;
+pub mod conversation;
 pub mod cost;
 pub mod dispatch_ledger;
 pub mod dw;

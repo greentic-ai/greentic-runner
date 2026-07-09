@@ -1114,6 +1114,7 @@ mod aw {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
@@ -1286,6 +1287,7 @@ mod aw {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
@@ -2547,6 +2549,7 @@ mod aw {
                     long_term: None,
                 }),
                 knowledge: None,
+                conversational: false,
             };
             let mut provider = InMemoryConfigProvider::new();
             provider.insert(tenant, agent_id, cfg);

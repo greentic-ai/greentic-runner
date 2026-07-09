@@ -116,6 +116,12 @@ pub struct AgentConfig {
     pub memory: Option<MemorySettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub knowledge: Option<KnowledgeSettings>,
+    /// Opt-in: this node is a conversational segment. When true the runtime
+    /// advertises the built-in `end_conversation` tool and terminates the loop
+    /// with `TerminationReason::ConversationEnded` when the agent calls it.
+    /// Set by the flow node (SP2/SP3); defaults false ⇒ one-shot behaviour.
+    #[serde(default)]
+    pub conversational: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,6 +335,7 @@ mod tests {
             limits: AgentLimits::default(),
             memory: None,
             knowledge: None,
+            conversational: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();

@@ -1611,6 +1611,7 @@ mod aw {
                 limits: AgentLimits::default(),
                 memory: None,
                 knowledge: None,
+                conversational: false,
             }
         }
 
@@ -1643,6 +1644,7 @@ mod aw {
                     limits: AgentLimits::default(),
                     memory: None,
                     knowledge: None,
+                    conversational: false,
                 },
             );
             let config_provider = Arc::new(config_provider);
