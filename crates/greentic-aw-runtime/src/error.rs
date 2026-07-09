@@ -134,6 +134,9 @@ pub enum ConfigError {
 #[serde(rename_all = "snake_case")]
 pub enum TerminationReason {
     FinalReply,
+    /// The agent called the built-in `end_conversation` tool: the conversational
+    /// segment is complete and the flow may advance to this node's successor.
+    ConversationEnded,
     MaxIterations,
     Timeout,
     Error,
@@ -198,5 +201,13 @@ mod tests {
             budget,
             AgentError::Internal("x".into()).user_facing_message(&cfg)
         );
+    }
+
+    #[test]
+    fn conversation_ended_serializes_snake_case() {
+        let json = serde_json::to_string(&TerminationReason::ConversationEnded).unwrap();
+        assert_eq!(json, "\"conversation_ended\"");
+        let back: TerminationReason = serde_json::from_str("\"conversation_ended\"").unwrap();
+        assert_eq!(back, TerminationReason::ConversationEnded);
     }
 }
