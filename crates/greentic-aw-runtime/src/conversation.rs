@@ -14,8 +14,7 @@ pub(crate) const END_CONVERSATION_TOOL: &str = "end_conversation";
 
 /// One-line system-prompt note appended for conversational nodes so the model
 /// knows it MAY end the conversation (spec §"Tool discoverability").
-pub(crate) const END_CONVERSATION_SYSTEM_NOTE: &str =
-    "When the user's goal for this conversation has been met, call the \
+pub(crate) const END_CONVERSATION_SYSTEM_NOTE: &str = "When the user's goal for this conversation has been met, call the \
      `end_conversation` tool to finish. Put your closing message to the user in \
      your assistant reply on that same turn (or pass it as the tool's `note`).";
 
