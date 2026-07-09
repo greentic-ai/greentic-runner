@@ -6532,6 +6532,136 @@ mod tests {
             );
         }
     }
+
+    /// A `dw.agent` stub that returns a different scripted payload on each turn
+    /// (one per `execute` call), so a multi-turn conversation can be driven.
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedAgentHandler {
+        payloads: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for ScriptedAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            self.payloads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("scripted agent handler exhausted: too many turns"))
+        }
+    }
+
+    /// End-to-end SP1+SP2+SP3: a conversational `dw.agent` flow parks on each
+    /// normal reply, RESUMES from the snapshot re-entering the SAME node, and
+    /// only advances to the `thanks` successor once the agent returns
+    /// `terminated_by == conversation_ended`. This exercises the full multi-turn
+    /// loop across real park/resume cycles — the existing SP2 tests each drive
+    /// only a single turn, so none prove that a resumed turn re-enters the node
+    /// or that the successor actually renders after the conversation ends.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_multiturn_parks_resumes_then_advances_to_thanks() {
+        use std::collections::VecDeque;
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                conversational_dw_flow(true),
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(std::sync::Arc::new(ScriptedAgentHandler {
+                payloads: std::sync::Mutex::new(VecDeque::from(vec![
+                    json!({ "reply": "turn one", "trail": [], "terminated_by": "final_reply" }),
+                    json!({ "reply": "turn two", "trail": [], "terminated_by": "final_reply" }),
+                    json!({ "reply": "goodbye", "trail": [], "terminated_by": "conversation_ended" }),
+                ])),
+            })),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: enter the agent; a normal reply parks, re-entering the node.
+        let r1 = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snap1 = match r1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("turn 1 must park, got {other:?}"),
+        };
+        assert_eq!(
+            snap1.next_node, "agent",
+            "turn 1 must re-enter the agent node"
+        );
+        assert!(
+            serde_json::to_string(&r1.output)
+                .unwrap()
+                .contains("turn one"),
+            "turn 1 reply must render before parking: {:?}",
+            r1.output
+        );
+
+        // Turn 2: resume from the park → still a normal reply → park AGAIN.
+        // This is the loop: a resumed turn re-enters the same node.
+        let r2 = rt
+            .block_on(engine.resume(conv_ctx(), snap1, Value::Null))
+            .unwrap();
+        let snap2 = match r2.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("turn 2 must park again (loop), got {other:?}"),
+        };
+        assert_eq!(
+            snap2.next_node, "agent",
+            "turn 2 must re-enter the agent node"
+        );
+        assert!(
+            serde_json::to_string(&r2.output)
+                .unwrap()
+                .contains("turn two"),
+            "turn 2 reply must render before parking: {:?}",
+            r2.output
+        );
+
+        // Turn 3: resume → the agent ends the conversation → advance to `thanks`.
+        let observer = CountingObserver::new();
+        let ctx3 = FlowContext {
+            observer: Some(&observer),
+            ..conv_ctx()
+        };
+        let r3 = rt
+            .block_on(engine.resume(ctx3, snap2, Value::Null))
+            .unwrap();
+        assert!(
+            matches!(r3.status, FlowStatus::Completed),
+            "turn 3 (conversation_ended) must advance and complete, got {:?}",
+            r3.status
+        );
+        let ends = observer.ends.lock().unwrap();
+        assert!(
+            ends.iter()
+                .any(|e| serde_json::to_string(e).unwrap().contains("thanks")),
+            "the `thanks` successor must render after the conversation ends: {:?}",
+            *ends
+        );
+    }
 }
 
 use tracing::Instrument;
