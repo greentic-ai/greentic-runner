@@ -1048,21 +1048,21 @@ mod aw {
 
     /// Shared store-agnostic tail: builds the extension runtime, LLM backend,
     /// config providers, and [`AgentRuntime`] given the three already-constructed
-    /// store trait objects.
+    /// store trait objects, then mounts the knowledge (RAG) and long-term-memory
+    /// seams so the returned in-process runtime grounds identically to the
+    /// out-of-process NATS serve path ([`build_agent_runtime`]).
     ///
     /// Extracted so both the Redis path ([`build_agent_node_handler`]) and the
     /// ephemeral desktop path ([`build_agent_node_handler_ephemeral`]) share
     /// identical post-store construction logic; store differences are the only
-    /// divergence between the two callers.
+    /// divergence between the two callers. Returning the bare [`AgentRuntime`]
+    /// (rather than the wrapped handler) also keeps the mounted knowledge seam
+    /// observable to the regression test that guards this wiring.
     ///
     /// Returns `None` when the extension runtime fails to initialise (the only
     /// failure mode at this layer — store errors are handled by callers).
-    ///
-    /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
-    /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
-    /// plain [`AgentRuntime::step`] path.
     #[allow(clippy::too_many_arguments)]
-    async fn build_runtime_handler_with_stores(
+    async fn build_runtime_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
         secrets: crate::secrets::DynSecretsManager,
@@ -1071,8 +1071,7 @@ mod aw {
         state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
-        audit_sink: Option<AuditSink>,
-    ) -> Option<Arc<dyn AgentNodeHandler>> {
+    ) -> Option<Arc<AgentRuntime>> {
         use std::time::Duration;
 
         use greentic_aw_runtime::LayeredConfigProvider;
@@ -1160,22 +1159,75 @@ mod aw {
         };
         let telemetry = Arc::new(OtelTelemetry);
 
-        let runtime = Arc::new(
-            AgentRuntime::new(
-                config_provider,
-                state_store,
-                ext_runtime,
-                llm,
-                telemetry,
-                token_meter,
-                ledger,
-                mcp_source_from_env(),
-            )
-            .with_component_source(component_source_from_packs(&packs, &tenant))
-            .with_flow_source(flow_source_from_packs(&packs, &tenant)),
-        );
+        let base = AgentRuntime::new(
+            config_provider,
+            state_store,
+            ext_runtime,
+            llm,
+            telemetry,
+            token_meter,
+            ledger,
+            mcp_source_from_env(),
+        )
+        .with_component_source(component_source_from_packs(&packs, &tenant))
+        .with_flow_source(flow_source_from_packs(&packs, &tenant));
+
+        // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
+        // `dw.agent` workers ground on the ingested corpus exactly as the
+        // out-of-process NATS serve path does (see [`build_agent_runtime`], which
+        // makes the identical pair of calls). Both attach helpers are env-driven
+        // and fail-open: with the feature off (default) or the operator env unset
+        // they are no-ops that leave `base` unchanged, so this cannot break the
+        // non-knowledge build or hard-fail boot. Without these calls the
+        // in-process handler's `runtime.knowledge` stayed `None`, so
+        // `knowledge_active()` was false and `search_knowledge` was never invoked
+        // — the model hallucinated instead of retrieving from the corpus that had
+        // already been ingested at boot.
+        #[cfg(feature = "long-term-chronicle")]
+        let base = crate::runner::long_term_memory::attach(base).await;
+        #[cfg(feature = "knowledge-chronicle")]
+        let base = crate::runner::knowledge_mount::attach(base).await;
+        let runtime = Arc::new(base);
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
+        Some(runtime)
+    }
+
+    /// Wrap the shared in-process [`AgentRuntime`] (built by
+    /// [`build_runtime_with_stores`], including the mounted knowledge and
+    /// long-term-memory seams) in a flow-node handler. Both the Redis path
+    /// ([`build_agent_node_handler`]) and the ephemeral desktop path
+    /// ([`build_agent_node_handler_ephemeral`]) route through here.
+    ///
+    /// Returns `None` when the runtime could not be built (extension-runtime init
+    /// failure — the only failure mode at this layer).
+    ///
+    /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
+    /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
+    /// plain [`AgentRuntime::step`] path.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_runtime_handler_with_stores(
+        merged_agents: HashMap<String, AgentConfig>,
+        tenant: String,
+        secrets: crate::secrets::DynSecretsManager,
+        ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: Vec<Arc<crate::pack::PackRuntime>>,
+        state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore>,
+        token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
+        ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
+        audit_sink: Option<AuditSink>,
+    ) -> Option<Arc<dyn AgentNodeHandler>> {
+        let runtime = build_runtime_with_stores(
+            merged_agents,
+            tenant,
+            secrets,
+            ext_llm_port,
+            packs,
+            state_store,
+            token_meter,
+            ledger,
+        )
+        .await?;
         Some(Arc::new(RuntimeAgentNodeHandler::new(runtime, audit_sink)))
     }
 
@@ -2208,6 +2260,95 @@ mod aw {
                 handler.is_some(),
                 "ephemeral builder must not require Redis"
             );
+        }
+
+        /// Regression guard for the in-process knowledge (RAG) mount.
+        ///
+        /// Before the fix `build_runtime_with_stores` built the in-process
+        /// [`AgentRuntime`] via `AgentRuntime::new(...)` and returned it WITHOUT
+        /// calling [`crate::runner::knowledge_mount::attach`], so
+        /// `runtime.knowledge` stayed `None`, `knowledge_active()` was false and
+        /// `search_knowledge` was never invoked — the in-process `dw.agent`
+        /// worker hallucinated instead of grounding on the ingested corpus. This
+        /// proves the in-process path now mounts the knowledge seam exactly like
+        /// the NATS serve path ([`build_agent_runtime`]).
+        ///
+        /// Uses the `surreal-memory` graph backend so attach needs no on-disk
+        /// lock and no network: `KnowledgeChronicle::from_config` only constructs
+        /// the embedder/LLM clients (their endpoint is consulted at call time),
+        /// so the seam mounts without any live embedding API call.
+        #[cfg(feature = "knowledge-chronicle")]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn in_process_runtime_mounts_knowledge_seam() {
+            use greentic_aw_runtime::cost::MockTokenMeter;
+            use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_LLM_EXTENSION");
+                std::env::set_var("GREENTIC_KNOWLEDGE_BACKEND", "surreal-memory");
+                std::env::set_var(
+                    "GREENTIC_KNOWLEDGE_EMBED_BASE_URL",
+                    "https://embeddings.invalid/v1",
+                );
+                std::env::set_var("GREENTIC_KNOWLEDGE_EMBED_API_KEY", "sk-test");
+                std::env::set_var("GREENTIC_KNOWLEDGE_EMBED_MODEL", "text-embedding-3-small");
+            }
+
+            // Build the in-process runtime through the SAME shared tail both
+            // in-process handlers use (Redis + ephemeral), with cheap mock stores.
+            async fn build_runtime() -> Option<Arc<AgentRuntime>> {
+                let mut agents = HashMap::new();
+                agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+                let secrets: crate::secrets::DynSecretsManager =
+                    Arc::new(greentic_secrets_lib::env::EnvSecretsManager);
+                let state_store: Arc<dyn greentic_aw_runtime::state::AgentStateStore> =
+                    Arc::new(MockAgentStateStore::new());
+                let token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter> =
+                    Arc::new(MockTokenMeter::new(0));
+                let ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger> =
+                    Arc::new(NoopToolLedger);
+                super::build_runtime_with_stores(
+                    agents,
+                    "t1".to_string(),
+                    secrets,
+                    None,
+                    Vec::new(),
+                    state_store,
+                    token_meter,
+                    ledger,
+                )
+                .await
+            }
+
+            // Embedding env present + surreal-memory backend => knowledge mounts.
+            let runtime = build_runtime().await.expect("runtime should build");
+            assert!(
+                runtime.has_knowledge(),
+                "in-process dw.agent runtime must mount the knowledge (RAG) seam so \
+                 search_knowledge is reachable"
+            );
+
+            // Control: with the embedding endpoint unset the operator has opted
+            // out, so the seam stays unmounted — proving the positive case is the
+            // attach call doing its job, not a tautology.
+            unsafe {
+                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_BASE_URL");
+                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_API_KEY");
+                std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_MODEL");
+            }
+            let runtime_optout = build_runtime().await.expect("runtime should build");
+            assert!(
+                !runtime_optout.has_knowledge(),
+                "knowledge must stay unmounted when the embedding endpoint env is unset"
+            );
+
+            unsafe {
+                std::env::remove_var("GREENTIC_KNOWLEDGE_BACKEND");
+            }
         }
 
         /// In-memory `SecretsManager` for backend tests: returns seeded values,
