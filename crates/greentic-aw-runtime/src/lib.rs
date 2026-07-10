@@ -339,6 +339,15 @@ impl AgentRuntime {
         self
     }
 
+    /// Whether a knowledge / RAG backend is mounted. Mirrors the check
+    /// [`knowledge::knowledge_active`] applies against `runtime.knowledge` in the
+    /// agentic loop, exposed so hosts and tests can confirm the seam is wired
+    /// without issuing a (network-bound) [`Self::search_knowledge`] call.
+    #[must_use]
+    pub fn has_knowledge(&self) -> bool {
+        self.knowledge.is_some()
+    }
+
     /// Hybrid retrieval over the agent's knowledge corpus. Returns
     /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
     pub async fn search_knowledge(
