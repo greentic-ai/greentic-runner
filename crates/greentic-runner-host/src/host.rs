@@ -140,6 +140,15 @@ impl Default for HostBuilder {
     }
 }
 
+/// Result of [`RunnerHost::handle_activity_traced`]: the same outbound replies
+/// as [`RunnerHost::handle_activity`], plus this turn's per-step node outputs
+/// (keyed by each step's `operation`; for a `dw.agent` step that is the
+/// agent_id). Observability only.
+pub struct TurnTrace {
+    pub replies: Vec<Activity>,
+    pub node_outputs: HashMap<String, Value>,
+}
+
 /// Runtime host that manages tenant-bound packs and flow execution.
 pub struct RunnerHost {
     configs: HashMap<String, Arc<HostConfig>>,
@@ -199,6 +208,41 @@ impl RunnerHost {
     }
 
     pub async fn handle_activity(&self, tenant: &str, activity: Activity) -> Result<Vec<Activity>> {
+        let (runtime, envelope) = self.prepare_turn(tenant, activity)?;
+        let result = runtime.state_machine().handle(envelope).await?;
+        Ok(normalize_replies(result, tenant))
+    }
+
+    /// Like [`Self::handle_activity`], but also returns this turn's per-step
+    /// node-output map (keyed by each step's `operation`; for a `dw.agent` step
+    /// that is the agent_id). Observability only — `replies` are byte-identical
+    /// to [`Self::handle_activity`] for the same input.
+    pub async fn handle_activity_traced(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<TurnTrace> {
+        let (runtime, envelope) = self.prepare_turn(tenant, activity)?;
+        let (result, node_outputs) = runtime.state_machine().handle_traced(envelope).await?;
+        let replies = normalize_replies(result, tenant);
+        let node_outputs = match node_outputs {
+            Value::Object(map) => map.into_iter().collect(),
+            _ => HashMap::new(),
+        };
+        Ok(TurnTrace {
+            replies,
+            node_outputs,
+        })
+    }
+
+    /// Shared setup for [`Self::handle_activity`] / [`Self::handle_activity_traced`]:
+    /// resolve the tenant runtime and build the canonical ingress envelope. The
+    /// single seam guarantees the traced and untraced paths cannot diverge.
+    fn prepare_turn(
+        &self,
+        tenant: &str,
+        activity: Activity,
+    ) -> Result<(Arc<TenantRuntime>, IngressEnvelope)> {
         let runtime = self
             .active
             .load(tenant)
@@ -240,9 +284,7 @@ impl RunnerHost {
             reply_scope: None,
         }
         .canonicalize();
-
-        let result = runtime.state_machine().handle(envelope).await?;
-        Ok(normalize_replies(result, tenant))
+        Ok((runtime, envelope))
     }
 
     pub async fn tenant(&self, tenant: &str) -> Option<TenantHandle> {

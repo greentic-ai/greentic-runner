@@ -104,6 +104,10 @@ pub enum FlowStatus {
 pub struct FlowExecution {
     pub output: Value,
     pub status: FlowStatus,
+    /// Per-node outputs for this turn (`node_id → node_output_view(payload)`),
+    /// captured from the flow's `ExecutionState` before it is finalised.
+    /// Observability only — never affects `output`/egress.
+    pub node_outputs: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -271,17 +275,19 @@ struct ComponentCall {
 }
 
 impl FlowExecution {
-    fn completed(output: Value) -> Self {
+    fn completed(output: Value, node_outputs: JsonMap<String, Value>) -> Self {
         Self {
             output,
             status: FlowStatus::Completed,
+            node_outputs,
         }
     }
 
-    fn waiting(output: Value, wait: FlowWait) -> Self {
+    fn waiting(output: Value, wait: FlowWait, node_outputs: JsonMap<String, Value>) -> Self {
         Self {
             output,
             status: FlowStatus::Waiting(Box::new(wait)),
+            node_outputs,
         }
     }
 }
@@ -751,8 +757,10 @@ impl FlowEngine {
                     match decision {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
+                            let node_outputs = state.outputs_map();
                             return Ok(FlowExecution::completed(
                                 state.finalize_with(Some(output.payload.clone())),
+                                node_outputs,
                             ));
                         }
                         NextDecision::Wait => {
@@ -770,6 +778,7 @@ impl FlowEngine {
                                 next_node: node_id.as_str().to_string(),
                                 state: snapshot_state,
                             };
+                            let node_outputs = state.outputs_map();
                             let output_value = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::waiting(
                                 output_value,
@@ -780,6 +789,7 @@ impl FlowEngine {
                                     )),
                                     snapshot,
                                 },
+                                node_outputs,
                             ));
                         }
                     }
@@ -817,10 +827,12 @@ impl FlowEngine {
                         next_node: resume_target.as_str().to_string(),
                         state: snapshot_state,
                     };
+                    let node_outputs = state.outputs_map();
                     let output_value = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
+                        node_outputs,
                     ));
                 }
                 NodeControl::LoopHere { reason } => {
@@ -838,10 +850,12 @@ impl FlowEngine {
                         next_node: node_id.as_str().to_string(),
                         state: snapshot_state,
                     };
+                    let node_outputs = state.outputs_map();
                     let output_value = state.finalize_with(Some(output.payload.clone()));
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
+                        node_outputs,
                     ));
                 }
                 NodeControl::Jump(jump) => {
@@ -861,7 +875,11 @@ impl FlowEngine {
                         "needs_user": needs_user,
                     });
                     state.push_egress(response);
-                    return Ok(FlowExecution::completed(state.finalize_with(None)));
+                    let node_outputs = state.outputs_map();
+                    return Ok(FlowExecution::completed(
+                        state.finalize_with(None),
+                        node_outputs,
+                    ));
                 }
             }
         }
@@ -4174,6 +4192,22 @@ mod tests {
         let rt = Runtime::new().unwrap();
         let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
         assert!(matches!(result.status, FlowStatus::Completed));
+
+        // The completed FlowExecution exposes its per-node outputs (captured
+        // from ExecutionState.nodes before finalize_with drops them). This is
+        // the map the demo reads to surface a mid-flow dw.agent's output.
+        assert!(
+            !result.node_outputs.is_empty(),
+            "completed flow must expose its per-node outputs"
+        );
+        assert!(
+            result
+                .node_outputs
+                .values()
+                .any(|v| v.to_string().contains("logged")),
+            "node_outputs must carry the executed node's payload: {:?}",
+            result.node_outputs
+        );
 
         let starts = observer.starts.lock().unwrap();
         let ends = observer.ends.lock().unwrap();
