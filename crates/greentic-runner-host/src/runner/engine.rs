@@ -858,6 +858,36 @@ impl FlowEngine {
                         node_outputs,
                     ));
                 }
+                NodeControl::AwaitHere {
+                    reason,
+                    correlation_id: _,
+                } => {
+                    // Await the async agent response, but resume at THIS node so
+                    // the conversational branch evaluates `terminated_by`. Snapshot
+                    // is correlation-keyed (the NATS response resumes it), unlike
+                    // LoopHere's session-keyed park. Mirror the remote-await Wait
+                    // snapshot construction EXCEPT next_node = self.
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(), // SELF, not successor
+                        state: snapshot_state,
+                    };
+                    let node_outputs = state.outputs_map();
+                    // Finalize with None (render nothing here — the reply, if any,
+                    // was already surfaced before the dispatch): match the
+                    // remote-await Wait finalize semantics confirmed in Task 1.
+                    let output_value = state.clone().finalize_with(None);
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                        node_outputs,
+                    ));
+                }
                 NodeControl::Jump(jump) => {
                     let jump_target = self.apply_jump(&step_ctx, &mut state, jump).await?;
                     flow_ir = jump_target.flow;
@@ -2301,6 +2331,17 @@ impl DispatchOutcome {
         }
     }
 
+    #[allow(dead_code)] // called starting Task 4 (emission) / Task 5 (wiring)
+    fn await_here(output: NodeOutput, reason: Option<String>, correlation_id: String) -> Self {
+        Self {
+            output,
+            control: NodeControl::AwaitHere {
+                reason,
+                correlation_id,
+            },
+        }
+    }
+
     fn with_control(output: NodeOutput, control: NodeControl) -> Self {
         Self { output, control }
     }
@@ -2319,6 +2360,17 @@ enum NodeControl {
     /// renders the reply.
     LoopHere {
         reason: Option<String>,
+    },
+    /// Park the flow and await a correlation-keyed async runtime response
+    /// (out-of-process conversational `dw.agent`), but RE-ENTER this same
+    /// node when the response arrives — like `LoopHere` it resumes at THIS
+    /// node (not the routing successor) so the conversational decision can
+    /// evaluate the response, unlike `Wait` which resumes at the routing
+    /// successor. Resumed via the dispatch listener + `RuntimeSessionResumer`.
+    #[allow(dead_code)] // constructed starting Task 4 (emission) / Task 5 (wiring)
+    AwaitHere {
+        reason: Option<String>,
+        correlation_id: String,
     },
     Jump(JumpControl),
     Respond {
@@ -5034,6 +5086,30 @@ mod tests {
         let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0,"vars":{},"park_turns":{}}"#;
         let mut legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy decode");
         assert!(!legacy.take_agent_await("agent"), "absent key → empty");
+    }
+
+    #[test]
+    fn dispatch_outcome_await_here_stores_variant() {
+        // DispatchOutcome::await_here must store NodeControl::AwaitHere with
+        // both the reason and the correlation_id carried through unchanged
+        // (Task 4/5 build on this; the drive-loop handler resumes at self —
+        // see the behavioral coverage in Task 6).
+        let output = NodeOutput::new(json!({"ok": true}));
+        let outcome = DispatchOutcome::await_here(
+            output,
+            Some("awaiting agent response".to_string()),
+            "corr-123".to_string(),
+        );
+        match outcome.control {
+            NodeControl::AwaitHere {
+                reason,
+                correlation_id,
+            } => {
+                assert_eq!(reason.as_deref(), Some("awaiting agent response"));
+                assert_eq!(correlation_id, "corr-123");
+            }
+            other => panic!("expected NodeControl::AwaitHere, got {other:?}"),
+        }
     }
 
     /// Regression: a `Routing::Custom` array containing at least one
