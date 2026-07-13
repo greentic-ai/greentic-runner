@@ -1006,19 +1006,83 @@ impl FlowEngine {
                 #[cfg(feature = "agentic-worker")]
                 match self.dw_agent_dispatch {
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
-                        // Reroute to the durable out-of-process agentic path.
-                        // Wrap the raw node payload as the dispatch `input` (the
-                        // serve invoker reads `input.user_text`); `await=true` →
-                        // pause+resume, identical to `agentic.call`.
-                        let remote_payload = serde_json::json!({ "await": true, "input": payload });
-                        self.execute_remote_dispatch(
-                            ctx,
-                            "agentic",
-                            agent_id,
-                            remote_payload,
-                            false,
-                        )
-                        .await
+                        if *conversational {
+                            if state.take_agent_await(node_id) {
+                                // Resuming with the agent's NATS response. SPIKE §Q2:
+                                // the response is NOT in the `payload` argument (that
+                                // is a freshly re-rendered request-mapping template) —
+                                // it landed in `state.entry` as the envelope
+                                // `{ok, output, events, error}`, so the agent output is
+                                // `state.entry.output` (= `{reply, trail, terminated_by}`)
+                                // and `terminated_by` is nested one level under `.output`.
+                                // `state.entry` is readable here (same module; precedent
+                                // `inject_card_locale(&mut payload, &state.entry)` above).
+                                let agent_out =
+                                    state.entry.get("output").cloned().unwrap_or(Value::Null);
+                                let output = NodeOutput::new(agent_out.clone());
+                                let ended = agent_out
+                                    .get("terminated_by")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("conversation_ended");
+                                if ended {
+                                    state.reset_park_turns(node_id);
+                                    Ok(DispatchOutcome::complete(output))
+                                } else {
+                                    let turns = state.bump_park_turns(node_id);
+                                    if turns >= MAX_PARK_TURNS {
+                                        tracing::warn!(
+                                            agent_id = %agent_id,
+                                            turns,
+                                            "conversational dw.agent (nats) hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
+                                        );
+                                        // Reset on force-advance too, so a graph that
+                                        // re-enters this node later starts with a fresh
+                                        // budget (mirrors the `conversation_ended` path —
+                                        // the counter is cleared on every exit past the node).
+                                        state.reset_park_turns(node_id);
+                                        Ok(DispatchOutcome::complete(output))
+                                    } else {
+                                        Ok(DispatchOutcome::with_control(
+                                            output,
+                                            NodeControl::LoopHere {
+                                                reason: Some(format!(
+                                                    "conversational dw.agent `{agent_id}` (nats) awaiting next user message"
+                                                )),
+                                            },
+                                        ))
+                                    }
+                                }
+                            } else {
+                                // Fresh user turn: dispatch to NATS, park awaiting the
+                                // response and re-enter THIS node on resume (not the
+                                // routing successor) so the conversational decision
+                                // above can evaluate the agent's response.
+                                state.mark_agent_await(node_id);
+                                let remote_payload =
+                                    serde_json::json!({ "await": true, "input": payload });
+                                self.execute_remote_dispatch(
+                                    ctx,
+                                    "agentic",
+                                    agent_id,
+                                    remote_payload,
+                                    true,
+                                )
+                                .await
+                            }
+                        } else {
+                            // Non-conversational: unchanged single await → resumes at
+                            // the routing successor, exactly as before.
+                            let remote_payload =
+                                serde_json::json!({ "await": true, "input": payload });
+                            self.execute_remote_dispatch(
+                                ctx,
+                                "agentic",
+                                agent_id,
+                                remote_payload,
+                                false,
+                            )
+                            .await
+                        }
                     }
                     crate::runner::agent_node::DwAgentDispatch::InProcess => {
                         let output = self.execute_dw_agent(ctx, agent_id, payload).await?;
@@ -2287,17 +2351,16 @@ impl ExecutionState {
     }
 
     /// Mark `node_id` as awaiting an async `dw.agent` NATS dispatch response.
-    /// Not yet called from production dispatch code — wired in a follow-up
-    /// task of the NATS conversational dispatch plan.
-    #[allow(dead_code)]
+    /// Called from the conversational `DwAgentDispatch::Nats` branch in
+    /// `dispatch_node` before dispatching a fresh user turn.
     fn mark_agent_await(&mut self, node_id: &str) {
         self.pending_agent_await.insert(node_id.to_string(), ());
     }
 
     /// Check-and-clear: returns whether `node_id` was awaiting an agent response.
-    /// Not yet called from production dispatch code — wired in a follow-up
-    /// task of the NATS conversational dispatch plan.
-    #[allow(dead_code)]
+    /// Called from the conversational `DwAgentDispatch::Nats` branch in
+    /// `dispatch_node` on resume, to distinguish "resuming with the agent's
+    /// response" from "a fresh user turn".
     fn take_agent_await(&mut self, node_id: &str) -> bool {
         self.pending_agent_await.remove(node_id).is_some()
     }
@@ -2392,9 +2455,11 @@ enum NodeControl {
     /// successor. Resumed via the dispatch listener + `RuntimeSessionResumer`.
     AwaitHere {
         reason: Option<String>,
-        // Read (`correlation_id: _` today) starting Task 5, when the
-        // conversational dw.agent NATS caller passes `resume_at_self: true`
-        // and the resume path needs it to key the snapshot lookup.
+        // Audit-carried, not read: per the spike's keying model (§Q3), the
+        // actual resume lookup is keyed by `(session_hint, ReplyScope.scope_hash)`
+        // via `build_store_ctx`/`FlowResumeStore`, not by this field — the
+        // `drive_flow` handler destructures it as `correlation_id: _`. Kept on
+        // the variant for debugging/observability only.
         #[allow(dead_code)]
         correlation_id: String,
     },
