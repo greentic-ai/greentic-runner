@@ -111,6 +111,9 @@ fn append_chunks(
                 chunk_index,
                 text: window,
                 metadata,
+                // Pack-baked text carries no pre-computed vector; the backend
+                // embeds it at ingest time.
+                embedding: None,
             });
             chunk_index += 1;
         }

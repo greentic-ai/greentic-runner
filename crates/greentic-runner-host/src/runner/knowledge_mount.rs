@@ -310,6 +310,7 @@ fn to_dw_chunk(c: AwChunk) -> DwChunk {
         chunk_index: c.chunk_index,
         text: c.text,
         metadata: c.metadata,
+        embedding: c.embedding,
     }
 }
 
@@ -411,6 +412,37 @@ mod tests {
         ] {
             unset(key);
         }
+    }
+
+    #[test]
+    fn to_dw_chunk_carries_precomputed_embedding() {
+        let vec = vec![0.1_f32, 0.2, 0.3];
+        let aw = AwChunk {
+            doc_id: "faq".into(),
+            chunk_index: 2,
+            text: "Refunds within 5 days.".into(),
+            metadata: serde_json::Map::new(),
+            embedding: Some(vec.clone()),
+        };
+        let dw = to_dw_chunk(aw);
+        assert_eq!(dw.doc_id, "faq");
+        assert_eq!(dw.chunk_index, 2);
+        assert_eq!(dw.text, "Refunds within 5 days.");
+        // The pre-computed vector must survive the AW→DW mapping unchanged so the
+        // Chronicle backend can skip re-embedding.
+        assert_eq!(dw.embedding, Some(vec));
+    }
+
+    #[test]
+    fn to_dw_chunk_preserves_absent_embedding() {
+        let aw = AwChunk {
+            doc_id: "faq".into(),
+            chunk_index: 0,
+            text: "No vector here.".into(),
+            metadata: serde_json::Map::new(),
+            embedding: None,
+        };
+        assert_eq!(to_dw_chunk(aw).embedding, None);
     }
 
     #[test]
