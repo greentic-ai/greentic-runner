@@ -100,6 +100,36 @@ pub async fn run_step(
             ConversationState::empty(&tenant, session_id)
         }
     };
+    // --- Opening-message short-circuit ---
+    // On the FIRST turn with no user text (the flow entered the agent via a
+    // button/card rather than a typed message), reply with the author-configured
+    // opening message instead of spending an LLM call to fabricate a greeting.
+    // Recorded in state so the conversation has context; `FinalReply` so a
+    // conversational agent then parks, awaiting the user's real first message.
+    if state.messages.is_empty()
+        && message.text.trim().is_empty()
+        && let Some(opening) = config
+            .opening_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let opening = opening.to_string();
+        state.messages.push(ChatMessage::Assistant {
+            content: opening.clone(),
+            tool_calls: vec![],
+        });
+        if let Err(e) = runtime.state_store.save(&tenant, session_id, &state).await {
+            warn!(error = %e, "state save failed after opening message");
+        }
+        return Ok(AgentOutput {
+            reply: opening,
+            trail: Vec::new(),
+            terminated_by: TerminationReason::FinalReply,
+            usage: StepUsage::default(),
+        });
+    }
+
     // --- Assemble guardrail chain (once per step, before any message push) ---
     // Mandatory refs from the platform policy are resolved first; if any
     // mandatory guardrail cannot be resolved the agent is blocked (fail-closed).
@@ -837,6 +867,7 @@ mod tests {
             memory: None,
             knowledge: None,
             conversational: false,
+            opening_message: None,
         }
     }
 
@@ -897,6 +928,93 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn opening_message_short_circuits_first_empty_turn() {
+        // The mock LLM would reply "from llm" if called — but an opening message
+        // on an empty FIRST turn must be returned verbatim WITHOUT an LLM call.
+        let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+            content: Some("from llm".into()),
+            tool_calls: vec![],
+            tokens_in: 5,
+            tokens_out: 5,
+        })]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.opening_message = Some("Welcome to support!".into());
+        cp.insert(&tc, "a", c);
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                // Blank input (whitespace only) — e.g. a button click, no message.
+                AgentInput {
+                    text: "  ".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "Welcome to support!");
+        // No LLM call → zero usage, empty trail.
+        assert_eq!(out.usage.tokens_in, 0);
+        assert_eq!(out.usage.tokens_out, 0);
+        assert!(out.trail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn opening_message_ignored_when_user_typed() {
+        // With actual user text, the opening message is NOT used — the LLM runs.
+        let (runtime, tc) = {
+            let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+                content: Some("real answer".into()),
+                tool_calls: vec![],
+                tokens_in: 3,
+                tokens_out: 4,
+            })]));
+            let store = Arc::new(MockAgentStateStore::new());
+            let telemetry = Arc::new(MockTelemetry::new());
+            let cp = MockConfigProvider::new();
+            let tc = TenantContext::new("acme", "prod");
+            let mut c = cfg();
+            c.opening_message = Some("Welcome!".into());
+            cp.insert(&tc, "a", c);
+            let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let runtime = AgentRuntime::new(
+                Arc::new(cp),
+                store,
+                ext,
+                llm,
+                telemetry,
+                Arc::new(crate::cost::MockTokenMeter::new(0)),
+                Arc::new(crate::mock::NoopToolLedger),
+                None,
+            );
+            (runtime, tc)
+        };
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "track my order".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "real answer");
     }
 
     /// Build a runtime whose mock LLM replays `responses` in order, for a
