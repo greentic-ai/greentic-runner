@@ -252,3 +252,16 @@ greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greenti
 # carries it until it is published to crates.io (mirrors the greentic-types patch
 # above). CI fetches greenticai git deps over https, so this is reproducible.
 greentic-mcp-exec = { git = "https://github.com/greenticai/greentic-mcp.git", rev = "a4ad9e4ef8f6a6ff0496e2d3dfa2de9e35f84adc" }
+
+# `greentic-dw-operala-invoker` (and its sibling `*-llm` provider crates in
+# greentic-dw) pin `greentic-llm` via a git tag (v1.2.6-research), while this
+# workspace already depends on the same crate published to crates.io
+# (=1.3.0-research.0, pulled transitively through greentic-aw-runtime's
+# `greentic-llm-backend` feature and now also directly by greentic-runner-host
+# for the in-process operala wiring). Without unifying the two, `Arc<dyn
+# greentic_llm::LlmProvider>` built against the registry crate would not type-
+# match `DeepWorkerInvoker::new`, which expects the git crate's trait object.
+# Redirect the git source onto the registry release so both resolve to a
+# single crate instance (reverse of the SDK/mcp-exec patches above).
+[patch."https://github.com/greenticai/greentic-llm"]
+greentic-llm = { version = "=1.3.0-research.0" }
