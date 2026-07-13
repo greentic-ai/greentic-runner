@@ -175,8 +175,11 @@ pub async fn run_step(
     let st_active =
         crate::short_term::short_term_active(runtime.short_term_memory.is_some(), &config);
     // Whether the `end_conversation` tool + system-prompt note are offered
-    // this turn. Only conversational agents get either.
-    let conv_active = crate::end_conversation::conversational_active(&config);
+    // this turn. Enabled when EITHER the agent's own config opts in OR this
+    // invocation does (the flow node marked `conversational` — SP3). The node
+    // drives the engine park-loop, so it must also let the agent end it.
+    let conv_active =
+        message.conversational || crate::end_conversation::conversational_active(&config);
 
     // --- Long-term recall: inject relevant facts into this turn's prompt ---
     let system_prompt = if lt_active {
@@ -850,6 +853,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
             )
             .await
@@ -864,13 +868,24 @@ mod tests {
         responses: Vec<Result<LlmResponse, LlmError>>,
         tools: Vec<crate::config::ToolRef>,
     ) -> (AgentRuntime, TenantContext) {
+        runtime_with_config_conversational(responses, tools, true)
+    }
+
+    /// Like [`conversational_runtime`] but the agent CONFIG's `conversational`
+    /// is caller-controlled, so tests can exercise the node/invocation flag
+    /// (`AgentInput.conversational`) independently of the config default.
+    fn runtime_with_config_conversational(
+        responses: Vec<Result<LlmResponse, LlmError>>,
+        tools: Vec<crate::config::ToolRef>,
+        config_conversational: bool,
+    ) -> (AgentRuntime, TenantContext) {
         let llm = Arc::new(MockLlmBackend::new(responses));
         let store = Arc::new(MockAgentStateStore::new());
         let telemetry = Arc::new(MockTelemetry::new());
         let cp = MockConfigProvider::new();
         let tc = TenantContext::new("acme", "prod");
         let mut c = cfg();
-        c.conversational = true;
+        c.conversational = config_conversational;
         c.tools = tools;
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
@@ -920,7 +935,15 @@ mod tests {
         // Empty allow-list → the `lookup` call is blocked (a tool failure).
         let (runtime, tc) = conversational_runtime(responses, vec![]);
         let out = runtime
-            .step(tc.clone(), "sess-1", "a", AgentInput { text: "hi".into() })
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out.terminated_by, TerminationReason::FinalReply);
@@ -939,11 +962,86 @@ mod tests {
         })];
         let (runtime, tc) = conversational_runtime(responses, vec![]);
         let out = runtime
-            .step(tc.clone(), "sess-1", "a", AgentInput { text: "hi".into() })
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
         assert_eq!(out.reply, "All set — goodbye!");
+    }
+
+    /// SP3: the flow node's `conversational` flag (carried on `AgentInput`) must
+    /// enable the host `end_conversation` tool EVEN WHEN the agent's own config
+    /// default is non-conversational — so a node-marked-conversational segment
+    /// can be ended by the agent (and the engine advances past the park-loop).
+    #[tokio::test]
+    async fn node_conversational_input_enables_end_conversation_over_config() {
+        let responses = vec![Ok(LlmResponse {
+            content: Some("bye".into()),
+            tool_calls: vec![end_conversation_call("Take care!")],
+            tokens_in: 1,
+            tokens_out: 1,
+        })];
+        // Agent CONFIG is NON-conversational; only the invocation opts in.
+        let (runtime, tc) = runtime_with_config_conversational(responses, vec![], false);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    conversational: true,
+                },
+            )
+            .await
+            .unwrap();
+        // end_conversation was honoured because the invocation flag turned
+        // conv_active on despite the config default.
+        assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+        assert_eq!(out.reply, "Take care!");
+    }
+
+    /// Control: a non-conversational config AND a non-conversational invocation
+    /// means `end_conversation` is NOT offered, so the model's call is treated as
+    /// an ordinary (disallowed) tool and the turn ends as a normal FinalReply.
+    #[tokio::test]
+    async fn non_conversational_ignores_end_conversation() {
+        let responses = vec![
+            Ok(LlmResponse {
+                content: Some("trying to end".into()),
+                tool_calls: vec![end_conversation_call("bye")],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+            Ok(LlmResponse {
+                content: Some("final answer".into()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+        ];
+        let (runtime, tc) = runtime_with_config_conversational(responses, vec![], false);
+        let out = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hi".into(),
+                    conversational: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::FinalReply);
     }
 
     /// 4b: when a knowledge backend is wired and the agent's binding is enabled,
@@ -1007,6 +1105,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "do I get refunds?".into(),
+                    ..Default::default()
                 },
             )
             .await
@@ -1084,6 +1183,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 obs.clone(),
             )
@@ -1135,6 +1235,7 @@ mod tests {
                 "a",
                 AgentInput {
                     text: "hello".into(),
+                    ..Default::default()
                 },
                 obs.clone(),
             )

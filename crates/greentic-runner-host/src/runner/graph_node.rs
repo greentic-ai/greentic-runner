@@ -1134,6 +1134,7 @@ mod aw {
         // input as a fresh user turn, so an empty string keeps the history intact.
         let input = AgentInput {
             text: String::new(),
+            ..Default::default()
         };
 
         let out = run_agent_step(
@@ -1290,6 +1291,7 @@ mod aw {
 
         let input = AgentInput {
             text: String::new(),
+            ..Default::default()
         };
 
         let out = run_agent_step(
@@ -2565,6 +2567,7 @@ mod aw {
 
             let input = AgentInput {
                 text: String::new(),
+                ..Default::default()
             };
             let out = run_agent_step(
                 &runtime,
@@ -2614,6 +2617,7 @@ mod aw {
 
             let input = AgentInput {
                 text: String::new(),
+                ..Default::default()
             };
             let out = run_agent_step(
                 &runtime,

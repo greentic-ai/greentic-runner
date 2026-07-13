@@ -11,6 +11,11 @@ pub trait AgentNodeHandler: Send + Sync {
     /// Execute one agentic step. `flow_input` is the upstream node's
     /// JSON payload (expects at least `{"user_text": "..."}`); returns
     /// the node output JSON (`{"reply", "trail", "terminated_by"}`).
+    ///
+    /// `conversational` is the flow node's `conversational` flag (SP3): when
+    /// true the agent is offered the host `end_conversation` tool so it can end
+    /// the segment the engine park-loop maintains, regardless of the agent's
+    /// own config default.
     async fn execute(
         &self,
         tenant_id: &str,
@@ -18,6 +23,7 @@ pub trait AgentNodeHandler: Send + Sync {
         agent_id: &str,
         session_id: &str,
         flow_input: &Value,
+        conversational: bool,
     ) -> Result<Value>;
 }
 
@@ -219,6 +225,7 @@ mod aw {
             agent_id: &str,
             session_id: &str,
             flow_input: &Value,
+            conversational: bool,
         ) -> Result<Value> {
             let user_text = flow_input
                 .get("user_text")
@@ -226,7 +233,10 @@ mod aw {
                 .unwrap_or("")
                 .to_string();
             let tenant = TenantContext::new(tenant_id, env_id);
-            let input = AgentInput { text: user_text };
+            let input = AgentInput {
+                text: user_text,
+                conversational,
+            };
 
             // Off by default: with no audit sink configured, this is exactly
             // the pre-existing `self.runtime.step(...)` call — no observer is
@@ -1703,7 +1713,14 @@ mod aw {
             let handler = RuntimeAgentNodeHandler::new(runtime, None);
 
             let output = handler
-                .execute("t", "e", "greeter", "sess-1", &json!({"user_text": "ping"}))
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    false,
+                )
                 .await
                 .expect("execute should succeed");
 
@@ -1794,6 +1811,7 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    false,
                 )
                 .await
                 .expect("execute should succeed");
@@ -1847,6 +1865,7 @@ mod aw {
                     "greeter",
                     "sess-1",
                     &json!({"user_text": "remember this"}),
+                    false,
                 )
                 .await
                 .expect("execute should succeed");

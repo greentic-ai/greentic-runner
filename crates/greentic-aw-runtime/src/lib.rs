@@ -398,9 +398,17 @@ impl AgentRuntime {
 }
 
 /// Inbound user message handed to [`AgentRuntime::step`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct AgentInput {
     pub text: String,
+    /// Whether THIS invocation is a conversational segment. Set from the flow
+    /// node's `conversational` flag so a node marked conversational makes the
+    /// agent's host `end_conversation` tool available (and the closing prompt
+    /// note) even when the agent's own [`AgentConfig::conversational`] default
+    /// is false — the node, not just the agent config, can opt in. OR-ed with
+    /// the agent config in the loop.
+    #[serde(default)]
+    pub conversational: bool,
 }
 
 /// Outbound reply produced by [`AgentRuntime::step`].
