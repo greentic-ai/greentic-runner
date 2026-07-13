@@ -8,6 +8,14 @@
 //! splits it into overlapping character windows. Chunk ingest downstream is
 //! idempotent (Chronicle keys chunks by a deterministic content hash), so
 //! re-reading the same corpus on every boot is safe.
+//!
+//! When the pack was built with precomputed embeddings, a corpus file entry also
+//! carries `vectors_asset_path` pointing at a per-doc `assets/knowledge/<id>.vec.json`
+//! that lists the already-chunked text paired with its embedding vector. For those
+//! files this module emits the pre-chunked text + vector verbatim (skipping both
+//! the character-window re-chunk and downstream re-embedding). If that asset is
+//! missing or unparseable we log and fall back to the `.txt` re-chunk path so a
+//! damaged vectors asset never aborts boot.
 
 use std::sync::Arc;
 
@@ -38,6 +46,42 @@ struct CorpusFile {
     /// Human-facing source name, e.g. `faq.pdf`. Used as the chunk `doc_id`.
     #[serde(default)]
     original_name: String,
+    /// Archive-relative path of the precomputed vectors asset, e.g.
+    /// `assets/knowledge/faq.vec.json`. `None` (the default, backward-compatible)
+    /// means the pack carries no precomputed vectors for this file and the runner
+    /// re-chunks + re-embeds the `.txt` as before.
+    #[serde(default)]
+    vectors_asset_path: Option<String>,
+}
+
+/// The precomputed-vectors sidecar (`assets/knowledge/<id>.vec.json`) baked next
+/// to a document's `.txt`. Holds the document pre-chunked at build time, each
+/// chunk paired with its embedding vector, so the runner can emit chunk+vector
+/// verbatim instead of re-chunking and re-embedding.
+#[derive(Debug, Deserialize)]
+struct VectorsAsset {
+    /// Embedding model the vectors were produced with (e.g. `text-embedding-3-small`).
+    /// Informational: logged when the asset loads.
+    #[serde(default)]
+    embedding_model: String,
+    /// Dimensionality of each `vector`. Informational: logged when the asset loads.
+    #[serde(default)]
+    dims: usize,
+    #[serde(default)]
+    chunks: Vec<VectorChunk>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VectorChunk {
+    /// Zero-based position of this chunk within the source document.
+    #[serde(default)]
+    chunk_index: usize,
+    /// Verbatim chunk text as chunked at build time (do NOT re-window this).
+    #[serde(default)]
+    chunk_text: String,
+    /// Precomputed embedding for `chunk_text`.
+    #[serde(default)]
+    vector: Vec<f32>,
 }
 
 /// Collect and chunk the knowledge corpus across every pack. Returns an empty
@@ -59,26 +103,123 @@ pub fn collect(packs: &[Arc<PackRuntime>]) -> Vec<KnowledgeChunk> {
             }
         };
         for file in &annotation.files {
-            let Some(raw) = pack.read_pack_file(&file.asset_path) else {
-                tracing::warn!(pack_id = %pack_id, asset = %file.asset_path, "knowledge: corpus asset missing from pack; skipping");
-                continue;
-            };
-            let text = match String::from_utf8(raw) {
-                Ok(text) => text,
-                Err(_) => {
-                    tracing::warn!(pack_id = %pack_id, asset = %file.asset_path, "knowledge: corpus asset is not UTF-8; skipping");
-                    continue;
-                }
-            };
-            let doc_id = if file.original_name.is_empty() {
-                file.asset_path.clone()
-            } else {
-                file.original_name.clone()
-            };
-            append_chunks(&mut chunks, &pack_id, &file.asset_path, &doc_id, &text);
+            collect_file(&mut chunks, &pack_id, file, &|name| {
+                pack.read_pack_file(name)
+            });
         }
     }
     chunks
+}
+
+/// Emit the chunks for a single corpus file. When the file carries precomputed
+/// vectors (`vectors_asset_path`) that load successfully, the pre-chunked
+/// text+vector pairs are pushed verbatim. Otherwise — no vectors asset, or an
+/// unreadable/unparseable/empty one — this falls back to reading the `.txt` and
+/// re-chunking it (with `embedding: None`). `read` resolves an archive-relative
+/// path to its bytes (backed by [`PackRuntime::read_pack_file`] in production).
+fn collect_file<R: Fn(&str) -> Option<Vec<u8>>>(
+    out: &mut Vec<KnowledgeChunk>,
+    pack_id: &str,
+    file: &CorpusFile,
+    read: &R,
+) {
+    let doc_id = if file.original_name.is_empty() {
+        file.asset_path.clone()
+    } else {
+        file.original_name.clone()
+    };
+
+    if let Some(vec_path) = file.vectors_asset_path.as_deref() {
+        match load_vectors(read, pack_id, vec_path) {
+            Some(asset) if !asset.chunks.is_empty() => {
+                append_vector_chunks(out, pack_id, &file.asset_path, &doc_id, asset);
+                return;
+            }
+            _ => {
+                // Missing / unparseable / empty vectors asset: fall back to the
+                // `.txt` re-chunk path rather than dropping the document or
+                // aborting boot.
+                tracing::warn!(
+                    pack_id = %pack_id,
+                    vectors_asset = %vec_path,
+                    fallback_asset = %file.asset_path,
+                    "knowledge: precomputed vectors asset unusable; falling back to text re-chunk"
+                );
+            }
+        }
+    }
+
+    let Some(raw) = read(&file.asset_path) else {
+        tracing::warn!(pack_id = %pack_id, asset = %file.asset_path, "knowledge: corpus asset missing from pack; skipping");
+        return;
+    };
+    let text = match String::from_utf8(raw) {
+        Ok(text) => text,
+        Err(_) => {
+            tracing::warn!(pack_id = %pack_id, asset = %file.asset_path, "knowledge: corpus asset is not UTF-8; skipping");
+            return;
+        }
+    };
+    append_chunks(out, pack_id, &file.asset_path, &doc_id, &text);
+}
+
+/// Read and parse a precomputed-vectors asset. Returns `None` (after logging) when
+/// the asset is absent or does not parse, so the caller can fall back cleanly.
+fn load_vectors<R: Fn(&str) -> Option<Vec<u8>>>(
+    read: &R,
+    pack_id: &str,
+    vec_path: &str,
+) -> Option<VectorsAsset> {
+    let bytes = read(vec_path)?;
+    match serde_json::from_slice::<VectorsAsset>(&bytes) {
+        Ok(asset) => {
+            tracing::debug!(
+                pack_id = %pack_id,
+                vectors_asset = %vec_path,
+                embedding_model = %asset.embedding_model,
+                dims = asset.dims,
+                chunks = asset.chunks.len(),
+                "knowledge: loaded precomputed vectors asset"
+            );
+            Some(asset)
+        }
+        Err(error) => {
+            tracing::warn!(
+                pack_id = %pack_id,
+                vectors_asset = %vec_path,
+                error = %error,
+                "knowledge: failed to parse precomputed vectors asset"
+            );
+            None
+        }
+    }
+}
+
+/// Push one [`KnowledgeChunk`] per precomputed chunk, carrying its embedding
+/// verbatim. Mirrors [`append_chunks`]'s `doc_id`/metadata shape so downstream
+/// ingest treats vectored and re-chunked documents identically apart from the
+/// pre-supplied vector.
+fn append_vector_chunks(
+    out: &mut Vec<KnowledgeChunk>,
+    pack_id: &str,
+    asset_path: &str,
+    doc_id: &str,
+    asset: VectorsAsset,
+) {
+    for chunk in asset.chunks {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("pack_id".into(), pack_id.into());
+        metadata.insert("asset_path".into(), asset_path.into());
+        out.push(KnowledgeChunk {
+            doc_id: doc_id.to_string(),
+            chunk_index: chunk.chunk_index,
+            text: chunk.chunk_text,
+            metadata,
+            // Precomputed at build time; the backend uses this directly instead
+            // of embedding `text` at ingest.
+            embedding: Some(chunk.vector),
+        });
+    }
 }
 
 /// Split `text` into overlapping character windows and push one [`KnowledgeChunk`]
@@ -169,6 +310,166 @@ mod tests {
         let mut out = Vec::new();
         append_chunks(&mut out, "p", "a", "doc", "   \n\t  ");
         assert!(out.is_empty());
+    }
+
+    fn corpus_file(
+        asset_path: &str,
+        original_name: &str,
+        vectors_asset_path: Option<&str>,
+    ) -> CorpusFile {
+        CorpusFile {
+            asset_path: asset_path.to_string(),
+            original_name: original_name.to_string(),
+            vectors_asset_path: vectors_asset_path.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn vectors_asset_emits_precomputed_chunks_without_rechunking() {
+        // Vectors chosen to be exactly representable in f32 so JSON round-trip
+        // equality is stable.
+        let vec_json = serde_json::json!({
+            "embedding_model": "text-embedding-3-small",
+            "dims": 3,
+            "chunks": [
+                { "chunk_index": 0, "chunk_text": "first chunk", "vector": [0.5, 0.25, 0.125] },
+                { "chunk_index": 1, "chunk_text": "second chunk", "vector": [1.0, -2.0, 0.75] }
+            ]
+        });
+        let vec_bytes = serde_json::to_vec(&vec_json).unwrap();
+        // A `.txt` long enough to yield several windows *if* it were re-chunked —
+        // proving the vectors path bypasses `append_chunks`.
+        let long_txt = "z".repeat(CHUNK_CHARS * 3).into_bytes();
+        let read = |name: &str| -> Option<Vec<u8>> {
+            match name {
+                "assets/knowledge/faq.vec.json" => Some(vec_bytes.clone()),
+                "assets/knowledge/faq.txt" => Some(long_txt.clone()),
+                _ => None,
+            }
+        };
+
+        let file = corpus_file(
+            "assets/knowledge/faq.txt",
+            "faq.pdf",
+            Some("assets/knowledge/faq.vec.json"),
+        );
+        let mut out = Vec::new();
+        collect_file(&mut out, "pack-1", &file, &read);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "must emit exactly the 2 precomputed chunks, not re-chunk the .txt"
+        );
+        assert_eq!(out[0].doc_id, "faq.pdf");
+        assert_eq!(out[0].chunk_index, 0);
+        assert_eq!(out[0].text, "first chunk");
+        assert_eq!(out[0].embedding, Some(vec![0.5, 0.25, 0.125]));
+        assert_eq!(out[1].chunk_index, 1);
+        assert_eq!(out[1].text, "second chunk");
+        assert_eq!(out[1].embedding, Some(vec![1.0, -2.0, 0.75]));
+        assert_eq!(
+            out[0].metadata.get("pack_id").and_then(|v| v.as_str()),
+            Some("pack-1")
+        );
+        assert_eq!(
+            out[0].metadata.get("asset_path").and_then(|v| v.as_str()),
+            Some("assets/knowledge/faq.txt")
+        );
+    }
+
+    #[test]
+    fn no_vectors_asset_path_rechunks_with_no_embedding() {
+        let read = |name: &str| -> Option<Vec<u8>> {
+            (name == "assets/knowledge/a.txt").then(|| b"hello world".to_vec())
+        };
+        let file = corpus_file("assets/knowledge/a.txt", "a.txt", None);
+        let mut out = Vec::new();
+        collect_file(&mut out, "p", &file, &read);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].doc_id, "a.txt");
+        assert_eq!(out[0].text, "hello world");
+        assert_eq!(
+            out[0].embedding, None,
+            "no vectors asset => backend embeds at ingest"
+        );
+    }
+
+    #[test]
+    fn missing_vectors_asset_falls_back_to_text_rechunk() {
+        // vec.json absent; only the `.txt` resolves.
+        let read = |name: &str| -> Option<Vec<u8>> {
+            (name == "assets/knowledge/a.txt").then(|| b"hello world".to_vec())
+        };
+        let file = corpus_file(
+            "assets/knowledge/a.txt",
+            "a.txt",
+            Some("assets/knowledge/a.vec.json"),
+        );
+        let mut out = Vec::new();
+        collect_file(&mut out, "p", &file, &read);
+
+        assert_eq!(out.len(), 1, "must not panic; falls back to text re-chunk");
+        assert_eq!(out[0].text, "hello world");
+        assert_eq!(out[0].embedding, None);
+    }
+
+    #[test]
+    fn corrupt_vectors_asset_falls_back_to_text_rechunk() {
+        let read = |name: &str| -> Option<Vec<u8>> {
+            match name {
+                "assets/knowledge/a.vec.json" => Some(b"{ not valid json".to_vec()),
+                "assets/knowledge/a.txt" => Some(b"hello world".to_vec()),
+                _ => None,
+            }
+        };
+        let file = corpus_file(
+            "assets/knowledge/a.txt",
+            "a.txt",
+            Some("assets/knowledge/a.vec.json"),
+        );
+        let mut out = Vec::new();
+        collect_file(&mut out, "p", &file, &read);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "corrupt vectors asset must fall back, not panic"
+        );
+        assert_eq!(out[0].text, "hello world");
+        assert_eq!(out[0].embedding, None);
+    }
+
+    #[test]
+    fn empty_vectors_asset_falls_back_to_text_rechunk() {
+        let vec_json = serde_json::json!({
+            "embedding_model": "text-embedding-3-small",
+            "dims": 3,
+            "chunks": []
+        });
+        let vec_bytes = serde_json::to_vec(&vec_json).unwrap();
+        let read = |name: &str| -> Option<Vec<u8>> {
+            match name {
+                "assets/knowledge/a.vec.json" => Some(vec_bytes.clone()),
+                "assets/knowledge/a.txt" => Some(b"hello world".to_vec()),
+                _ => None,
+            }
+        };
+        let file = corpus_file(
+            "assets/knowledge/a.txt",
+            "a.txt",
+            Some("assets/knowledge/a.vec.json"),
+        );
+        let mut out = Vec::new();
+        collect_file(&mut out, "p", &file, &read);
+
+        assert_eq!(
+            out.len(),
+            1,
+            "empty chunk list must fall back to text re-chunk"
+        );
+        assert_eq!(out[0].embedding, None);
     }
 
     #[test]
