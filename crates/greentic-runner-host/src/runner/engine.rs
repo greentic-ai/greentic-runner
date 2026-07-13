@@ -2138,6 +2138,11 @@ pub struct ExecutionState {
     /// conversational agent.
     #[serde(default)]
     park_turns: HashMap<String, u32>,
+    /// Marks a node as awaiting an async `dw.agent` NATS dispatch response.
+    /// Set on dispatch, checked-and-cleared on resume; mirrors `park_turns`'
+    /// per-node, serde-defaulted, persisted-in-snapshot pattern.
+    #[serde(default)]
+    pending_agent_await: HashMap<String, ()>,
 }
 
 impl ExecutionState {
@@ -2151,6 +2156,7 @@ impl ExecutionState {
             redirect_count: 0,
             vars: JsonMap::new(),
             park_turns: HashMap::new(),
+            pending_agent_await: HashMap::new(),
         }
     }
 
@@ -2182,6 +2188,7 @@ impl ExecutionState {
             "nodes": nodes,
             "redirect_count": self.redirect_count,
             "park_turns": self.park_turns.clone(),
+            "pending_agent_await": self.pending_agent_await.keys().cloned().collect::<Vec<_>>(),
         })
     }
 
@@ -2223,6 +2230,22 @@ impl ExecutionState {
     /// conversational segment ends), so a later re-entry starts fresh.
     fn reset_park_turns(&mut self, node_id: &str) {
         self.park_turns.remove(node_id);
+    }
+
+    /// Mark `node_id` as awaiting an async `dw.agent` NATS dispatch response.
+    /// Not yet called from production dispatch code — wired in a follow-up
+    /// task of the NATS conversational dispatch plan.
+    #[allow(dead_code)]
+    fn mark_agent_await(&mut self, node_id: &str) {
+        self.pending_agent_await.insert(node_id.to_string(), ());
+    }
+
+    /// Check-and-clear: returns whether `node_id` was awaiting an agent response.
+    /// Not yet called from production dispatch code — wired in a follow-up
+    /// task of the NATS conversational dispatch plan.
+    #[allow(dead_code)]
+    fn take_agent_await(&mut self, node_id: &str) -> bool {
+        self.pending_agent_await.remove(node_id).is_some()
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -4980,6 +5003,37 @@ mod tests {
         let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
         let decoded_legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
         assert!(decoded_legacy.park_turns.is_empty());
+    }
+
+    #[test]
+    fn pending_agent_await_mark_and_take() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        assert!(!st.take_agent_await("agent"), "unmarked node takes false");
+        st.mark_agent_await("agent");
+        assert!(st.take_agent_await("agent"), "marked node takes true");
+        assert!(!st.take_agent_await("agent"), "take clears the marker");
+        // Independent per node.
+        st.mark_agent_await("a");
+        st.mark_agent_await("b");
+        assert!(st.take_agent_await("a"));
+        assert!(st.take_agent_await("b"));
+    }
+
+    #[test]
+    fn pending_agent_await_survives_snapshot_roundtrip() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.mark_agent_await("agent");
+        let json = serde_json::to_string(&st).expect("serialize");
+        let back: ExecutionState = serde_json::from_str(&json).expect("deserialize");
+        let mut back = back;
+        assert!(
+            back.take_agent_await("agent"),
+            "marker survives serde round-trip"
+        );
+        // Legacy snapshot without the key decodes to empty (serde default).
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0,"vars":{},"park_turns":{}}"#;
+        let mut legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy decode");
+        assert!(!legacy.take_agent_await("agent"), "absent key → empty");
     }
 
     /// Regression: a `Routing::Custom` array containing at least one
