@@ -338,6 +338,7 @@ mod aw {
         graphs: HashMap<String, GraphConfig>,
         audit_sink: Option<AuditSink>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: HashMap<String, AgentConfig>,
     ) -> Option<Arc<dyn GraphNodeHandler>> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
         use greentic_aw_runtime::OtelTelemetry;
@@ -395,6 +396,7 @@ mod aw {
             ledger,
             audit_sink,
             packs,
+            Arc::new(merged_agents),
         );
 
         tracing::info!(graph_count, "AW graph runtime constructed");
@@ -462,6 +464,11 @@ mod aw {
         /// tenant-pinned, and building it per turn from the in-memory pack
         /// list is cheap; see [`run_one_agent_turn`]).
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        /// Process-level merged agent configs (pack + operator-overridden),
+        /// threaded through so a graph node's `agent_ref` (SP1 Task 1) can be
+        /// resolved to a full [`AgentConfig`] at turn time. Unused until Task 3
+        /// wires `agent_ref` resolution into [`run_one_agent_turn`].
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
     }
 
     impl TurnEffectSource for RuntimeTurnSource {
@@ -479,6 +486,7 @@ mod aw {
                 self.ledger.clone(),
                 self.mcp_source.clone(),
                 self.packs.clone(),
+                self.merged_agents.clone(),
                 audit_sink,
                 real_tenant,
             )
@@ -548,6 +556,10 @@ mod aw {
         /// `run_agent_step` seam then stays on the plain `.step()` path,
         /// byte-identical regardless of this field's value.
         audit_sink: Option<AuditSink>,
+        /// Process-level merged agent configs, threaded through to
+        /// [`RuntimeTurnSource`] so it can build per-turn `agent_ref`
+        /// resolution (Task 3). Plumbing only in this task.
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -574,6 +586,7 @@ mod aw {
             ledger: Arc<dyn ToolLedger>,
             audit_sink: Option<AuditSink>,
             packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+            merged_agents: Arc<HashMap<String, AgentConfig>>,
         ) -> Self {
             let tool = build_tool(ext_runtime.clone());
             // Built once here (like the other Arcs) so the MCP catalog cache +
@@ -588,6 +601,7 @@ mod aw {
                 ledger,
                 mcp_source,
                 packs,
+                merged_agents: merged_agents.clone(),
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -607,7 +621,16 @@ mod aw {
                 tool,
                 approval,
                 audit_sink,
+                merged_agents,
             }
+        }
+
+        /// **Test-only** accessor exposing the plumbed `merged_agents` map, so
+        /// wiring tests can assert the map reaches the handler without needing
+        /// a full agent-turn round trip (SP1 Task 2; consumed by Task 3).
+        #[cfg(test)]
+        pub(crate) fn merged_agents(&self) -> &HashMap<String, AgentConfig> {
+            &self.merged_agents
         }
 
         /// **Test-only** constructor that injects effect closures directly,
@@ -637,6 +660,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink: None,
+                merged_agents: Arc::new(HashMap::new()),
             }
         }
 
@@ -936,6 +960,7 @@ mod aw {
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
     ) -> AgentTurnFn {
@@ -948,6 +973,7 @@ mod aw {
             let ledger = ledger.clone();
             let mcp_source = mcp_source.clone();
             let packs = packs.clone();
+            let merged_agents = merged_agents.clone();
             let audit_sink = audit_sink.clone();
             let real_tenant = real_tenant.clone();
             Box::pin(async move {
@@ -961,6 +987,7 @@ mod aw {
                     ledger,
                     mcp_source,
                     packs,
+                    merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
                 )
@@ -1064,6 +1091,7 @@ mod aw {
         ledger: Arc<dyn ToolLedger>,
         mcp_source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
+        _merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<AgentTurnResult, GraphExecError> {
@@ -2654,6 +2682,7 @@ mod aw {
                 state: GraphRunState::default(),
                 provider: None,
                 tools: vec![],
+                agent_ref: None,
             }
         }
 
@@ -2680,6 +2709,56 @@ mod aw {
             )
         }
 
+        /// SP1 Task 2 wiring test: a handler built via `from_parts` with a
+        /// one-entry `merged_agents` map exposes that exact map to the turn
+        /// effects (via the `#[cfg(test)]` accessor) — no behaviour change
+        /// yet, just confirming the plumbing reaches `RuntimeGraphNodeHandler`
+        /// (Task 3 consumes it from `RuntimeTurnSource`/`run_one_agent_turn`).
+        #[test]
+        fn from_parts_exposes_merged_agents_to_the_handler() {
+            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
+            let graphs: Arc<dyn GraphConfigSource> =
+                Arc::new(InMemoryGraphProvider::new(HashMap::new()));
+            let checkpoint: Arc<dyn CheckpointStore> = Arc::new(InMemoryCheckpointStore::default());
+            let llm = plain_reply_llm("unused");
+
+            let mut agents = HashMap::new();
+            agents.insert(
+                "x".to_string(),
+                AgentConfig {
+                    agent_id: "x".to_string(),
+                    system_prompt: "You are x.".to_string(),
+                    tools: vec![],
+                    guardrails: vec![],
+                    llm: LlmProviderRef {
+                        provider: "openai".to_string(),
+                        model: "gpt-4o-mini".to_string(),
+                        credential_ref: None,
+                    },
+                    limits: AgentLimits::default(),
+                    memory: None,
+                    knowledge: None,
+                    conversational: false,
+                },
+            );
+
+            let handler = RuntimeGraphNodeHandler::from_parts(
+                graphs,
+                checkpoint,
+                state_store,
+                ext_runtime,
+                llm,
+                telemetry,
+                token_meter,
+                ledger,
+                None,
+                Arc::new(vec![]),
+                Arc::new(agents),
+            );
+
+            assert!(handler.merged_agents().contains_key("x"));
+        }
+
         #[tokio::test]
         async fn run_one_agent_turn_without_audit_sink_completes_unchanged() {
             let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
@@ -2695,6 +2774,7 @@ mod aw {
                 ledger,
                 None,
                 Arc::new(vec![]),
+                Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
             )
@@ -2728,6 +2808,7 @@ mod aw {
                 ledger,
                 None,
                 Arc::new(vec![]),
+                Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
             )
@@ -2768,6 +2849,7 @@ mod aw {
                 ledger,
                 None,
                 Arc::new(vec![]),
+                Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
             )
