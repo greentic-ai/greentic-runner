@@ -3,6 +3,7 @@
 //! that lets the streaming observer coexist with the audit observer.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dashmap::DashMap;
 use greentic_aw_runtime::StepObserver;
@@ -53,11 +54,25 @@ pub enum FrameStatus {
 /// to the bounded SSE channel, so no frame is dropped.
 pub struct SseForwardObserver {
     tx: UnboundedSender<StreamFrame>,
+    /// Flips to `true` on the first `on_token_delta` call. Lets the SSE
+    /// handler's no-delta fallback tell whether the backend actually streamed
+    /// token chunks this turn, so it only synthesizes a single `TextChunk`
+    /// from the assembled reply for non-streaming backends (streaming
+    /// backends already delivered their text via this observer).
+    streamed: AtomicBool,
 }
 
 impl SseForwardObserver {
     pub fn new(tx: UnboundedSender<StreamFrame>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            streamed: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this observer has forwarded at least one token delta so far.
+    pub fn streamed(&self) -> bool {
+        self.streamed.load(Ordering::Relaxed)
     }
 }
 
@@ -66,6 +81,7 @@ impl StepObserver for SseForwardObserver {
         true
     }
     fn on_token_delta(&self, chunk: &str) {
+        self.streamed.store(true, Ordering::Relaxed);
         let _ = self.tx.send(StreamFrame::TextChunk {
             text: chunk.to_string(),
         });
@@ -164,6 +180,15 @@ mod tests {
         comp.on_tool_call("email", "call_1");
         assert_eq!(*a.calls.lock().unwrap(), vec!["t:hi", "c:email:call_1"]);
         assert_eq!(*b.calls.lock().unwrap(), vec!["t:hi", "c:email:call_1"]);
+    }
+
+    #[test]
+    fn sse_forward_observer_streamed_flips_true_on_first_delta() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = SseForwardObserver::new(tx);
+        assert!(!obs.streamed(), "should start unstreamed");
+        obs.on_token_delta("hi");
+        assert!(obs.streamed(), "should flip true after first delta");
     }
 
     #[test]
