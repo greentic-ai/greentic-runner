@@ -134,7 +134,23 @@ terminated_by}, events, error}` envelope the NATS response listener builds), not
 node's re-rendered request payload; `terminated_by == "conversation_ended"` completes the
 node (advances to the successor), otherwise it loops (`NodeControl::LoopHere`, session-keyed,
 awaiting the next user message) — with the same `MAX_PARK_TURNS` cap and force-advance
-behavior as the in-process path.
+behavior as the in-process path. Only a resume whose `state.entry` carries an `"ok"` key is
+treated as that response (an interleave guard — a user message arriving before the real
+response instead falls through and re-dispatches as a fresh turn), and an `{ok:false, ...}`
+error envelope surfaces `error.message` as the reply and re-parks (`LoopHere`) without
+bumping the `MAX_PARK_TURNS` cap.
+
+**Known limitation:** the await has no deadline. A lost/never-arriving `aw-serve` response
+currently wedges the segment indefinitely (the interleave guard above lets a *new* user
+message re-dispatch a fresh turn, but the original stuck wait is never cleaned up). A
+bounded deadline was tried and reverted: the naive version set a fixed-timeout watchdog on
+every fresh dispatch, but the NATS correlation id is deterministic per-conversation (no
+per-dispatch nonce), the watchdog is fire-and-forget with no cancellation, and
+`FlowResumeStore` overwrites the wait slot by `scope_hash` on every turn — so a watchdog from
+an earlier turn fires later and injects a spurious `{ok:false, error:{code:"timeout"}}`
+into whatever turn is parked at that moment, producing a bogus timeout reply mid-conversation.
+A correct bounded deadline needs a per-dispatch correlation nonce plus watchdog cancellation
+(likely shared with `sorla.call`); tracked as a follow-up, not yet implemented.
 
 ### Async runtime dispatch (`sorla.call` node)
 

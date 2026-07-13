@@ -1017,7 +1017,23 @@ impl FlowEngine {
                 match self.dw_agent_dispatch {
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
                         if *conversational {
-                            if state.take_agent_await(node_id) {
+                            // Interleave guard (#1): the pending-await marker alone
+                            // does not prove this resume carries the agent's NATS
+                            // response — a user message can arrive before it (e.g.
+                            // the user types again while the agent is still
+                            // thinking) and land in `state.entry` too. The NATS
+                            // response envelope is always `{ok, output, events,
+                            // error}`; a user-message resume has no `"ok"` key. Only
+                            // treat this as the response path when BOTH the marker
+                            // is set AND `state.entry` looks like that envelope.
+                            // `&&` short-circuits, so `take_agent_await` (which
+                            // clears the marker) is not called when the shape check
+                            // fails — the marker survives for the real response,
+                            // and the stray user message falls through to the
+                            // fresh-dispatch branch below (re-dispatches as a new
+                            // turn instead of being misread as a null agent reply).
+                            let is_agent_response = state.entry.get("ok").is_some();
+                            if is_agent_response && state.take_agent_await(node_id) {
                                 // Resuming with the agent's NATS response. SPIKE §Q2:
                                 // the response is NOT in the `payload` argument (that
                                 // is a freshly re-rendered request-mapping template) —
@@ -1027,46 +1043,93 @@ impl FlowEngine {
                                 // and `terminated_by` is nested one level under `.output`.
                                 // `state.entry` is readable here (same module; precedent
                                 // `inject_card_locale(&mut payload, &state.entry)` above).
-                                let agent_out =
-                                    state.entry.get("output").cloned().unwrap_or(Value::Null);
-                                let output = NodeOutput::new(agent_out.clone());
-                                let ended = agent_out
-                                    .get("terminated_by")
-                                    .and_then(serde_json::Value::as_str)
-                                    == Some("conversation_ended");
-                                if ended {
-                                    state.reset_park_turns(node_id);
-                                    Ok(DispatchOutcome::complete(output))
+                                let ok = state
+                                    .entry
+                                    .get("ok")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                                if !ok {
+                                    // Error envelope (Fix B): a transport/agent error
+                                    // must not be silently swallowed as a null reply,
+                                    // and must NOT bump the park-loop cap — a flapping
+                                    // backend should not burn the segment's turn budget
+                                    // or force-advance past it. Surface the error
+                                    // message as the reply and re-park (fail-safe:
+                                    // await the next user message). There is currently
+                                    // no self-inflicted await deadline (see the
+                                    // fresh-dispatch branch below), but this also
+                                    // handles a `{ok:false}` envelope from any other
+                                    // source (e.g. a flow-authored deadline) the same way.
+                                    let message = state
+                                        .entry
+                                        .get("error")
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("the agent could not respond");
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        error = %message,
+                                        "conversational dw.agent (nats) response was an error/timeout envelope; surfacing and re-parking without bumping the park-loop cap"
+                                    );
+                                    let output =
+                                        NodeOutput::new(serde_json::json!({ "reply": message }));
+                                    Ok(DispatchOutcome::with_control(
+                                        output,
+                                        NodeControl::LoopHere {
+                                            reason: Some(format!(
+                                                "conversational dw.agent `{agent_id}` (nats) awaiting next user message after error response"
+                                            )),
+                                        },
+                                    ))
                                 } else {
-                                    let turns = state.bump_park_turns(node_id);
-                                    if turns >= MAX_PARK_TURNS {
-                                        tracing::warn!(
-                                            agent_id = %agent_id,
-                                            turns,
-                                            "conversational dw.agent (nats) hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
-                                        );
-                                        // Reset on force-advance too, so a graph that
-                                        // re-enters this node later starts with a fresh
-                                        // budget (mirrors the `conversation_ended` path —
-                                        // the counter is cleared on every exit past the node).
+                                    let agent_out =
+                                        state.entry.get("output").cloned().unwrap_or(Value::Null);
+                                    let output = NodeOutput::new(agent_out.clone());
+                                    let ended = agent_out
+                                        .get("terminated_by")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("conversation_ended");
+                                    if ended {
                                         state.reset_park_turns(node_id);
                                         Ok(DispatchOutcome::complete(output))
                                     } else {
-                                        Ok(DispatchOutcome::with_control(
-                                            output,
-                                            NodeControl::LoopHere {
-                                                reason: Some(format!(
-                                                    "conversational dw.agent `{agent_id}` (nats) awaiting next user message"
-                                                )),
-                                            },
-                                        ))
+                                        let turns = state.bump_park_turns(node_id);
+                                        if turns >= MAX_PARK_TURNS {
+                                            tracing::warn!(
+                                                agent_id = %agent_id,
+                                                turns,
+                                                "conversational dw.agent (nats) hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
+                                            );
+                                            // Reset on force-advance too, so a graph that
+                                            // re-enters this node later starts with a fresh
+                                            // budget (mirrors the `conversation_ended` path —
+                                            // the counter is cleared on every exit past the node).
+                                            state.reset_park_turns(node_id);
+                                            Ok(DispatchOutcome::complete(output))
+                                        } else {
+                                            Ok(DispatchOutcome::with_control(
+                                                output,
+                                                NodeControl::LoopHere {
+                                                    reason: Some(format!(
+                                                        "conversational dw.agent `{agent_id}` (nats) awaiting next user message"
+                                                    )),
+                                                },
+                                            ))
+                                        }
                                     }
                                 }
                             } else {
                                 // Fresh user turn: dispatch to NATS, park awaiting the
                                 // response and re-enter THIS node on resume (not the
                                 // routing successor) so the conversational decision
-                                // above can evaluate the agent's response.
+                                // above can evaluate the agent's response. No await
+                                // deadline: a bounded wait needs a per-dispatch
+                                // correlation nonce + watchdog cancellation (the
+                                // correlation id is deterministic per-conversation and
+                                // the resume-store slot is overwritten every turn, so a
+                                // naive deadline's fire-and-forget watchdog can inject a
+                                // spurious timeout into a later, healthy turn) — tracked
+                                // as a follow-up.
                                 state.mark_agent_await(node_id);
                                 let remote_payload =
                                     serde_json::json!({ "await": true, "input": payload });
@@ -7320,6 +7383,183 @@ mod tests {
                 .contains("hello there"),
             "nats turn 1 must surface the identical reply once the response resume lands: {:?}",
             n1r.output
+        );
+    }
+
+    /// Build the error envelope shape a NATS response resume can also land in
+    /// `state.entry`: `{ok:false, output:null, events:[], error:{code,
+    /// message}}` (mirrors `agent_response_envelope`, but for the failure
+    /// path — a genuine agent/transport error. This code sets no deadline of
+    /// its own, but the same `{ok:false}` shape is also what a flow-authored
+    /// timeout, or any other error source, would arrive as — Fix B handles it
+    /// identically either way.
+    #[cfg(feature = "agentic-worker")]
+    fn agent_error_envelope(message: &str, code: Option<&str>) -> Value {
+        json!({
+            "ok": false,
+            "output": Value::Null,
+            "events": [],
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// Fix A (interleave guard): a user message arriving before the agent's
+    /// NATS response must NOT be misread as that response. With the
+    /// pending-await marker set (turn 1's fresh dispatch), a resume whose
+    /// `state.entry` is a plain user-message shape (no `"ok"` key) must fall
+    /// through to the fresh-dispatch branch — re-dispatching to NATS as a new
+    /// turn and parking via `AwaitHere` again — instead of being consumed as
+    /// a (null) agent reply. The marker must also survive: it was NOT
+    /// consumed by the misrouted resume, only by the eventual real response.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_interleaved_user_message_is_not_misread_as_response() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch marks the pending-await and parks (AwaitHere).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "turn 1 dispatch must mark the pending await"
+        );
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // A stray user message arrives BEFORE the agent's NATS response —
+        // same shape a real inbound activity would resume with, no `"ok"` key.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                json!({ "text": "are you still there?" }),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!(
+                "a stray user message must re-dispatch as a fresh turn (Waiting/AwaitHere), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "the fresh re-dispatch still awaits at self"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "the stray user message must trigger its OWN fresh NATS dispatch, not be swallowed"
+        );
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "the marker must still be set for the real response to land against"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is surfaced — this was not a misread null agent turn"
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "a stray user message must not touch the park-loop cap"
+        );
+    }
+
+    /// Fix B (error envelope handling): a `{ok:false, ...}` response — any
+    /// agent/transport error, or a timeout-shaped envelope from any source
+    /// (this code no longer sets its own deadline) — must surface the error
+    /// message as the reply, re-park via `LoopHere` (fail-safe: await the
+    /// next user message, do not force-advance), and must NOT bump the
+    /// park-loop turn counter. Exercises two full error cycles (error →
+    /// user turn → error) to confirm the cap counter never advances even
+    /// after repeated failures.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_error_envelope_surfaces_and_reparks_without_cap_bump() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch → AwaitHere.
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // A plain agent/transport error resumes the flow.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, agent_error_envelope("boom", None)))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("an error envelope must re-park (Waiting/LoopHere), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("boom"),
+            "the error message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "an error response must NOT bump the park-loop cap counter"
+        );
+
+        // A user turn in between re-dispatches (as usual).
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "hello?" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after user turn, got {other:?}"),
+        };
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
+
+        // A timeout-coded envelope (this code sets no deadline of its own —
+        // this shape would only arrive from a flow-authored deadline or some
+        // other upstream source) behaves identically to a plain error.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_error_envelope("timeout waiting for agent response", Some("timeout")),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => {
+                panic!("a timeout envelope must also re-park (Waiting/LoopHere), got {other:?}")
+            }
+        };
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("timeout waiting for agent response"),
+            "the timeout message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "two error/timeout responses in a row (with an intervening user turn) must still \
+             not have bumped the park-loop cap counter"
         );
     }
 
