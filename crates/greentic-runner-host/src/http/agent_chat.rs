@@ -156,10 +156,48 @@ fn first_nonempty_reply(activities: &[Activity]) -> Option<String> {
         .find(|t| !t.trim().is_empty())
 }
 
+/// RAII guard: removes this turn's entry from `stream_observers` on every
+/// exit path (Ok, Err, or a panic unwinding through the task). The registry
+/// is keyed only by `conversationId`, so a stale guard from an earlier turn
+/// must not evict a newer turn's observer — `Drop` only removes the entry
+/// when it is still THIS turn's observer (`Arc::ptr_eq`), so a guard whose
+/// entry was already replaced by a newer overlapping turn is a no-op.
+#[cfg(feature = "agentic-worker")]
+struct Cleanup {
+    registry: StreamObserverRegistry,
+    conversation_id: String,
+    observer: Arc<dyn greentic_aw_runtime::StepObserver>,
+}
+
+#[cfg(feature = "agentic-worker")]
+impl Cleanup {
+    /// The remove-if predicate, extracted so it can be exercised directly by
+    /// tests without needing a full `tokio::spawn` + `Drop` round-trip.
+    fn remove_stale(
+        registry: &StreamObserverRegistry,
+        conversation_id: &str,
+        observer: &Arc<dyn greentic_aw_runtime::StepObserver>,
+    ) {
+        registry.remove_if(conversation_id, |_k, stored| Arc::ptr_eq(stored, observer));
+    }
+}
+
+#[cfg(feature = "agentic-worker")]
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        Self::remove_stale(&self.registry, &self.conversation_id, &self.observer);
+    }
+}
+
 /// Extractor-free core: registers a streaming observer under the
 /// conversation id, runs the turn on a background task, and returns a stream
 /// of frames. Mirrors `execute_chat`'s extractor-free split so tests can
 /// drive it without axum's extractor stack.
+///
+/// The `stream_observers` registry assumes at most one in-flight streaming
+/// turn per `conversationId`; a second overlapping turn on the same id
+/// replaces the first turn's registry entry (see `Cleanup` above for how the
+/// first turn's eventual cleanup avoids evicting the replacement).
 #[cfg(feature = "agentic-worker")]
 pub fn agent_chat_stream_core(
     state: &ServerState,
@@ -175,23 +213,19 @@ pub fn agent_chat_stream_core(
     let observer_dyn: Arc<dyn greentic_aw_runtime::StepObserver> = observer.clone();
     state
         .stream_observers
-        .insert(conversation_id.clone(), observer_dyn);
+        .insert(conversation_id.clone(), observer_dyn.clone());
 
     let host = state.host.clone();
     let default_tenant = state.routing.default_tenant().to_string();
     let registry: StreamObserverRegistry = state.stream_observers.clone();
 
     tokio::spawn(async move {
-        // RAII guard: remove the registry entry on every exit path (Ok, Err,
-        // or a panic unwinding through this task) so a stuck entry never
-        // outlives its turn.
-        struct Cleanup(StreamObserverRegistry, String);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                self.0.remove(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(registry, conversation_id.clone());
+        // See `Cleanup`'s doc comment for why this guard is ptr_eq-protected.
+        let _cleanup = Cleanup {
+            registry,
+            conversation_id: conversation_id.clone(),
+            observer: observer_dyn,
+        };
 
         let tenant = req.tenant.unwrap_or(default_tenant);
         let mut activity = Activity::text(req.text)
@@ -349,5 +383,38 @@ mod tests {
     ) -> Vec<StreamFrame> {
         use futures::StreamExt;
         stream.collect().await
+    }
+
+    /// Two overlapping turns on the same `conversationId`: the second
+    /// `insert` replaces the first turn's observer. The first turn's stale
+    /// `Cleanup` must not evict the second turn's observer (ptr_eq guard);
+    /// the second turn's own cleanup does remove it.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn cleanup_remove_stale_does_not_evict_a_replaced_observer() {
+        let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
+        let (tx_a, _rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let observer_a: Arc<dyn greentic_aw_runtime::StepObserver> =
+            Arc::new(SseForwardObserver::new(tx_a));
+        let observer_b: Arc<dyn greentic_aw_runtime::StepObserver> =
+            Arc::new(SseForwardObserver::new(tx_b));
+
+        registry.insert("c1".to_string(), observer_a.clone());
+        // A second overlapping turn on the same conversation id replaces A.
+        registry.insert("c1".to_string(), observer_b.clone());
+
+        // A's stale cleanup must not evict B's entry.
+        Cleanup::remove_stale(&registry, "c1", &observer_a);
+        assert!(
+            registry
+                .get("c1")
+                .is_some_and(|e| Arc::ptr_eq(e.value(), &observer_b)),
+            "stale cleanup for A must not evict B's observer"
+        );
+
+        // B's own cleanup removes its entry.
+        Cleanup::remove_stale(&registry, "c1", &observer_b);
+        assert!(registry.get("c1").is_none());
     }
 }
