@@ -1003,6 +1003,11 @@ impl FlowEngine {
                                         turns,
                                         "conversational dw.agent hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
                                     );
+                                    // Reset on force-advance too, so a graph that
+                                    // re-enters this node later starts with a fresh
+                                    // budget (mirrors the `conversation_ended` path —
+                                    // the counter is cleared on every exit past the node).
+                                    state.reset_park_turns(node_id);
                                     Ok(DispatchOutcome::complete(output))
                                 } else {
                                     Ok(DispatchOutcome::with_control(
