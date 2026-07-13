@@ -57,6 +57,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -103,6 +104,7 @@ async fn fail_closed_mandatory_unresolved_returns_guardrail_denied() {
             "a",
             AgentInput {
                 text: "hello — please process this".into(),
+                conversational: false,
             },
         )
         .await;
@@ -155,6 +157,7 @@ async fn no_mandatory_guardrails_passes_through() {
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     };
 
     let tc = TenantContext::new("acme", "prod");
@@ -184,7 +187,10 @@ async fn no_mandatory_guardrails_passes_through() {
             tc,
             "session-guardrail-2",
             "a",
-            AgentInput { text: "hi".into() },
+            AgentInput {
+                text: "hi".into(),
+                conversational: false,
+            },
         )
         .await
         .expect("no guardrails configured — step must succeed");
@@ -216,6 +222,7 @@ async fn mandatory_ref_with_empty_registry_fails_closed() {
             "a",
             AgentInput {
                 text: "sensitive input".into(),
+                conversational: false,
             },
         )
         .await;
@@ -298,6 +305,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     };
 
     let cp = greentic_aw_runtime::mock::MockConfigProvider::new();
@@ -333,6 +341,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
             },
         )
         .await;
