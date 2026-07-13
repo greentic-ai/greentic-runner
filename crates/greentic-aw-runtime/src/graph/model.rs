@@ -37,6 +37,11 @@ pub enum NodeKind {
         /// maps to `"openai"` for backward compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// When set, run the referenced published agent's FULL config
+        /// (memory/knowledge/guardrails) resolved from the pack's merged
+        /// agents, instead of the inline system_prompt/model/tools.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_ref: Option<String>,
     },
     /// A deterministic tool call node.
     #[serde(rename_all = "camelCase")]
@@ -1220,6 +1225,7 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 tools: vec![],
                 provider: None,
+                agent_ref: None,
             },
         };
         let value = serde_json::to_value(&node).expect("serialization must succeed");
@@ -1227,5 +1233,27 @@ mod tests {
             value.get("provider").is_none(),
             "provider: None must be omitted from JSON, got: {value}"
         );
+    }
+
+    #[test]
+    fn agent_node_carries_optional_agent_ref() {
+        let j = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": [{"from":"a","to":"r"}]
+        });
+        let cfg = GraphConfig::from_json(&j.to_string()).unwrap();
+        let a = cfg.graph.nodes.iter().find(|n| n.id == "a").unwrap();
+        match &a.kind {
+            NodeKind::Agent { agent_ref, .. } => assert_eq!(agent_ref.as_deref(), Some("support")),
+            other => panic!("expected Agent, got {other:?}"),
+        }
+        // absent -> None: re-serialize without agentRef must round-trip to None (skip_serializing_if)
+        let back = serde_json::to_value(&a.kind).unwrap();
+        assert_eq!(back["agentRef"], serde_json::json!("support"));
     }
 }
