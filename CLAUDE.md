@@ -106,8 +106,12 @@ multi-turn segment: after each agent turn the engine parks and re-enters the sam
 (`NodeControl::LoopHere`) on the next inbound message, until the agent's output carries
 `terminated_by == "conversation_ended"`, at which point the flow advances to the node's
 successor (SP2). Non-conversational `dw.agent` is unchanged (one-shot). The flow-doc
-`conversational` flag wiring is SP3; the out-of-process (Nats) dispatch path and a
-`max_turns` safety cap are deferred follow-ups.
+`conversational` flag wiring is SP3. A safety backstop caps the park-loop at
+`MAX_PARK_TURNS` (100) consecutive parked turns per node: an agent that never emits
+`conversation_ended` force-advances to the successor after the cap (per-node counter
+`ExecutionState.park_turns`, persisted in the park/resume snapshot; a plain constant,
+no env var / config knob). The out-of-process (Nats) dispatch path is still a deferred
+follow-up.
 
 ### Async runtime dispatch (`sorla.call` node)
 
