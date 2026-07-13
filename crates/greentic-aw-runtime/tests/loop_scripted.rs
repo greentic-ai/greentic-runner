@@ -41,6 +41,7 @@ fn cfg(max_iter: u32, timeout_ms: u64, tools: Vec<ToolRef>, cap: Option<u32>) ->
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     }
 }
 
@@ -105,6 +106,7 @@ async fn happy_path_one_iteration() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
             },
         )
         .await
@@ -125,7 +127,15 @@ async fn max_iterations_terminates_loop() {
     ];
     let (rt, tel, tc) = build_runtime(script, cfg(3, 60_000, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::MaxIterations);
@@ -137,7 +147,15 @@ async fn timeout_terminates_loop() {
     // timeout=0ms → the iteration-start timeout check fires immediately.
     let (rt, tel, tc) = build_runtime(vec![Ok(final_reply("never"))], cfg(8, 0, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::Timeout);
@@ -154,7 +172,15 @@ async fn tool_not_allowed_becomes_observation_then_reply() {
     ];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, vec![], None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
@@ -183,7 +209,15 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
     ];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);
@@ -205,7 +239,15 @@ async fn token_budget_exceeded_returns_error() {
         100,
     );
     let err = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::TokenBudgetExceeded));
@@ -236,7 +278,15 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
     let script = vec![Ok(mixed), Ok(final_reply("the real answer"))];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.reply, "the real answer");
@@ -271,7 +321,15 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
     let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
 
     let err = rt
-        .step(tc, "s", "a", AgentInput { text: "x".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "x".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, AgentError::LlmProviderUnavailable));
@@ -339,6 +397,7 @@ async fn long_term_facts_are_injected_into_system_prompt() {
         "a",
         AgentInput {
             text: "what do I like?".into(),
+            conversational: false,
         },
     )
     .await
@@ -357,9 +416,17 @@ async fn no_injection_when_long_term_disabled() {
         cfg(8, 60_000, vec![], None),
         mem,
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let prompts = llm.seen_system_prompts.lock().unwrap();
     assert_eq!(prompts[0], "sys");
     assert!(!prompts[0].contains("<long_term_memory>"));
@@ -380,6 +447,7 @@ async fn turn_is_ingested_as_episode_in_background() {
             "a",
             AgentInput {
                 text: "what do I like?".into(),
+                conversational: false,
             },
         )
         .await
@@ -402,9 +470,17 @@ async fn no_ingest_when_long_term_disabled() {
         cfg(8, 60_000, vec![], None),
         mem.clone(),
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     // Give any erroneously-spawned task a chance to run, then assert none did.
     tokio::task::yield_now().await;
     assert!(mem.ingested().is_empty());
@@ -414,9 +490,17 @@ async fn no_ingest_when_long_term_disabled() {
 async fn recall_memory_tool_advertised_when_active() {
     let mem = Arc::new(MockLongTermMemory::new(vec![]));
     let (rt, llm, tc) = build_lt_runtime(vec![Ok(final_reply("hi"))], cfg_with_long_term(8), mem);
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(tools[0].iter().any(|n| n == "recall_memory"));
 }
@@ -429,9 +513,17 @@ async fn recall_memory_tool_absent_when_disabled() {
         cfg(8, 60_000, vec![], None),
         mem,
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(!tools[0].iter().any(|n| n == "recall_memory"));
 }
@@ -457,6 +549,7 @@ async fn recall_memory_call_is_handled_host_side() {
             "a",
             AgentInput {
                 text: "what do I like?".into(),
+                conversational: false,
             },
         )
         .await
@@ -547,9 +640,17 @@ async fn remember_and_recall_tools_advertised_when_active() {
     // Config has memory.short_term set and the provider is attached → the LLM
     // request must include both "remember" and "recall" tool names.
     let (rt, llm, tc) = build_st_runtime(vec![Ok(final_reply("hi"))], cfg_with_short_term(8));
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(
         tools[0].iter().any(|n| n == "remember"),
@@ -571,9 +672,17 @@ async fn short_term_tools_absent_when_disabled() {
         vec![Ok(final_reply("hi"))],
         cfg(8, 60_000, vec![], None), // no memory binding
     );
-    rt.step(tc, "s", "a", AgentInput { text: "hi".into() })
-        .await
-        .unwrap();
+    rt.step(
+        tc,
+        "s",
+        "a",
+        AgentInput {
+            text: "hi".into(),
+            conversational: false,
+        },
+    )
+    .await
+    .unwrap();
     let tools = llm.seen_tool_names.lock().unwrap();
     assert!(
         !tools[0].iter().any(|n| n == "remember"),
@@ -618,6 +727,7 @@ async fn remember_then_recall_roundtrips_via_tools() {
             "a",
             AgentInput {
                 text: "what is my fav color?".into(),
+                conversational: false,
             },
         )
         .await
@@ -662,6 +772,7 @@ async fn recall_missing_key_returns_null() {
             "a",
             AgentInput {
                 text: "do you know my name?".into(),
+                conversational: false,
             },
         )
         .await
@@ -709,6 +820,7 @@ async fn conversational_agent_is_offered_end_conversation_tool() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
             },
         )
         .await
@@ -754,6 +866,7 @@ async fn non_conversational_agent_has_no_end_conversation_tool() {
             "a",
             AgentInput {
                 text: "hello".into(),
+                conversational: false,
             },
         )
         .await
@@ -812,7 +925,15 @@ async fn end_conversation_terminates_with_final_message() {
         0,
     );
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
@@ -829,7 +950,15 @@ async fn end_conversation_falls_back_to_accompanying_content() {
         0,
     );
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
@@ -842,7 +971,15 @@ async fn end_conversation_empty_reply_when_neither_present() {
     c.conversational = true;
     let (rt, _tel, tc) = build_runtime(vec![Ok(end_conversation_call("c1", None, None))], c, 0);
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "bye".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "bye".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
@@ -860,7 +997,15 @@ async fn end_conversation_ignored_when_not_conversational() {
     ];
     let (rt, _tel, tc) = build_runtime(script, cfg(4, 5_000, vec![], None), 0); // conversational = false
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "hi".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "hi".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
     assert_eq!(out.terminated_by, TerminationReason::FinalReply);

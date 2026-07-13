@@ -89,6 +89,13 @@ impl HostServer {
             health,
             reload,
             admin,
+            // Clone off `host` (not a fresh registry): the SSE stream
+            // handler (writer) and `RuntimeAgentNodeHandler::execute`
+            // (reader, wired in at `TenantRuntime` construction) must share
+            // the exact same `Arc<DashMap<..>>` or a registration here would
+            // never be seen by the agent step.
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: host.stream_observers(),
             host,
             sql,
         };
@@ -97,7 +104,13 @@ impl HostServer {
             .route("/healthz", get(http::health::handler))
             .route("/admin/packs/status", get(admin::status))
             .route("/admin/packs/reload", post(admin::reload))
-            .route("/agent/chat", post(crate::http::agent_chat::agent_chat))
+            .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
+        #[cfg(feature = "agentic-worker")]
+        let router = router.route(
+            "/agent/chat/stream",
+            post(crate::http::agent_chat::agent_chat_stream),
+        );
+        let router = router
             .route(
                 "/sql/{conn}/schema",
                 get(crate::sql::routes::schema_handler),
@@ -138,6 +151,40 @@ pub struct ServerState {
     /// Defaults to an empty gateway (returns 404/401 for all connections)
     /// when no SQL connections are configured.
     pub sql: SqlGateway,
+    /// Session-id → active streaming observer (R2). Cloned from
+    /// `host.stream_observers()` at server-build time so it is the exact
+    /// same registry `RuntimeAgentNodeHandler::execute` reads from — a
+    /// `POST /agent/chat/stream` handler inserts an observer here before
+    /// dispatching a turn.
+    #[cfg(feature = "agentic-worker")]
+    pub stream_observers: crate::http::agent_stream::StreamObserverRegistry,
+}
+
+impl ServerState {
+    /// Test-only builder: an empty host (`RunnerHost::for_test`, no loaded
+    /// packs), default routing, and — when `agentic-worker` is enabled — an
+    /// empty streaming-observer registry cloned from the same host. Mirrors
+    /// the inline `state()` test helpers in `http/admin.rs` / `http/auth.rs`
+    /// / `http/health.rs`, but lives here (next to the struct) so it's
+    /// reusable from `http/agent_chat.rs`'s SSE core test.
+    // Only consumed by the `agentic-worker`-gated SSE core test in
+    // `http/agent_chat.rs` today — gating on both keeps a lean (no
+    // `agentic-worker`) test build free of dead-code warnings.
+    #[cfg(all(test, feature = "agentic-worker"))]
+    pub(crate) fn for_test() -> Self {
+        let host = RunnerHost::for_test();
+        Self {
+            active: Arc::new(ActivePacks::new()),
+            routing: TenantRouting::new(crate::routing::RoutingConfig::default()),
+            health: Arc::new(HealthState::new()),
+            reload: None,
+            admin: AdminAuth::default(),
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: host.stream_observers(),
+            host,
+            sql: SqlGateway::new(std::collections::HashMap::new(), String::new()),
+        }
+    }
 }
 
 impl axum::extract::FromRef<ServerState> for SqlGateway {

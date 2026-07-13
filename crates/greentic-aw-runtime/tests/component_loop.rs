@@ -111,6 +111,7 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         knowledge: None,
         guardrails: vec![],
         conversational: false,
+        opening_message: None,
     }
 }
 
@@ -192,7 +193,15 @@ async fn component_tool_offered_called_and_result_in_trail() {
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 
@@ -244,7 +253,15 @@ async fn empty_component_source_offers_no_tool() {
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 

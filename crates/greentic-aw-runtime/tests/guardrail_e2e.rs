@@ -273,6 +273,7 @@ async fn pii_guardrail_masks_inbound_email() {
             "pii-agent",
             AgentInput {
                 text: "email me at x@y.com please".into(),
+                conversational: false,
             },
         )
         .await
@@ -314,6 +315,7 @@ async fn pii_guardrail_denies_blocklist_match() {
             "pii-agent",
             AgentInput {
                 text: "this message contains forbidden content".into(),
+                conversational: false,
             },
         )
         .await;
@@ -385,6 +387,7 @@ fn build_full_runtime(
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     };
 
     let cp = MockConfigProvider::new();

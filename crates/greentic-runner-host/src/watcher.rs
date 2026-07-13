@@ -64,6 +64,8 @@ pub async fn start_pack_watcher(
     let secrets_manager = host.secrets_manager();
     #[cfg(feature = "agentic-worker")]
     let ext_llm_port = host.ext_llm_port();
+    #[cfg(feature = "agentic-worker")]
+    let stream_observers = host.stream_observers();
 
     reload_once(
         configs.as_ref(),
@@ -79,6 +81,8 @@ pub async fn start_pack_watcher(
         secrets_manager.clone(),
         #[cfg(feature = "agentic-worker")]
         ext_llm_port.clone(),
+        #[cfg(feature = "agentic-worker")]
+        stream_observers.clone(),
     )
     .await?;
 
@@ -93,6 +97,8 @@ pub async fn start_pack_watcher(
     let secrets_manager_clone = secrets_manager.clone();
     #[cfg(feature = "agentic-worker")]
     let ext_llm_port_clone = ext_llm_port.clone();
+    #[cfg(feature = "agentic-worker")]
+    let stream_observers_clone = stream_observers.clone();
     let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(refresh);
         loop {
@@ -118,6 +124,8 @@ pub async fn start_pack_watcher(
                 secrets_manager_clone.clone(),
                 #[cfg(feature = "agentic-worker")]
                 ext_llm_port_clone.clone(),
+                #[cfg(feature = "agentic-worker")]
+                stream_observers_clone.clone(),
             )
             .await
             {
@@ -146,6 +154,8 @@ async fn reload_once(
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
     #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+    #[cfg(feature = "agentic-worker")]
+    stream_observers: crate::http::agent_stream::StreamObserverRegistry,
 ) -> Result<()> {
     let index = Index::load(&cfg.index_location)?;
     let resolved = manager.resolve_all_for_index(&index)?;
@@ -213,6 +223,8 @@ async fn reload_once(
             Arc::clone(&secrets_manager),
             #[cfg(feature = "agentic-worker")]
             ext_llm_port.clone(),
+            #[cfg(feature = "agentic-worker")]
+            Some(stream_observers.clone()),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;

@@ -277,6 +277,7 @@ fn build_agent_config(allowed_tools: Vec<ToolRef>) -> AgentConfig {
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     }
 }
 
@@ -378,6 +379,7 @@ async fn verified_store_pull_tool_offered_and_result_in_trail() {
             "a",
             AgentInput {
                 text: "e2e-go".into(),
+                conversational: false,
             },
         )
         .await
@@ -497,6 +499,7 @@ async fn tampered_digest_degrades_tool_not_offered() {
             "a",
             AgentInput {
                 text: "e2e-go".into(),
+                conversational: false,
             },
         )
         .await
