@@ -185,7 +185,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -196,7 +196,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1066,7 +1066,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1170,7 +1170,7 @@ dependencies = [
 [[package]]
 name = "chronicle-core"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#9c3eb3614d49a15d7d212ba3e90a0bb9c8e2ba71"
+source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#84acbee262374a9cc24f553864723792ce7ee676"
 dependencies = [
  "async-trait",
  "blake2",
@@ -1188,7 +1188,7 @@ dependencies = [
 [[package]]
 name = "chronicle-driver-falkor"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#9c3eb3614d49a15d7d212ba3e90a0bb9c8e2ba71"
+source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#84acbee262374a9cc24f553864723792ce7ee676"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -1204,7 +1204,7 @@ dependencies = [
 [[package]]
 name = "chronicle-driver-neo4j"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#9c3eb3614d49a15d7d212ba3e90a0bb9c8e2ba71"
+source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#84acbee262374a9cc24f553864723792ce7ee676"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -1218,7 +1218,7 @@ dependencies = [
 [[package]]
 name = "chronicle-driver-surreal"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#9c3eb3614d49a15d7d212ba3e90a0bb9c8e2ba71"
+source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#84acbee262374a9cc24f553864723792ce7ee676"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -1234,7 +1234,7 @@ dependencies = [
 [[package]]
 name = "chronicle-llm-openai"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#9c3eb3614d49a15d7d212ba3e90a0bb9c8e2ba71"
+source = "git+https://github.com/greentic-biz/greentic-chronicle-ext.git?branch=research#84acbee262374a9cc24f553864723792ce7ee676"
 dependencies = [
  "async-openai",
  "async-trait",
@@ -2241,7 +2241,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2505,7 +2505,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3225,7 +3225,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-embedding"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "greentic-types",
  "serde",
@@ -3236,7 +3236,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-embedding-openai-compatible"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "greentic-dw-embedding",
  "greentic-types",
@@ -3249,7 +3249,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-knowledge"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "async-trait",
  "greentic-dw-providers-common",
@@ -3262,7 +3262,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-knowledge-chronicle"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -3282,7 +3282,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-llm"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "greentic-cap-types",
  "greentic-types",
@@ -3294,7 +3294,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-llm-openai-compatible"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "greentic-dw-llm",
  "greentic-dw-providers-common",
@@ -3323,7 +3323,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-memory-chronicle"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "async-trait",
  "chronicle-core",
@@ -3346,7 +3346,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-memory-long-term"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3369,7 +3369,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-providers-common"
 version = "1.3.0-research.0"
-source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#8a9d6b5c1196c0bf790440702fc9c62789247ccb"
+source = "git+https://github.com/greenticai/greentic-dw-providers.git?branch=research#2ab77a44a168c264186f170a3bb20dcb8f1f6711"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-embedding",
@@ -5537,7 +5537,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6625,7 +6625,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7472,7 +7472,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7563,7 +7563,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7790,7 +7790,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8192,7 +8192,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8913,7 +8913,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10541,7 +10541,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

@@ -30,6 +30,11 @@ pub struct KnowledgeChunk {
     pub text: String,
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Optional pre-computed embedding vector for this chunk. When present,
+    /// backends should use this vector directly instead of embedding `text`;
+    /// `None` preserves the existing backend-computed-embedding behavior.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Outcome of an ingest: the backend-assigned id for each stored chunk.
@@ -305,6 +310,7 @@ mod tests {
                     chunk_index: 0,
                     text: "Refunds within 5 days.".into(),
                     metadata: serde_json::Map::new(),
+                    embedding: None,
                 }],
             )
             .await
