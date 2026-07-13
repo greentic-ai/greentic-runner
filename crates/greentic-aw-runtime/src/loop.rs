@@ -12,7 +12,7 @@ use crate::state::{ChatMessage, ConversationState};
 use crate::telemetry::StepTelemetryCtx;
 use crate::tenant::TenantContext;
 use crate::tools::{dispatch_tool_call, is_tool_allowed, list_tools_for_llm};
-use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver};
+use crate::{AgentInput, AgentOutput, AgentRuntime, AgentStep, StepObserver, StepUsage};
 
 /// Agents already warned about unavailable tools, so the loud preflight warning
 /// fires once per agent per process (the loop resolves tools every iteration —
@@ -269,6 +269,10 @@ pub async fn run_step(
     );
 
     let mut total_tokens: u64 = 0;
+    // Separate in/out accumulators surfaced on `AgentOutput.usage` (total is
+    // still tracked for telemetry/metering below).
+    let mut tokens_in_total: u64 = 0;
+    let mut tokens_out_total: u64 = 0;
     let mut trail: Vec<AgentStep> = Vec::new();
     let mut terminated_by = TerminationReason::MaxIterations;
     let mut iterations: u32 = 0;
@@ -349,6 +353,8 @@ pub async fn run_step(
 
         let step_tokens = u64::from(response.tokens_in) + u64::from(response.tokens_out);
         total_tokens += step_tokens;
+        tokens_in_total += u64::from(response.tokens_in);
+        tokens_out_total += u64::from(response.tokens_out);
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
@@ -633,6 +639,11 @@ pub async fn run_step(
             reply,
             trail,
             terminated_by,
+            usage: StepUsage {
+                tokens_in: tokens_in_total,
+                tokens_out: tokens_out_total,
+                iterations,
+            },
         });
     }
 
@@ -682,6 +693,11 @@ pub async fn run_step(
         reply,
         trail,
         terminated_by,
+        usage: StepUsage {
+            tokens_in: tokens_in_total,
+            tokens_out: tokens_out_total,
+            iterations,
+        },
     })
 }
 
@@ -860,6 +876,10 @@ mod tests {
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+        // Per-turn usage is surfaced on the output (one LLM call: 10 in / 20 out).
+        assert_eq!(out.usage.tokens_in, 10);
+        assert_eq!(out.usage.tokens_out, 20);
+        assert_eq!(out.usage.iterations, 1);
     }
 
     /// Build a runtime whose mock LLM replays `responses` in order, for a

@@ -411,12 +411,29 @@ pub struct AgentInput {
     pub conversational: bool,
 }
 
+/// Token + iteration accounting for one [`AgentRuntime::step`]. Surfaced on
+/// [`AgentOutput`] so a caller (e.g. the designer's Run Demo trace) can show
+/// per-turn LLM usage without a separate telemetry channel.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StepUsage {
+    /// Prompt tokens summed across every LLM call in this step.
+    pub tokens_in: u64,
+    /// Completion tokens summed across every LLM call in this step.
+    pub tokens_out: u64,
+    /// Plan-Act-Observe iterations the loop ran this step.
+    pub iterations: u32,
+}
+
 /// Outbound reply produced by [`AgentRuntime::step`].
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct AgentOutput {
     pub reply: String,
     pub trail: Vec<AgentStep>,
     pub terminated_by: TerminationReason,
+    /// Per-step token + iteration usage (default zero for callers that don't
+    /// track it, e.g. mocks).
+    #[serde(default)]
+    pub usage: StepUsage,
 }
 
 /// One iteration of the Plan-Act-Observe loop, surfaced in the audit

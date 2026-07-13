@@ -282,6 +282,7 @@ mod aw {
                         "reply": output.reply,
                         "trail": output.trail,
                         "terminated_by": output.terminated_by,
+                        "usage": output.usage,
                     }))
                 }
                 Err(AgentError::GuardrailDenied {
