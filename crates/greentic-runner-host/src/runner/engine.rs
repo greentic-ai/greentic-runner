@@ -1011,8 +1011,14 @@ impl FlowEngine {
                         // serve invoker reads `input.user_text`); `await=true` →
                         // pause+resume, identical to `agentic.call`.
                         let remote_payload = serde_json::json!({ "await": true, "input": payload });
-                        self.execute_remote_dispatch(ctx, "agentic", agent_id, remote_payload)
-                            .await
+                        self.execute_remote_dispatch(
+                            ctx,
+                            "agentic",
+                            agent_id,
+                            remote_payload,
+                            false,
+                        )
+                        .await
                     }
                     crate::runner::agent_node::DwAgentDispatch::InProcess => {
                         let output = self.execute_dw_agent(ctx, agent_id, payload).await?;
@@ -1150,7 +1156,7 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "sorla", target, payload)
+        self.execute_remote_dispatch(ctx, "sorla", target, payload, false)
             .await
     }
 
@@ -1162,7 +1168,7 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "operala", target, payload)
+        self.execute_remote_dispatch(ctx, "operala", target, payload, false)
             .await
     }
 
@@ -1176,7 +1182,7 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "agentic", target, payload)
+        self.execute_remote_dispatch(ctx, "agentic", target, payload, false)
             .await
     }
 
@@ -1189,7 +1195,7 @@ impl FlowEngine {
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
-        self.execute_remote_dispatch(ctx, "telco-x", target, payload)
+        self.execute_remote_dispatch(ctx, "telco-x", target, payload, false)
             .await
     }
 
@@ -1216,7 +1222,7 @@ impl FlowEngine {
             }));
             return Ok(DispatchOutcome::complete(output));
         }
-        self.execute_remote_dispatch(ctx, "approval", target, payload)
+        self.execute_remote_dispatch(ctx, "approval", target, payload, false)
             .await
     }
 
@@ -1313,6 +1319,15 @@ impl FlowEngine {
     /// - `await=false` -> publish + complete immediately with
     ///   `{ "dispatched": true, "correlation_id": <marked hint> }`.
     ///
+    /// `resume_at_self`: when the runtime enters `AwaitingResponse`, controls
+    /// whether the flow resumes at the routing successor
+    /// ([`DispatchOutcome::wait`], `resume_at_self = false` — the behavior for
+    /// every non-conversational caller) or re-enters THIS node
+    /// ([`DispatchOutcome::await_here`], `resume_at_self = true` — the
+    /// conversational out-of-process `dw.agent` caller) once the async
+    /// response arrives. Only affects the `AwaitingResponse` branch; the
+    /// `Dispatched` (fire-and-forget) branch is unaffected either way.
+    ///
     /// [`RemoteDispatchHandler`]: crate::runner::remote_dispatch::RemoteDispatchHandler
     async fn execute_remote_dispatch(
         &self,
@@ -1320,6 +1335,7 @@ impl FlowEngine {
         runtime: &str,
         target: &str,
         payload: Value,
+        resume_at_self: bool,
     ) -> Result<DispatchOutcome> {
         let handler = self.remote_dispatch_handler.as_ref().with_context(|| {
             format!("{runtime}.call node dispatched but no RemoteDispatchHandler configured")
@@ -1396,9 +1412,17 @@ impl FlowEngine {
                 let reason = format!("await-runtime:{correlation_id}");
                 let output = NodeOutput::new(serde_json::json!({
                     "pending": true,
-                    "correlation_id": correlation_id,
+                    "correlation_id": correlation_id.clone(),
                 }));
-                Ok(DispatchOutcome::wait(output, Some(reason)))
+                if resume_at_self {
+                    Ok(DispatchOutcome::await_here(
+                        output,
+                        Some(reason),
+                        correlation_id,
+                    ))
+                } else {
+                    Ok(DispatchOutcome::wait(output, Some(reason)))
+                }
             }
             crate::runner::remote_dispatch::RemoteDispatchAction::Dispatched => {
                 let output = NodeOutput::new(serde_json::json!({
@@ -2331,7 +2355,6 @@ impl DispatchOutcome {
         }
     }
 
-    #[allow(dead_code)] // called starting Task 4 (emission) / Task 5 (wiring)
     fn await_here(output: NodeOutput, reason: Option<String>, correlation_id: String) -> Self {
         Self {
             output,
@@ -2367,9 +2390,12 @@ enum NodeControl {
     /// node (not the routing successor) so the conversational decision can
     /// evaluate the response, unlike `Wait` which resumes at the routing
     /// successor. Resumed via the dispatch listener + `RuntimeSessionResumer`.
-    #[allow(dead_code)] // constructed starting Task 4 (emission) / Task 5 (wiring)
     AwaitHere {
         reason: Option<String>,
+        // Read (`correlation_id: _` today) starting Task 5, when the
+        // conversational dw.agent NATS caller passes `resume_at_self: true`
+        // and the resume path needs it to key the snapshot lookup.
+        #[allow(dead_code)]
         correlation_id: String,
     },
     Jump(JumpControl),
