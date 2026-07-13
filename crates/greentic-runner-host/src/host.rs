@@ -128,6 +128,8 @@ impl HostBuilder {
             secrets_manager: secrets,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: self.ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             #[cfg(feature = "telemetry")]
             telemetry: self.telemetry,
         })
@@ -162,6 +164,13 @@ pub struct RunnerHost {
     secrets_manager: DynSecretsManager,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
+    /// Session-id → active streaming observer, shared by every `dw.agent`
+    /// node handler this host builds (writer: the `POST /agent/chat/stream`
+    /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
+    /// Always present (an empty registry, not `None`) — no external
+    /// dependency gates it, unlike `ext_llm_port`.
+    #[cfg(feature = "agentic-worker")]
+    stream_observers: crate::http::agent_stream::StreamObserverRegistry,
     #[cfg(feature = "telemetry")]
     telemetry: Option<TelemetryCfg>,
 }
@@ -332,6 +341,16 @@ impl RunnerHost {
         self.ext_llm_port.clone()
     }
 
+    /// The shared session-keyed streaming-observer registry (R2). Cloning
+    /// this `Arc` and handing it to both `TenantRuntime` construction (so
+    /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
+    /// the `POST /agent/chat/stream` SSE handler can write to it) is what
+    /// keeps the two sides talking about the same registry.
+    #[cfg(feature = "agentic-worker")]
+    pub fn stream_observers(&self) -> crate::http::agent_stream::StreamObserverRegistry {
+        self.stream_observers.clone()
+    }
+
     pub fn tenant_configs(&self) -> HashMap<String, Arc<HostConfig>> {
         self.configs.clone()
     }
@@ -386,6 +405,8 @@ impl RunnerHost {
             secrets_manager,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: Arc::new(dashmap::DashMap::new()),
             #[cfg(feature = "telemetry")]
             telemetry: None,
         })
@@ -422,6 +443,8 @@ impl RunnerHost {
             self.secrets_manager(),
             #[cfg(feature = "agentic-worker")]
             self.ext_llm_port(),
+            #[cfg(feature = "agentic-worker")]
+            Some(self.stream_observers()),
         )
         .await?;
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;

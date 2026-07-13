@@ -138,6 +138,8 @@ timers: []
             secrets,
             #[cfg(feature = "agentic-worker")]
             None,
+            #[cfg(feature = "agentic-worker")]
+            None,
         )
         .await?;
         Ok((workspace, runtime))

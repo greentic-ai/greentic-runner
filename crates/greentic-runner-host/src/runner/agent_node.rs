@@ -185,6 +185,12 @@ mod aw {
         /// on the plain [`AgentRuntime::step`] path, byte-identical to the
         /// behaviour before this observer existed.
         audit_sink: Option<AuditSink>,
+        /// Session-keyed streaming-observer registry (R2). `None` — the
+        /// default when no registry was wired in — keeps `execute` from
+        /// looking up a stream observer at all. When `Some`, `execute` looks
+        /// up `session_id` in the registry on every call; a miss (no active
+        /// SSE stream for that session) behaves exactly like `None`.
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
     }
 
     impl RuntimeAgentNodeHandler {
@@ -194,10 +200,22 @@ mod aw {
         /// an [`AgentAuditObserver`] so tool calls/results are published to
         /// `audit.<tenant>.agent.<event>`. When `None`, `execute` uses
         /// [`AgentRuntime::step`] directly (no observer, no behaviour change).
-        pub fn new(runtime: Arc<AgentRuntime>, audit_sink: Option<AuditSink>) -> Self {
+        ///
+        /// `stream_observers` (R2) is the session-keyed registry a
+        /// `POST /agent/chat/stream` handler inserts into before dispatching a
+        /// turn; `execute` looks up `session_id` in it and, when present, fans
+        /// the step's token/tool callbacks out to that observer alongside the
+        /// audit observer (via [`crate::http::agent_stream::CompositeObserver`]
+        /// when both are present).
+        pub fn new(
+            runtime: Arc<AgentRuntime>,
+            audit_sink: Option<AuditSink>,
+            stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        ) -> Self {
             Self {
                 runtime,
                 audit_sink,
+                stream_observers,
             }
         }
     }
@@ -238,22 +256,44 @@ mod aw {
                 conversational,
             };
 
-            // Off by default: with no audit sink configured, this is exactly
-            // the pre-existing `self.runtime.step(...)` call — no observer is
-            // constructed and behaviour is byte-identical to before EPIC-B B-3.
-            let step_result = match &self.audit_sink {
-                Some(sink) => {
-                    let observer: Arc<dyn StepObserver> = Arc::new(AgentAuditObserver::new(
-                        sink.clone(),
-                        tenant_ctx_for_audit(tenant_id, env_id),
-                        agent_id.to_string(),
-                        session_id.to_string(),
-                    ));
+            // Off by default: with neither an audit sink nor a registered
+            // stream observer, this is exactly the pre-existing
+            // `self.runtime.step(...)` call — no observer is constructed and
+            // behaviour is byte-identical to before EPIC-B B-3 / R2.
+            let mut observers: Vec<Arc<dyn StepObserver>> = Vec::new();
+            if let Some(sink) = &self.audit_sink {
+                observers.push(Arc::new(AgentAuditObserver::new(
+                    sink.clone(),
+                    tenant_ctx_for_audit(tenant_id, env_id),
+                    agent_id.to_string(),
+                    session_id.to_string(),
+                )));
+            }
+            if let Some(reg) = &self.stream_observers
+                && let Some(entry) = reg.get(session_id)
+            {
+                observers.push(entry.value().clone());
+            }
+            let step_result = match observers.len() {
+                0 => self.runtime.step(tenant, session_id, agent_id, input).await,
+                1 => {
                     self.runtime
-                        .step_with_observer(tenant, session_id, agent_id, input, observer)
+                        .step_with_observer(
+                            tenant,
+                            session_id,
+                            agent_id,
+                            input,
+                            observers.remove(0),
+                        )
                         .await
                 }
-                None => self.runtime.step(tenant, session_id, agent_id, input).await,
+                _ => {
+                    let composite: Arc<dyn StepObserver> =
+                        Arc::new(crate::http::agent_stream::CompositeObserver::new(observers));
+                    self.runtime
+                        .step_with_observer(tenant, session_id, agent_id, input, composite)
+                        .await
+                }
             };
 
             match step_result {
@@ -1215,7 +1255,9 @@ mod aw {
     ///
     /// `audit_sink` (EPIC-B B-3) is forwarded verbatim to the constructed
     /// [`RuntimeAgentNodeHandler`] — `None` keeps `dw.agent` execution on the
-    /// plain [`AgentRuntime::step`] path.
+    /// plain [`AgentRuntime::step`] path. `stream_observers` (R2) is likewise
+    /// forwarded verbatim — `None` keeps `execute` from consulting the
+    /// session-keyed streaming-observer registry at all.
     #[allow(clippy::too_many_arguments)]
     async fn build_runtime_handler_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
@@ -1227,6 +1269,7 @@ mod aw {
         token_meter: Arc<dyn greentic_aw_runtime::cost::TokenMeter>,
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
         audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         let runtime = build_runtime_with_stores(
             merged_agents,
@@ -1239,7 +1282,11 @@ mod aw {
             ledger,
         )
         .await?;
-        Some(Arc::new(RuntimeAgentNodeHandler::new(runtime, audit_sink)))
+        Some(Arc::new(RuntimeAgentNodeHandler::new(
+            runtime,
+            audit_sink,
+            stream_observers,
+        )))
     }
 
     /// Build the production `DwAgent` handler if the environment is configured.
@@ -1279,6 +1326,7 @@ mod aw {
         ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -1303,6 +1351,7 @@ mod aw {
             token_meter,
             ledger,
             audit_sink,
+            stream_observers,
         )
         .await
     }
@@ -1323,6 +1372,7 @@ mod aw {
         ext_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
+        stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -1360,6 +1410,7 @@ mod aw {
             token_meter,
             ledger,
             audit_sink,
+            stream_observers,
         )
         .await
     }
@@ -1713,7 +1764,7 @@ mod aw {
                 ledger,
                 None,
             ));
-            let handler = RuntimeAgentNodeHandler::new(runtime, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
 
             let output = handler
                 .execute(
@@ -1805,7 +1856,7 @@ mod aw {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let sink = AuditSink::from_sender(tx);
-            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink));
+            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink), None);
 
             let output = handler
                 .execute(
@@ -1851,6 +1902,91 @@ mod aw {
             );
         }
 
+        // -----------------------------------------------------------------------
+        // stream_observers registry lookup (R2)
+        // -----------------------------------------------------------------------
+
+        #[tokio::test]
+        async fn execute_routes_registered_stream_observer_and_receives_tool_events() {
+            use crate::http::agent_stream::StreamObserverRegistry;
+            use std::sync::Mutex;
+
+            // A recording StepObserver we register under the session id. The
+            // scripted-tool-call runtime (shared with the audit test above)
+            // drives `MockLlmBackend`, which does not stream token deltas, so
+            // this asserts on `on_tool_call`/`on_tool_result` (per the R2
+            // design note) rather than `on_token_delta`.
+            #[derive(Default)]
+            struct Rec {
+                hits: Mutex<Vec<String>>,
+            }
+            impl StepObserver for Rec {
+                fn wants_streaming(&self) -> bool {
+                    true
+                }
+                fn on_tool_call(&self, name: &str, _call_id: &str) {
+                    self.hits.lock().unwrap().push(format!("c:{name}"));
+                }
+                fn on_tool_result(&self, name: &str, _call_id: &str, _result: &Value) {
+                    self.hits.lock().unwrap().push(format!("r:{name}"));
+                }
+            }
+
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
+            let rec = Arc::new(Rec::default());
+            registry.insert("sess-1".to_string(), rec.clone() as Arc<dyn StepObserver>);
+
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry));
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                    false,
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
+
+            let hits = rec.hits.lock().unwrap();
+            assert!(
+                hits.iter().any(|h| h == "c:remember"),
+                "tool call forwarded to the registered stream observer: {hits:?}"
+            );
+            assert!(
+                hits.iter().any(|h| h == "r:remember"),
+                "tool result forwarded to the registered stream observer: {hits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn execute_ignores_stream_registry_when_session_not_registered() {
+            use crate::http::agent_stream::StreamObserverRegistry;
+
+            // A registry that exists but has no entry for this session must
+            // behave exactly like `None` — no observer is built at all, so
+            // the plain `self.runtime.step(...)` path runs unchanged.
+            let runtime = runtime_with_scripted_remember_call("t1", "e1");
+            let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
+
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry));
+            let output = handler
+                .execute(
+                    "t1",
+                    "e1",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "remember this"}),
+                    false,
+                )
+                .await
+                .expect("execute should succeed");
+            assert_eq!(output["reply"].as_str(), Some("done"));
+        }
+
         #[tokio::test]
         async fn execute_without_audit_sink_uses_plain_step_path_unchanged() {
             // Same scripted tool call as the audited test above, but the
@@ -1859,7 +1995,7 @@ mod aw {
             // the tool call and returns the same reply, exactly as it did
             // before AgentAuditObserver existed.
             let runtime = runtime_with_scripted_remember_call("t1", "e1");
-            let handler = RuntimeAgentNodeHandler::new(runtime, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
 
             let output = handler
                 .execute(
@@ -2275,6 +2411,7 @@ mod aw {
                 secrets,
                 None,
                 Vec::new(),
+                None,
                 None,
             )
             .await;

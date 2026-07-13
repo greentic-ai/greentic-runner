@@ -89,6 +89,13 @@ impl HostServer {
             health,
             reload,
             admin,
+            // Clone off `host` (not a fresh registry): the SSE stream
+            // handler (writer) and `RuntimeAgentNodeHandler::execute`
+            // (reader, wired in at `TenantRuntime` construction) must share
+            // the exact same `Arc<DashMap<..>>` or a registration here would
+            // never be seen by the agent step.
+            #[cfg(feature = "agentic-worker")]
+            stream_observers: host.stream_observers(),
             host,
             sql,
         };
@@ -138,6 +145,13 @@ pub struct ServerState {
     /// Defaults to an empty gateway (returns 404/401 for all connections)
     /// when no SQL connections are configured.
     pub sql: SqlGateway,
+    /// Session-id → active streaming observer (R2). Cloned from
+    /// `host.stream_observers()` at server-build time so it is the exact
+    /// same registry `RuntimeAgentNodeHandler::execute` reads from — a
+    /// `POST /agent/chat/stream` handler inserts an observer here before
+    /// dispatching a turn.
+    #[cfg(feature = "agentic-worker")]
+    pub stream_observers: crate::http::agent_stream::StreamObserverRegistry,
 }
 
 impl axum::extract::FromRef<ServerState> for SqlGateway {
