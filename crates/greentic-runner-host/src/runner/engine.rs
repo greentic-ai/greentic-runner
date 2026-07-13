@@ -1244,7 +1244,8 @@ impl FlowEngine {
             .as_ref()
             .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
         let session_id = ctx.session_id.unwrap_or("");
-        let result = handler
+        let started = std::time::Instant::now();
+        let mut result = handler
             .execute(
                 ctx.tenant,
                 &self.default_env,
@@ -1254,6 +1255,15 @@ impl FlowEngine {
                 conversational,
             )
             .await?;
+        // Per-node timing: record this agent step's own execution time on its
+        // output (`duration_ms`), so a trace can show per-node — not just
+        // per-turn — latency. Injected only when the output is a JSON object.
+        if let Value::Object(map) = &mut result {
+            map.insert(
+                "duration_ms".into(),
+                Value::from(started.elapsed().as_millis() as u64),
+            );
+        }
         Ok(NodeOutput::new(result))
     }
 
