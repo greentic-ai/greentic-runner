@@ -355,6 +355,14 @@ pub async fn run_step(
         total_tokens += step_tokens;
         tokens_in_total += u64::from(response.tokens_in);
         tokens_out_total += u64::from(response.tokens_out);
+        // Per-call trace: record this LLM iteration's assistant content + token
+        // cost (before its tool calls) so a caller can show a per-message
+        // breakdown, not just the aggregate `AgentOutput.usage`.
+        trail.push(AgentStep::LlmCall {
+            content: response.content.clone().unwrap_or_default(),
+            tokens_in: u64::from(response.tokens_in),
+            tokens_out: u64::from(response.tokens_out),
+        });
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
@@ -880,6 +888,15 @@ mod tests {
         assert_eq!(out.usage.tokens_in, 10);
         assert_eq!(out.usage.tokens_out, 20);
         assert_eq!(out.usage.iterations, 1);
+        // The trail records the LLM call (per-message breakdown) before the reply.
+        assert!(matches!(
+            out.trail.first(),
+            Some(crate::AgentStep::LlmCall {
+                tokens_in: 10,
+                tokens_out: 20,
+                ..
+            })
+        ));
     }
 
     /// Build a runtime whose mock LLM replays `responses` in order, for a

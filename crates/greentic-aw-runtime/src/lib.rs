@@ -442,6 +442,15 @@ pub struct AgentOutput {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentStep {
+    /// One LLM iteration's assistant output + token cost, recorded before that
+    /// iteration's tool calls. Lets a caller show a per-message breakdown (each
+    /// model call), not just the aggregate `AgentOutput.usage`. `content` is the
+    /// assistant text for the turn (empty when the model only emitted tool calls).
+    LlmCall {
+        content: String,
+        tokens_in: u64,
+        tokens_out: u64,
+    },
     ToolCall {
         name: String,
         call_id: String,
