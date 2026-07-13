@@ -94,12 +94,18 @@ The `MAX_PARK_TURNS` backstop (PR #554) applies unchanged: the re-park-per-user-
 
 ## Data flow / resume keying (the crux)
 
-Two resume snapshots are saved at the same node in different phases, under **different keys**, so they never collide:
+**Correction (spike §Q3 + final review):** an earlier draft of this section claimed AwaitHere and LoopHere use **different keys** so "they never collide." That is **wrong**. The spike established that `FlowResumeStore::save`/`build_store_ctx` store **every** wait kind under the SAME `(session_hint, ReplyScope.scope_hash)` store key — the correlation id is *stripped from the key*. So the two phases occupy the **same single slot**; they never coexist because each park overwrites it. The correlation id only drives how the NATS response reconstructs the hint/scope (`RuntimeSessionResumer`) so it recomputes that same key.
 
-- **AwaitHere** → correlation-keyed (`await-runtime:{correlation_id}`), resumed by the NATS response via the dispatch listener + `RuntimeSessionResumer` (existing machinery). The resume envelope delivers the **agent response** as the node's payload.
-- **LoopHere** → session-keyed, resumed by the next user message via ingress (existing conversational-park machinery). The resume delivers the **user message** as the node's payload.
+- **AwaitHere** (fresh-turn → dispatched) is resumed by the NATS response; the resume envelope `{ok, output, events, error}` lands in `state.entry`, and the branch reads `state.entry.output.terminated_by`.
+- **LoopHere** (not-ended → re-park) is resumed by the next user message via ingress; the branch re-dispatches to NATS.
 
-On every resume `next_node = self`, so `dispatch_node` re-runs at the node; `pending_agent_await` selects the phase. The non-conversational NATS arm keeps using `Wait` (successor) — unchanged.
+On every resume `next_node = self`, so `dispatch_node` re-runs at the node; `pending_agent_await` (check-and-clear) selects the phase. **Safety rests on sequential single-slot resume, not key separation** — turns are serialized per session, so the happy path is correct. A known interleaving limitation (a user message arriving *before* the awaited NATS response resolves to the same slot and is misread) is tracked as a follow-up, not fixed in this slice. The non-conversational NATS arm keeps using `Wait` (successor) — unchanged.
+
+### Known limitations (follow-ups, not in this slice)
+
+- **Interleave desync:** a user message arriving mid-await hits the single AwaitHere slot with the phase marker still set → misread as the (absent) agent response (null turn), then the real response is misread as a fresh turn. Pre-existing single-slot property, amplified by interactivity; mitigate with an envelope-shape guard on the marker (only honor it when `state.entry.ok` is present).
+- **No await deadline:** the dw.agent remote payload sets no `deadline_ms`; a dropped `aw-serve` response wedges the conversational segment forever (marker set). Pre-existing for non-conversational NATS dw.agent too; add a deadline + timeout→error-re-park.
+- **Error-envelope silent re-park:** an `{ok:false, error, output:null}` response yields a null reply + a `park_turns` bump; a run of errors silently force-advances past the segment. Follow-up: surface the error and do NOT bump `park_turns` on transport/agent errors.
 
 ## Integration risk + spike-first
 

@@ -863,10 +863,20 @@ impl FlowEngine {
                     correlation_id: _,
                 } => {
                     // Await the async agent response, but resume at THIS node so
-                    // the conversational branch evaluates `terminated_by`. Snapshot
-                    // is correlation-keyed (the NATS response resumes it), unlike
-                    // LoopHere's session-keyed park. Mirror the remote-await Wait
-                    // snapshot construction EXCEPT next_node = self.
+                    // the conversational branch evaluates `terminated_by`. Mirror the
+                    // remote-await Wait snapshot construction EXCEPT next_node = self.
+                    //
+                    // Keying note: the resume snapshot is stored under the SAME
+                    // `(session_hint, scope_hash)` store key as every other wait kind
+                    // (`build_store_ctx` strips the correlation from the key). The
+                    // correlation id is NOT part of the key — it only drives how the
+                    // NATS response reconstructs the hint/scope (RuntimeSessionResumer)
+                    // so it recomputes that same key. So an AwaitHere park and a later
+                    // LoopHere park for the same conversation occupy the same single
+                    // slot; they never coexist because each park overwrites it. Safety
+                    // rests on sequential single-slot resume, not key separation — an
+                    // inbound arriving mid-await resolves to this slot (a known
+                    // interleaving limitation, tracked as a follow-up).
                     let mut snapshot_state = state.clone();
                     snapshot_state.clear_egress();
                     let snapshot = FlowSnapshot {
