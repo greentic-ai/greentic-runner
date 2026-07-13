@@ -116,8 +116,20 @@ successor (SP2). Non-conversational `dw.agent` is unchanged (one-shot). The flow
 `MAX_PARK_TURNS` (100) consecutive parked turns per node: an agent that never emits
 `conversation_ended` force-advances to the successor after the cap (per-node counter
 `ExecutionState.park_turns`, persisted in the park/resume snapshot; a plain constant,
-no env var / config knob). The out-of-process (Nats) dispatch path is still a deferred
-follow-up.
+no env var / config knob).
+
+The out-of-process (`DwAgentDispatch::Nats`) dispatch path supports the same
+conversational park-loop, identical in outcome to the in-process path. A fresh user turn
+marks a pending-await marker (`ExecutionState.pending_agent_await`, serde-persisted) and
+dispatches to the `agentic` NATS runtime with `resume_at_self: true`, which parks via
+`NodeControl::AwaitHere` — a correlation-keyed wait that resumes at the node itself
+(not the routing successor) once the async response arrives. On resume, the agent's
+response is read from `state.entry.output` (the `{ok, output: {reply, trail,
+terminated_by}, events, error}` envelope the NATS response listener builds), not from the
+node's re-rendered request payload; `terminated_by == "conversation_ended"` completes the
+node (advances to the successor), otherwise it loops (`NodeControl::LoopHere`, session-keyed,
+awaiting the next user message) — with the same `MAX_PARK_TURNS` cap and force-advance
+behavior as the in-process path.
 
 ### Async runtime dispatch (`sorla.call` node)
 
