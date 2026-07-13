@@ -319,6 +319,11 @@ impl TenantRuntime {
             let agent_audit_sink = audit_nats_client
                 .clone()
                 .map(crate::trace::audit_sink::AuditSink::new);
+            // `merged_agents` is MOVED into `build_agent_node_handler` below
+            // (redis/ephemeral branches); clone for the graph handler first so
+            // it can resolve a graph node's `agent_ref` (SP1) against the same
+            // process-level merged config map.
+            let graph_agents = merged_agents.clone();
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
                     merged_agents,
@@ -396,6 +401,7 @@ impl TenantRuntime {
                 graphs,
                 agent_audit_sink.clone(),
                 Arc::new(pack_runtimes.clone()),
+                graph_agents,
             )
             .await
             {
