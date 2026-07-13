@@ -465,9 +465,8 @@ mod aw {
         /// list is cheap; see [`run_one_agent_turn`]).
         packs: Arc<Vec<Arc<crate::pack::PackRuntime>>>,
         /// Process-level merged agent configs (pack + operator-overridden),
-        /// threaded through so a graph node's `agent_ref` (SP1 Task 1) can be
-        /// resolved to a full [`AgentConfig`] at turn time. Unused until Task 3
-        /// wires `agent_ref` resolution into [`run_one_agent_turn`].
+        /// threaded into [`run_one_agent_turn`] so a graph node's `agent_ref`
+        /// resolves to that agent's full [`AgentConfig`] at turn time.
         merged_agents: Arc<HashMap<String, AgentConfig>>,
     }
 

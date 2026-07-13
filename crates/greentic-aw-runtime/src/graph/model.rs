@@ -1252,7 +1252,7 @@ mod tests {
             NodeKind::Agent { agent_ref, .. } => assert_eq!(agent_ref.as_deref(), Some("support")),
             other => panic!("expected Agent, got {other:?}"),
         }
-        // absent -> None: re-serialize without agentRef must round-trip to None (skip_serializing_if)
+        // a present agent_ref re-serializes to the camelCase `agentRef` key
         let back = serde_json::to_value(&a.kind).unwrap();
         assert_eq!(back["agentRef"], serde_json::json!("support"));
     }
