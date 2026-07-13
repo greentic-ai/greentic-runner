@@ -1090,6 +1090,7 @@ mod aw {
             memory: None,
             knowledge: None,
             conversational: false,
+            opening_message: None,
         })
     }
 
@@ -1350,6 +1351,7 @@ mod aw {
             memory: None,
             knowledge: None,
             conversational: false,
+            opening_message: None,
         };
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
@@ -2613,6 +2615,7 @@ mod aw {
                 }),
                 knowledge: None,
                 conversational: false,
+                opening_message: None,
             };
             let mut provider = InMemoryConfigProvider::new();
             provider.insert(tenant, agent_id, cfg);
@@ -2907,6 +2910,7 @@ mod aw {
                     top_k: 5,
                 }),
                 conversational: false,
+                opening_message: None,
             }
         }
 
