@@ -77,14 +77,13 @@ impl StepObserver for SseForwardObserver {
             args: serde_json::Value::Null,
         });
     }
-    fn on_tool_result(&self, name: &str, call_id: &str, result: &serde_json::Value) {
+    fn on_tool_result(&self, _name: &str, call_id: &str, result: &serde_json::Value) {
         let _ = self.tx.send(StreamFrame::ToolResult {
             call_id: call_id.to_string(),
             status: FrameStatus::Ok,
             result: Some(result.clone()),
             error: None,
         });
-        let _ = name; // tool name already carried by the paired ToolCall frame
     }
 }
 
