@@ -4563,6 +4563,7 @@ mod tests {
                 memory: None,
                 knowledge: None,
                 conversational: false,
+                opening_message: None,
             },
         );
         let config_provider = Arc::new(config_provider);
@@ -7591,6 +7592,7 @@ mod tests {
             _agent_id: &str,
             _session_id: &str,
             _flow_input: &serde_json::Value,
+            _conversational: bool,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self
                 .script

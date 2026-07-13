@@ -1660,6 +1660,7 @@ mod aw {
                 memory: None,
                 knowledge: None,
                 conversational: false,
+                opening_message: None,
             }
         }
 
@@ -1693,6 +1694,7 @@ mod aw {
                     memory: None,
                     knowledge: None,
                     conversational: false,
+                    opening_message: None,
                 },
             );
             let config_provider = Arc::new(config_provider);
