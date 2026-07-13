@@ -100,6 +100,12 @@ turn with `TerminationReason::ConversationEnded` and the closing message (`final
 arg, else the accompanying reply) becomes the final reply — routed through the same
 outbound-guardrail/save path as a normal `FinalReply`. This is SP1 of the in-flow
 conversational chat-segment epic (`docs/superpowers/specs/2026-07-07-conversational-agent-chat-segment-epic-design.md`).
+**Tool-failure blocker guard:** if any tool the agent tried during the turn failed
+(dispatch error or allow-list block), an `end_conversation` request is downgraded to a
+normal `FinalReply` (the turn parks) instead of `ConversationEnded`. This keeps a
+conversational segment open — the closing message, which explains the failure, is shown
+and the flow does not silently advance past the blocker. The `end_conversation`
+system-prompt note also steers the model not to end on tool/backend failures.
 
 A conversational `dw.agent` node (`NodeKind::DwAgent.conversational`, default false) is a
 multi-turn segment: after each agent turn the engine parks and re-enters the same node

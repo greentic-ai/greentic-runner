@@ -270,6 +270,13 @@ pub async fn run_step(
     let mut terminated_by = TerminationReason::MaxIterations;
     let mut iterations: u32 = 0;
     let mut reply = String::new();
+    // Turn-scoped: set once any tool the agent tried failed (dispatch error or
+    // allow-list block). A tool failure often lands one iteration BEFORE the
+    // model decides to give up and call `end_conversation`, so this flag must
+    // survive across iterations of the Plan-Act-Observe loop. Consumed by the
+    // `end_conversation` short-circuit below to keep a conversational agent
+    // PARKED (surface the blocker) instead of silently ending the conversation.
+    let mut turn_had_tool_error = false;
 
     for iter in 0..config.limits.max_iter {
         iterations = iter + 1;
@@ -386,7 +393,17 @@ pub async fn run_step(
                     result: ok,
                 });
                 reply = closing;
-                terminated_by = TerminationReason::ConversationEnded;
+                // Blocker guard: if a tool/backend failed earlier this turn, the
+                // model often gives up and asks to end. Honouring that would
+                // silently advance the flow past the failure with the user none
+                // the wiser. Instead keep the conversation PARKED (FinalReply,
+                // not ConversationEnded) so the closing message — which explains
+                // the failure — is shown and the user can respond or retry.
+                terminated_by = if turn_had_tool_error {
+                    TerminationReason::FinalReply
+                } else {
+                    TerminationReason::ConversationEnded
+                };
                 break;
             }
 
@@ -460,6 +477,7 @@ pub async fn run_step(
                         name: call.tool_name.clone(),
                         reason: "not in allow-list".into(),
                     });
+                    turn_had_tool_error = true;
                     continue;
                 }
 
@@ -517,6 +535,7 @@ pub async fn run_step(
                             call_id: call.call_id.clone(),
                             result: err_obs,
                         });
+                        turn_had_tool_error = true;
                         continue;
                     }
                 };
@@ -770,6 +789,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
+    use crate::error::{LlmError, TerminationReason};
     use crate::llm::LlmResponse;
     use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
     use crate::tenant::TenantContext;
@@ -836,6 +856,94 @@ mod tests {
             .unwrap();
         assert_eq!(out.reply, "hi from llm");
         assert_eq!(telemetry.recorded.lock().unwrap().len(), 1);
+    }
+
+    /// Build a runtime whose mock LLM replays `responses` in order, for a
+    /// conversational agent with the given allow-listed `tools`.
+    fn conversational_runtime(
+        responses: Vec<Result<LlmResponse, LlmError>>,
+        tools: Vec<crate::config::ToolRef>,
+    ) -> (AgentRuntime, TenantContext) {
+        let llm = Arc::new(MockLlmBackend::new(responses));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        let mut c = cfg();
+        c.conversational = true;
+        c.tools = tools;
+        cp.insert(&tc, "a", c);
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+        (runtime, tc)
+    }
+
+    fn end_conversation_call(final_message: &str) -> crate::state::ToolCallRecord {
+        crate::state::ToolCallRecord {
+            call_id: "end-call".into(),
+            extension_id: "host".into(),
+            tool_name: crate::end_conversation::END_CONVERSATION_TOOL.into(),
+            args: serde_json::json!({ "final_message": final_message }),
+        }
+    }
+
+    /// Blocker guard: when a tool fails during the turn, the model's subsequent
+    /// `end_conversation` request must NOT end the conversation — it parks
+    /// (`FinalReply`) so the closing message (which explains the failure) is
+    /// shown and the flow does not silently advance past the blocker.
+    #[tokio::test]
+    async fn conversational_tool_error_then_end_conversation_stays_parked() {
+        // Iteration 1: the model calls a tool that is not in the allow-list →
+        // recorded as a tool failure. Iteration 2: it gives up and asks to end.
+        let responses = vec![
+            Ok(LlmResponse {
+                content: Some("let me look that up".into()),
+                tool_calls: vec![crate::state::ToolCallRecord {
+                    call_id: "c1".into(),
+                    extension_id: "greentic.test".into(),
+                    tool_name: "lookup".into(),
+                    args: serde_json::json!({}),
+                }],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+            Ok(LlmResponse {
+                content: Some("reasoning".into()),
+                tool_calls: vec![end_conversation_call("Sorry, my systems are unavailable.")],
+                tokens_in: 1,
+                tokens_out: 1,
+            }),
+        ];
+        // Empty allow-list → the `lookup` call is blocked (a tool failure).
+        let (runtime, tc) = conversational_runtime(responses, vec![]);
+        let out = runtime
+            .step(tc.clone(), "sess-1", "a", AgentInput { text: "hi".into() })
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::FinalReply);
+        assert_eq!(out.reply, "Sorry, my systems are unavailable.");
+    }
+
+    /// Control: with no tool failure in the turn, `end_conversation` ends the
+    /// conversation normally (`ConversationEnded`) so the flow routes onward.
+    #[tokio::test]
+    async fn conversational_clean_end_conversation_ends() {
+        let responses = vec![Ok(LlmResponse {
+            content: Some("reasoning".into()),
+            tool_calls: vec![end_conversation_call("All set — goodbye!")],
+            tokens_in: 1,
+            tokens_out: 1,
+        })];
+        let (runtime, tc) = conversational_runtime(responses, vec![]);
+        let out = runtime
+            .step(tc.clone(), "sess-1", "a", AgentInput { text: "hi".into() })
+            .await
+            .unwrap();
+        assert_eq!(out.terminated_by, TerminationReason::ConversationEnded);
+        assert_eq!(out.reply, "All set — goodbye!");
     }
 
     /// 4b: when a knowledge backend is wired and the agent's binding is enabled,

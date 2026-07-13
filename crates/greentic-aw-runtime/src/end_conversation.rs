@@ -47,7 +47,11 @@ pub(crate) fn augment_system_prompt(base: &str) -> String {
         "{base}\n\nWhen the conversation has reached a natural end — the user's goal \
          is met, they say goodbye, or there is nothing left to do — call the \
          `end_conversation` tool with a brief `final_message`. Do not call it while \
-         the user still needs help."
+         the user still needs help. If a tool or backend system fails or is \
+         unavailable, do NOT end the conversation: clearly tell the user which \
+         capability failed and that it looks like a configuration or availability \
+         problem, then stay available so they can respond or retry. A tool failure \
+         is a blocker to surface, not a reason to say goodbye."
     )
 }
 
@@ -100,5 +104,14 @@ mod tests {
         let out = augment_system_prompt("BASE");
         assert!(out.starts_with("BASE"));
         assert!(out.contains("end_conversation"));
+    }
+
+    #[test]
+    fn augment_warns_against_ending_on_tool_failure() {
+        let out = augment_system_prompt("BASE");
+        // The note must steer the model to keep the conversation open (surface
+        // the blocker) rather than say goodbye when a tool/backend fails.
+        assert!(out.contains("do NOT end the conversation"));
+        assert!(out.contains("blocker"));
     }
 }
