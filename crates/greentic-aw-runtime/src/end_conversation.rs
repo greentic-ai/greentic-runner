@@ -74,6 +74,7 @@ mod tests {
             memory: None,
             knowledge: None,
             conversational,
+            opening_message: None,
         }
     }
 

@@ -208,6 +208,7 @@ mod tests {
             }),
             guardrails: vec![],
             conversational: false,
+            opening_message: None,
         }
     }
 

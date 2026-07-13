@@ -339,6 +339,7 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         memory: None,
         knowledge: None,
         conversational: false,
+        opening_message: None,
     };
     for (tenant, env) in [
         ("default", "default"),

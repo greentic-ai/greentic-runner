@@ -136,6 +136,7 @@ pub fn agent_config_from_dw_manifest(m: &DwApplicationManifest) -> AgentConfig {
         memory: build_memory(m),
         knowledge: None,
         conversational: false,
+        opening_message: None,
     }
 }
 

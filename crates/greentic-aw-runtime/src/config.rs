@@ -122,6 +122,13 @@ pub struct AgentConfig {
     /// one-shot behaviour.
     #[serde(default)]
     pub conversational: bool,
+    /// Optional author-configured greeting. When set, the FIRST turn that
+    /// arrives with no user text (e.g. the flow entered the agent via a
+    /// button/card, not a typed message) replies with this verbatim instead of
+    /// making an LLM call — an instant, deterministic welcome. `None` keeps the
+    /// prior behaviour (the model fabricates a greeting from the system prompt).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opening_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -336,6 +343,7 @@ mod tests {
             memory: None,
             knowledge: None,
             conversational: false,
+            opening_message: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round: AgentConfig = serde_json::from_str(&json).unwrap();

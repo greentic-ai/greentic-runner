@@ -238,6 +238,7 @@ mod tests {
             knowledge: None,
             guardrails: vec![],
             conversational: false,
+            opening_message: None,
         };
         assert!(!long_term_active(false, &cfg));
         assert!(!long_term_active(true, &cfg));
