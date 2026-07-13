@@ -324,6 +324,12 @@ impl TenantRuntime {
             // it can resolve a graph node's `agent_ref` (SP1) against the same
             // process-level merged config map.
             let graph_agents = merged_agents.clone();
+            // Also needed after `merged_agents` is moved into
+            // `build_agent_node_handler`/`_ephemeral` below, to resolve the
+            // in-process operala.call LLM key the same way (see the
+            // `desktop-agent-ephemeral` block after the DwAgent wiring).
+            #[cfg(feature = "desktop-agent-ephemeral")]
+            let operala_agents = merged_agents.clone();
             let agent_handler = if redis_set {
                 crate::runner::agent_node::build_agent_node_handler(
                     merged_agents,
@@ -363,6 +369,101 @@ impl TenantRuntime {
             if let Some(handler) = agent_handler {
                 engine.set_agent_node_handler(handler);
                 tracing::info!("DwAgent runtime wired into FlowEngine");
+            }
+
+            // In-process deep-worker runtime for `operala.call` nodes
+            // (desktop-agent-ephemeral only, e.g. the designer's offline
+            // Test-chat sidecar — same feature the ephemeral DwAgent handler
+            // above uses). Reuses the exact key-resolution policy the
+            // in-process dw.agent LLM backend uses (env key wins; otherwise
+            // the first agent's `llm.credential_ref` resolved from the
+            // per-tenant secrets store), then builds a
+            // `greentic_llm::RigBackend` — the same OpenAI-compatible,
+            // multi-provider client `GreenticLlmBackend` uses for dw.agent —
+            // and wraps it in `DeepWorkerInvoker`. No handler is wired (and
+            // `operala.call` falls back to the NATS `RemoteDispatchHandler`,
+            // failing without it) when no LLM key resolves or the provider
+            // fails to build.
+            #[cfg(feature = "desktop-agent-ephemeral")]
+            {
+                let env_key = std::env::var("GREENTIC_LLM_API_KEY")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        std::env::var("OPENAI_API_KEY")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                    });
+                let api_key = match env_key {
+                    Some(key) => Some(key),
+                    None => {
+                        crate::runner::agent_node::resolve_in_process_llm_key(
+                            &secrets_manager,
+                            &config.tenant,
+                            &operala_agents,
+                        )
+                        .await
+                    }
+                };
+                match api_key {
+                    Some(api_key) => {
+                        let provider_kind: greentic_llm::ProviderKind =
+                            std::env::var("GREENTIC_LLM_PROVIDER")
+                                .ok()
+                                .filter(|value| !value.trim().is_empty())
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or(greentic_llm::ProviderKind::Openai);
+                        let model = std::env::var("GREENTIC_LLM_MODEL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                        let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty());
+                        // `Credential` is `ZeroizeOnDrop` (implements Drop), so
+                        // struct-update syntax cannot move out of
+                        // `Default::default()` — build a default and set the
+                        // fields we have (mirrors `GreenticLlmBackend::provider_for`).
+                        #[allow(clippy::field_reassign_with_default)]
+                        let credential = {
+                            let mut credential = greentic_llm::Credential::default();
+                            credential.api_key = api_key;
+                            credential.base_url = base_url;
+                            credential
+                        };
+                        match greentic_llm::RigBackend::new(provider_kind, &model, &credential) {
+                            Ok(backend) => {
+                                let llm: Arc<dyn greentic_llm::LlmProvider> = Arc::new(backend);
+                                let invoker =
+                                    greentic_dw_operala_invoker::DeepWorkerInvoker::new(llm);
+                                engine.set_operala_node_handler(Arc::new(
+                                    crate::runner::operala_node::RuntimeOperalaNodeHandler::new(
+                                        invoker,
+                                    ),
+                                ));
+                                tracing::info!(
+                                    provider = ?provider_kind,
+                                    model = %model,
+                                    "operala.call in-process deep-worker runtime wired into FlowEngine"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "failed to build the operala.call in-process LLM provider; \
+                                     operala.call nodes will fall back to NATS (and fail without it)"
+                                );
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            "no LLM API key resolved (env or store) for operala.call \
+                             in-process wiring; operala.call nodes will fall back to NATS \
+                             (and fail without it)"
+                        );
+                    }
+                }
             }
 
             // Collect agent-graph sidecars from each pack. Unlike agents (a
