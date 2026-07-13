@@ -1256,4 +1256,39 @@ mod tests {
         let back = serde_json::to_value(&a.kind).unwrap();
         assert_eq!(back["agentRef"], serde_json::json!("support"));
     }
+
+    /// SP1 Task 4: an `agent_ref` node is subject to the same "exactly 1
+    /// outgoing edge" rule as any other Agent node (Rule 4) — no separate
+    /// `agent_ref`-specific validation is needed. Confirms the existing rule
+    /// covers it both ways (valid with 1 edge, rejected with 0).
+    #[test]
+    fn agent_ref_node_validates_with_one_edge() {
+        let ok = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": [{"from":"a","to":"r"}]
+        });
+        assert!(GraphConfig::from_json(&ok.to_string()).is_ok());
+
+        let bad = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "a",
+            "nodes": [
+                {"id":"a","kind":"agent","systemPrompt":"","model":"gpt-4","agentRef":"support"},
+                {"id":"r","kind":"respond"}
+            ],
+            "edges": []
+        });
+        let err = GraphConfig::from_json(&bad.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exactly 1 outgoing edge"),
+            "unexpected error: {err}"
+        );
+    }
 }

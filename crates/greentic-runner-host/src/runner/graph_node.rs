@@ -556,10 +556,6 @@ mod aw {
         /// `run_agent_step` seam then stays on the plain `.step()` path,
         /// byte-identical regardless of this field's value.
         audit_sink: Option<AuditSink>,
-        /// Process-level merged agent configs, threaded through to
-        /// [`RuntimeTurnSource`] so it can build per-turn `agent_ref`
-        /// resolution (Task 3). Plumbing only in this task.
-        merged_agents: Arc<HashMap<String, AgentConfig>>,
     }
 
     impl RuntimeGraphNodeHandler {
@@ -601,7 +597,7 @@ mod aw {
                 ledger,
                 mcp_source,
                 packs,
-                merged_agents: merged_agents.clone(),
+                merged_agents,
             });
             // NOTE: the real `ApprovalFn` is designer-provided (it wires the
             // `greentic.approval.request.v1` / `.response.v1` NATS round trip
@@ -621,16 +617,7 @@ mod aw {
                 tool,
                 approval,
                 audit_sink,
-                merged_agents,
             }
-        }
-
-        /// **Test-only** accessor exposing the plumbed `merged_agents` map, so
-        /// wiring tests can assert the map reaches the handler without needing
-        /// a full agent-turn round trip (SP1 Task 2; consumed by Task 3).
-        #[cfg(test)]
-        pub(crate) fn merged_agents(&self) -> &HashMap<String, AgentConfig> {
-            &self.merged_agents
         }
 
         /// **Test-only** constructor that injects effect closures directly,
@@ -660,7 +647,6 @@ mod aw {
                 tool,
                 approval,
                 audit_sink: None,
-                merged_agents: Arc::new(HashMap::new()),
             }
         }
 
@@ -2775,56 +2761,6 @@ mod aw {
             )
         }
 
-        /// SP1 Task 2 wiring test: a handler built via `from_parts` with a
-        /// one-entry `merged_agents` map exposes that exact map to the turn
-        /// effects (via the `#[cfg(test)]` accessor) — no behaviour change
-        /// yet, just confirming the plumbing reaches `RuntimeGraphNodeHandler`
-        /// (Task 3 consumes it from `RuntimeTurnSource`/`run_one_agent_turn`).
-        #[test]
-        fn from_parts_exposes_merged_agents_to_the_handler() {
-            let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
-            let graphs: Arc<dyn GraphConfigSource> =
-                Arc::new(InMemoryGraphProvider::new(HashMap::new()));
-            let checkpoint: Arc<dyn CheckpointStore> = Arc::new(InMemoryCheckpointStore::default());
-            let llm = plain_reply_llm("unused");
-
-            let mut agents = HashMap::new();
-            agents.insert(
-                "x".to_string(),
-                AgentConfig {
-                    agent_id: "x".to_string(),
-                    system_prompt: "You are x.".to_string(),
-                    tools: vec![],
-                    guardrails: vec![],
-                    llm: LlmProviderRef {
-                        provider: "openai".to_string(),
-                        model: "gpt-4o-mini".to_string(),
-                        credential_ref: None,
-                    },
-                    limits: AgentLimits::default(),
-                    memory: None,
-                    knowledge: None,
-                    conversational: false,
-                },
-            );
-
-            let handler = RuntimeGraphNodeHandler::from_parts(
-                graphs,
-                checkpoint,
-                state_store,
-                ext_runtime,
-                llm,
-                telemetry,
-                token_meter,
-                ledger,
-                None,
-                Arc::new(vec![]),
-                Arc::new(agents),
-            );
-
-            assert!(handler.merged_agents().contains_key("x"));
-        }
-
         #[tokio::test]
         async fn run_one_agent_turn_without_audit_sink_completes_unchanged() {
             let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
@@ -2999,7 +2935,10 @@ mod aw {
 
             assert!(cfg.system_prompt.contains("FAQ-BOT"));
             assert!(cfg.memory.is_some(), "memory carried through unstripped");
-            assert!(cfg.knowledge.is_some(), "knowledge carried through unstripped");
+            assert!(
+                cfg.knowledge.is_some(),
+                "knowledge carried through unstripped"
+            );
         }
 
         #[test]
@@ -3025,7 +2964,8 @@ mod aw {
             let err = resolve_turn_config(&req, &merged, "graph.s").expect_err("must error");
 
             assert!(
-                err.to_string().contains("referenced agent 'missing' not found"),
+                err.to_string()
+                    .contains("referenced agent 'missing' not found"),
                 "unexpected error message: {err}"
             );
         }
@@ -3141,7 +3081,8 @@ mod aw {
             .expect_err("must error when agent_ref doesn't resolve");
 
             assert!(
-                err.to_string().contains("referenced agent 'missing' not found"),
+                err.to_string()
+                    .contains("referenced agent 'missing' not found"),
                 "unexpected error message: {err}"
             );
         }
