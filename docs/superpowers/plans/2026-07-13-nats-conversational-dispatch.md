@@ -177,7 +177,7 @@ fn pending_agent_await_survives_snapshot_roundtrip() {
                 }
 ```
 
-Note (from Task 1 spike): the correlation-keyed save is done by the caller of `execute_remote_dispatch` today via `FlowWait`/the resume reason `await-runtime:{correlation_id}`. If the save-keying is derived from the `reason` string (as the existing remote-await Wait does), the `AwaitHere` `reason` MUST carry the same `await-runtime:{correlation_id}` form so the dispatch listener resumes it — confirm the exact keying in Task 1 and set `reason` accordingly here.
+Note (CONFIRMED by Task 1 spike — findings §Q3): the correlation-keyed save/fetch keying is `(session_hint, ReplyScope.scope_hash)` via `build_store_ctx`/`FlowResumeStore::save` (`engine/runtime.rs:94-160`), **shared unchanged by every wait kind**. The `reason` string is cosmetic (never parsed as a key). So `AwaitHere` needs **no special keying** — it flows through the same `FlowWait` save path as `Wait`, and the response resumes it because `RuntimeSessionResumer` (`runtime_session_resumer.rs:125-183`) reconstructs the identical `(hint, scope_hash)` from the echoed `correlation_id`. The ONLY difference from `Wait` is `next_node = self`. Carry the `reason` through for audit/debug parity, but it is not load-bearing.
 
 - [ ] **Step 4: Build + regression.** `cargo build -p greentic-runner-host` and `cargo test -p greentic-runner-host --lib runner::engine` (existing Wait/LoopHere/remote-dispatch tests stay green).
 
@@ -188,7 +188,7 @@ Note (from Task 1 spike): the correlation-keyed save is done by the caller of `e
 ## Task 4: Emit `AwaitHere` from the conversational NATS dispatch
 
 **Files:**
-- Modify: `crates/greentic-runner-host/src/runner/engine.rs` (`execute_remote_dispatch` return site — the `AwaitingResponse` → `DispatchOutcome::wait` branch ~:77-85)
+- Modify: `crates/greentic-runner-host/src/runner/engine.rs` (`execute_remote_dispatch` — the `AwaitingResponse` → `DispatchOutcome::wait(output, Some(reason))` return site, **spike-confirmed at `engine.rs:1362-1372`**; the `correlation_id` is already built at `:1330-1341` in the same fn — reuse it)
 
 **Interfaces:**
 - Consumes: `DispatchOutcome::await_here` (Task 3).
@@ -238,10 +238,22 @@ Replace with:
                     crate::runner::agent_node::DwAgentDispatch::Nats => {
                         if *conversational {
                             if state.take_agent_await(node_id) {
-                                // Resuming with the agent's response (this `payload`
-                                // IS the NATS response — confirmed in Task 1 spike).
-                                let output = crate::runner::agent_node::NodeOutput::new(payload.clone());
-                                let ended = payload
+                                // Resuming with the agent's NATS response. SPIKE §Q2:
+                                // the response is NOT in the `payload` argument (that
+                                // is a freshly re-rendered request-mapping template) —
+                                // it landed in `state.entry` as the envelope
+                                // `{ok, output, events, error}`, so the agent output is
+                                // `state.entry.output` (= `{reply, trail, terminated_by}`)
+                                // and `terminated_by` is nested one level under `.output`.
+                                // `state.entry` is readable here (same module; precedent
+                                // `inject_card_locale(&mut payload, &state.entry)` at :897).
+                                let agent_out = state
+                                    .entry
+                                    .get("output")
+                                    .cloned()
+                                    .unwrap_or(serde_json::Value::Null);
+                                let output = crate::runner::agent_node::NodeOutput::new(agent_out.clone());
+                                let ended = agent_out
                                     .get("terminated_by")
                                     .and_then(serde_json::Value::as_str)
                                     == Some("conversation_ended");
