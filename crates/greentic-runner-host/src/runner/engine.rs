@@ -993,16 +993,27 @@ impl FlowEngine {
                                 .and_then(serde_json::Value::as_str)
                                 == Some("conversation_ended");
                             if ended {
+                                state.reset_park_turns(node_id);
                                 Ok(DispatchOutcome::complete(output))
                             } else {
-                                Ok(DispatchOutcome::with_control(
-                                    output,
-                                    NodeControl::LoopHere {
-                                        reason: Some(format!(
-                                            "conversational dw.agent `{agent_id}` awaiting next user message"
-                                        )),
-                                    },
-                                ))
+                                let turns = state.bump_park_turns(node_id);
+                                if turns >= MAX_PARK_TURNS {
+                                    tracing::warn!(
+                                        agent_id = %agent_id,
+                                        turns,
+                                        "conversational dw.agent hit park-loop cap ({MAX_PARK_TURNS}); force-advancing to successor"
+                                    );
+                                    Ok(DispatchOutcome::complete(output))
+                                } else {
+                                    Ok(DispatchOutcome::with_control(
+                                        output,
+                                        NodeControl::LoopHere {
+                                            reason: Some(format!(
+                                                "conversational dw.agent `{agent_id}` awaiting next user message"
+                                            )),
+                                        },
+                                    ))
+                                }
                             }
                         } else {
                             Ok(DispatchOutcome::complete(output))
@@ -2089,6 +2100,17 @@ pub struct NodeEvent<'a> {
     pub payload: &'a Value,
 }
 
+/// Safety backstop for a CONVERSATIONAL `dw.agent` node's park-and-loop cycle.
+///
+/// This is NOT a UX limit — it exists purely so that a stuck or misbehaving
+/// conversational agent (one that never emits `conversation_ended`) cannot
+/// trap a flow at the same node forever. After this many parked turns at a
+/// single conversational `dw.agent` node without a `conversation_ended`
+/// termination, the flow force-advances to the node's successor using the
+/// agent's last output. Deliberately a plain constant: no env var, no
+/// per-agent config knob.
+const MAX_PARK_TURNS: u32 = 100;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionState {
     #[serde(default)]
@@ -2105,6 +2127,12 @@ pub struct ExecutionState {
     redirect_count: u32,
     #[serde(default)]
     vars: JsonMap<String, Value>,
+    /// Per-node park-loop turn counter for conversational `dw.agent` nodes,
+    /// keyed by node id. Mirrors `redirect_count`'s per-execution safety-cap
+    /// pattern, but tracked per node since a flow may hold more than one
+    /// conversational agent.
+    #[serde(default)]
+    park_turns: HashMap<String, u32>,
 }
 
 impl ExecutionState {
@@ -2117,6 +2145,7 @@ impl ExecutionState {
             last_output: None,
             redirect_count: 0,
             vars: JsonMap::new(),
+            park_turns: HashMap::new(),
         }
     }
 
@@ -2147,6 +2176,7 @@ impl ExecutionState {
             "input": self.input.clone(),
             "nodes": nodes,
             "redirect_count": self.redirect_count,
+            "park_turns": self.park_turns.clone(),
         })
     }
 
@@ -2175,6 +2205,19 @@ impl ExecutionState {
 
     fn increment_redirect_count(&mut self) {
         self.redirect_count = self.redirect_count.saturating_add(1);
+    }
+
+    /// Bump the park-loop turn counter for `node_id` and return the NEW count.
+    fn bump_park_turns(&mut self, node_id: &str) -> u32 {
+        let entry = self.park_turns.entry(node_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    /// Clear the park-loop turn counter for `node_id` (e.g. once the
+    /// conversational segment ends), so a later re-entry starts fresh.
+    fn reset_park_turns(&mut self, node_id: &str) {
+        self.park_turns.remove(node_id);
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -4892,6 +4935,48 @@ mod tests {
         assert_eq!(err.to_string(), "redirect_limit");
     }
 
+    #[test]
+    fn park_turns_bump_and_reset() {
+        let mut state = ExecutionState::new(Value::Null);
+        assert_eq!(state.bump_park_turns("a"), 1);
+        assert_eq!(state.bump_park_turns("a"), 2);
+        // A different node's counter is independent.
+        assert_eq!(state.bump_park_turns("b"), 1);
+        assert_eq!(state.bump_park_turns("a"), 3);
+
+        state.reset_park_turns("a");
+        assert_eq!(
+            state.bump_park_turns("a"),
+            1,
+            "reset must restart from zero"
+        );
+        assert_eq!(
+            state.bump_park_turns("b"),
+            2,
+            "resetting `a` must not disturb `b`'s counter"
+        );
+    }
+
+    #[test]
+    fn park_turns_survives_snapshot_roundtrip() {
+        // park_turns must persist across a park/resume, which is a serde
+        // round-trip of ExecutionState (same contract as redirect_count /
+        // vars — see execution_state_vars_survive_serde_round_trip).
+        let mut state = ExecutionState::new(json!({}));
+        state.bump_park_turns("agent-1");
+        state.bump_park_turns("agent-1");
+
+        let encoded = serde_json::to_string(&state).expect("serialize");
+        let decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded.park_turns.get("agent-1"), Some(&2));
+
+        // A legacy snapshot serialized before `park_turns` existed (no
+        // `park_turns` key) must still load, defaulting to an empty map.
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let decoded_legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(decoded_legacy.park_turns.is_empty());
+    }
+
     /// Regression: a `Routing::Custom` array containing at least one
     /// conditional entry must pause (return `Wait`) when no condition
     /// matches, instead of terminating. Concrete bug it guards against:
@@ -6565,6 +6650,49 @@ mod tests {
                 result.status
             );
         }
+    }
+
+    /// Safety-backstop behavioral test: a conversational `dw.agent` that
+    /// never emits `conversation_ended` must keep parking up to
+    /// `MAX_PARK_TURNS` turns, then force-advance to the successor instead
+    /// of trapping the flow forever.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_force_advances_after_park_loop_cap() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "still thinking", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1, got {other:?}"),
+        };
+
+        // Turns 2..MAX_PARK_TURNS (exclusive) must keep parking.
+        for turn in 2..MAX_PARK_TURNS {
+            let result = rt
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting at turn {turn}, got {other:?}"),
+            };
+        }
+
+        // The MAX_PARK_TURNS-th turn must force-advance instead of parking again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at turn {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
     }
 }
 
