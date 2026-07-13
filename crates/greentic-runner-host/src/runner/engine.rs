@@ -1095,7 +1095,9 @@ impl FlowEngine {
                         }
                     }
                     crate::runner::agent_node::DwAgentDispatch::InProcess => {
-                        let output = self.execute_dw_agent(ctx, agent_id, payload).await?;
+                        let output = self
+                            .execute_dw_agent(ctx, agent_id, payload, *conversational)
+                            .await?;
                         if *conversational {
                             let ended = output
                                 .payload
@@ -1137,8 +1139,7 @@ impl FlowEngine {
                 }
                 #[cfg(not(feature = "agentic-worker"))]
                 {
-                    let _ = conversational;
-                    self.execute_dw_agent(ctx, agent_id, payload)
+                    self.execute_dw_agent(ctx, agent_id, payload, *conversational)
                         .await
                         .map(DispatchOutcome::complete)
                 }
@@ -1173,6 +1174,7 @@ impl FlowEngine {
         ctx: &FlowContext<'_>,
         agent_id: &str,
         payload: Value,
+        conversational: bool,
     ) -> Result<NodeOutput> {
         let handler = self
             .agent_node_handler
@@ -1186,6 +1188,7 @@ impl FlowEngine {
                 agent_id,
                 session_id,
                 &payload,
+                conversational,
             )
             .await?;
         Ok(NodeOutput::new(result))
@@ -1197,6 +1200,7 @@ impl FlowEngine {
         _ctx: &FlowContext<'_>,
         agent_id: &str,
         _payload: Value,
+        _conversational: bool,
     ) -> Result<NodeOutput> {
         anyhow::bail!(
             "DwAgent node '{agent_id}' cannot run: this build was compiled without the \
@@ -6716,6 +6720,7 @@ mod tests {
             _agent_id: &str,
             _session_id: &str,
             _flow_input: &serde_json::Value,
+            _conversational: bool,
         ) -> anyhow::Result<serde_json::Value> {
             Ok(self.payload.clone())
         }

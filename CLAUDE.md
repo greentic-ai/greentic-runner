@@ -94,6 +94,11 @@ Worker config is an `AgentConfig` (`greentic-aw-runtime/src/config.rs`), supplie
 manifest, `<agent_id>.json` in `GREENTIC_AGENT_MANIFESTS_DIR`, or the admin endpoint.
 
 An agent may be marked `conversational` (`AgentConfig.conversational`, default false).
+The host `end_conversation` tool is offered when EITHER that config opts in OR the
+invocation does — `AgentInput.conversational`, set from the flow node's `conversational`
+flag (SP3). So a flow node marked conversational makes the agent able to end the segment
+the engine park-loop maintains, even when the agent's own config default is false (the
+node, not just the agent config, can opt in; the two are OR-ed in the loop as `conv_active`).
 Conversational agents are offered a host built-in `end_conversation` tool (reserved `host`
 extension id) plus a system-prompt note; when the model calls it, the loop terminates the
 turn with `TerminationReason::ConversationEnded` and the closing message (`final_message`
