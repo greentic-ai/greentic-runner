@@ -1350,10 +1350,19 @@ impl FlowEngine {
         payload: Value,
     ) -> Result<DispatchOutcome> {
         if let Some(handler) = self.operala_node_handler.as_ref() {
-            let operation = payload
+            // `greentic-dw-authoring` stamps `operation: "invoke"` on the
+            // `operala.call` node, but the deep-worker invoker's contract
+            // accepts only `"" | "run"`. Normalize so an authored `deep_worker`
+            // actually runs in-process instead of failing operation validation.
+            let raw_operation = payload
                 .get("operation")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let operation = if raw_operation.eq_ignore_ascii_case("invoke") {
+                "run"
+            } else {
+                raw_operation
+            };
             let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
             let session_id = ctx.session_id.unwrap_or("");
             let result = handler
