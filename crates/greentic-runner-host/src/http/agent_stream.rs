@@ -49,9 +49,12 @@ pub enum FrameStatus {
 }
 
 /// A `StepObserver` that forwards token/tool callbacks as `StreamFrame`s onto an
-/// unbounded channel drained by the SSE responder. Unbounded + non-blocking send
-/// keeps the LLM read loop free of backpressure; the drain side awaits each send
-/// to the bounded SSE channel, so no frame is dropped.
+/// unbounded `tokio::sync::mpsc` channel. The send side (this observer, called
+/// from the LLM read loop) never blocks or drops a frame for backpressure
+/// reasons — the channel is unbounded. The receive side is drained directly by
+/// the SSE responder via `futures::stream::unfold`, which feeds `Sse::new`
+/// (see `agent_chat_stream_core` / `agent_chat_stream`); there is no separate
+/// bounded intermediate stage between the observer and the SSE response.
 pub struct SseForwardObserver {
     tx: UnboundedSender<StreamFrame>,
     /// Flips to `true` on the first `on_token_delta` call. Lets the SSE
