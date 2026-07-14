@@ -1929,11 +1929,14 @@ mod aw {
                 fn wants_streaming(&self) -> bool {
                     true
                 }
-                fn on_tool_call(&self, name: &str, _call_id: &str) {
+                fn on_tool_call(&self, name: &str, _call_id: &str, _args: &Value) {
                     self.hits.lock().unwrap().push(format!("c:{name}"));
                 }
                 fn on_tool_result(&self, name: &str, _call_id: &str, _result: &Value) {
                     self.hits.lock().unwrap().push(format!("r:{name}"));
+                }
+                fn on_tool_failed(&self, name: &str, _call_id: &str, _error: &Value) {
+                    self.hits.lock().unwrap().push(format!("f:{name}"));
                 }
             }
 

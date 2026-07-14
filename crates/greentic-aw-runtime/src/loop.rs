@@ -423,7 +423,7 @@ pub async fn run_step(
                     .iter()
                     .find(|c| c.tool_name == crate::end_conversation::END_CONVERSATION_TOOL)
             {
-                observer.on_tool_call(&end_call.tool_name, &end_call.call_id);
+                observer.on_tool_call(&end_call.tool_name, &end_call.call_id, &end_call.args);
                 let closing = end_call
                     .args
                     .get("final_message")
@@ -468,7 +468,7 @@ pub async fn run_step(
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's long-term backend instead of an extension.
                 if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let result = host_recall_memory(runtime, &tenant, &call).await;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
@@ -486,7 +486,7 @@ pub async fn run_step(
                 // Intercepted before the allow-list + WASM dispatch; routed to
                 // the runtime's short-term backend instead of an extension.
                 if st_active && call.tool_name == crate::short_term::REMEMBER_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let result = host_remember(runtime, &tenant, session_id, &call).await;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
@@ -501,7 +501,7 @@ pub async fn run_step(
                     continue;
                 }
                 if st_active && call.tool_name == crate::short_term::RECALL_TOOL {
-                    observer.on_tool_call(&call.tool_name, &call.call_id);
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                     let result = host_recall(runtime, &tenant, session_id, &call).await;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
@@ -516,13 +516,17 @@ pub async fn run_step(
                     continue;
                 }
                 if !is_tool_allowed(&call, &config.tools) {
+                    let reason = "not in allow-list";
+                    observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let err_obs = serde_json::json!({ "error": reason });
+                    observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
                         content: serde_json::json!({ "error": "tool not allowed for this agent" }),
                     });
                     trail.push(AgentStep::ToolCallBlocked {
                         name: call.tool_name.clone(),
-                        reason: "not in allow-list".into(),
+                        reason: reason.into(),
                     });
                     turn_had_tool_error = true;
                     continue;
@@ -531,6 +535,8 @@ pub async fn run_step(
                 // --- Idempotency: reuse a previously-recorded result ---
                 match runtime.ledger.get(&tenant, session_id, &call.call_id).await {
                     Ok(Some(cached)) => {
+                        observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                        observer.on_tool_result(&call.tool_name, &call.call_id, &cached);
                         state.messages.push(ChatMessage::Tool {
                             call_id: call.call_id.clone(),
                             content: cached,
@@ -552,7 +558,7 @@ pub async fn run_step(
                 // the error as a Tool observation so the LLM can react, then
                 // continue. Failed calls are NOT recorded in the ledger
                 // (they should remain retryable on the next turn).
-                observer.on_tool_call(&call.tool_name, &call.call_id);
+                observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
                 let result = match dispatch_tool_call(
                     runtime.ext_runtime.clone(),
                     mcp_catalog.clone(),
@@ -574,9 +580,9 @@ pub async fn run_step(
                             call_id: call.call_id.clone(),
                             content: err_obs.clone(),
                         });
-                        // Surface the failure as a tool result too, so audit/stream
-                        // observers see a matching result instead of a dangling call.
-                        observer.on_tool_result(&call.tool_name, &call.call_id, &err_obs);
+                        // Surface the failure so audit/stream observers see a matching
+                        // outcome instead of a dangling call.
+                        observer.on_tool_failed(&call.tool_name, &call.call_id, &err_obs);
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
@@ -1292,7 +1298,7 @@ mod tests {
         fn on_token_delta(&self, chunk: &str) {
             self.deltas.lock().expect("lock").push(chunk.to_string());
         }
-        fn on_tool_call(&self, name: &str, _call_id: &str) {
+        fn on_tool_call(&self, name: &str, _call_id: &str, _args: &serde_json::Value) {
             self.tool_calls.lock().expect("lock").push(name.to_string());
         }
     }
@@ -1401,6 +1407,116 @@ mod tests {
             *obs.deltas.lock().unwrap(),
             0,
             "no deltas on the non-streaming path"
+        );
+    }
+
+    /// A tool call for a tool NOT in the agent's allow-list must still fire
+    /// `on_tool_call` (so a chip renders with real args) followed by
+    /// `on_tool_failed` (so it renders as failed/blocked) — NOT
+    /// `on_tool_result`, which would make a blocked tool look like it
+    /// succeeded.
+    #[tokio::test]
+    async fn blocked_tool_fires_on_tool_call_then_on_tool_failed() {
+        use crate::state::ToolCallRecord;
+
+        #[derive(Default)]
+        struct ToolEvents {
+            calls: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+            results: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+            failures: std::sync::Mutex<Vec<(String, String, serde_json::Value)>>,
+        }
+        impl crate::StepObserver for ToolEvents {
+            fn on_tool_call(&self, name: &str, call_id: &str, args: &serde_json::Value) {
+                self.calls.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    args.clone(),
+                ));
+            }
+            fn on_tool_result(&self, name: &str, call_id: &str, result: &serde_json::Value) {
+                self.results.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    result.clone(),
+                ));
+            }
+            fn on_tool_failed(&self, name: &str, call_id: &str, error: &serde_json::Value) {
+                self.failures.lock().unwrap().push((
+                    name.to_string(),
+                    call_id.to_string(),
+                    error.clone(),
+                ));
+            }
+        }
+
+        let llm = Arc::new(MockLlmBackend::new(vec![
+            Ok(LlmResponse {
+                content: None,
+                tool_calls: vec![ToolCallRecord {
+                    call_id: "call_1".into(),
+                    extension_id: "http".into(),
+                    tool_name: "fetch".into(),
+                    args: serde_json::json!({"url": "https://example.com"}),
+                }],
+                tokens_in: 10,
+                tokens_out: 5,
+            }),
+            Ok(LlmResponse {
+                content: Some("done".into()),
+                tool_calls: vec![],
+                tokens_in: 3,
+                tokens_out: 2,
+            }),
+        ]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        // `cfg()` has an empty tools allow-list, so the tool call is blocked.
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
+
+        let obs = Arc::new(ToolEvents::default());
+        let out = runtime
+            .step_with_observer(
+                tc.clone(),
+                "sess-4",
+                "a",
+                AgentInput {
+                    text: "please fetch".into(),
+                    ..Default::default()
+                },
+                obs.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.reply, "done");
+
+        let calls = obs.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "fetch");
+        assert_eq!(calls[0].1, "call_1");
+        assert_eq!(
+            calls[0].2,
+            serde_json::json!({"url": "https://example.com"})
+        );
+        drop(calls);
+
+        assert!(
+            obs.results.lock().unwrap().is_empty(),
+            "a blocked tool must not fire on_tool_result"
+        );
+        let failures = obs.failures.lock().unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, "fetch");
+        assert_eq!(failures[0].1, "call_1");
+        assert_eq!(
+            failures[0].2,
+            serde_json::json!({"error": "not in allow-list"})
         );
     }
 }

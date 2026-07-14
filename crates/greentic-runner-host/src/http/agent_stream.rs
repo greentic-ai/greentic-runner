@@ -89,11 +89,11 @@ impl StepObserver for SseForwardObserver {
             text: chunk.to_string(),
         });
     }
-    fn on_tool_call(&self, name: &str, call_id: &str) {
+    fn on_tool_call(&self, name: &str, call_id: &str, args: &serde_json::Value) {
         let _ = self.tx.send(StreamFrame::ToolCall {
             call_id: call_id.to_string(),
             tool_name: name.to_string(),
-            args: serde_json::Value::Null,
+            args: args.clone(),
         });
     }
     fn on_tool_result(&self, _name: &str, call_id: &str, result: &serde_json::Value) {
@@ -102,6 +102,19 @@ impl StepObserver for SseForwardObserver {
             status: FrameStatus::Ok,
             result: Some(result.clone()),
             error: None,
+        });
+    }
+    fn on_tool_failed(&self, _name: &str, call_id: &str, error: &serde_json::Value) {
+        let message = error
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        let _ = self.tx.send(StreamFrame::ToolResult {
+            call_id: call_id.to_string(),
+            status: FrameStatus::Error,
+            result: None,
+            error: Some(message),
         });
     }
 }
@@ -128,14 +141,19 @@ impl StepObserver for CompositeObserver {
             m.on_token_delta(chunk);
         }
     }
-    fn on_tool_call(&self, name: &str, call_id: &str) {
+    fn on_tool_call(&self, name: &str, call_id: &str, args: &serde_json::Value) {
         for m in &self.members {
-            m.on_tool_call(name, call_id);
+            m.on_tool_call(name, call_id, args);
         }
     }
     fn on_tool_result(&self, name: &str, call_id: &str, result: &serde_json::Value) {
         for m in &self.members {
             m.on_tool_result(name, call_id, result);
+        }
+    }
+    fn on_tool_failed(&self, name: &str, call_id: &str, error: &serde_json::Value) {
+        for m in &self.members {
+            m.on_tool_failed(name, call_id, error);
         }
     }
 }
@@ -159,11 +177,14 @@ mod tests {
         fn on_token_delta(&self, c: &str) {
             self.calls.lock().unwrap().push(format!("t:{c}"));
         }
-        fn on_tool_call(&self, n: &str, id: &str) {
+        fn on_tool_call(&self, n: &str, id: &str, _args: &serde_json::Value) {
             self.calls.lock().unwrap().push(format!("c:{n}:{id}"));
         }
         fn on_tool_result(&self, n: &str, id: &str, _r: &serde_json::Value) {
             self.calls.lock().unwrap().push(format!("r:{n}:{id}"));
+        }
+        fn on_tool_failed(&self, n: &str, id: &str, _e: &serde_json::Value) {
+            self.calls.lock().unwrap().push(format!("f:{n}:{id}"));
         }
     }
 
@@ -180,9 +201,16 @@ mod tests {
         let comp = CompositeObserver::new(vec![a.clone(), b.clone()]);
         assert!(comp.wants_streaming(), "OR of members");
         comp.on_token_delta("hi");
-        comp.on_tool_call("email", "call_1");
-        assert_eq!(*a.calls.lock().unwrap(), vec!["t:hi", "c:email:call_1"]);
-        assert_eq!(*b.calls.lock().unwrap(), vec!["t:hi", "c:email:call_1"]);
+        comp.on_tool_call("email", "call_1", &json!({"to": "x@example.com"}));
+        comp.on_tool_failed("email", "call_1", &json!({"error": "boom"}));
+        assert_eq!(
+            *a.calls.lock().unwrap(),
+            vec!["t:hi", "c:email:call_1", "f:email:call_1"]
+        );
+        assert_eq!(
+            *b.calls.lock().unwrap(),
+            vec!["t:hi", "c:email:call_1", "f:email:call_1"]
+        );
     }
 
     #[test]
@@ -200,7 +228,7 @@ mod tests {
         let obs = SseForwardObserver::new(tx);
         assert!(obs.wants_streaming());
         obs.on_token_delta("Hel");
-        obs.on_tool_call("sql", "c1");
+        obs.on_tool_call("sql", "c1", &json!({"query": "select 1"}));
         obs.on_tool_result("sql", "c1", &json!({"rows": 2}));
         obs.on_token_delta("lo");
         drop(obs);
@@ -209,9 +237,70 @@ mod tests {
             kinds.push(f);
         }
         assert!(matches!(kinds[0], StreamFrame::TextChunk { ref text } if text == "Hel"));
-        assert!(matches!(kinds[1], StreamFrame::ToolCall { ref call_id, .. } if call_id == "c1"));
+        assert!(matches!(
+            kinds[1],
+            StreamFrame::ToolCall { ref call_id, ref args, .. }
+            if call_id == "c1" && *args == json!({"query": "select 1"})
+        ));
         assert!(matches!(kinds[2], StreamFrame::ToolResult { ref call_id, .. } if call_id == "c1"));
         assert!(matches!(kinds[3], StreamFrame::TextChunk { ref text } if text == "lo"));
+    }
+
+    #[test]
+    fn sse_forward_observer_emits_tool_call_args() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = SseForwardObserver::new(tx);
+        obs.on_tool_call("http", "c2", &json!({"url": "https://example.com"}));
+        let frame = rx.try_recv().expect("frame sent");
+        match frame {
+            StreamFrame::ToolCall {
+                call_id,
+                tool_name,
+                args,
+            } => {
+                assert_eq!(call_id, "c2");
+                assert_eq!(tool_name, "http");
+                assert_eq!(args, json!({"url": "https://example.com"}));
+            }
+            other => panic!("expected ToolCall frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_forward_observer_on_tool_failed_emits_error_status() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = SseForwardObserver::new(tx);
+        obs.on_tool_failed("http", "c3", &json!({"error": "connection refused"}));
+        let frame = rx.try_recv().expect("frame sent");
+        match frame {
+            StreamFrame::ToolResult {
+                call_id,
+                status,
+                result,
+                error,
+            } => {
+                assert_eq!(call_id, "c3");
+                assert!(matches!(status, FrameStatus::Error));
+                assert!(result.is_none());
+                assert_eq!(error, Some("connection refused".to_string()));
+            }
+            other => panic!("expected ToolResult frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_forward_observer_on_tool_failed_stringifies_non_error_shaped_value() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = SseForwardObserver::new(tx);
+        // No "error" string field — falls back to Value::to_string().
+        obs.on_tool_failed("http", "c4", &json!({"reason": "blocked"}));
+        let frame = rx.try_recv().expect("frame sent");
+        match frame {
+            StreamFrame::ToolResult { error, .. } => {
+                assert_eq!(error, Some(json!({"reason": "blocked"}).to_string()));
+            }
+            other => panic!("expected ToolResult frame, got {other:?}"),
+        }
     }
 
     #[test]
