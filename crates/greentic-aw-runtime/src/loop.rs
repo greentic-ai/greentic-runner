@@ -437,7 +437,9 @@ pub async fn run_step(
                 trail.push(AgentStep::ToolCall {
                     name: end_call.tool_name.clone(),
                     call_id: end_call.call_id.clone(),
+                    args: end_call.args.clone(),
                     result: ok,
+                    duration_ms: 0,
                 });
                 reply = closing;
                 // Blocker guard: if a tool/backend failed earlier this turn, the
@@ -469,7 +471,9 @@ pub async fn run_step(
                 // the runtime's long-term backend instead of an extension.
                 if lt_active && call.tool_name == crate::long_term::RECALL_MEMORY_TOOL {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_recall_memory(runtime, &tenant, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -478,7 +482,9 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
@@ -487,7 +493,9 @@ pub async fn run_step(
                 // the runtime's short-term backend instead of an extension.
                 if st_active && call.tool_name == crate::short_term::REMEMBER_TOOL {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_remember(runtime, &tenant, session_id, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -496,13 +504,17 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
                 if st_active && call.tool_name == crate::short_term::RECALL_TOOL {
                     observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                    let t0 = Instant::now();
                     let result = host_recall(runtime, &tenant, session_id, &call).await;
+                    let duration_ms = t0.elapsed().as_millis() as u64;
                     observer.on_tool_result(&call.tool_name, &call.call_id, &result);
                     state.messages.push(ChatMessage::Tool {
                         call_id: call.call_id.clone(),
@@ -511,7 +523,9 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
+                        duration_ms,
                     });
                     continue;
                 }
@@ -559,6 +573,7 @@ pub async fn run_step(
                 // continue. Failed calls are NOT recorded in the ledger
                 // (they should remain retryable on the next turn).
                 observer.on_tool_call(&call.tool_name, &call.call_id, &call.args);
+                let t0 = Instant::now();
                 let result = match dispatch_tool_call(
                     runtime.ext_runtime.clone(),
                     mcp_catalog.clone(),
@@ -571,6 +586,7 @@ pub async fn run_step(
                 {
                     Ok(r) => r,
                     Err(e) => {
+                        let duration_ms = t0.elapsed().as_millis() as u64;
                         warn!(
                             error = %e, tool = %call.tool_name,
                             "tool dispatch failed; recording as observation and continuing"
@@ -586,12 +602,15 @@ pub async fn run_step(
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
+                            args: call.args.clone(),
                             result: err_obs,
+                            duration_ms,
                         });
                         turn_had_tool_error = true;
                         continue;
                     }
                 };
+                let duration_ms = t0.elapsed().as_millis() as u64;
 
                 observer.on_tool_result(&call.tool_name, &call.call_id, &result);
 
@@ -611,7 +630,9 @@ pub async fn run_step(
                 trail.push(AgentStep::ToolCall {
                     name: call.tool_name.clone(),
                     call_id: call.call_id,
+                    args: call.args.clone(),
                     result,
+                    duration_ms,
                 });
             }
             continue; // next LLM turn with tool observations

@@ -458,7 +458,16 @@ pub enum AgentStep {
     ToolCall {
         name: String,
         call_id: String,
+        /// The arguments the model passed to the tool (its input). Lets a caller
+        /// show what was actually requested, not just the tool name. Defaults to
+        /// `null` for older trails that predate this field.
+        #[serde(default)]
+        args: serde_json::Value,
         result: serde_json::Value,
+        /// Wall-clock time spent dispatching this tool call, in milliseconds.
+        /// `0` for host built-ins that resolve instantly and for older trails.
+        #[serde(default)]
+        duration_ms: u64,
     },
     ToolCallReused {
         name: String,
