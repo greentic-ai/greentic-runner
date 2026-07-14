@@ -352,11 +352,24 @@ mod aw {
                     // Never leak the internal AgentError to the flow output. Log
                     // the detail for operators; return a sanitised reply only.
                     tracing::warn!(error = %error, agent_id, session_id, "DwAgent step failed");
-                    Ok(json!({
+                    let mut out = json!({
                         "reply": SANITISED_ERROR_REPLY,
                         "trail": Vec::<AgentStep>::new(),
                         "terminated_by": "error",
-                    }))
+                    });
+                    // Opt-in diagnostic: surface the internal error detail (never
+                    // part of the user-facing reply) when `GREENTIC_AGENT_ERROR_DETAIL`
+                    // is truthy, so an operator debugging the offline Test-chat
+                    // sidecar sees the real cause instead of only "Something went
+                    // wrong". The runner's telemetry `main` exports tracing to OTLP,
+                    // not stderr, so the `warn!` above is otherwise invisible.
+                    if std::env::var("GREENTIC_AGENT_ERROR_DETAIL")
+                        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                        .unwrap_or(false)
+                    {
+                        out["error_detail"] = json!(format!("{error} || {error:?}"));
+                    }
+                    Ok(out)
                 }
             }
         }
