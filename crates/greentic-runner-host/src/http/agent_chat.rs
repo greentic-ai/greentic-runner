@@ -189,6 +189,36 @@ impl Drop for Cleanup {
     }
 }
 
+/// Build the ingress [`Activity`] for one `/agent/chat/stream` turn.
+///
+/// The session id is stamped with the `conversationId` on purpose. The SSE
+/// handler registers this turn's stream observer keyed by the raw
+/// `conversationId` (`stream_observers.insert(conversation_id, ..)`), while the
+/// `dw.agent` node looks that observer up by the node's `session_id` — which is
+/// the canonical ingress session hint. Leaving the session unset makes
+/// `IngressEnvelope::canonicalize` derive a 5-part
+/// `{tenant}:{provider}:{channel}:{conversation}:{user}` hint that never equals
+/// the bare `conversationId`, so the lookup misses, the turn runs with no
+/// observer, and it silently falls back to a single non-streamed reply (no
+/// token / tool / llm-call frames — the "no trace log" bug). Stamping the
+/// session keeps the hint bare so the registration and lookup keys agree.
+#[cfg(feature = "agentic-worker")]
+fn build_stream_turn_activity(
+    text: String,
+    conversation_id: String,
+    user_id: Option<String>,
+    flow_id: Option<String>,
+) -> Activity {
+    let mut activity = Activity::text(text)
+        .with_session(conversation_id.clone())
+        .in_conversation(conversation_id)
+        .from_user(user_id.unwrap_or_else(|| DEFAULT_USER.to_string()));
+    if let Some(flow) = flow_id {
+        activity = activity.with_flow(flow);
+    }
+    activity
+}
+
 /// Extractor-free core: registers a streaming observer under the
 /// conversation id, runs the turn on a background task, and returns a stream
 /// of frames. Mirrors `execute_chat`'s extractor-free split so tests can
@@ -228,12 +258,8 @@ pub fn agent_chat_stream_core(
         };
 
         let tenant = req.tenant.unwrap_or(default_tenant);
-        let mut activity = Activity::text(req.text)
-            .in_conversation(conversation_id)
-            .from_user(req.user_id.unwrap_or_else(|| DEFAULT_USER.to_string()));
-        if let Some(flow) = req.flow_id {
-            activity = activity.with_flow(flow);
-        }
+        let activity =
+            build_stream_turn_activity(req.text, conversation_id, req.user_id, req.flow_id);
 
         match host.handle_activity(&tenant, activity).await {
             Ok(activities) => {
@@ -375,6 +401,29 @@ mod tests {
         );
         // registry cleaned up after the turn
         assert!(state.stream_observers.get("c1").is_none());
+    }
+
+    /// Regression for the silent "no trace" bug on `/agent/chat/stream`: the
+    /// SSE handler registers the turn's stream observer keyed by the raw
+    /// `conversationId` (`stream_observers.insert(conversation_id, ..)`), but the
+    /// dw.agent node looks it up by the canonical ingress session hint. When the
+    /// activity carries no explicit session, `canonicalize` derives a 5-part
+    /// `{tenant}:{provider}:{channel}:{conversation}:{user}` hint that never
+    /// equals the bare `conversationId`, the observer is never found, and the
+    /// turn silently falls back to a single non-streamed reply (no tool / token
+    /// frames). Stamping session = conversationId keeps the hint bare so the two
+    /// keys match.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn stream_turn_activity_stamps_session_with_conversation_id() {
+        let activity = build_stream_turn_activity("hi".into(), "conv-uuid-1".into(), None, None);
+        assert_eq!(
+            activity.session_id(),
+            Some("conv-uuid-1"),
+            "stream turn must stamp session = conversationId so the canonical \
+             hint matches the observer registry key"
+        );
+        assert_eq!(activity.conversation(), Some("conv-uuid-1"));
     }
 
     #[cfg(feature = "agentic-worker")]
