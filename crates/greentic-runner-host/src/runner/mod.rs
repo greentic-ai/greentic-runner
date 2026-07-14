@@ -24,6 +24,7 @@ pub mod mcp_node;
 #[cfg(feature = "agentic-worker")]
 pub mod mcp_warm_listener;
 pub mod mocks;
+pub mod operala_node;
 pub mod operator;
 pub mod remote_dispatch;
 pub mod runtime_session_resumer;

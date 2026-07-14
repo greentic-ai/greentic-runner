@@ -56,6 +56,14 @@ pub struct FlowEngine {
     /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
     /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
     remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
+    /// Bridges `operala.call` flow nodes into an in-process deep-worker
+    /// runtime (see `runner::operala_node`). Not feature-gated (like
+    /// `remote_dispatch_handler`): `operala.call` is a core runtime-dispatch
+    /// node and the trait itself has no feature-gated dependencies — only the
+    /// concrete production impl (built under `desktop-agent-ephemeral` in
+    /// `runtime.rs`) does. `None` falls back to the existing NATS
+    /// `RemoteDispatchHandler` path (`execute_remote_dispatch`).
+    operala_node_handler: Option<Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
     /// Controls whether `dw.agent` nodes run in-process (default) or are
     /// rerouted over the durable agentic NATS path (`GREENTIC_AW_DISPATCH=nats`).
     #[cfg(feature = "agentic-worker")]
@@ -401,6 +409,7 @@ impl FlowEngine {
             validation: config.validation.clone(),
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
+            operala_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
             #[cfg(feature = "agentic-worker")]
@@ -426,6 +435,19 @@ impl FlowEngine {
         handler: Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
     ) {
         self.remote_dispatch_handler = Some(handler);
+    }
+
+    /// Set the handler that bridges `operala.call` flow nodes into an
+    /// in-process deep-worker runtime. Constructed by the runner binary
+    /// (`runtime.rs`, `desktop-agent-ephemeral` feature) so `operala.call`
+    /// nodes run with no NATS in that build. Mirrors [`set_agent_node_handler`].
+    ///
+    /// [`set_agent_node_handler`]: FlowEngine::set_agent_node_handler
+    pub fn set_operala_node_handler(
+        &mut self,
+        handler: Arc<dyn crate::runner::operala_node::OperalaNodeHandler>,
+    ) {
+        self.operala_node_handler = Some(handler);
     }
 
     /// Set the handler that bridges `DwAgent` flow nodes into the agentic-worker
@@ -1311,14 +1333,50 @@ impl FlowEngine {
             .await
     }
 
-    /// Dispatch an `operala.call` flow node via the shared remote-dispatch seam.
-    /// Identical to [`execute_sorla_call`] except the runtime name is `"operala"`.
+    /// Dispatch an `operala.call` flow node.
+    ///
+    /// When an in-process [`OperalaNodeHandler`] is wired (`desktop-agent-
+    /// ephemeral`, e.g. the designer's offline Test-chat sidecar), the node
+    /// runs the deep-worker runtime directly — no NATS, no
+    /// `RemoteDispatchHandler` — and completes inline. Otherwise falls back to
+    /// the shared remote-dispatch seam, identical to [`execute_sorla_call`]
+    /// except the runtime name is `"operala"`.
+    ///
+    /// [`OperalaNodeHandler`]: crate::runner::operala_node::OperalaNodeHandler
     async fn execute_operala_call(
         &self,
         ctx: &FlowContext<'_>,
         target: &str,
         payload: Value,
     ) -> Result<DispatchOutcome> {
+        if let Some(handler) = self.operala_node_handler.as_ref() {
+            // `greentic-dw-authoring` stamps `operation: "invoke"` on the
+            // `operala.call` node, but the deep-worker invoker's contract
+            // accepts only `"" | "run"`. Normalize so an authored `deep_worker`
+            // actually runs in-process instead of failing operation validation.
+            let raw_operation = payload
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let operation = if raw_operation.eq_ignore_ascii_case("invoke") {
+                "run"
+            } else {
+                raw_operation
+            };
+            let inner_input = payload.get("input").cloned().unwrap_or(Value::Null);
+            let session_id = ctx.session_id.unwrap_or("");
+            let result = handler
+                .execute(
+                    ctx.tenant,
+                    &self.default_env,
+                    target,
+                    operation,
+                    session_id,
+                    &inner_input,
+                )
+                .await?;
+            return Ok(DispatchOutcome::complete(NodeOutput::new(result)));
+        }
         self.execute_remote_dispatch(ctx, "operala", target, payload, false)
             .await
     }
@@ -3958,6 +4016,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         }
     }
 
@@ -4469,6 +4528,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -4643,6 +4703,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -4784,6 +4845,7 @@ mod tests {
             graph_node_handler: Some(handler_dyn),
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
         let ctx = FlowContext {
             tenant: "demo",
@@ -4956,6 +5018,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
 
         let ctx = FlowContext {
@@ -5074,6 +5137,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         }
     }
 
@@ -5818,6 +5882,7 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
 
         let ctx = FlowContext {
@@ -6058,6 +6123,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
 
         let observer = CountingObserver::new();
@@ -6200,6 +6266,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
         let observer = CountingObserver::new();
         let ctx = FlowContext {
@@ -6699,6 +6766,7 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
+            operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
 
@@ -6873,6 +6941,7 @@ mod tests {
             agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
             graph_node_handler: None,
             mcp_tool_source: None,
+            operala_node_handler: None,
         }
     }
 
@@ -7078,6 +7147,7 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
+            operala_node_handler: None,
         }
     }
 
@@ -7632,7 +7702,144 @@ mod tests {
             agent_node_handler: Some(handler),
             graph_node_handler: None,
             mcp_tool_source: None,
+            operala_node_handler: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // operala.call in-process handler wiring
+    // -----------------------------------------------------------------------
+
+    struct StubOperalaHandler {
+        payload: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl crate::runner::operala_node::OperalaNodeHandler for StubOperalaHandler {
+        async fn execute(
+            &self,
+            _tenant: &str,
+            _env: &str,
+            _target: &str,
+            _operation: &str,
+            _session_id: &str,
+            _input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a single-node flow: an `operala.call` node (given `target`) that
+    /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
+    /// the (non-conversational) operala path.
+    fn operala_flow(target: &str) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let node_id = NodeId::from_str("op").unwrap();
+        nodes.insert(
+            node_id.clone(),
+            HostNode {
+                kind: NodeKind::OperalaCall {
+                    target: target.to_string(),
+                },
+                component: "operala.call".to_string(),
+                component_id: "operala.call".to_string(),
+                operation_name: Some(target.to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "operation": "", "input": { "goal": "hi" } }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            id: "operala.flow".to_string(),
+            start: Some(node_id),
+            nodes,
+            vars_init: JsonMap::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with the given optional in-process
+    /// operala handler and no NATS `RemoteDispatchHandler` — a `None` handler
+    /// exercises the existing NATS-fallback error path.
+    fn operala_engine(
+        flow: HostFlow,
+        handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
+    ) -> FlowEngine {
+        FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "operala.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            operala_node_handler: handler,
+        }
+    }
+
+    fn operala_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "operala.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-op"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[test]
+    fn operala_call_with_in_process_handler_completes_inline() {
+        let handler = std::sync::Arc::new(StubOperalaHandler {
+            payload: json!({ "reply": "stub" }),
+        });
+        let engine = operala_engine(operala_flow("deep_worker"), Some(handler));
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("operala.call with an in-process handler must complete");
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        assert_eq!(execution.output, json!({ "reply": "stub" }));
+    }
+
+    #[test]
+    fn operala_call_without_handler_or_nats_fails() {
+        let engine = operala_engine(operala_flow("deep_worker"), None);
+        let err = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect_err("operala.call with no in-process handler and no NATS must fail");
+        assert!(
+            err.to_string()
+                .contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
+            "unexpected error: {err}"
+        );
     }
 }
 

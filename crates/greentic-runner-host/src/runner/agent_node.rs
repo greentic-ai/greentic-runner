@@ -1059,7 +1059,12 @@ mod aw {
     /// The in-process backend carries a single key, so when agents declare
     /// different credential_refs only the first is used — matching the existing
     /// one-key in-process model; the bridge-extension path resolves per-request.
-    async fn resolve_in_process_llm_key(
+    ///
+    /// `pub(crate)` (not private): also reused by `runtime.rs` to resolve the
+    /// `greentic_llm::LlmProvider` key for the in-process `operala.call`
+    /// (`DeepWorkerInvoker`) wiring, so the two in-process LLM paths (dw.agent,
+    /// operala.call) share one key-resolution policy instead of drifting.
+    pub(crate) async fn resolve_in_process_llm_key(
         secrets: &crate::secrets::DynSecretsManager,
         tenant: &str,
         merged_agents: &HashMap<String, AgentConfig>,
@@ -2922,6 +2927,13 @@ pub(crate) use aw::{
     EnvSecretsBackend, build_ext_runtime, build_llm_backend, component_source_from_packs,
     mcp_source_from_env,
 };
+
+// Only consumed by `runtime.rs`'s in-process operala.call wiring, which is
+// itself gated behind `desktop-agent-ephemeral` — re-exporting unconditionally
+// under plain `agentic-worker` would trip `unused_imports` on builds that have
+// `agentic-worker` without `desktop-agent-ephemeral`.
+#[cfg(feature = "desktop-agent-ephemeral")]
+pub(crate) use aw::resolve_in_process_llm_key;
 
 // flow_source_from_packs is used only inside the aw module (build_runtime_handler_with_stores
 // + tests) so it stays pub(crate) there without a top-level re-export.
