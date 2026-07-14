@@ -37,8 +37,20 @@ anyhow.workspace = true
 base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
-greentic-runner-host = { workspace = true }
-greentic-runner-desktop = { workspace = true }
+# NOT `workspace = true`: Cargo/edition-2024 forbids a member from overriding
+# `default-features` on a workspace-inherited dependency unless the workspace
+# declaration itself already says `default-features = false` — and flipping it
+# there would cascade to every other workspace member that depends on these
+# crates (crates/tests, aw-event-bridge, telco-x-event-bridge), pulling their
+# `agentic-worker`/`state-disk` defaults out from under them too. Writing the
+# path+version out explicitly here (instead of inheriting) keeps the
+# `default-features = false` scoped to just this runner->host / runner->desktop
+# edge, so a lean `--no-default-features --features verify` build of
+# `greentic-runner` produces a coherent (agentic-worker-OFF) feature graph
+# without touching any other member's defaults. See the `agentic-worker`
+# feature below, which re-forwards it for the default build.
+greentic-runner-host = { path = "../greentic-runner-host", version = "=1.3.0-research.0", default-features = false }
+greentic-runner-desktop = { path = "../greentic-runner-desktop", version = "=1.3.0-research.0", default-features = false }
 greentic-interfaces.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
@@ -98,6 +110,7 @@ desktop-agent-ephemeral = ["greentic-runner-host/desktop-agent-ephemeral"]
 # defaults because greentic-aw-runtime is not on crates.io.
 agentic-worker = [
     "greentic-runner-host/agentic-worker",
+    "greentic-runner-host/state-disk",
     "greentic-runner-desktop/agentic-worker",
 ]
 # Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…) via
