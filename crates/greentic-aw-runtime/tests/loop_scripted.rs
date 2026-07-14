@@ -231,6 +231,59 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
 }
 
 #[tokio::test]
+async fn tool_call_trail_carries_args_and_duration() {
+    // The trail records the model's tool arguments (input) and a wall-clock
+    // duration alongside each tool call, so a caller (e.g. the demo trace) can
+    // show WHAT was requested and how long it took — not just the tool name.
+    let allowed = vec![ToolRef {
+        extension_id: "http".into(),
+        tool_name: "fetch".into(),
+        description: None,
+        input_schema: None,
+    }];
+    let sent_args = serde_json::json!({ "url": "https://example.com", "method": "GET" });
+    let script = vec![
+        Ok(tool_call_with_args(
+            "c1",
+            "http",
+            "fetch",
+            sent_args.clone(),
+        )),
+        Ok(final_reply("done")),
+    ];
+    let (rt, _tel, tc) = build_runtime(script, cfg(4, 60_000, allowed, None), 0);
+    let out = rt
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
+        .await
+        .unwrap();
+    let (args, _duration_ms) = out
+        .trail
+        .iter()
+        .find_map(|s| match s {
+            AgentStep::ToolCall {
+                call_id,
+                args,
+                duration_ms,
+                ..
+            } if call_id == "c1" => Some((args.clone(), *duration_ms)),
+            _ => None,
+        })
+        .expect("tool call c1 recorded in trail");
+    assert_eq!(
+        args, sent_args,
+        "trail carries the model's tool args verbatim"
+    );
+}
+
+#[tokio::test]
 async fn token_budget_exceeded_returns_error() {
     // Daily cap 10, already-used 100 → gate trips before any LLM call.
     let (rt, _tel, tc) = build_runtime(
