@@ -44,6 +44,13 @@ pub trait OperalaNodeHandler: Send + Sync {
 /// env fallback (`GREENTIC_LLM_PROVIDER`/`_MODEL`) is used. When NEITHER is
 /// available the call errors instead of guessing a provider: a wrong default
 /// silently sends the key to the wrong API (e.g. a DeepSeek key to OpenAI → 401).
+///
+/// Its only production caller is `dw::RuntimeOperalaNodeHandler::build_invoker`
+/// below, which lives in the `desktop-agent-ephemeral`-gated `mod dw`; cfg-gate
+/// this the same way (plus `test`, for the unit tests at the bottom of this
+/// file) so it isn't flagged dead in builds where that feature is off (e.g. a
+/// lean `--no-default-features --features verify` build).
+#[cfg(any(feature = "desktop-agent-ephemeral", test))]
 fn resolve_operala_provider_model(
     input: &Value,
     fallback_provider: Option<&str>,

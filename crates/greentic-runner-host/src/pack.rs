@@ -1905,6 +1905,11 @@ impl PackRuntime {
     /// in-memory fields as `list_flows` but without `.await`, so it is safe to
     /// call from a synchronous context (e.g. `FlowInvoker::list_flows`).
     /// This avoids a `block_on`-in-async-context panic on the runner thread.
+    ///
+    /// Its only caller is `runner::flow_invoker::PackRuntimeFlowInvoker`,
+    /// which is entirely `#![cfg(feature = "agentic-worker")]`; gate this the
+    /// same way so it isn't flagged dead when that feature is off.
+    #[cfg(feature = "agentic-worker")]
     pub(crate) fn flow_descriptors(&self) -> Vec<FlowDescriptor> {
         if let Some(cache) = &self.flows {
             return cache.descriptors.clone();

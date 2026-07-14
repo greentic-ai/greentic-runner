@@ -2377,6 +2377,15 @@ pub struct NodeEvent<'a> {
 /// termination, the flow force-advances to the node's successor using the
 /// agent's last output. Deliberately a plain constant: no env var, no
 /// per-agent config knob.
+///
+/// Only referenced from the conversational `DwAgent` branch of
+/// `dispatch_node` and from the (already `#[cfg(feature = "agentic-worker")]`
+/// -gated) park-loop-cap unit tests below; cfg-gate it the same way so it
+/// isn't flagged dead when that feature is off (e.g. a lean
+/// `--no-default-features --features verify` build). Unlike
+/// `bump_park_turns`/etc. below, no plain (ungated) test references this
+/// constant directly, so no `test` alternative is needed here.
+#[cfg(feature = "agentic-worker")]
 const MAX_PARK_TURNS: u32 = 100;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2483,6 +2492,11 @@ impl ExecutionState {
     }
 
     /// Bump the park-loop turn counter for `node_id` and return the NEW count.
+    ///
+    /// Like `MAX_PARK_TURNS`, only called from the conversational `DwAgent`
+    /// branch of `dispatch_node` (`agentic-worker`-gated) plus the unit tests
+    /// below.
+    #[cfg(any(feature = "agentic-worker", test))]
     fn bump_park_turns(&mut self, node_id: &str) -> u32 {
         let entry = self.park_turns.entry(node_id.to_string()).or_insert(0);
         *entry = entry.saturating_add(1);
@@ -2491,6 +2505,7 @@ impl ExecutionState {
 
     /// Clear the park-loop turn counter for `node_id` (e.g. once the
     /// conversational segment ends), so a later re-entry starts fresh.
+    #[cfg(any(feature = "agentic-worker", test))]
     fn reset_park_turns(&mut self, node_id: &str) {
         self.park_turns.remove(node_id);
     }
@@ -2498,6 +2513,7 @@ impl ExecutionState {
     /// Mark `node_id` as awaiting an async `dw.agent` NATS dispatch response.
     /// Called from the conversational `DwAgentDispatch::Nats` branch in
     /// `dispatch_node` before dispatching a fresh user turn.
+    #[cfg(any(feature = "agentic-worker", test))]
     fn mark_agent_await(&mut self, node_id: &str) {
         self.pending_agent_await.insert(node_id.to_string(), ());
     }
@@ -2506,6 +2522,7 @@ impl ExecutionState {
     /// Called from the conversational `DwAgentDispatch::Nats` branch in
     /// `dispatch_node` on resume, to distinguish "resuming with the agent's
     /// response" from "a fresh user turn".
+    #[cfg(any(feature = "agentic-worker", test))]
     fn take_agent_await(&mut self, node_id: &str) -> bool {
         self.pending_agent_await.remove(node_id).is_some()
     }
@@ -2589,6 +2606,13 @@ enum NodeControl {
     /// Unlike `Wait` (which resumes at the routing successor and renders
     /// nothing), `LoopHere` sets the resume target to the current node and
     /// renders the reply.
+    ///
+    /// Only constructed from the conversational `DwAgent` branch of
+    /// `dispatch_node`, which is `#[cfg(feature = "agentic-worker")]` —
+    /// `#[allow(dead_code)]` rather than cfg-gating the variant itself so the
+    /// (unconditionally-compiled) match arm handling it in `run_flow`'s
+    /// dispatch loop doesn't need a matching cfg attribute.
+    #[allow(dead_code)]
     LoopHere {
         reason: Option<String>,
     },
