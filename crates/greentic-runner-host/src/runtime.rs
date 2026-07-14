@@ -407,54 +407,36 @@ impl TenantRuntime {
                 };
                 match api_key {
                     Some(api_key) => {
-                        let provider_kind: greentic_llm::ProviderKind =
-                            std::env::var("GREENTIC_LLM_PROVIDER")
-                                .ok()
-                                .filter(|value| !value.trim().is_empty())
-                                .and_then(|value| value.parse().ok())
-                                .unwrap_or(greentic_llm::ProviderKind::Openai);
-                        let model = std::env::var("GREENTIC_LLM_MODEL")
+                        // Provider/model are resolved PER WORKER from each
+                        // `operala.call` node's `input.llm` binding (stamped by
+                        // greentic-dw-authoring); the handler builds the LLM per
+                        // dispatch. Only read the process-level env OVERRIDE here
+                        // as a fallback — no hardcoded provider/model default (a
+                        // mismatched guess silently sends the key to the wrong
+                        // API, e.g. a DeepSeek key to OpenAI → 401). When a node
+                        // carries no `input.llm` and no env override is set, the
+                        // dispatch errors explicitly instead of guessing.
+                        let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
                             .ok()
-                            .filter(|value| !value.trim().is_empty())
-                            .unwrap_or_else(|| "gpt-4o-mini".to_string());
+                            .filter(|value| !value.trim().is_empty());
+                        let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty());
                         let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
                             .ok()
                             .filter(|value| !value.trim().is_empty());
-                        // `Credential` is `ZeroizeOnDrop` (implements Drop), so
-                        // struct-update syntax cannot move out of
-                        // `Default::default()` — build a default and set the
-                        // fields we have (mirrors `GreenticLlmBackend::provider_for`).
-                        #[allow(clippy::field_reassign_with_default)]
-                        let credential = {
-                            let mut credential = greentic_llm::Credential::default();
-                            credential.api_key = api_key;
-                            credential.base_url = base_url;
-                            credential
-                        };
-                        match greentic_llm::RigBackend::new(provider_kind, &model, &credential) {
-                            Ok(backend) => {
-                                let llm: Arc<dyn greentic_llm::LlmProvider> = Arc::new(backend);
-                                let invoker =
-                                    greentic_dw_operala_invoker::DeepWorkerInvoker::new(llm);
-                                engine.set_operala_node_handler(Arc::new(
-                                    crate::runner::operala_node::RuntimeOperalaNodeHandler::new(
-                                        invoker,
-                                    ),
-                                ));
-                                tracing::info!(
-                                    provider = ?provider_kind,
-                                    model = %model,
-                                    "operala.call in-process deep-worker runtime wired into FlowEngine"
-                                );
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    %error,
-                                    "failed to build the operala.call in-process LLM provider; \
-                                     operala.call nodes will fall back to NATS (and fail without it)"
-                                );
-                            }
-                        }
+                        engine.set_operala_node_handler(Arc::new(
+                            crate::runner::operala_node::RuntimeOperalaNodeHandler::new(
+                                api_key,
+                                base_url,
+                                fallback_provider,
+                                fallback_model,
+                            ),
+                        ));
+                        tracing::info!(
+                            "operala.call in-process deep-worker runtime wired into FlowEngine \
+                             (provider/model resolved per-worker from node input.llm)"
+                        );
                     }
                     None => {
                         tracing::warn!(

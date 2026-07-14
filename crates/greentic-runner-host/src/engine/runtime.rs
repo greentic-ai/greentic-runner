@@ -736,7 +736,11 @@ impl Adapter for PackFlowAdapter {
                     tracing::warn!(error = %write_err, "failed to write trace");
                 }
                 return Err(RunnerError::AdapterCall {
-                    reason: err.to_string(),
+                    // `{:#}` flattens the full anyhow source chain; a bare
+                    // `to_string()` keeps only the outermost context and drops
+                    // the real root cause (e.g. the underlying LLM/dispatch
+                    // error behind "in-process operala dispatch … failed").
+                    reason: format!("{err:#}"),
                 });
             }
         };
