@@ -420,19 +420,29 @@ impl TenantRuntime {
                     Some(api_key) => {
                         // Provider/model are resolved PER WORKER from each
                         // `operala.call` node's `input.llm` binding (stamped by
-                        // greentic-dw-authoring); the handler builds the LLM per
-                        // dispatch. Only read the process-level env OVERRIDE here
-                        // as a fallback — no hardcoded provider/model default (a
-                        // mismatched guess silently sends the key to the wrong
-                        // API, e.g. a DeepSeek key to OpenAI → 401). When a node
-                        // carries no `input.llm` and no env override is set, the
-                        // dispatch errors explicitly instead of guessing.
+                        // greentic-dw-authoring for authored deep-worker packs);
+                        // the handler builds the LLM per dispatch. For a node
+                        // that carries NO `input.llm` — e.g. an operala.call
+                        // synthesized at runtime for a dw.agent's chronicle
+                        // knowledge/memory retrieval — fall back to the agent's
+                        // OWN configured provider/model (the same `operala_agents`
+                        // the api_key is resolved from), which is NOT a guess: it
+                        // is this worker's declared LLM, consistent with its key.
+                        // The process-level env still OVERRIDES both. Only when
+                        // neither the node, the agent config, nor the env carries
+                        // a provider/model does the dispatch error explicitly.
+                        let agent_llm =
+                            operala_agents.values().map(|agent| &agent.llm).find(|llm| {
+                                !llm.provider.trim().is_empty() && !llm.model.trim().is_empty()
+                            });
                         let fallback_provider = std::env::var("GREENTIC_LLM_PROVIDER")
                             .ok()
-                            .filter(|value| !value.trim().is_empty());
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| agent_llm.map(|llm| llm.provider.clone()));
                         let fallback_model = std::env::var("GREENTIC_LLM_MODEL")
                             .ok()
-                            .filter(|value| !value.trim().is_empty());
+                            .filter(|value| !value.trim().is_empty())
+                            .or_else(|| agent_llm.map(|llm| llm.model.clone()));
                         let base_url = std::env::var("GREENTIC_LLM_BASE_URL")
                             .ok()
                             .filter(|value| !value.trim().is_empty());
