@@ -393,6 +393,9 @@ pub async fn run_step(
             tokens_in: u64::from(response.tokens_in),
             tokens_out: u64::from(response.tokens_out),
         });
+        // Stream the per-iteration token trace (a streaming consumer renders a
+        // per-message LLM/token line even when the turn calls no tools).
+        observer.on_llm_call(u64::from(response.tokens_in), u64::from(response.tokens_out));
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
