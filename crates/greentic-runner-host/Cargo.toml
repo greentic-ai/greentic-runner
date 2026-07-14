@@ -38,6 +38,13 @@ greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-bac
 # with no NATS — needed for the designer's offline Test-chat sidecar.
 desktop-agent-ephemeral = [
     "agentic-worker",
+    # dw.agent MUST use the multi-provider in-process backend (GreenticLlmBackend
+    # → DeepSeek/Anthropic/…). Without this the ephemeral sidecar falls back to
+    # the OpenAI-only `OpenAiLlmBackend`, which ignores the agent's configured
+    # provider and calls OpenAI with the (usually empty) OpenAI key — a hard 401
+    # for any non-OpenAI worker (e.g. a DeepSeek dw.agent in the offline
+    # Test-chat sidecar). This feature already pulls `dep:greentic-llm` below.
+    "greentic-llm-backend",
     "greentic-aw-runtime?/test-mock",
     "greentic-aw-runtime?/dev-allow-unsigned",
     "dep:greentic-dw-operala-invoker",
