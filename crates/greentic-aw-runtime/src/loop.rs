@@ -437,6 +437,7 @@ pub async fn run_step(
                 trail.push(AgentStep::ToolCall {
                     name: end_call.tool_name.clone(),
                     call_id: end_call.call_id.clone(),
+                    args: end_call.args.clone(),
                     result: ok,
                 });
                 reply = closing;
@@ -478,6 +479,7 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
                     });
                     continue;
@@ -496,6 +498,7 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
                     });
                     continue;
@@ -511,6 +514,7 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCall {
                         name: call.tool_name.clone(),
                         call_id: call.call_id,
+                        args: call.args.clone(),
                         result,
                     });
                     continue;
@@ -523,6 +527,7 @@ pub async fn run_step(
                     trail.push(AgentStep::ToolCallBlocked {
                         name: call.tool_name.clone(),
                         reason: "not in allow-list".into(),
+                        args: call.args.clone(),
                     });
                     turn_had_tool_error = true;
                     continue;
@@ -580,6 +585,7 @@ pub async fn run_step(
                         trail.push(AgentStep::ToolCall {
                             name: call.tool_name.clone(),
                             call_id: call.call_id.clone(),
+                            args: call.args.clone(),
                             result: err_obs,
                         });
                         turn_had_tool_error = true;
@@ -602,9 +608,11 @@ pub async fn run_step(
                     call_id: call.call_id.clone(),
                     content: result.clone(),
                 });
+                let args = call.args.clone();
                 trail.push(AgentStep::ToolCall {
                     name: call.tool_name.clone(),
                     call_id: call.call_id,
+                    args,
                     result,
                 });
             }

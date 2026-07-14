@@ -454,6 +454,8 @@ pub enum AgentStep {
     ToolCall {
         name: String,
         call_id: String,
+        #[serde(default)]
+        args: serde_json::Value,
         result: serde_json::Value,
     },
     ToolCallReused {
@@ -463,8 +465,48 @@ pub enum AgentStep {
     ToolCallBlocked {
         name: String,
         reason: String,
+        #[serde(default)]
+        args: serde_json::Value,
     },
     Reply {
         text: String,
     },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_call_step_roundtrips_args_and_defaults_when_absent() {
+        use serde_json::json;
+        // args present → serialized + read back
+        let step = AgentStep::ToolCall {
+            name: "hubspot.list_contacts".into(),
+            call_id: "c1".into(),
+            args: json!({ "limit": 10 }),
+            result: json!({ "ok": true }),
+        };
+        let v = serde_json::to_value(&step).unwrap();
+        assert_eq!(v["kind"], "tool_call");
+        assert_eq!(v["args"], json!({ "limit": 10 }));
+        let back: AgentStep = serde_json::from_value(v).unwrap();
+        assert!(matches!(back, AgentStep::ToolCall { args, .. } if args == json!({ "limit": 10 })));
+
+        // old envelope without "args" → defaults to Null (backward-compat)
+        let old = json!({ "kind": "tool_call", "name": "x", "call_id": "c2", "result": {} });
+        let back: AgentStep = serde_json::from_value(old).unwrap();
+        assert!(matches!(back, AgentStep::ToolCall { args, .. } if args.is_null()));
+
+        // blocked variant carries args too
+        let blocked = AgentStep::ToolCallBlocked {
+            name: "danger.delete".into(),
+            reason: "not in allow-list".into(),
+            args: json!({ "id": 5 }),
+        };
+        let v = serde_json::to_value(&blocked).unwrap();
+        assert_eq!(v["kind"], "tool_call_blocked");
+        assert_eq!(v["args"], json!({ "id": 5 }));
+    }
 }
