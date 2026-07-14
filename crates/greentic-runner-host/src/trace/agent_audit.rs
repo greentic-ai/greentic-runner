@@ -64,13 +64,14 @@ impl StepObserver for AgentAuditObserver {
 
     fn on_token_delta(&self, _chunk: &str) {}
 
-    fn on_tool_call(&self, name: &str, call_id: &str) {
+    fn on_tool_call(&self, name: &str, call_id: &str, args: &Value) {
         self.emit(
             "tool_call",
             json!({
                 "agent_id": self.agent_id,
                 "tool": name,
                 "call_id": call_id,
+                "args": args,
             }),
         );
     }
@@ -83,6 +84,18 @@ impl StepObserver for AgentAuditObserver {
                 "tool": name,
                 "call_id": call_id,
                 "result": result,
+            }),
+        );
+    }
+
+    fn on_tool_failed(&self, name: &str, call_id: &str, error: &Value) {
+        self.emit(
+            "tool_result",
+            json!({
+                "agent_id": self.agent_id,
+                "tool": name,
+                "call_id": call_id,
+                "error": error,
             }),
         );
     }
@@ -118,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn on_tool_call_enqueues_one_tool_call_event() {
         let (observer, mut rx) = observer_with_channel();
-        observer.on_tool_call("http", "c1");
+        observer.on_tool_call("http", "c1", &json!({"url": "https://example.com"}));
 
         let (subject, bytes) = rx.try_recv().expect("event enqueued");
         assert_eq!(subject, "audit.t1.agent.tool_call");
@@ -138,6 +151,10 @@ mod tests {
         assert_eq!(
             value.get("payload").and_then(|p| p.get("call_id")),
             Some(&json!("c1"))
+        );
+        assert_eq!(
+            value.get("payload").and_then(|p| p.get("args")),
+            Some(&json!({"url": "https://example.com"}))
         );
 
         assert!(rx.try_recv().is_err(), "exactly one event enqueued");
@@ -162,6 +179,34 @@ mod tests {
         assert_eq!(
             value.get("payload").and_then(|p| p.get("result")),
             Some(&json!({"ok": true}))
+        );
+
+        assert!(rx.try_recv().is_err(), "exactly one event enqueued");
+    }
+
+    #[tokio::test]
+    async fn on_tool_failed_enqueues_one_tool_result_event_with_error_payload() {
+        let (observer, mut rx) = observer_with_channel();
+        observer.on_tool_failed("http", "c1", &json!({"error": "connection refused"}));
+
+        let (subject, bytes) = rx.try_recv().expect("event enqueued");
+        assert_eq!(subject, "audit.t1.agent.tool_result");
+
+        let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert!(
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .expect("type is a string")
+                .ends_with("agent.tool_result")
+        );
+        assert_eq!(
+            value.get("payload").and_then(|p| p.get("error")),
+            Some(&json!({"error": "connection refused"}))
+        );
+        assert!(
+            value.get("payload").and_then(|p| p.get("result")).is_none(),
+            "a failed call must not carry a 'result' field"
         );
 
         assert!(rx.try_recv().is_err(), "exactly one event enqueued");

@@ -130,10 +130,14 @@ pub trait StepObserver: Send + Sync {
     /// Called with each incremental text chunk of the assistant reply.
     /// Only invoked when [`StepObserver::wants_streaming`] returns `true`.
     fn on_token_delta(&self, _chunk: &str) {}
-    /// Called just before a tool is dispatched.
-    fn on_tool_call(&self, _name: &str, _call_id: &str) {}
+    /// Called just before a tool is dispatched, with its arguments.
+    fn on_tool_call(&self, _name: &str, _call_id: &str, _args: &serde_json::Value) {}
     /// Called after a tool dispatch succeeds, with the tool's result.
     fn on_tool_result(&self, _name: &str, _call_id: &str, _result: &serde_json::Value) {}
+    /// Called after a tool dispatch fails or is blocked (e.g. not in the
+    /// agent's allow-list), with the error/reason payload. Additive hook —
+    /// see the "Extending this trait" note above.
+    fn on_tool_failed(&self, _name: &str, _call_id: &str, _error: &serde_json::Value) {}
 }
 
 /// No-op observer used by the non-streaming [`AgentRuntime::step`].
