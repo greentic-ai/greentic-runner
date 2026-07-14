@@ -41,6 +41,8 @@ LOCAL_CHECK_STEPS=fmt,clippy ci/local_check.sh
 
 The `dependency_sanity` step detects multiple wasmtime versions in the dependency tree (local workspace crates vs published greentic-* version skew) and fails early before clippy/tests hit confusing trait-mismatch errors.
 
+GitHub CI (`ci.yml`) is much thinner than `ci/local_check.sh`: it runs `cargo fmt --check`, a warning-only toolchain-drift check, and the heavy WASM fixture tests — no clippy and no full test suite. A red `ci/local_check.sh` can therefore be pre-existing on the base branch; reproduce on a pristine checkout before assuming your change caused it.
+
 ## Workspace Layout
 
 ```
@@ -304,6 +306,8 @@ Provider secrets: `SLACK_SIGNING_SECRET`, `WEBEX_WEBHOOK_SECRET`, `WHATSAPP_VERI
 - `component-v0-6-introspection` — v0.6 component inspection
 - `greentic-x-provider` — Greentic-X extension runtime integration (host crate; pulls `greentic-x-runtime` + `greentic-x-types`)
 - `legacy-gen-bindings` — gates the `greentic-gen-bindings` binary (runner crate only)
+- `desktop-agent-ephemeral` — ephemeral in-memory desktop-agent mode: enables `agentic-worker` plus `greentic-aw-runtime`'s `test-mock` and `dev-allow-unsigned` (not for production)
+- `greentic-llm-backend` — in-process LLM backend for the agentic worker: enables `agentic-worker` plus `greentic-aw-runtime/greentic-llm-backend`
 
 ## Git Conventions
 
