@@ -41,6 +41,8 @@ LOCAL_CHECK_STEPS=fmt,clippy ci/local_check.sh
 
 The `dependency_sanity` step detects multiple wasmtime versions in the dependency tree (local workspace crates vs published greentic-* version skew) and fails early before clippy/tests hit confusing trait-mismatch errors.
 
+GitHub CI (`ci.yml`) is much thinner than `ci/local_check.sh`: it runs `cargo fmt --check`, a warning-only toolchain-drift check, and the heavy WASM fixture tests — no clippy and no full test suite. A red `ci/local_check.sh` can therefore be pre-existing on the base branch; reproduce on a pristine checkout before assuming your change caused it.
+
 ## Workspace Layout
 
 ```
