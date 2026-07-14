@@ -138,6 +138,11 @@ pub trait StepObserver: Send + Sync {
     /// agent's allow-list), with the error/reason payload. Additive hook —
     /// see the "Extending this trait" note above.
     fn on_tool_failed(&self, _name: &str, _call_id: &str, _error: &serde_json::Value) {}
+    /// Called after each LLM iteration completes, with that call's token usage.
+    /// Additive hook — lets a streaming consumer surface a per-message LLM/token
+    /// trace even for turns that call no tools (the token trail is otherwise
+    /// only in the final `AgentOutput.trail`, which the SSE stream omits).
+    fn on_llm_call(&self, _tokens_in: u64, _tokens_out: u64) {}
 }
 
 /// No-op observer used by the non-streaming [`AgentRuntime::step`].

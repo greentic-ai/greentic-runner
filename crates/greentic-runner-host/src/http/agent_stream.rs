@@ -35,6 +35,12 @@ pub enum StreamFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// One completed LLM iteration's token usage. Lets the designer render a
+    /// per-message LLM/token trace line even when the turn calls no tools.
+    LlmCall {
+        tokens_in: u64,
+        tokens_out: u64,
+    },
     Done,
     Error {
         message: String,
@@ -117,6 +123,12 @@ impl StepObserver for SseForwardObserver {
             error: Some(message),
         });
     }
+    fn on_llm_call(&self, tokens_in: u64, tokens_out: u64) {
+        let _ = self.tx.send(StreamFrame::LlmCall {
+            tokens_in,
+            tokens_out,
+        });
+    }
 }
 
 /// Fan-out `StepObserver`: forwards every callback to all members and reports
@@ -154,6 +166,11 @@ impl StepObserver for CompositeObserver {
     fn on_tool_failed(&self, name: &str, call_id: &str, error: &serde_json::Value) {
         for m in &self.members {
             m.on_tool_failed(name, call_id, error);
+        }
+    }
+    fn on_llm_call(&self, tokens_in: u64, tokens_out: u64) {
+        for m in &self.members {
+            m.on_llm_call(tokens_in, tokens_out);
         }
     }
 }
@@ -286,6 +303,29 @@ mod tests {
             }
             other => panic!("expected ToolResult frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sse_forward_observer_on_llm_call_emits_kebab_llm_call_frame() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let obs = SseForwardObserver::new(tx);
+        obs.on_llm_call(5168, 274);
+        let frame = rx.try_recv().expect("frame sent");
+        match &frame {
+            StreamFrame::LlmCall {
+                tokens_in,
+                tokens_out,
+            } => {
+                assert_eq!(*tokens_in, 5168);
+                assert_eq!(*tokens_out, 274);
+            }
+            other => panic!("expected LlmCall frame, got {other:?}"),
+        }
+        // Wire shape the designer's `RunnerFrame::LlmCall` deserializes.
+        let wire = serde_json::to_value(&frame).unwrap();
+        assert_eq!(wire["kind"], "llm-call");
+        assert_eq!(wire["tokens_in"], 5168);
+        assert_eq!(wire["tokens_out"], 274);
     }
 
     #[test]
