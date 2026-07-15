@@ -90,6 +90,17 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
 ///
 /// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
 /// order is otherwise arbitrary between calls.
+///
+/// Deduplicated on the exact `(extension_id, cap_id, version)` triple. When
+/// several installed versions of the same extension (e.g.
+/// `greentic.adaptive-cards-2.1.0-research` through `-2.1.5-research`)
+/// register the same capability at the same reported `version`,
+/// `CapabilityRegistry::offerings()` yields several byte-identical bindings;
+/// without this, the admin payload reports the same offering many times over
+/// (seen live: 76 entries for 32 distinct extensions). `kind` is
+/// deliberately NOT part of the dedupe key — two bindings sharing a triple
+/// but differing in `kind` would be a genuine anomaly, not a duplicate, and
+/// must both surface.
 #[cfg(feature = "agentic-worker")]
 fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> serde_json::Value {
     let mut offerings: Vec<&greentic_ext_runtime::OfferedBinding> = registry.offerings().collect();
@@ -99,8 +110,16 @@ fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> ser
             .cmp(&b.cap_id.to_string())
             .then_with(|| a.extension_id.cmp(&b.extension_id))
     });
+    let mut seen = std::collections::HashSet::new();
     let caps: Vec<serde_json::Value> = offerings
         .into_iter()
+        .filter(|offering| {
+            seen.insert((
+                offering.extension_id.clone(),
+                offering.cap_id.to_string(),
+                offering.version.to_string(),
+            ))
+        })
         .map(|offering| {
             json!({
                 "extension_id": offering.extension_id,
@@ -242,5 +261,45 @@ mod tests {
         let caps = body["capabilities"].as_array().unwrap();
         assert_eq!(caps[0]["cap_id"], "greentic:guardrail/injection");
         assert_eq!(caps[1]["cap_id"], "greentic:guardrail/secrets");
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn offerings_to_json_deduplicates_identical_offerings() {
+        use greentic_ext_runtime::{CapabilityRegistry, OfferedBinding};
+        use greentic_extension_sdk_contract::ExtensionKind;
+
+        // Reproduces the live-runner defect: several installed versions of the
+        // same extension (e.g. greentic.adaptive-cards-2.1.0-research through
+        // -2.1.5-research) each register the identical
+        // (extension_id, cap_id, version) triple, so `offerings()` yields
+        // byte-identical bindings that must collapse to a single JSON entry.
+        let mut registry = CapabilityRegistry::new();
+        for _ in 0..2 {
+            registry.add_offering(OfferedBinding {
+                extension_id: "greentic.adaptive-cards".to_string(),
+                cap_id: "greentic:adaptive-cards/dsl-roles".parse().unwrap(),
+                version: "0.1.0".parse().unwrap(),
+                kind: ExtensionKind::Design,
+                export_path: String::new(),
+            });
+        }
+
+        let body = offerings_to_json(&registry);
+        let caps = body["capabilities"].as_array().unwrap();
+        assert_eq!(
+            caps.len(),
+            1,
+            "two identical (extension_id, cap_id, version) offerings must collapse to one entry"
+        );
+        assert_eq!(
+            caps[0],
+            serde_json::json!({
+                "extension_id": "greentic.adaptive-cards",
+                "cap_id": "greentic:adaptive-cards/dsl-roles",
+                "version": "0.1.0",
+                "kind": "DesignExtension"
+            })
+        );
     }
 }
