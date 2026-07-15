@@ -46,11 +46,26 @@ desktop-agent-ephemeral = [
     # Test-chat sidecar). This feature already pulls `dep:greentic-llm` below.
     "greentic-llm-backend",
     "greentic-aw-runtime?/test-mock",
-    "greentic-aw-runtime?/dev-allow-unsigned",
+    # NOTE: deliberately does NOT pull `greentic-aw-runtime?/dev-allow-unsigned`.
+    # It used to, which meant asking for "in-memory agent state" silently also
+    # disabled extension signature verification — two unrelated things, one of
+    # them a security control. Anything that needs the bypass must now name it:
+    # `--features dev-allow-unsigned`. See that feature's comment below.
     "dep:greentic-dw-operala-invoker",
     "dep:greentic-dw-operala-bridge",
     "dep:greentic-llm",
 ]
+# Lets `GREENTIC_EXT_ALLOW_UNSIGNED=1` skip extension signature verification.
+#
+# LOCAL DEV ONLY. A runner built with this loads unsigned — and therefore
+# attacker-supplyable — extensions. That includes guardrails, so a "mandatory"
+# guardrail policy on such a runner guarantees nothing: the operator is told the
+# turn is checked, and it may not be. Never enable it in a build that serves
+# production traffic.
+#
+# Split out of `desktop-agent-ephemeral` deliberately: the bypass must be named
+# by whoever wants it, not inherited from a feature about in-memory state.
+dev-allow-unsigned = ["agentic-worker", "greentic-aw-runtime?/dev-allow-unsigned"]
 # Wires an operator-configured native Chronicle (graphiti over Neo4j) long-term
 # memory backend into the agentic worker. Heavy (pulls the Chronicle graph
 # engine); off by default. The operator supplies Neo4j + the LLM and embedding

@@ -105,6 +105,10 @@ long-term-chronicle = ["greentic-runner-host/long-term-chronicle"]
 # without Redis. For local/sidecar use (e.g. the designer's loopback test-chat
 # runner sidecar) — NOT production deploys (use the Redis-backed stores). Off by default.
 desktop-agent-ephemeral = ["greentic-runner-host/desktop-agent-ephemeral"]
+# Skips extension signature verification when GREENTIC_EXT_ALLOW_UNSIGNED=1.
+# LOCAL DEV ONLY — never in a build that serves production traffic. Split out of
+# desktop-agent-ephemeral so the bypass has to be asked for by name.
+dev-allow-unsigned = ["greentic-runner-host/dev-allow-unsigned"]
 # Gates DwAgent (agentic-worker) nodes and their unpublishable runtime deps.
 # Enabled by default for local workspace builds; excluded from published
 # defaults because greentic-aw-runtime is not on crates.io.
