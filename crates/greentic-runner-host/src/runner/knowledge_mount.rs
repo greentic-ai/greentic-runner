@@ -139,6 +139,21 @@ fn build_config() -> Option<KnowledgeConfig> {
     Some(config)
 }
 
+/// The model + dimension the configured embedder will produce, for validating
+/// pack-supplied precomputed vectors before they reach ingest. `None` when no
+/// embedder is configured — the caller skips ingest entirely in that case.
+///
+/// Goes through [`build_config`] rather than reading the env vars directly, so
+/// the expectation applies the same defaulting the embedder does — notably
+/// `DEFAULT_EMBEDDING_DIM` when `GREENTIC_KNOWLEDGE_EMBED_DIM` is unset or
+/// unparseable. This is a SEPARATE `build_config` call from the one
+/// [`ingest_corpus`] makes, not a shared value; they agree because nothing
+/// mutates the environment between them, not because the types enforce it.
+pub(crate) fn embedding_expectation() -> Option<(String, usize)> {
+    let config = build_config()?;
+    Some((config.embedding_model.clone()?, config.embedding_dim))
+}
+
 /// The graph-store backend resolved from the environment, before any connection
 /// is attempted. Selection is kept separate from connection so it is unit-testable
 /// without a live database.
