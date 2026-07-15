@@ -3940,6 +3940,14 @@ fn build_routing_context(
     ctx.insert("entry".into(), entry.clone());
     ctx.insert("in".into(), entry.clone());
 
+    // Every prior node's output, keyed by id — the SAME projection
+    // `template_context` exposes for `{{node.<id>.<field>}}`, so a routing
+    // condition resolves `node.<id>.<field>` exactly as a param template does.
+    // Without this a guard could only read the current node's payload (spread
+    // at the top level, above), so a condition naming any other node resolved
+    // to nothing and silently took the false branch on every input.
+    ctx.insert("node".into(), Value::Object(state.outputs_map()));
+
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
     // greentic-runner direct path: entry.metadata.*
@@ -5844,6 +5852,70 @@ mod tests {
         assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
         // A non-numeric operand on an ordering op is false, not a panic.
         assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
+    }
+
+    /// A routing condition must be able to read ANY prior node's output, not
+    /// just the immediate predecessor's payload. `state.nodes` has always held
+    /// them; the routing context simply never exposed them, so
+    /// `node.<id>.<field>` resolved to nothing and the guard silently took the
+    /// false branch on every input.
+    ///
+    /// This drives the REAL `build_routing_context` — see
+    /// `condition_evaluator_supports_comparisons_and_contains` for why a
+    /// hand-built context proves nothing here.
+    #[test]
+    fn routing_context_exposes_prior_node_outputs_under_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        // The cross-node form, matching `{{node.<id>.<field>}}` in params.
+        assert!(
+            evaluate_simple_condition("node.register.q_age >= 18", &ctx),
+            "a prior node's output must be readable via node.<id>.<field>: {ctx:?}"
+        );
+        // The node_io envelope resolves too — same projection as params.
+        assert!(
+            evaluate_simple_condition("node.register.data.q_age >= 18", &ctx),
+            "the data envelope must resolve like it does in params: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_keeps_the_predecessor_shorthand() {
+        // Negative-ish: the existing form must not regress. The current node's
+        // payload stays spread at the top level, which is what PR #665's
+        // source-node prefix strip relies on.
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "q_age": 30 }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            evaluate_simple_condition("q_age >= 30", &ctx),
+            "the bare form must still resolve against the current payload: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_does_not_resolve_a_missing_node() {
+        // Negative: a ref to a node with no output must NOT resolve — it must
+        // stay false, not accidentally match something.
+        let state = ExecutionState::new(json!({}));
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            !evaluate_simple_condition("node.ghost.x == \"y\"", &ctx),
+            "a missing node must not resolve: {ctx:?}"
+        );
     }
 
     /// Symmetric to the success default: when a node FAILS (`ok == false`)
