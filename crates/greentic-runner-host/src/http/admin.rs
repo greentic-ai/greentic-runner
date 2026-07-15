@@ -91,10 +91,6 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
 /// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
 /// order is otherwise arbitrary between calls.
 #[cfg(feature = "agentic-worker")]
-// Removed in Task 3, which adds the `/admin/capabilities` handler that calls
-// this. Until that caller exists the lib target has none, and the crate builds
-// under `-D warnings`.
-#[allow(dead_code)]
 fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> serde_json::Value {
     let mut offerings: Vec<&greentic_ext_runtime::OfferedBinding> = registry.offerings().collect();
     offerings.sort_by(|a, b| {
@@ -115,6 +111,21 @@ fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> ser
         })
         .collect();
     json!({ "capabilities": caps })
+}
+
+/// `GET /admin/capabilities` — report the capabilities installed on this runner.
+///
+/// Consumed by `greentic-designer-admin` to preflight a mandatory guardrail
+/// policy before saving it: a policy naming a cap absent from this list will
+/// fail closed at runtime (`greentic-aw-runtime` `loop.rs`), blocking every
+/// agent turn in scope.
+#[cfg(feature = "agentic-worker")]
+pub async fn capabilities(_: AdminGuard, State(state): State<ServerState>) -> impl IntoResponse {
+    let body = match &state.ext_runtime {
+        Some(runtime) => offerings_to_json(&runtime.capability_registry()),
+        None => json!({ "capabilities": [] }),
+    };
+    (StatusCode::OK, Json(body))
 }
 
 #[cfg(test)]
@@ -138,6 +149,8 @@ mod tests {
             admin: AdminAuth::default(),
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: None,
             host,
             sql: crate::sql::SqlGateway::new(std::collections::HashMap::new(), String::new()),
         }

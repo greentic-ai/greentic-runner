@@ -97,6 +97,15 @@ impl HostServer {
             // never be seen by the agent step.
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            // Built here rather than reused from `host`: the per-tenant runtimes
+            // are constructed later, inside `TenantRuntime`, with per-tenant
+            // secrets. Blocking during boot is intentional and bounded — it runs
+            // once, before the listener binds.
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: crate::runner::agent_node::build_ext_runtime(
+                std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
+                None,
+            ),
             host,
             sql,
         };
@@ -134,10 +143,12 @@ pub(crate) fn router(state: ServerState) -> Router {
         .route("/admin/packs/reload", post(admin::reload))
         .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
     #[cfg(feature = "agentic-worker")]
-    let router = router.route(
-        "/agent/chat/stream",
-        post(crate::http::agent_chat::agent_chat_stream),
-    );
+    let router = router
+        .route(
+            "/agent/chat/stream",
+            post(crate::http::agent_chat::agent_chat_stream),
+        )
+        .route("/admin/capabilities", get(admin::capabilities));
     router
         .route(
             "/sql/{conn}/schema",
@@ -168,6 +179,19 @@ pub struct ServerState {
     /// dispatching a turn.
     #[cfg(feature = "agentic-worker")]
     pub stream_observers: crate::http::agent_stream::StreamObserverRegistry,
+    /// Extension runtime backing `GET /admin/capabilities`, so an operator
+    /// console can see which capabilities this runner actually has installed.
+    ///
+    /// Built once at server-build time. This is a *separate* instance from the
+    /// per-tenant runtimes in `agent_node::build_ext_runtime`, which need
+    /// per-tenant secrets backends — so it costs one extra set of WASM loads at
+    /// boot. All tenants scan the same `GREENTIC_EXTENSIONS_DIR/design/`, so the
+    /// registries are identical and a process-level answer is correct.
+    ///
+    /// `None` when the runtime could not be built (e.g. no extension directory);
+    /// the handler then reports an empty list rather than failing.
+    #[cfg(feature = "agentic-worker")]
+    pub ext_runtime: Option<std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>>,
 }
 
 impl ServerState {
@@ -191,6 +215,8 @@ impl ServerState {
             admin: AdminAuth::default(),
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: None,
             host,
             sql: SqlGateway::new(std::collections::HashMap::new(), String::new()),
         }
@@ -230,5 +256,33 @@ mod router_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Anti-regression for the greentic-designer #796 class of bug: a handler
+    /// that exists but is never registered. Without the `.route(...)` line this
+    /// returns 404.
+    #[tokio::test]
+    async fn assembled_router_serves_admin_capabilities() {
+        let app = router(ServerState::for_test());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/capabilities")
+                    .extension(loopback())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // `ServerState::for_test()` has no ext_runtime, so the list is empty —
+        // but the envelope key must still be present and an array.
+        assert_eq!(body, serde_json::json!({ "capabilities": [] }));
     }
 }

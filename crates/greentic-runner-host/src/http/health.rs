@@ -114,6 +114,8 @@ mod tests {
             admin: AdminAuth::default(),
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: None,
             host,
             sql: crate::sql::SqlGateway::new(std::collections::HashMap::new(), String::new()),
         }
