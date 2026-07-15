@@ -173,6 +173,11 @@ impl StepObserver for CompositeObserver {
             m.on_llm_call(tokens_in, tokens_out);
         }
     }
+    fn on_guardrail(&self, obs: &greentic_aw_runtime::guardrail::GuardrailObservation) {
+        for m in &self.members {
+            m.on_guardrail(obs);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +208,24 @@ mod tests {
         fn on_tool_failed(&self, n: &str, id: &str, _e: &serde_json::Value) {
             self.calls.lock().unwrap().push(format!("f:{n}:{id}"));
         }
+        fn on_guardrail(&self, obs: &greentic_aw_runtime::guardrail::GuardrailObservation) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("g:{}:{:?}", obs.cap_id, obs.action));
+        }
+    }
+
+    fn guardrail_observation(
+        action: greentic_aw_runtime::guardrail::GuardrailAction,
+    ) -> greentic_aw_runtime::guardrail::GuardrailObservation {
+        greentic_aw_runtime::guardrail::GuardrailObservation {
+            cap_id: "greentic:guardrail/pii".to_string(),
+            extension_id: "ext-pii".to_string(),
+            direction: greentic_aw_runtime::guardrail::GuardrailDirection::Inbound,
+            code: "pii".to_string(),
+            action,
+        }
     }
 
     #[test]
@@ -220,13 +243,26 @@ mod tests {
         comp.on_token_delta("hi");
         comp.on_tool_call("email", "call_1", &json!({"to": "x@example.com"}));
         comp.on_tool_failed("email", "call_1", &json!({"error": "boom"}));
+        comp.on_guardrail(&guardrail_observation(
+            greentic_aw_runtime::guardrail::GuardrailAction::Blocked,
+        ));
         assert_eq!(
             *a.calls.lock().unwrap(),
-            vec!["t:hi", "c:email:call_1", "f:email:call_1"]
+            vec![
+                "t:hi",
+                "c:email:call_1",
+                "f:email:call_1",
+                "g:greentic:guardrail/pii:Blocked"
+            ]
         );
         assert_eq!(
             *b.calls.lock().unwrap(),
-            vec!["t:hi", "c:email:call_1", "f:email:call_1"]
+            vec![
+                "t:hi",
+                "c:email:call_1",
+                "f:email:call_1",
+                "g:greentic:guardrail/pii:Blocked"
+            ]
         );
     }
 
