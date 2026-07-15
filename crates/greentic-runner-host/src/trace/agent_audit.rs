@@ -245,7 +245,6 @@ mod tests {
             extension_id: "ext-pii".to_string(),
             direction: greentic_aw_runtime::guardrail::GuardrailDirection::Inbound,
             code: "pii".to_string(),
-            message: "blocked pii".to_string(),
             action,
         }
     }

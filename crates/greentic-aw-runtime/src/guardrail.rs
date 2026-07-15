@@ -312,7 +312,6 @@ pub struct GuardrailObservation {
     pub extension_id: String,
     pub direction: GuardrailDirection,
     pub code: String,
-    pub message: String,
     pub action: GuardrailAction,
 }
 
@@ -337,7 +336,7 @@ pub enum ChainOutcome {
 /// - Each guardrail in the chain is evaluated in order against the current content.
 /// - If a guardrail returns `Update(new_content)`, the new content is threaded forward to the next guardrail.
 /// - If a guardrail returns `Accept`, execution continues with the content unchanged.
-/// - If a guardrail returns `Deny(info)`, execution stops and `ChainOutcome::Denied` is returned immediately (short-circuit).
+/// - If a guardrail returns `Deny(info)` in Enforce mode, execution stops and `ChainOutcome::Denied` is returned immediately (short-circuit). In Monitor mode, the denial is recorded as a `GuardrailObservation` instead, and execution continues with the content UNCHANGED.
 /// - If a guardrail's evaluator returns an error:
 ///   - For **mandatory** guardrails: fails closed — returns `ChainOutcome::Denied` with code "internal".
 ///   - For **agent-level** guardrails: fails open — logs a warning and continues with content unchanged.
@@ -391,7 +390,6 @@ pub fn run_chain(
                         extension_id: g.extension_id.clone(),
                         direction,
                         code: info.code.clone(),
-                        message: info.message.clone(),
                         action: GuardrailAction::Blocked,
                     };
                     return ChainOutcome::Denied {
@@ -413,7 +411,6 @@ pub fn run_chain(
                         extension_id: g.extension_id.clone(),
                         direction,
                         code: info.code,
-                        message: info.message,
                         action: GuardrailAction::Monitored,
                     });
                 }
@@ -431,7 +428,6 @@ pub fn run_chain(
                         extension_id: g.extension_id.clone(),
                         direction,
                         code: info.code.clone(),
-                        message: info.message.clone(),
                         action: GuardrailAction::Blocked,
                     };
                     return ChainOutcome::Denied {
