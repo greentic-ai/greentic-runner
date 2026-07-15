@@ -4008,6 +4008,7 @@ dependencies = [
  "greentic-dw-operala-invoker",
  "greentic-dw-providers-common",
  "greentic-ext-runtime",
+ "greentic-extension-sdk-contract",
  "greentic-flow",
  "greentic-interfaces",
  "greentic-interfaces-host",

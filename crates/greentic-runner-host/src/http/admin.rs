@@ -79,6 +79,40 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
     }
 }
 
+/// Serialise a capability registry's offerings into the `/admin/capabilities`
+/// response body.
+///
+/// CROSS-REPO CONTRACT. `greentic-designer-admin` parses this exact shape to
+/// preflight guardrail policies (see that repo's
+/// `docs/superpowers/specs/2026-07-15-guardrail-policy-preflight-design.md`).
+/// Renaming a key does not fail its build — the preflight silently degrades to
+/// "no capabilities offered". Change this shape only alongside that consumer.
+///
+/// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
+/// order is otherwise arbitrary between calls.
+#[cfg(feature = "agentic-worker")]
+fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> serde_json::Value {
+    let mut offerings: Vec<&greentic_ext_runtime::OfferedBinding> = registry.offerings().collect();
+    offerings.sort_by(|a, b| {
+        a.cap_id
+            .to_string()
+            .cmp(&b.cap_id.to_string())
+            .then_with(|| a.extension_id.cmp(&b.extension_id))
+    });
+    let caps: Vec<serde_json::Value> = offerings
+        .into_iter()
+        .map(|offering| {
+            json!({
+                "extension_id": offering.extension_id,
+                "cap_id": offering.cap_id.to_string(),
+                "version": offering.version.to_string(),
+                "kind": offering.kind,
+            })
+        })
+        .collect();
+    json!({ "capabilities": caps })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +167,63 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
         let body = json_body(response).await;
         assert_eq!(body["error"], "reload handle unavailable");
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn offerings_to_json_matches_the_admin_contract() {
+        use greentic_ext_runtime::{CapabilityRegistry, OfferedBinding};
+        use greentic_extension_sdk_contract::ExtensionKind;
+
+        let mut registry = CapabilityRegistry::new();
+        registry.add_offering(OfferedBinding {
+            extension_id: "greentic.guardrail-pii".to_string(),
+            cap_id: "greentic:guardrail/pii".parse().unwrap(),
+            version: "0.1.0".parse().unwrap(),
+            kind: ExtensionKind::Design,
+            export_path: String::new(),
+        });
+
+        assert_eq!(
+            offerings_to_json(&registry),
+            serde_json::json!({
+                "capabilities": [{
+                    "extension_id": "greentic.guardrail-pii",
+                    "cap_id": "greentic:guardrail/pii",
+                    "version": "0.1.0",
+                    "kind": "DesignExtension"
+                }]
+            })
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn offerings_to_json_is_ordered_and_handles_empty() {
+        use greentic_ext_runtime::{CapabilityRegistry, OfferedBinding};
+        use greentic_extension_sdk_contract::ExtensionKind;
+
+        assert_eq!(
+            offerings_to_json(&CapabilityRegistry::new()),
+            serde_json::json!({ "capabilities": [] })
+        );
+
+        // `offerings()` walks a HashMap, so ordering is not inherent. Two caps
+        // inserted in reverse order must still come out sorted, or the admin's
+        // response and these assertions become flaky.
+        let mut registry = CapabilityRegistry::new();
+        for cap in ["greentic:guardrail/secrets", "greentic:guardrail/injection"] {
+            registry.add_offering(OfferedBinding {
+                extension_id: "ext".to_string(),
+                cap_id: cap.parse().unwrap(),
+                version: "1.0.0".parse().unwrap(),
+                kind: ExtensionKind::Design,
+                export_path: String::new(),
+            });
+        }
+        let body = offerings_to_json(&registry);
+        let caps = body["capabilities"].as_array().unwrap();
+        assert_eq!(caps[0]["cap_id"], "greentic:guardrail/injection");
+        assert_eq!(caps[1]["cap_id"], "greentic:guardrail/secrets");
     }
 }
