@@ -403,10 +403,18 @@ Expected: all PASS (Task 1's unit tests plus the routing test).
 Run: `cargo test -p greentic-runner-host --all-features 2>&1 | tail -20`
 Expected: no regressions. Pay attention to the wait/resume suite — `dispatch_outcome_await_here_stores_variant`, `evaluate_custom_routing_waits_when_conditional_falls_through`, and the conversational `dw.agent` park/loop tests must stay green.
 
-- [ ] **Step 7: Run the gate**
+- [ ] **Step 7: Run the gate (package-scoped)**
 
-Run: `LOCAL_CHECK_STEPS=fmt,clippy,workspace_tests ./ci/local_check.sh`
-Expected: clean (exit 0).
+Run:
+```bash
+cargo fmt -p greentic-runner-host -- --check
+cargo clippy -p greentic-runner-host --all-targets --all-features -- -D warnings
+```
+Expected: both exit 0.
+
+Use the package-scoped commands, not `./ci/local_check.sh`. Verified in Task 1: `cargo fmt --all -- --check`
+exits 1 on a **pre-existing** violation at `crates/greentic-aw-runtime/src/loop.rs:395` — a different
+package this branch never touches, already broken at the base. Do not format or fix that package.
 
 - [ ] **Step 8: Commit**
 
@@ -519,10 +527,27 @@ git commit -m "test(runner): cover approval.call await parking at self"
 
 **Files:** none (verification only)
 
-- [ ] **Step 1: Run the full local CI**
+- [ ] **Step 1: Run the package-scoped gate (the full one cannot pass — see below)**
 
-Run: `./ci/local_check.sh`
-Expected: clean. `host_smoke` is skipped by default (`RUN_HOST=never`) and `conformance` is off by default (`RUN_CONFORMANCE=0`) — that is the normal local shape; do not force them on.
+Run:
+```bash
+cargo fmt -p greentic-runner-host -- --check
+cargo clippy -p greentic-runner-host --all-targets --all-features -- -D warnings
+```
+Expected: both exit 0.
+
+**Do not chase `./ci/local_check.sh` to green.** Verified during Task 1: `cargo fmt --all -- --check`
+exits 1 on a **pre-existing** violation at `crates/greentic-aw-runtime/src/loop.rs:395` — a different
+package that this branch never touches (every commit here is confined to
+`crates/greentic-runner-host/`). It is broken at the base (`research` @ `b4c86e29`), not by us.
+
+**Do NOT format or otherwise "fix" `greentic-aw-runtime`** — it is outside this branch's scope and
+the repo's main checkout has unrelated work in flight there. Record the pre-existing failure in your
+report so it reaches the PR summary (the repo rule is to document an out-of-scope failure, not hide
+it and not silently absorb it).
+
+For reference, the full script's other defaults: `host_smoke` is skipped (`RUN_HOST=never`) and
+`conformance` is off (`RUN_CONFORMANCE=0`) — that is the normal local shape; do not force them on.
 
 - [ ] **Step 2: Confirm no sibling dispatch node changed behaviour**
 
