@@ -30,6 +30,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
         cap_id: mandatory_cap_id.to_string(),
         offer_id: None,
         config: serde_json::Value::Null,
+        mode: greentic_aw_runtime::config::GuardrailMode::Enforce,
     }];
 
     let llm_script = vec![Ok(LlmResponse {

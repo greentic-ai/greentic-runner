@@ -93,6 +93,23 @@ impl Default for KnowledgeSettings {
     }
 }
 
+/// What to do when a guardrail returns an explicit `deny` verdict.
+///
+/// Orthogonal to [`crate::guardrail::ResolvedGuardrail::mandatory`], which decides
+/// fail-open vs fail-closed when the evaluator *errors*. This decides what an
+/// explicit deny *means*. The guardrail component never sees this value — a
+/// verdict is a detection result; acting on it is the runner's policy decision.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuardrailMode {
+    /// Deny blocks the turn. The historical (and default) behaviour: a payload
+    /// that predates this field means Enforce.
+    #[default]
+    Enforce,
+    /// Deny is recorded but does NOT block; the content passes through unchanged.
+    Monitor,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GuardrailRef {
     pub cap_id: String,
@@ -100,6 +117,8 @@ pub struct GuardrailRef {
     pub offer_id: Option<String>,
     #[serde(default)]
     pub config: serde_json::Value,
+    #[serde(default)]
+    pub mode: GuardrailMode,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -383,10 +402,35 @@ mod tests {
             cap_id: "greentic.cap.guardrail.v1".to_string(),
             offer_id: Some("pii".to_string()),
             config: serde_json::json!({ "mask": ["email"] }),
+            mode: GuardrailMode::Enforce,
         };
         let s = serde_json::to_string(&r).unwrap();
         let back: GuardrailRef = serde_json::from_str(&s).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn guardrail_ref_without_mode_defaults_to_enforce() {
+        // Every policy payload in the wild today omits `mode`. It must mean Enforce.
+        let r: GuardrailRef =
+            serde_json::from_str(r#"{"cap_id":"greentic:guardrail/pii"}"#).unwrap();
+        assert_eq!(r.mode, GuardrailMode::Enforce);
+    }
+
+    #[test]
+    fn guardrail_ref_parses_monitor_mode() {
+        let r: GuardrailRef =
+            serde_json::from_str(r#"{"cap_id":"greentic:guardrail/pii","mode":"monitor"}"#)
+                .unwrap();
+        assert_eq!(r.mode, GuardrailMode::Monitor);
+    }
+
+    #[test]
+    fn guardrail_mode_serializes_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&GuardrailMode::Monitor).unwrap(),
+            r#""monitor""#
+        );
     }
 
     #[test]

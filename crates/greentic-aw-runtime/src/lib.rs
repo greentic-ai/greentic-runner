@@ -143,6 +143,10 @@ pub trait StepObserver: Send + Sync {
     /// trace even for turns that call no tools (the token trail is otherwise
     /// only in the final `AgentOutput.trail`, which the SSE stream omits).
     fn on_llm_call(&self, _tokens_in: u64, _tokens_out: u64) {}
+    /// Called for every guardrail denial — blocked (Enforce) or merely recorded
+    /// (Monitor). Default no-op: only the audit observer forwards these.
+    /// Additive hook — see the "Extending this trait" note above.
+    fn on_guardrail(&self, _obs: &crate::guardrail::GuardrailObservation) {}
 }
 
 /// No-op observer used by the non-streaming [`AgentRuntime::step`].
