@@ -180,10 +180,21 @@ pub async fn run_step(
         &guardrail_ctx,
         runtime.guardrail_evaluator.as_ref(),
     ) {
-        crate::guardrail::ChainOutcome::Pass { content, .. } => content,
-        crate::guardrail::ChainOutcome::Denied {
-            info, direction, ..
+        crate::guardrail::ChainOutcome::Pass {
+            content,
+            observations,
         } => {
+            for obs in &observations {
+                observer.on_guardrail(obs);
+            }
+            content
+        }
+        crate::guardrail::ChainOutcome::Denied {
+            info,
+            direction,
+            observation,
+        } => {
+            observer.on_guardrail(&observation);
             return Err(AgentError::GuardrailDenied {
                 direction,
                 code: info.code,
@@ -674,10 +685,21 @@ pub async fn run_step(
             &guardrail_ctx,
             runtime.guardrail_evaluator.as_ref(),
         ) {
-            crate::guardrail::ChainOutcome::Pass { content, .. } => content,
-            crate::guardrail::ChainOutcome::Denied {
-                info, direction, ..
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
             } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                content
+            }
+            crate::guardrail::ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
                 return Err(AgentError::GuardrailDenied {
                     direction,
                     code: info.code,
@@ -883,7 +905,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::{AgentConfig, AgentLimits, LlmProviderRef};
-    use crate::error::{LlmError, TerminationReason};
+    use crate::error::{AgentError, LlmError, TerminationReason};
     use crate::llm::LlmResponse;
     use crate::mock::{MockAgentStateStore, MockConfigProvider, MockLlmBackend, MockTelemetry};
     use crate::tenant::TenantContext;
@@ -1549,5 +1571,159 @@ mod tests {
             failures[0].2,
             serde_json::json!({"error": "not in allow-list"})
         );
+    }
+
+    // --- StepObserver::on_guardrail wiring ------------------------------
+    //
+    // A genuine `run_step` integration test would need a `ResolvedGuardrail`
+    // chain entry whose capability actually resolves, which in turn needs a
+    // populated `CapabilityRegistry` on the `ExtensionRuntime`. There is no
+    // public seam to inject offerings directly: `ExtensionRuntime::for_test()`
+    // builds an empty registry, and the only way to populate one is
+    // `register_loaded_from_dir`, which requires a real, signed WASM
+    // extension on disk (see `tests/guardrail_e2e.rs`, which does exactly
+    // that for the full e2e suite — real component-guardrail-pii binary,
+    // ephemeral Ed25519 signing key, tempdir). That is too heavy for a
+    // focused unit test of the observer seam, so per the plan's authorised
+    // fallback these tests exercise `run_chain` directly and apply the exact
+    // notify pattern the two `run_step` call sites use (mirrored above),
+    // without building a full `AgentRuntime`. This still proves the
+    // regression this task guards against: a BLOCKED denial (Enforce) must
+    // reach the observer, not just a Monitored one.
+    #[derive(Default)]
+    struct RecordingObserver {
+        guardrails: std::sync::Mutex<Vec<crate::guardrail::GuardrailObservation>>,
+    }
+    impl crate::StepObserver for RecordingObserver {
+        fn on_guardrail(&self, obs: &crate::guardrail::GuardrailObservation) {
+            self.guardrails.lock().unwrap().push(obs.clone());
+        }
+    }
+
+    struct DenyingEvaluator {
+        code: String,
+        message: String,
+    }
+    impl crate::guardrail::GuardrailEvaluator for DenyingEvaluator {
+        fn evaluate(
+            &self,
+            _extension_id: &str,
+            _input: &crate::guardrail::GuardrailInput,
+        ) -> Result<crate::guardrail::GuardrailVerdict, crate::guardrail::GuardrailInvokeError>
+        {
+            Ok(crate::guardrail::GuardrailVerdict::Deny(
+                crate::guardrail::GuardrailDenyInfo {
+                    code: self.code.clone(),
+                    message: self.message.clone(),
+                    details: None,
+                },
+            ))
+        }
+    }
+
+    fn guardrail_run_ctx() -> crate::guardrail::GuardrailRunCtx {
+        crate::guardrail::GuardrailRunCtx {
+            agent_id: "a".into(),
+            session_id: "s1".into(),
+            tenant_id: "acme".into(),
+            env_id: "prod".into(),
+        }
+    }
+
+    /// Mirrors the notify logic at the loop.rs guardrail call sites: forward
+    /// every `Pass` observation, or the `Denied` observation, to the observer.
+    fn run_chain_and_notify(
+        chain: &[crate::guardrail::ResolvedGuardrail],
+        direction: crate::guardrail::GuardrailDirection,
+        content: String,
+        observer: &dyn crate::StepObserver,
+        evaluator: &dyn crate::guardrail::GuardrailEvaluator,
+    ) -> Result<String, crate::error::AgentError> {
+        match crate::guardrail::run_chain(
+            chain,
+            direction,
+            content,
+            &guardrail_run_ctx(),
+            evaluator,
+        ) {
+            crate::guardrail::ChainOutcome::Pass {
+                content,
+                observations,
+            } => {
+                for obs in &observations {
+                    observer.on_guardrail(obs);
+                }
+                Ok(content)
+            }
+            crate::guardrail::ChainOutcome::Denied {
+                info,
+                direction,
+                observation,
+            } => {
+                observer.on_guardrail(&observation);
+                Err(AgentError::GuardrailDenied {
+                    direction,
+                    code: info.code,
+                    message: info.message,
+                    details: info.details,
+                })
+            }
+        }
+    }
+
+    #[test]
+    fn run_step_notifies_the_observer_for_a_monitored_denial() {
+        // A recording observer proves the observation escapes run_chain and
+        // reaches the seam the host emits from.
+        let observer = RecordingObserver::default();
+        let chain = vec![crate::guardrail::ResolvedGuardrail {
+            extension_id: "ext-pii".into(),
+            cap_id: "greentic:guardrail/pii".into(),
+            mandatory: false,
+            mode: crate::config::GuardrailMode::Monitor,
+            config: serde_json::Value::Null,
+        }];
+        let evaluator = DenyingEvaluator {
+            code: "pii".into(),
+            message: "blocked pii".into(),
+        };
+        let out = run_chain_and_notify(
+            &chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            "hi".into(),
+            &observer,
+            &evaluator,
+        );
+        assert!(out.is_ok(), "monitor mode must not fail the turn");
+        let seen = observer.guardrails.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Monitored);
+    }
+
+    #[test]
+    fn run_step_notifies_the_observer_for_a_blocked_denial() {
+        let observer = RecordingObserver::default();
+        let chain = vec![crate::guardrail::ResolvedGuardrail {
+            extension_id: "ext-pii".into(),
+            cap_id: "greentic:guardrail/pii".into(),
+            mandatory: false,
+            mode: crate::config::GuardrailMode::Enforce,
+            config: serde_json::Value::Null,
+        }];
+        let evaluator = DenyingEvaluator {
+            code: "pii".into(),
+            message: "blocked pii".into(),
+        };
+        let out = run_chain_and_notify(
+            &chain,
+            crate::guardrail::GuardrailDirection::Inbound,
+            "hi".into(),
+            &observer,
+            &evaluator,
+        );
+        assert!(matches!(out, Err(AgentError::GuardrailDenied { .. })));
+        let seen = observer.guardrails.lock().unwrap();
+        assert_eq!(seen.len(), 1, "a blocked denial must still be observed");
+        assert_eq!(seen[0].action, crate::guardrail::GuardrailAction::Blocked);
     }
 }
