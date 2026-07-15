@@ -11,7 +11,7 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify", "agentic-worker"]
+default = ["verify"]
 verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
