@@ -180,8 +180,10 @@ pub async fn run_step(
         &guardrail_ctx,
         runtime.guardrail_evaluator.as_ref(),
     ) {
-        crate::guardrail::ChainOutcome::Pass(text) => text,
-        crate::guardrail::ChainOutcome::Denied { info, direction } => {
+        crate::guardrail::ChainOutcome::Pass { content, .. } => content,
+        crate::guardrail::ChainOutcome::Denied {
+            info, direction, ..
+        } => {
             return Err(AgentError::GuardrailDenied {
                 direction,
                 code: info.code,
@@ -395,7 +397,10 @@ pub async fn run_step(
         });
         // Stream the per-iteration token trace (a streaming consumer renders a
         // per-message LLM/token line even when the turn calls no tools).
-        observer.on_llm_call(u64::from(response.tokens_in), u64::from(response.tokens_out));
+        observer.on_llm_call(
+            u64::from(response.tokens_in),
+            u64::from(response.tokens_out),
+        );
         if let Err(e) = runtime.token_meter.add(&tenant, step_tokens).await {
             warn!(error = %e, "token meter add failed; continuing");
         }
@@ -669,8 +674,10 @@ pub async fn run_step(
             &guardrail_ctx,
             runtime.guardrail_evaluator.as_ref(),
         ) {
-            crate::guardrail::ChainOutcome::Pass(text) => text,
-            crate::guardrail::ChainOutcome::Denied { info, direction } => {
+            crate::guardrail::ChainOutcome::Pass { content, .. } => content,
+            crate::guardrail::ChainOutcome::Denied {
+                info, direction, ..
+            } => {
                 return Err(AgentError::GuardrailDenied {
                     direction,
                     code: info.code,
