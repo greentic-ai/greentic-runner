@@ -1671,8 +1671,19 @@ mod tests {
         }
     }
 
+    // NOTE: these two tests pin the notify *pattern* mirrored above (call
+    // `on_guardrail` for every `Pass` observation, or for a `Denied`
+    // observation) — they do NOT exercise `run_step`'s real wiring of that
+    // pattern (see the module doc above for why a genuine `run_step`
+    // integration test isn't feasible as a focused unit test here). The real
+    // `run_step` → `observer.on_guardrail` wiring is covered by
+    // `crates/greentic-aw-runtime/tests/guardrail_e2e.rs`, and the
+    // `CompositeObserver` fan-out regression (dropping `on_guardrail` when
+    // fanning out to multiple observers) is covered by
+    // `crates/greentic-runner-host/src/http/agent_stream.rs`'s
+    // `composite_fans_out_to_all_members_and_ors_streaming` test.
     #[test]
-    fn run_step_notifies_the_observer_for_a_monitored_denial() {
+    fn guardrail_notify_pattern_reports_a_monitored_denial() {
         // A recording observer proves the observation escapes run_chain and
         // reaches the seam the host emits from.
         let observer = RecordingObserver::default();
@@ -1701,7 +1712,7 @@ mod tests {
     }
 
     #[test]
-    fn run_step_notifies_the_observer_for_a_blocked_denial() {
+    fn guardrail_notify_pattern_reports_a_blocked_denial() {
         let observer = RecordingObserver::default();
         let chain = vec![crate::guardrail::ResolvedGuardrail {
             extension_id: "ext-pii".into(),
