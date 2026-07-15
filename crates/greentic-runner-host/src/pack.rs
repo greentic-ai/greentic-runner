@@ -3834,6 +3834,7 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 err_map: None,
                 routing,
                 telemetry,
+                conversational: false,
             },
         );
     }

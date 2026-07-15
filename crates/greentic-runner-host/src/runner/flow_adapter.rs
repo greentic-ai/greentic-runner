@@ -187,6 +187,7 @@ fn map_node(node_id: NodeId, node_ir: NodeIR) -> Result<Node> {
         err_map: None,
         routing,
         telemetry: TelemetryHints::default(),
+        conversational: false,
     })
 }
 
