@@ -3827,23 +3827,6 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
     }
 }
 
-/// Build a context object for routing condition evaluation.
-///
-/// The context merges the node output with the flow entry so that conditions
-/// can reference both component results and incoming message data.
-///
-/// Layout:
-/// ```text
-/// {
-///   ...output.payload...,     // top-level fields from component output
-///   "entry": <flow entry>,
-///   "in":    <flow entry>,    // alias
-///   "response": {             // synthesised from envelope metadata
-///     <key>: <value>,         // e.g. "action": "about"
-///     ...
-///   }
-/// }
-/// ```
 /// Success-family outcome ports, in the priority order used to pick the default
 /// success `event` for a node that succeeded without emitting an explicit
 /// `outcome`. `on_success` is first so components whose success name is the
@@ -3928,6 +3911,32 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Build the context a routing condition is evaluated against.
+///
+/// Layout:
+/// ```text
+/// {
+///   ...output.payload...,     // this node's fields, spread at the top level
+///   "entry":    <flow entry>,
+///   "in":       <flow entry>, // alias for entry
+///   "node":     { "<id>": <node_output_view>, ... },  // every prior node
+///   "response": { <key>: <value>, ... },              // from envelope metadata
+///   "event":    "<outcome>"   // the port this node routes on
+/// }
+/// ```
+///
+/// The spread comes FIRST and the named keys are inserted after, so
+/// **`entry`, `in`, `node`, `response` and `event` are reserved**: a component
+/// whose payload has a top-level field with one of those names has it shadowed
+/// here. That is deliberate — the spread is what lets a guard say `q_age >= 18`
+/// about its own node (and is what the designer's source-node prefix strip
+/// relies on) — but it means those five names are not usable as payload fields
+/// in a routed node.
+///
+/// `node` is the same `outputs_map()` projection [`template_context`] exposes,
+/// so a condition resolves `node.<id>.<field>` exactly as a param template
+/// resolves `{{node.<id>.<field>}}`. Note `vars` is NOT here: `vars.x` in a
+/// condition does not resolve, whereas `{{vars.x}}` in a param does.
 fn build_routing_context(
     output: &NodeOutput,
     state: &ExecutionState,
