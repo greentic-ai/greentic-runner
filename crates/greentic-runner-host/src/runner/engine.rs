@@ -3685,12 +3685,14 @@ fn evaluate_custom_routing(
     );
 
     let mut has_condition = false;
+    let mut unmatched_conditions: Vec<&str> = Vec::new();
     for route in routes {
         let condition = route.get("condition").and_then(|v| v.as_str());
         let to = route.get("to").and_then(|v| v.as_str());
 
         if let Some(cond) = condition {
             has_condition = true;
+            unmatched_conditions.push(cond);
             if evaluate_simple_condition(cond, &ctx)
                 && let Some(target) = to
                 && let Ok(nid) = NodeId::new(target)
@@ -3724,9 +3726,10 @@ fn evaluate_custom_routing(
     // Routing arrays with no conditions at all (pure unconditional `out`
     // terminators) remain true ends.
     if has_condition {
-        tracing::debug!(
+        tracing::warn!(
             flow_id = %flow_ir.id,
             node_id = %node_id,
+            conditions = ?unmatched_conditions,
             "no conditional route matched; pausing run at current node for resume"
         );
         CustomRoutingDecision::Wait
@@ -3824,23 +3827,6 @@ fn resolve_dotted_path(value: &Value, path: &str) -> Option<String> {
     }
 }
 
-/// Build a context object for routing condition evaluation.
-///
-/// The context merges the node output with the flow entry so that conditions
-/// can reference both component results and incoming message data.
-///
-/// Layout:
-/// ```text
-/// {
-///   ...output.payload...,     // top-level fields from component output
-///   "entry": <flow entry>,
-///   "in":    <flow entry>,    // alias
-///   "response": {             // synthesised from envelope metadata
-///     <key>: <value>,         // e.g. "action": "about"
-///     ...
-///   }
-/// }
-/// ```
 /// Success-family outcome ports, in the priority order used to pick the default
 /// success `event` for a node that succeeded without emitting an explicit
 /// `outcome`. `on_success` is first so components whose success name is the
@@ -3925,6 +3911,32 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Build the context a routing condition is evaluated against.
+///
+/// Layout:
+/// ```text
+/// {
+///   ...output.payload...,     // this node's fields, spread at the top level
+///   "entry":    <flow entry>,
+///   "in":       <flow entry>, // alias for entry
+///   "node":     { "<id>": <node_output_view>, ... },  // every prior node
+///   "response": { <key>: <value>, ... },              // from envelope metadata
+///   "event":    "<outcome>"   // the port this node routes on
+/// }
+/// ```
+///
+/// The spread comes FIRST and the named keys are inserted after, so
+/// **`entry`, `in`, `node`, `response` and `event` are reserved**: a component
+/// whose payload has a top-level field with one of those names has it shadowed
+/// here. That is deliberate — the spread is what lets a guard say `q_age >= 18`
+/// about its own node (and is what the designer's source-node prefix strip
+/// relies on) — but it means those five names are not usable as payload fields
+/// in a routed node.
+///
+/// `node` is the same `outputs_map()` projection [`template_context`] exposes,
+/// so a condition resolves `node.<id>.<field>` exactly as a param template
+/// resolves `{{node.<id>.<field>}}`. Note `vars` is NOT here: `vars.x` in a
+/// condition does not resolve, whereas `{{vars.x}}` in a param does.
 fn build_routing_context(
     output: &NodeOutput,
     state: &ExecutionState,
@@ -3939,6 +3951,14 @@ fn build_routing_context(
     let entry = &state.entry;
     ctx.insert("entry".into(), entry.clone());
     ctx.insert("in".into(), entry.clone());
+
+    // Every prior node's output, keyed by id — the SAME projection
+    // `template_context` exposes for `{{node.<id>.<field>}}`, so a routing
+    // condition resolves `node.<id>.<field>` exactly as a param template does.
+    // Without this a guard could only read the current node's payload (spread
+    // at the top level, above), so a condition naming any other node resolved
+    // to nothing and silently took the false branch on every input.
+    ctx.insert("node".into(), Value::Object(state.outputs_map()));
 
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
@@ -5810,40 +5830,106 @@ mod tests {
         }
     }
 
-    /// `evaluate_simple_condition` backs the user-authored `conditional_branch`
-    /// expressions the catalog documents (e.g. `register.q_age >= 18`,
-    /// `submit.status == "ok"`). Beyond `==`/`!=` it must handle numeric
-    /// ordering (`>=` `<=` `>` `<`) and `contains` (case-insensitive substring);
-    /// otherwise those conditions silently evaluate to false and route wrong.
+    /// `evaluate_simple_condition` is a pure expression-parser test: it checks
+    /// operator parsing over an arbitrary, hand-built JSON context. This
+    /// context is **not** the shape `build_routing_context` produces at
+    /// runtime — it is not node-keyed, and the keys below (`a`/`b`/`c`) are
+    /// deliberately arbitrary so they cannot be mistaken for node ids. For
+    /// coverage of the real routing context (prior node outputs exposed
+    /// under `node.<id>`), see
+    /// `routing_context_exposes_prior_node_outputs_under_node`.
+    ///
+    /// What this test does pin (PR #486): beyond `==`/`!=`, the parser must
+    /// handle numeric ordering (`>=` `<=` `>` `<`) and `contains`
+    /// (case-insensitive substring); otherwise those conditions silently
+    /// evaluate to false and route wrong.
     #[test]
     fn condition_evaluator_supports_comparisons_and_contains() {
         let ctx = json!({
-            "register": { "q_age": 18 },
-            "submit": { "status": "ok" },
-            "msg": { "text": "Hello World" }
+            "a": { "age": 18 },
+            "b": { "status": "ok" },
+            "c": { "text": "Hello World" }
         });
 
         // Numeric ordering (operands parsed as numbers).
-        assert!(evaluate_simple_condition("register.q_age >= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age > 18", &ctx));
-        assert!(evaluate_simple_condition("register.q_age <= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age < 18", &ctx));
+        assert!(evaluate_simple_condition("a.age >= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age > 18", &ctx));
+        assert!(evaluate_simple_condition("a.age <= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age < 18", &ctx));
 
         // contains: case-insensitive substring over the resolved string.
-        assert!(evaluate_simple_condition(
-            "msg.text contains \"world\"",
-            &ctx
-        ));
-        assert!(!evaluate_simple_condition(
-            "msg.text contains \"bye\"",
-            &ctx
-        ));
+        assert!(evaluate_simple_condition("c.text contains \"world\"", &ctx));
+        assert!(!evaluate_simple_condition("c.text contains \"bye\"", &ctx));
 
         // Existing equality semantics unchanged (regression guard).
-        assert!(evaluate_simple_condition("submit.status == \"ok\"", &ctx));
-        assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
+        assert!(evaluate_simple_condition("b.status == \"ok\"", &ctx));
+        assert!(!evaluate_simple_condition("b.status != \"ok\"", &ctx));
         // A non-numeric operand on an ordering op is false, not a panic.
-        assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
+        assert!(!evaluate_simple_condition("b.status >= 1", &ctx));
+    }
+
+    /// A routing condition must be able to read ANY prior node's output, not
+    /// just the immediate predecessor's payload. `state.nodes` has always held
+    /// them; the routing context simply never exposed them, so
+    /// `node.<id>.<field>` resolved to nothing and the guard silently took the
+    /// false branch on every input.
+    ///
+    /// This drives the REAL `build_routing_context` — see
+    /// `condition_evaluator_supports_comparisons_and_contains` for why a
+    /// hand-built context proves nothing here.
+    #[test]
+    fn routing_context_exposes_prior_node_outputs_under_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        // The cross-node form, matching `{{node.<id>.<field>}}` in params.
+        assert!(
+            evaluate_simple_condition("node.register.q_age >= 18", &ctx),
+            "a prior node's output must be readable via node.<id>.<field>: {ctx:?}"
+        );
+        // The node_io envelope resolves too — same projection as params.
+        assert!(
+            evaluate_simple_condition("node.register.data.q_age >= 18", &ctx),
+            "the data envelope must resolve like it does in params: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_keeps_the_predecessor_shorthand() {
+        // Negative-ish: the existing form must not regress. The current node's
+        // payload stays spread at the top level, which is what PR #665's
+        // source-node prefix strip relies on.
+        let mut state = ExecutionState::new(json!({}));
+        state
+            .nodes
+            .insert("register".into(), NodeOutput::new(json!({ "q_age": 21 })));
+
+        let current = NodeOutput::new(json!({ "q_age": 30 }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            evaluate_simple_condition("q_age >= 30", &ctx),
+            "the bare form must still resolve against the current payload: {ctx:?}"
+        );
+    }
+
+    #[test]
+    fn routing_context_does_not_resolve_a_missing_node() {
+        // Negative: a ref to a node with no output must NOT resolve — it must
+        // stay false, not accidentally match something.
+        let state = ExecutionState::new(json!({}));
+        let current = NodeOutput::new(json!({ "status": "ok" }));
+        let ctx = build_routing_context(&current, &state, "on_success", "on_error");
+
+        assert!(
+            !evaluate_simple_condition("node.ghost.x == \"y\"", &ctx),
+            "a missing node must not resolve: {ctx:?}"
+        );
     }
 
     /// Symmetric to the success default: when a node FAILS (`ok == false`)
