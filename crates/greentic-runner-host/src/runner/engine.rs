@@ -1462,9 +1462,18 @@ impl FlowEngine {
             return Ok(DispatchOutcome::complete(output));
         }
 
-        state.mark_approval_await(node_id);
-        self.execute_remote_dispatch(ctx, "approval", target, payload, true)
-            .await
+        // Mark only once the dispatch actually parked. A fire-and-forget
+        // (`await: false`) dispatch completes without parking, and an early `?`
+        // error never parks either — marking before the call would leave the
+        // node believing it is awaiting a decision it never requested, and every
+        // later inbound would re-park forever.
+        let outcome = self
+            .execute_remote_dispatch(ctx, "approval", target, payload, true)
+            .await?;
+        if matches!(outcome.control, NodeControl::AwaitHere { .. }) {
+            state.mark_approval_await(node_id);
+        }
+        Ok(outcome)
     }
 
     /// Execute a `component == "mcp"` flow node (LOCKED ENCODING v2).
@@ -4051,6 +4060,10 @@ fn approval_outcome_from_entry(entry: &Value) -> &'static str {
     if timed_out {
         return "timeout";
     }
+    // Fail closed: a failed envelope is never a pass, whatever `output` says.
+    if entry.get("ok").and_then(Value::as_bool) == Some(false) {
+        return "denied";
+    }
     match entry.pointer("/output/decision").and_then(Value::as_str) {
         Some(decision) if decision.eq_ignore_ascii_case("approved") => "approved",
         _ => "denied",
@@ -4145,6 +4158,20 @@ mod approval_gate_tests {
         );
         assert_eq!(
             approval_outcome_from_entry(&json!({ "ok": false, "error": { "code": "nats_down" } })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn a_failed_envelope_is_denied_even_if_it_carries_an_approval() {
+        // Fail closed: `ok: false` with a non-timeout error must not pass,
+        // regardless of a stale/forged decision field.
+        assert_eq!(
+            approval_outcome_from_entry(&json!({
+                "ok": false,
+                "error": { "code": "nats_down" },
+                "output": { "decision": "approved" }
+            })),
             "denied"
         );
     }
