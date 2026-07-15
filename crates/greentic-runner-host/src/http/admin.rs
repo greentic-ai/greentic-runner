@@ -88,8 +88,26 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
 /// Renaming a key does not fail its build — the preflight silently degrades to
 /// "no capabilities offered". Change this shape only alongside that consumer.
 ///
-/// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
-/// order is otherwise arbitrary between calls.
+/// This list means "offered by some install", NOT "resolvable right now".
+/// `CapabilityRegistry` accumulates offerings across installs and never
+/// evicts, but `ExtensionRuntime`'s loaded map is keyed by `extension_id` and
+/// `insert` replaces (newest wins). If `greentic.foo-1.0` offers cap X and
+/// `greentic.foo-2.0` drops it, this list can still report X while no loaded
+/// extension can resolve it — a preflight false positive: a policy naming X
+/// would pass here and then fail closed at runtime. Fixing this needs an
+/// upstream change in the pinned `greentic-ext-runtime` and is deliberately
+/// out of scope for this branch.
+///
+/// `{"capabilities":[]}` is returned both when nothing is installed and when
+/// `ext_runtime` is `None` — the consumer cannot distinguish those cases from
+/// this response alone.
+///
+/// Sorted by the full `(cap_id, extension_id, version, kind)` tuple — the
+/// same tuple the dedupe key below uses, so the order is total and does not
+/// fall back to `offerings()`'s underlying `HashMap`/registration order for
+/// any tie. `kind` (which has no `Ord`) is compared via
+/// `ExtensionKind::dir_name()`, a total `const fn` returning a stable
+/// `&'static str` per variant.
 ///
 /// Deduplicated on the full `(extension_id, cap_id, version, kind)` tuple.
 /// When several installed versions of the same extension (e.g.
@@ -110,6 +128,8 @@ fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> ser
             .to_string()
             .cmp(&b.cap_id.to_string())
             .then_with(|| a.extension_id.cmp(&b.extension_id))
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.kind.dir_name().cmp(b.kind.dir_name()))
     });
     let mut seen = std::collections::HashSet::new();
     let caps: Vec<serde_json::Value> = offerings
@@ -259,10 +279,58 @@ mod tests {
                 export_path: String::new(),
             });
         }
+
+        // Same cap_id ("greentic:guardrail/secrets"), deliberately inserted out
+        // of order, to exercise every tiebreak level the dedupe key implies:
+        // extension_id, then version, then kind. The dedupe key is the full
+        // (extension_id, cap_id, version, kind) tuple, so the sort must be total
+        // over that same tuple or entries that tie on (cap_id, extension_id)
+        // fall back to registry (HashMap/Vec) accumulation order.
+        registry.add_offering(OfferedBinding {
+            extension_id: "zeta".to_string(),
+            cap_id: "greentic:guardrail/secrets".parse().unwrap(),
+            version: "1.0.0".parse().unwrap(),
+            kind: ExtensionKind::Design,
+            export_path: String::new(),
+        });
+        registry.add_offering(OfferedBinding {
+            extension_id: "ext".to_string(),
+            cap_id: "greentic:guardrail/secrets".parse().unwrap(),
+            version: "2.0.0".parse().unwrap(),
+            kind: ExtensionKind::Design,
+            export_path: String::new(),
+        });
+        registry.add_offering(OfferedBinding {
+            extension_id: "ext".to_string(),
+            cap_id: "greentic:guardrail/secrets".parse().unwrap(),
+            version: "1.0.0".parse().unwrap(),
+            kind: ExtensionKind::Provider,
+            export_path: String::new(),
+        });
+        registry.add_offering(OfferedBinding {
+            extension_id: "aaa".to_string(),
+            cap_id: "greentic:guardrail/secrets".parse().unwrap(),
+            version: "1.0.0".parse().unwrap(),
+            kind: ExtensionKind::Design,
+            export_path: String::new(),
+        });
+
         let body = offerings_to_json(&registry);
         let caps = body["capabilities"].as_array().unwrap();
+        assert_eq!(caps.len(), 6);
+        // Group 1: the lone "injection" cap sorts before every "secrets" entry.
         assert_eq!(caps[0]["cap_id"], "greentic:guardrail/injection");
-        assert_eq!(caps[1]["cap_id"], "greentic:guardrail/secrets");
+        // Group 2: "secrets", ordered by extension_id, then version, then kind.
+        assert_eq!(caps[1]["extension_id"], "aaa");
+        assert_eq!(caps[2]["extension_id"], "ext");
+        assert_eq!(caps[2]["version"], "1.0.0");
+        assert_eq!(caps[2]["kind"], "DesignExtension");
+        assert_eq!(caps[3]["extension_id"], "ext");
+        assert_eq!(caps[3]["version"], "1.0.0");
+        assert_eq!(caps[3]["kind"], "ProviderExtension");
+        assert_eq!(caps[4]["extension_id"], "ext");
+        assert_eq!(caps[4]["version"], "2.0.0");
+        assert_eq!(caps[5]["extension_id"], "zeta");
     }
 
     #[cfg(feature = "agentic-worker")]
@@ -333,11 +401,10 @@ mod tests {
             2,
             "two bindings sharing a triple but differing in `kind` must both surface"
         );
-        let kinds: std::collections::HashSet<_> =
-            caps.iter().map(|c| c["kind"].as_str().unwrap()).collect();
-        assert_eq!(
-            kinds,
-            std::collections::HashSet::from(["DesignExtension", "BundleExtension"])
-        );
+        // The comparator is now total over the dedupe key, so position is
+        // deterministic, not just membership: `Bundle`'s dir_name ("bundle")
+        // sorts before `Design`'s ("design").
+        assert_eq!(caps[0]["kind"], "BundleExtension");
+        assert_eq!(caps[1]["kind"], "DesignExtension");
     }
 }

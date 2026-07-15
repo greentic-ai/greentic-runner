@@ -99,8 +99,11 @@ impl HostServer {
             stream_observers: host.stream_observers(),
             // Built here rather than reused from `host`: the per-tenant runtimes
             // are constructed later, inside `TenantRuntime`, with per-tenant
-            // secrets. Blocking during boot is intentional and bounded — it runs
-            // once, before the listener binds.
+            // secrets. This blocks boot on a full extra set of WASM loads,
+            // landing entirely in the pre-bind window — `/healthz` cannot answer
+            // at all until this returns. Measured: ~80s to readiness with 81
+            // extensions installed, on top of whatever the per-tenant load
+            // already costs. A deployment health-gate must tolerate that delay.
             #[cfg(feature = "agentic-worker")]
             ext_runtime: crate::runner::agent_node::build_ext_runtime(
                 std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
@@ -188,8 +191,11 @@ pub struct ServerState {
     /// boot. All tenants scan the same `GREENTIC_EXTENSIONS_DIR/design/`, so the
     /// registries are identical and a process-level answer is correct.
     ///
-    /// `None` when the runtime could not be built (e.g. no extension directory);
-    /// the handler then reports an empty list rather than failing.
+    /// `None` only when `ExtensionRuntime::new` itself fails. A missing/absent
+    /// extension directory does NOT produce `None`: `scan_kind_dir` errors,
+    /// logs a warning, and the runtime still comes back `Some` with an empty
+    /// registry (`agent_node.rs:918-948`). Either way the handler reports an
+    /// empty list rather than failing.
     #[cfg(feature = "agentic-worker")]
     pub ext_runtime: Option<std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>>,
 }
@@ -201,9 +207,9 @@ impl ServerState {
     /// the inline `state()` test helpers in `http/admin.rs` / `http/auth.rs`
     /// / `http/health.rs`, but lives here (next to the struct) so it's
     /// reusable from `http/agent_chat.rs`'s SSE core test.
-    // Only consumed by the `agentic-worker`-gated SSE core test in
-    // `http/agent_chat.rs` today — gating on both keeps a lean (no
-    // `agentic-worker`) test build free of dead-code warnings.
+    // Consumed by the `agentic-worker`-gated SSE core test in
+    // `http/agent_chat.rs` and by `router_tests` in this file — gating on both
+    // keeps a lean (no `agentic-worker`) test build free of dead-code warnings.
     #[cfg(all(test, feature = "agentic-worker"))]
     pub(crate) fn for_test() -> Self {
         let host = RunnerHost::for_test();
