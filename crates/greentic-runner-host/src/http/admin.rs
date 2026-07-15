@@ -91,16 +91,17 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
 /// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
 /// order is otherwise arbitrary between calls.
 ///
-/// Deduplicated on the exact `(extension_id, cap_id, version)` triple. When
-/// several installed versions of the same extension (e.g.
+/// Deduplicated on the full `(extension_id, cap_id, version, kind)` tuple.
+/// When several installed versions of the same extension (e.g.
 /// `greentic.adaptive-cards-2.1.0-research` through `-2.1.5-research`)
 /// register the same capability at the same reported `version`,
 /// `CapabilityRegistry::offerings()` yields several byte-identical bindings;
 /// without this, the admin payload reports the same offering many times over
-/// (seen live: 76 entries for 32 distinct extensions). `kind` is
-/// deliberately NOT part of the dedupe key — two bindings sharing a triple
-/// but differing in `kind` would be a genuine anomaly, not a duplicate, and
-/// must both surface.
+/// (seen live: 76 entries for 32 distinct extensions). `kind` is included in
+/// the key: two bindings sharing the `(extension_id, cap_id, version)`
+/// triple but disagreeing on `kind` are a genuine anomaly, not a duplicate,
+/// so they hash to different keys and both entries surface instead of one
+/// silently collapsing onto the other.
 #[cfg(feature = "agentic-worker")]
 fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> serde_json::Value {
     let mut offerings: Vec<&greentic_ext_runtime::OfferedBinding> = registry.offerings().collect();
@@ -118,6 +119,7 @@ fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> ser
                 offering.extension_id.clone(),
                 offering.cap_id.to_string(),
                 offering.version.to_string(),
+                offering.kind,
             ))
         })
         .map(|offering| {
@@ -300,6 +302,42 @@ mod tests {
                 "version": "0.1.0",
                 "kind": "DesignExtension"
             })
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn offerings_to_json_surfaces_same_triple_different_kind() {
+        use greentic_ext_runtime::{CapabilityRegistry, OfferedBinding};
+        use greentic_extension_sdk_contract::ExtensionKind;
+
+        // Two bindings share the exact (extension_id, cap_id, version) triple
+        // but disagree on `kind`. That is a genuine anomaly, not a duplicate:
+        // both must surface so the disagreement is visible rather than
+        // silently collapsed by the dedupe key.
+        let mut registry = CapabilityRegistry::new();
+        for kind in [ExtensionKind::Design, ExtensionKind::Bundle] {
+            registry.add_offering(OfferedBinding {
+                extension_id: "greentic.mixed-kind".to_string(),
+                cap_id: "greentic:guardrail/mixed".parse().unwrap(),
+                version: "0.1.0".parse().unwrap(),
+                kind,
+                export_path: String::new(),
+            });
+        }
+
+        let body = offerings_to_json(&registry);
+        let caps = body["capabilities"].as_array().unwrap();
+        assert_eq!(
+            caps.len(),
+            2,
+            "two bindings sharing a triple but differing in `kind` must both surface"
+        );
+        let kinds: std::collections::HashSet<_> =
+            caps.iter().map(|c| c["kind"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            std::collections::HashSet::from(["DesignExtension", "BundleExtension"])
         );
     }
 }
