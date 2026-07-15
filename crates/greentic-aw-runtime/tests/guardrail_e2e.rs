@@ -366,6 +366,7 @@ fn build_full_runtime(
         cap_id: "greentic:guardrail/pii".into(),
         offer_id: None,
         config: guardrail_config,
+        mode: greentic_aw_runtime::config::GuardrailMode::Enforce,
     }]));
 
     let tc = TenantContext::new("test-tenant", "test");

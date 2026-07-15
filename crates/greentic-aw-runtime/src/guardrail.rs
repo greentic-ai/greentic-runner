@@ -4,7 +4,7 @@ use std::pin::Pin;
 use greentic_ext_runtime::capability::CapabilityRegistry;
 use greentic_extension_sdk_contract::{CapabilityId, CapabilityRef as ExtCapabilityRef};
 
-use crate::config::GuardrailRef;
+use crate::config::{GuardrailMode, GuardrailRef};
 use crate::tenant::TenantContext;
 
 /// Failure obtaining the mandatory guardrail policy. Treated as fail-closed by
@@ -67,6 +67,7 @@ pub struct ResolvedGuardrail {
     pub extension_id: String,
     pub cap_id: String,
     pub mandatory: bool,
+    pub mode: GuardrailMode,
     pub config: serde_json::Value,
 }
 
@@ -230,6 +231,7 @@ fn resolve_one(
             extension_id: binding.extension_id.clone(),
             cap_id: guardrail_ref.cap_id.clone(),
             mandatory: is_mandatory,
+            mode: guardrail_ref.mode,
             config: guardrail_ref.config.clone(),
         }),
         None => {
@@ -396,6 +398,7 @@ mod tests {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let policy = StaticGuardrailPolicy(refs.clone());
         assert_eq!(policy.mandatory_guardrails(&t).await.unwrap(), refs);
@@ -429,11 +432,13 @@ mod tests {
             cap_id: "greentic:guardrail/toxicity".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let agent = vec![GuardrailRef {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
 
         let chain = assemble_chain(&registry, &mandatory, &agent).expect("all refs are registered");
@@ -453,6 +458,7 @@ mod tests {
             cap_id: "greentic:guardrail/missing".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         // Agent-level unresolved refs are skipped (fail-open); result must be Ok with empty chain.
         let chain =
@@ -470,6 +476,7 @@ mod tests {
             cap_id: "greentic:guardrail/missing-mandatory".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let result = assemble_chain(&registry, &mandatory, &[]);
         assert!(
@@ -497,11 +504,13 @@ mod tests {
             cap_id: "greentic:guardrail/pii".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let agent = vec![GuardrailRef {
             cap_id: "greentic:guardrail/not-registered".into(),
             offer_id: None,
             config: serde_json::Value::Null,
+            mode: GuardrailMode::Enforce,
         }];
         let chain = assemble_chain(&registry, &mandatory, &agent)
             .expect("unresolved agent-level ref must not fail the chain");
@@ -545,6 +554,7 @@ mod tests {
             extension_id: ext.into(),
             cap_id: "greentic.cap.guardrail.v1".into(),
             mandatory,
+            mode: GuardrailMode::Enforce,
             config: serde_json::Value::Null,
         }
     }
