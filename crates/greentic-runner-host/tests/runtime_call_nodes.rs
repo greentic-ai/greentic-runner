@@ -556,3 +556,62 @@ fn agentic_call_await_pauses_with_session_hint_correlation() -> Result<()> {
     );
     Ok(())
 }
+
+// ── approval.call tests ───────────────────────────────────────────────────────
+
+#[test]
+fn approval_call_await_parks_at_self_not_the_successor() -> Result<()> {
+    let rt = *RUNTIME;
+    let temp = TempDir::new()?;
+    let pack_path = temp.path().join("approval-await.gtpack");
+    let bindings_path = temp.path().join("bindings.yaml");
+    std::fs::write(&bindings_path, b"tenant: demo")?;
+
+    // `mode: always` → approval_requires_human → dispatch and park for a human.
+    build_dispatch_pack(
+        &pack_path,
+        "approval.call",
+        json!({ "await": true, "operation": "create", "input": { "mode": "always" } }),
+        true,
+    )?;
+
+    let config = Arc::new(host_config(&bindings_path));
+    let handler = Arc::new(RuntimeCapturingStub::default());
+    let (pack, engine) = build_engine(&pack_path, Arc::clone(&config), Arc::clone(&handler))?;
+
+    let ctx = flow_ctx(&config, pack.metadata().pack_id.as_str());
+    let execution = rt
+        .block_on(engine.execute(ctx, Value::Null))
+        .context("await approval.call run")?;
+
+    let wait = match execution.status {
+        FlowStatus::Waiting(wait) => wait,
+        FlowStatus::Completed => {
+            anyhow::bail!("flow completed but should have paused awaiting the approval decision")
+        }
+    };
+
+    // THE contract this feature exists for. Every sibling dispatch node
+    // (sorla/operala/agentic/telco-x, resume_at_self = false) parks at the
+    // routing successor — here that would be "done". approval.call re-enters
+    // ITSELF so its own routing can see the decision.
+    assert_eq!(
+        wait.snapshot.next_node, "call",
+        "approval.call must park at self, not at the successor"
+    );
+
+    let recorded = handler
+        .last
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("handler should have recorded a dispatch");
+    assert_eq!(
+        recorded.runtime, "approval",
+        "runtime name must be 'approval', got '{}'",
+        recorded.runtime
+    );
+    assert_eq!(recorded.mode, DispatchMode::Await);
+    assert_eq!(recorded.target, "dep-1");
+    Ok(())
+}
