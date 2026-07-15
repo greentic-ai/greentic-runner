@@ -206,6 +206,19 @@ behind `#[cfg(feature = "agentic-worker")]`.
 - **The `AwaitHere` single-slot interleaving limitation is inherited, not fixed**
   (`engine.rs:866-880`, tracked in-tree as a follow-up). The stray-inbound re-park
   is what keeps it safe here.
+- **⚠️ The `timeout` outcome can never fire without `deadline_ms`.** The watchdog is
+  spawned only for `(DispatchMode::Await, Some(deadline_ms))`
+  (`runner/remote_dispatch.rs:145-185`), and `deadline_ms` is read from the node input
+  (`engine.rs`, in `execute_remote_dispatch`). An approval node authored without it can
+  emit only `approved` / `denied` — so the designer's third palette port would be **dead
+  wiring**. The designer follow-up must either require `deadline_ms` when the `timeout`
+  branch is connected, or surface that the port is inert without it. (Found in the final
+  review; recorded here so it does not resurface as a "why does this port never fire" bug.)
+- **Inherited watchdog caveat.** The runner's cancellation-less, nonce-less dispatch
+  watchdog (documented in `CLAUDE.md`, the reverted `dw.agent` deadline) applies here too.
+  Lower risk for approval than for a looping node — it parks once — and a spurious timeout
+  now routes to the `timeout` branch rather than silently taking the success edge, which is
+  arguably an improvement. No action; worth a line in the PR summary.
 
 ## Non-goals
 
