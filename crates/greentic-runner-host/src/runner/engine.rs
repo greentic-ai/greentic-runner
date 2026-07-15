@@ -1244,7 +1244,8 @@ impl FlowEngine {
                 self.execute_telco_x_call(ctx, target, payload).await
             }
             NodeKind::ApprovalCall { target } => {
-                self.execute_approval_call(ctx, target, payload).await
+                self.execute_approval_call(ctx, node_id, target, payload, state)
+                    .await
             }
             NodeKind::Mcp { server_id, tool } => self
                 .execute_mcp(ctx, server_id, tool, payload)
@@ -1408,30 +1409,61 @@ impl FlowEngine {
             .await
     }
 
-    /// Dispatch an `approval.call` flow node. Applies the autonomy gate first:
-    /// when the gate says a human is NOT required, complete immediately on the
-    /// `approved` branch WITHOUT creating a pending approval; otherwise dispatch
-    /// to the `"approval"` runtime over the shared remote-dispatch seam (which
-    /// durably pauses the flow until the human resolves it).
+    /// Human-in-the-loop approval gate.
+    ///
+    /// Sets `meta["outcome"]` to `approved` / `denied` / `timeout` on every path,
+    /// so routing conditions (`event == "approved"`) work identically whether a
+    /// human decided or the gate auto-approved. `ok` cannot serve as the
+    /// discriminator: greentic-admin publishes `ok: true` for approve AND deny.
+    ///
+    /// Uses `resume_at_self = true` so the response re-enters THIS node and its
+    /// own routing sees the decision. `pending_approval_await` distinguishes the
+    /// first entry from the resume, and stops a stray inbound (which lands in the
+    /// same wait slot — see the keying note on `NodeControl::AwaitHere`) from
+    /// re-dispatching a duplicate approval request.
     async fn execute_approval_call(
         &self,
         ctx: &FlowContext<'_>,
+        node_id: &str,
         target: &str,
         payload: Value,
+        state: &mut ExecutionState,
     ) -> Result<DispatchOutcome> {
+        if state.take_approval_await(node_id) {
+            if entry_is_approval_response(&state.entry) {
+                let outcome = approval_outcome_from_entry(&state.entry);
+                let output = NodeOutput::with_meta(
+                    state.entry.clone(),
+                    serde_json::json!({ "outcome": outcome }),
+                );
+                return Ok(DispatchOutcome::complete(output));
+            }
+            // A user activity arrived while we were parked. Re-park without
+            // re-dispatching; the correlation id is discarded by the AwaitHere
+            // handler, so re-parking needs nothing from the original dispatch.
+            state.mark_approval_await(node_id);
+            return Ok(DispatchOutcome::await_here(
+                NodeOutput::new(serde_json::json!({ "pending": true })),
+                Some("awaiting approval decision".to_string()),
+                String::new(),
+            ));
+        }
+
         let input = payload.get("input").cloned().unwrap_or(Value::Null);
         if !approval_requires_human(&input) {
-            // Match the shape the resume path injects ({ok, output, error})
-            // so downstream conditions read the decision at the same
-            // relative path regardless of whether a human was involved.
-            let output = NodeOutput::new(serde_json::json!({
-                "ok": true,
-                "output": { "decision": "approved", "auto": true },
-                "error": serde_json::Value::Null,
-            }));
+            let output = NodeOutput::with_meta(
+                serde_json::json!({
+                    "ok": true,
+                    "output": { "decision": "approved", "auto": true },
+                    "error": serde_json::Value::Null,
+                }),
+                serde_json::json!({ "outcome": "approved" }),
+            );
             return Ok(DispatchOutcome::complete(output));
         }
-        self.execute_remote_dispatch(ctx, "approval", target, payload, false)
+
+        state.mark_approval_await(node_id);
+        self.execute_remote_dispatch(ctx, "approval", target, payload, true)
             .await
     }
 
@@ -2535,18 +2567,12 @@ impl ExecutionState {
     }
 
     /// Mark `node_id` as parked awaiting an approval decision.
-    // `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
-    // consumer and wires this in; the allow is removed there.
-    #[allow(dead_code)]
     fn mark_approval_await(&mut self, node_id: &str) {
         self.pending_approval_await.insert(node_id.to_string(), ());
     }
 
     /// Check-and-clear: returns whether `node_id` dispatched an approval and is
     /// awaiting the decision.
-    // `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
-    // consumer and wires this in; the allow is removed there.
-    #[allow(dead_code)]
     fn take_approval_await(&mut self, node_id: &str) -> bool {
         self.pending_approval_await.remove(node_id).is_some()
     }
@@ -4003,9 +4029,6 @@ fn approval_requires_human(input: &Value) -> bool {
 /// activity. The dispatch response always carries a top-level `ok`
 /// (`{ok, output, events, error}`); an inbound activity never does. Mirrors the
 /// conversational `dw.agent` discriminator (`state.entry.get("ok").is_some()`).
-// `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
-// consumer and wires this in; the allow is removed there.
-#[allow(dead_code)]
 fn entry_is_approval_response(entry: &Value) -> bool {
     entry.get("ok").is_some()
 }
@@ -4020,9 +4043,6 @@ fn entry_is_approval_response(entry: &Value) -> bool {
 /// Fails closed: an unrecognised or absent decision is `denied`, mirroring
 /// `approval_requires_human`'s own `_ => true` fail-safe. A corrupt payload must
 /// never become a pass.
-// `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
-// consumer and wires this in; the allow is removed there.
-#[allow(dead_code)]
 fn approval_outcome_from_entry(entry: &Value) -> &'static str {
     let timed_out = entry
         .pointer("/error/code")
@@ -5617,6 +5637,42 @@ mod tests {
         match evaluate_custom_routing(&raw_routing, &routed, &state, &flow_ir, &current) {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err"),
             other => panic!("expected Next(\"err\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approval_outcomes_route_three_ways() {
+        // The contract this feature exists for: an approval node's decision
+        // selects the branch. `meta["outcome"]` wins over the ok-derived
+        // default, so `ok: true` still routes to "denied" when denied.
+        let raw_routing = json!([
+            { "condition": "event == \"approved\"", "to": "do_it" },
+            { "condition": "event == \"denied\"", "to": "reject" },
+            { "condition": "event == \"timeout\"", "to": "escalate" }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+        };
+        let current = NodeId::from_str("gate").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        for (outcome, expected) in [
+            ("approved", "do_it"),
+            ("denied", "reject"),
+            ("timeout", "escalate"),
+        ] {
+            let out = NodeOutput::with_meta(json!({}), json!({ "outcome": outcome }));
+            match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+                CustomRoutingDecision::Next(nid) => assert_eq!(
+                    nid.as_str(),
+                    expected,
+                    "outcome {outcome} must route to {expected}"
+                ),
+                other => panic!("outcome {outcome}: expected Next({expected}), got {other:?}"),
+            }
         }
     }
 
