@@ -91,6 +91,10 @@ pub async fn reload(AdminGuard: AdminGuard, State(state): State<ServerState>) ->
 /// Sorted by `(cap_id, extension_id)`: `offerings()` walks a `HashMap`, so the
 /// order is otherwise arbitrary between calls.
 #[cfg(feature = "agentic-worker")]
+// Removed in Task 3, which adds the `/admin/capabilities` handler that calls
+// this. Until that caller exists the lib target has none, and the crate builds
+// under `-D warnings`.
+#[allow(dead_code)]
 fn offerings_to_json(registry: &greentic_ext_runtime::CapabilityRegistry) -> serde_json::Value {
     let mut offerings: Vec<&greentic_ext_runtime::OfferedBinding> = registry.offerings().collect();
     offerings.sort_by(|a, b| {
