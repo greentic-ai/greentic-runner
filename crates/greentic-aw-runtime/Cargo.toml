@@ -1,0 +1,82 @@
+[package]
+name        = "greentic-aw-runtime"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redis state, tool dispatch via greentic-ext-runtime"
+
+[features]
+default   = []
+test-mock = []
+# Multi-provider in-process LLM backend: routes the worker's LLM call through
+# greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
+# instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
+greentic-llm-backend = ["dep:greentic-llm"]
+# Dev/desktop escape hatch: load unsigned tool extensions (still requires
+# GREENTIC_EXT_ALLOW_UNSIGNED=1 at runtime). Never enable in published builds.
+dev-allow-unsigned = ["greentic-ext-runtime/dev-allow-unsigned"]
+# NATS serve mode (agentic.call out-of-process dispatch). Pulls in the event
+# bridge + async-nats; `aw-serve` additionally needs `test-mock` for its
+# credit-free canned-reply runtime.
+serve     = ["dep:aw-event-bridge", "dep:async-nats"]
+
+[[bin]]
+name = "aw-serve"
+path = "src/bin/aw_serve.rs"
+required-features = ["serve", "test-mock"]
+
+[dependencies]
+anyhow              = { workspace = true }
+async-trait         = { workspace = true } # Used ONLY for object-safe trait bounds where RPITIT cannot be expressed (none in MVP); kept for forward-compat; do NOT use on AW traits.
+async-nats          = { version = "0.49", optional = true }
+aw-event-bridge     = { path = "../aw-event-bridge", version = ">=1.2.0-dev, <1.3.0-0", optional = true }
+# Store-pull + verify (Task 2): download a .gtxpack, verify sha256 + the Ed25519
+# signature on its describe.json, extract extension.wasm into the local cache.
+# Versions track the runner workspace lock (zip 8, ed25519-dalek 2, sha2 0.11,
+# base64 0.22) so no second copy is resolved.
+base64              = { workspace = true }
+ed25519-dalek       = { workspace = true }
+sha2                = { workspace = true }
+zip                 = { workspace = true }
+chrono              = { version = "0.4", features = ["serde"] }
+dashmap             = { workspace = true }
+futures             = { workspace = true }
+greentic-dw-manifest = "=1.1.1"
+# Episodic long-term memory contract (LongTermMemory trait + DTOs). Lightweight:
+# the trait crate only — the heavy Chronicle/Neo4j backend impl is injected at
+# the runner-host edge, never compiled into this runtime crate.
+greentic-dw-memory-long-term = "=1.1.0"
+greentic-ext-runtime = "=1.2.24"
+greentic-extension-sdk-contract = "=1.1.2"
+# Multi-provider LLM door (rig-core under the hood). Optional — see the
+# `greentic-llm-backend` feature.
+greentic-llm = { version = "=1.2.6-research", optional = true }
+greentic-secrets-lib = { workspace = true }
+greentic-types       = { workspace = true }
+# MCP transport for the agentic-worker MCP tool source (MCP-4). reqwest 0.13.
+greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
+# Local (in-process) wasix:mcp executor for the local-wasm transport (Task 3).
+greentic-mcp-exec = { version = "=1.1.2" }
+greentic-state      = { workspace = true }
+greentic-telemetry  = { workspace = true }
+redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
+reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+secrecy             = "0.10"
+serde               = { version = "1", features = ["derive"] }
+serde_json          = { workspace = true }
+# JCS (RFC 8785) canonicalization — MUST match the store's describe signing
+# (greentic-store-server signs `serde_jcs::to_vec(&describe)`); the local-wasm
+# MCP signature verify reconstructs the same bytes.
+serde_jcs           = "0.1"
+thiserror           = { workspace = true }
+tokio               = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing             = { workspace = true }
+url                 = { workspace = true }
+uuid                = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+semver = "1"
+serial_test = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+wiremock = "0.6"

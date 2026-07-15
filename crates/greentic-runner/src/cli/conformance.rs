@@ -917,6 +917,10 @@ fn build_host(enable_trace: bool) -> Result<RunnerHost> {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     };
 
     let wasi_policy = RunnerWasiPolicy::default().inherit_stdio(false);

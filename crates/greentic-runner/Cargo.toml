@@ -56,6 +56,7 @@ required-features = ["legacy-gen-bindings"]
 # them on the host crate and mirror them here if you need them surfaced.
 default = ["verify"]
 verify = ["greentic-runner-host/verify"]
+telemetry = ["greentic-runner-host/telemetry"]
 session-redis = ["greentic-runner-host/session-redis"]
 component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]

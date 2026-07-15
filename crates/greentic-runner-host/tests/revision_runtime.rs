@@ -70,6 +70,10 @@ fn host_config(bindings_path: &Path) -> Arc<HostConfig> {
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        #[cfg(feature = "agentic-worker")]
+        agents: std::collections::HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: std::collections::HashMap::new(),
     })
 }
 

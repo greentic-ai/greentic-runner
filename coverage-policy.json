@@ -14,7 +14,16 @@
       "crates/greentic-runner/src/gen_bindings/component.rs",
       "crates/greentic-runner/examples/run_demo.rs",
       "crates/greentic-runner-host/src/runner/mod.rs",
-      "crates/runner-core/examples/resolve_fs.rs"
+      "crates/runner-core/examples/resolve_fs.rs",
+      "crates/greentic-aw-runtime/src/bin/aw_serve.rs",
+      "crates/telco-x-event-bridge/src/bin/telco-x-serve.rs",
+      "crates/greentic-aw-runtime/src/state_redis.rs",
+      "crates/greentic-aw-runtime/src/graph/redis_checkpoint.rs",
+      "crates/aw-event-bridge/src/jetstream.rs",
+      "crates/greentic-runner-host/src/runner/dispatch_listener.rs",
+      "crates/greentic-runner-host/src/runner/mcp_warm_listener.rs",
+      "crates/greentic-runner-host/src/greentic_x_provider.rs",
+      "crates/greentic-aw-runtime/src/cost.rs"
     ]
   },
   "per_file": {

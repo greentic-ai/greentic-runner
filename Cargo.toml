@@ -15,6 +15,11 @@ exclude = [
     "tests/fixtures/runner-components",
     "tests/fixtures/wasi-p2-smoke",
     "tests/assets/provider-core-dummy",
+    # Main-only crates: not yet integrated into develop (their transitive deps
+    # pin 1.1.x interfaces which conflict with develop's 1.2.x ranges).
+    "crates/greentic-aw-runtime",
+    "crates/aw-event-bridge",
+    "crates/telco-x-event-bridge",
 ]
 
 [workspace.package]
@@ -258,3 +263,8 @@ features = [
 [profile.release.package.echo-secret]
 opt-level = "z"
 strip = true
+
+# SDK 1.2.4-research is git-tagged only (the SDK repo's research line is
+# intentionally not republished to crates.io). Redirect the crates.io
+# requirement from greentic-ext-runtime v1.2.13-research onto the git
+# tag so the workspace can adopt it without waiting on a registry release.

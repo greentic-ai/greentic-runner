@@ -3815,7 +3815,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yaml_bw",
+ "serde_yaml_gtc",
  "time",
  "zip 6.0.0",
 ]
@@ -3978,17 +3978,6 @@ checksum = "4fb771b59f6b1985d1406325ec28f97cfb14256abcec4fdfb37b36a1766d6af7"
 dependencies = [
  "arraydeque",
  "hashlink",
-]
-
-[[package]]
-name = "saphyr-parser-bw"
-version = "0.0.611"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67dec0c833db75dc98957956b303fe447ffc5eb13f2325ef4c2350f7f3aa69e3"
-dependencies = [
- "arraydeque",
- "smallvec",
- "thiserror 2.0.17",
 ]
 
 [[package]]

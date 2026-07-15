@@ -23,6 +23,7 @@ telemetry = []
 greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
 [dependencies]
+async-nats = "0.49"
 async-trait.workspace = true
 anyhow.workspace = true
 arc-swap.workspace = true
@@ -79,6 +80,15 @@ handlebars.workspace = true
 dashmap.workspace = true
 wasmtime-environ.workspace = true
 jsonschema.workspace = true
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "chrono",
+    "json",
+] }
+subtle = "2"
 
 # External stack components
 wasmtime = { workspace = true }
@@ -100,6 +110,9 @@ opentelemetry = "0.31"
 opentelemetry_sdk = "0.31"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["registry"] }
+tower.workspace = true
+http-body-util = "0.1"
+wiremock = "0.6"
 
 [[bench]]
 name = "perf"

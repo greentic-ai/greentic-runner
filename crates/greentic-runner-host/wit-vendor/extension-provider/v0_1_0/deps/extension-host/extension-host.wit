@@ -1,0 +1,55 @@
+package greentic:extension-host@0.1.0;
+
+interface logging {
+  enum level {
+    trace,
+    debug,
+    info,
+    warn,
+    error,
+  }
+  log: func(level: level, target: string, message: string);
+  log-kv: func(level: level, target: string, message: string,
+               fields: list<tuple<string, string>>);
+}
+
+interface i18n {
+  t: func(key: string) -> string;
+  tf: func(key: string, args: list<tuple<string, string>>) -> string;
+}
+
+interface secrets {
+  get: func(uri: string) -> result<string, string>;
+}
+
+interface broker {
+  call-extension: func(
+    kind: string,
+    target-id: string,
+    function: string,
+    args-json: string
+  ) -> result<string, string>;
+}
+
+interface http {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+  }
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+  fetch: func(req: request) -> result<response, string>;
+}
+
+world extension-host-world {
+  import logging;
+  import i18n;
+  import secrets;
+  import broker;
+  import http;
+}

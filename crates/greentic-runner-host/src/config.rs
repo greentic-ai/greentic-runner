@@ -35,6 +35,21 @@ pub struct HostConfig {
     pub validation: ValidationConfig,
     pub operator_policy: OperatorPolicy,
     pub fast2flow: Fast2FlowRoutingConfig,
+    /// Operator-declared Digital Worker agent configs, keyed by `agent_id`.
+    /// Sourced from the `agents:` section of the bindings YAML and consumed
+    /// by the production `ConfigProvider` (Task 4.3).
+    /// Only populated when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
+    /// Operator/producer-declared agent-graph configs, keyed by `graph_id`.
+    /// The pack loader (Task 8) reads `agent-graph.json` sidecars directly, but
+    /// this map is the contract that external producers (e.g. greentic-start's
+    /// env-file path, the admin registry hand-off) populate to supply graphs
+    /// that do not ship as a pack sidecar. Merged with pack-sidecar graphs at
+    /// runtime construction (producer entries win on `graph_id` collision).
+    /// Only populated when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    pub graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +73,20 @@ pub struct BindingsFile {
     pub operator: OperatorPolicyConfig,
     #[serde(default)]
     pub fast2flow: Fast2FlowRoutingConfig,
+    /// Digital Worker agent configs keyed by `agent_id`. The whole section is
+    /// optional; each value must be a complete `AgentConfig` (all `limits`
+    /// fields are required — `AgentLimits` has no serde defaults).
+    /// Only present when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    #[serde(default)]
+    pub agents: HashMap<String, greentic_aw_runtime::AgentConfig>,
+    /// Operator-declared agent-graph configs keyed by `graph_id`. The whole
+    /// section is optional; each value must be a complete `GraphConfig`
+    /// (camelCase fields, same wire shape as the `agent-graph.json` sidecar).
+    /// Only present when the `agentic-worker` feature is enabled.
+    #[cfg(feature = "agentic-worker")]
+    #[serde(default)]
+    pub graphs: HashMap<String, greentic_aw_runtime::graph::GraphConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -193,6 +222,8 @@ pub struct OAuthConfig {
     pub env: Option<String>,
     #[serde(default)]
     pub team: Option<String>,
+    #[serde(default)]
+    pub shared_secret: Option<String>,
 }
 
 impl HostConfig {
@@ -238,6 +269,10 @@ impl HostConfig {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::from_config(bindings.operator.clone()),
             fast2flow: bindings.fast2flow.clone(),
+            #[cfg(feature = "agentic-worker")]
+            agents: bindings.agents.clone(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: bindings.graphs.clone(),
         })
     }
 
@@ -265,6 +300,15 @@ impl HostConfig {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
             fast2flow: Fast2FlowRoutingConfig::default(),
+            // TODO(phase-4): TenantBindings (gtbind) has no agents section yet.
+            // When embedded gtbind hosts need Digital Worker agents, extend
+            // TenantBindings to carry them and populate this map here.
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            // TODO(phase-4): likewise, gtbind carries no agent-graph section;
+            // pack sidecars remain the local source of graphs for now.
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
     }
 
@@ -277,6 +321,14 @@ impl HostConfig {
     }
 
     pub fn oauth_broker_config(&self) -> Option<OAuthBrokerConfig> {
+        let env_secret = std::env::var("GREENTIC_OAUTH_BROKER_SHARED_SECRET").ok();
+        self.oauth_broker_config_with_env(env_secret.as_deref())
+    }
+
+    /// Internal builder that accepts the env-var value explicitly so that
+    /// tests can exercise the priority logic without mutating the process
+    /// environment (which is unsafe in Rust 2024).
+    fn oauth_broker_config_with_env(&self, env_secret: Option<&str>) -> Option<OAuthBrokerConfig> {
         let oauth = self.oauth.as_ref()?;
         let mut cfg = OAuthBrokerConfig::new(&oauth.http_base_url, &oauth.nats_url);
         if !oauth.provider.is_empty() {
@@ -287,6 +339,10 @@ impl HostConfig {
         {
             cfg.team = Some(team.clone());
         }
+        // Prefer env var; fall back to yaml field. Never log the value.
+        cfg.shared_secret = env_secret
+            .map(str::to_owned)
+            .or_else(|| oauth.shared_secret.clone());
         Some(cfg)
     }
 
@@ -557,7 +613,62 @@ mod tests {
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
             fast2flow: Fast2FlowRoutingConfig::default(),
+            #[cfg(feature = "agentic-worker")]
+            agents: HashMap::new(),
+            #[cfg(feature = "agentic-worker")]
+            graphs: HashMap::new(),
         }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn load_from_path_parses_agents_section() {
+        // All seven `limits` fields are required: AgentLimits has no serde
+        // defaults, so operator-authored YAML must spell each one out.
+        let yaml = r#"
+tenant: acme
+agents:
+  greeter:
+    agent_id: greeter
+    system_prompt: "You are a greeter."
+    tools: []
+    llm:
+      provider: openai
+      model: gpt-4o-mini
+    limits:
+      max_iter: 8
+      timeout: 60
+      max_history_turns: 20
+      llm_retry_attempts: 3
+      llm_retry_backoff: 250
+      provider_failure_message: null
+      daily_token_cap_per_tenant: null
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = HostConfig::load_from_path(&path).unwrap();
+        assert!(cfg.agents.contains_key("greeter"));
+        let greeter = &cfg.agents["greeter"];
+        assert_eq!(greeter.system_prompt, "You are a greeter.");
+        assert_eq!(greeter.limits.max_iter, 8);
+        // duration_secs / duration_ms custom serde maps the integers above.
+        assert_eq!(greeter.limits.timeout, std::time::Duration::from_secs(60));
+        assert_eq!(
+            greeter.limits.llm_retry_backoff,
+            std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn load_from_path_omitted_agents_section_yields_empty_map() {
+        let yaml = "tenant: acme\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let cfg = HostConfig::load_from_path(&path).unwrap();
+        assert!(cfg.agents.is_empty());
     }
 
     #[test]
@@ -662,12 +773,67 @@ fast2flow:
             provider: "demo".into(),
             env: None,
             team: Some("ops".into()),
+            shared_secret: None,
         }));
-        let broker = cfg.oauth_broker_config().expect("missing broker config");
+        // Use `_with_env(None)` so the test is not perturbed by a set
+        // GREENTIC_OAUTH_BROKER_SHARED_SECRET environment variable.
+        let broker = cfg
+            .oauth_broker_config_with_env(None)
+            .expect("missing broker config");
         assert_eq!(broker.http_base_url, "https://oauth.example/");
         assert_eq!(broker.nats_url, "nats://broker:4222");
         assert_eq!(broker.default_provider.as_deref(), Some("demo"));
         assert_eq!(broker.team.as_deref(), Some("ops"));
+        assert!(broker.shared_secret.is_none());
+    }
+
+    #[test]
+    fn oauth_broker_config_maps_shared_secret_from_yaml() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        // Pass None as the env var to exercise the yaml-field fallback path.
+        let broker = cfg
+            .oauth_broker_config_with_env(None)
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("yaml-secret"));
+    }
+
+    #[test]
+    fn oauth_broker_config_env_overrides_yaml_shared_secret() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: Some("yaml-secret".into()),
+        }));
+        let broker = cfg
+            .oauth_broker_config_with_env(Some("env-secret"))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("env-secret"));
+    }
+
+    #[test]
+    fn oauth_broker_config_env_provides_secret_when_yaml_absent() {
+        let cfg = host_config_with_oauth(Some(OAuthConfig {
+            http_base_url: "https://oauth.example/".into(),
+            nats_url: "nats://broker:4222".into(),
+            provider: "demo".into(),
+            env: None,
+            team: None,
+            shared_secret: None,
+        }));
+        let broker = cfg
+            .oauth_broker_config_with_env(Some("env-only-secret"))
+            .expect("missing broker config");
+        assert_eq!(broker.shared_secret.as_deref(), Some("env-only-secret"));
     }
 
     #[test]

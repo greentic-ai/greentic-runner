@@ -438,6 +438,54 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         engine.set_cross_pack_resolver(resolver);
     }
 
+    #[cfg(feature = "agentic-worker")]
+    {
+        #[cfg(feature = "desktop-agent-ephemeral")]
+        use greentic_runner_host::runner::agent_node::build_agent_node_handler_ephemeral;
+        use greentic_runner_host::runner::agent_node::{
+            agent_configs_from_manifest, build_agent_node_handler, merge_agent_sources,
+        };
+
+        let blobs = pack.manifest_agent_blobs();
+        if !blobs.is_empty() {
+            let pack_agents = agent_configs_from_manifest(&pack.metadata().pack_id, &blobs);
+            let merged = merge_agent_sources(pack_agents, HashMap::new());
+            let tenant = resolved_profile.tenant_id.clone();
+            let sm = resolve_secrets_manager(&opts)?;
+            let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let handler = if redis_set {
+                build_agent_node_handler(merged, tenant, sm, vec![Arc::clone(&pack)], None).await
+            } else {
+                #[cfg(feature = "desktop-agent-ephemeral")]
+                {
+                    build_agent_node_handler_ephemeral(
+                        merged,
+                        tenant,
+                        sm,
+                        vec![Arc::clone(&pack)],
+                        None,
+                    )
+                    .await
+                }
+                #[cfg(not(feature = "desktop-agent-ephemeral"))]
+                {
+                    let _ = (merged, tenant, sm);
+                    tracing::info!(
+                        "GREENTIC_AW_REDIS_URL unset and desktop-agent-ephemeral feature \
+                         off; dw.agent nodes disabled"
+                    );
+                    None
+                }
+            };
+            if let Some(handler) = handler {
+                engine.set_agent_node_handler(handler);
+                tracing::info!("DwAgent runtime wired into desktop FlowEngine");
+            }
+        }
+    }
+
     let started_at = OffsetDateTime::now_utc();
     let tenant_str = host_config.tenant.clone();
     let session_id_owned = resolved_profile.session_id.clone();
@@ -457,6 +505,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         attempt: 1,
         observer: Some(recorder_ref),
         mocks: Some(mock_ref),
+        reply_scope: None,
     };
 
     // Resume support: if the caller wired up a session_state_dir AND ctx
@@ -756,6 +805,13 @@ fn build_host_config(
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
         fast2flow: Default::default(),
+        // The `agents` and `graphs` fields are present only when the host is
+        // compiled with the `agentic-worker` feature, which this crate
+        // propagates via its own same-named feature flag.
+        #[cfg(feature = "agentic-worker")]
+        agents: HashMap::new(),
+        #[cfg(feature = "agentic-worker")]
+        graphs: HashMap::new(),
     }
 }
 

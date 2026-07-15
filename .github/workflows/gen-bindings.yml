@@ -2,10 +2,16 @@ name: Bindings generator
 permissions:
   contents: read
 
+# NOTE: no `pull_request:` trigger. This job runs `cargo test --package
+# greentic-runner`, which resolves the whole workspace; cargo then clones the
+# cross-org private repo `greentic-biz/greentic-chronicle-ext` (optional
+# `knowledge-chronicle` deps) during resolution. PR CI lacks cross-org
+# credentials, so it always failed at dependency-fetch — pure red noise on every
+# PR. Restore the `pull_request:` trigger once a cross-org deploy-key/PAT is
+# provisioned (see ci.yml for the same rationale).
 on:
   push:
     branches: [main]
-  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
