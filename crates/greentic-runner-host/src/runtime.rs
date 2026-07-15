@@ -305,7 +305,16 @@ impl TenantRuntime {
             // the `knowledge-chronicle` feature or when no pack carries a corpus.
             #[cfg(feature = "knowledge-chronicle")]
             {
-                let corpus = crate::runner::knowledge_corpus::collect(&pack_runtimes);
+                // The expectation comes from the same config `ingest_corpus` will
+                // build its embedder from, so precomputed vectors are validated
+                // against the embedder that actually runs.
+                let expectation = crate::runner::knowledge_mount::embedding_expectation();
+                let corpus = crate::runner::knowledge_corpus::collect(
+                    &pack_runtimes,
+                    expectation.as_ref().map(|(model, dim)| {
+                        crate::runner::knowledge_corpus::EmbeddingExpectation { model, dim: *dim }
+                    }),
+                );
                 crate::runner::knowledge_mount::ingest_corpus(&config.tenant_ctx(), corpus).await;
             }
 
