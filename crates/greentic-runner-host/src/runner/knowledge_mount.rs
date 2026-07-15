@@ -46,7 +46,20 @@ const ENV_SURREAL_PATH: &str = "GREENTIC_KNOWLEDGE_SURREAL_PATH";
 const DEFAULT_BACKEND: &str = "surreal-embedded";
 /// Default on-disk location for the embedded SurrealDB knowledge store. Distinct
 /// from the long-term-memory default so the two tiers never open the same store.
-const DEFAULT_SURREAL_PATH: &str = "/var/lib/greentic/knowledge";
+///
+/// Prefers the per-user `~/.greentic/knowledge` and only falls back to the
+/// system path — the same convention [`crate::runner::aw_backends`] uses for the
+/// agent state store. A bare `/var/lib/greentic` default is unwritable for any
+/// non-root process (e.g. the designer's Test-chat sidecar), and the mount
+/// failure is GRACEFUL ("knowledge disabled"), so vector retrieval silently
+/// yields nothing instead of erroring. Root/systemd deployments have no `HOME`
+/// and keep the system path.
+fn default_surreal_path() -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}/.greentic/knowledge"),
+        _ => "/var/lib/greentic/knowledge".to_string(),
+    }
+}
 // Neo4j (backend=neo4j) — may point at the same server long-term memory uses; the
 // `knowledge:<tenant>` group_id keeps corpora isolated from memory graph entities.
 const ENV_NEO4J_URI: &str = "GREENTIC_KNOWLEDGE_NEO4J_URI";
@@ -147,8 +160,7 @@ fn resolve_backend() -> Option<BackendChoice> {
     let kind = std::env::var(ENV_BACKEND).unwrap_or_else(|_| DEFAULT_BACKEND.to_string());
     match kind.as_str() {
         "surreal-embedded" => {
-            let path = std::env::var(ENV_SURREAL_PATH)
-                .unwrap_or_else(|_| DEFAULT_SURREAL_PATH.to_string());
+            let path = std::env::var(ENV_SURREAL_PATH).unwrap_or_else(|_| default_surreal_path());
             Some(BackendChoice::SurrealEmbedded { path })
         }
         "surreal-memory" => Some(BackendChoice::SurrealMemory),
@@ -452,7 +464,7 @@ mod tests {
         assert_eq!(
             resolve_backend(),
             Some(BackendChoice::SurrealEmbedded {
-                path: DEFAULT_SURREAL_PATH.to_string()
+                path: default_surreal_path()
             })
         );
         clear_backend_env();
