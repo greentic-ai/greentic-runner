@@ -5818,40 +5818,42 @@ mod tests {
         }
     }
 
-    /// `evaluate_simple_condition` backs the user-authored `conditional_branch`
-    /// expressions the catalog documents (e.g. `register.q_age >= 18`,
-    /// `submit.status == "ok"`). Beyond `==`/`!=` it must handle numeric
-    /// ordering (`>=` `<=` `>` `<`) and `contains` (case-insensitive substring);
-    /// otherwise those conditions silently evaluate to false and route wrong.
+    /// `evaluate_simple_condition` is a pure expression-parser test: it checks
+    /// operator parsing over an arbitrary, hand-built JSON context. This
+    /// context is **not** the shape `build_routing_context` produces at
+    /// runtime — it is not node-keyed, and the keys below (`a`/`b`/`c`) are
+    /// deliberately arbitrary so they cannot be mistaken for node ids. For
+    /// coverage of the real routing context (prior node outputs exposed
+    /// under `node.<id>`), see
+    /// `routing_context_exposes_prior_node_outputs_under_node`.
+    ///
+    /// What this test does pin (PR #486): beyond `==`/`!=`, the parser must
+    /// handle numeric ordering (`>=` `<=` `>` `<`) and `contains`
+    /// (case-insensitive substring); otherwise those conditions silently
+    /// evaluate to false and route wrong.
     #[test]
     fn condition_evaluator_supports_comparisons_and_contains() {
         let ctx = json!({
-            "register": { "q_age": 18 },
-            "submit": { "status": "ok" },
-            "msg": { "text": "Hello World" }
+            "a": { "age": 18 },
+            "b": { "status": "ok" },
+            "c": { "text": "Hello World" }
         });
 
         // Numeric ordering (operands parsed as numbers).
-        assert!(evaluate_simple_condition("register.q_age >= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age > 18", &ctx));
-        assert!(evaluate_simple_condition("register.q_age <= 18", &ctx));
-        assert!(!evaluate_simple_condition("register.q_age < 18", &ctx));
+        assert!(evaluate_simple_condition("a.age >= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age > 18", &ctx));
+        assert!(evaluate_simple_condition("a.age <= 18", &ctx));
+        assert!(!evaluate_simple_condition("a.age < 18", &ctx));
 
         // contains: case-insensitive substring over the resolved string.
-        assert!(evaluate_simple_condition(
-            "msg.text contains \"world\"",
-            &ctx
-        ));
-        assert!(!evaluate_simple_condition(
-            "msg.text contains \"bye\"",
-            &ctx
-        ));
+        assert!(evaluate_simple_condition("c.text contains \"world\"", &ctx));
+        assert!(!evaluate_simple_condition("c.text contains \"bye\"", &ctx));
 
         // Existing equality semantics unchanged (regression guard).
-        assert!(evaluate_simple_condition("submit.status == \"ok\"", &ctx));
-        assert!(!evaluate_simple_condition("submit.status != \"ok\"", &ctx));
+        assert!(evaluate_simple_condition("b.status == \"ok\"", &ctx));
+        assert!(!evaluate_simple_condition("b.status != \"ok\"", &ctx));
         // A non-numeric operand on an ordering op is false, not a panic.
-        assert!(!evaluate_simple_condition("submit.status >= 1", &ctx));
+        assert!(!evaluate_simple_condition("b.status >= 1", &ctx));
     }
 
     /// A routing condition must be able to read ANY prior node's output, not
