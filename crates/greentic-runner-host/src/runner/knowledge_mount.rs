@@ -14,9 +14,11 @@
 //! distinct path. The graph store is operator-selectable via
 //! `GREENTIC_KNOWLEDGE_BACKEND`, defaulting to embedded SurrealDB so document RAG
 //! works with no external graph server. The embedding endpoint
-//! (`GREENTIC_KNOWLEDGE_EMBED_*`, any OpenAI-compatible API) is the opt-in signal:
-//! absent it — or on a config / connection failure — the knowledge tier simply
-//! stays disabled; it never fails runtime construction.
+//! (`GREENTIC_KNOWLEDGE_EMBED_*`, any OpenAI-compatible API) is the opt-in signal —
+//! specifically its **key + model**; the base URL is optional and defaults to the
+//! embeddings client's provider default (a plain OpenAI provider has no explicit
+//! endpoint). Absent the signal — or on a config / connection failure — the
+//! knowledge tier simply stays disabled; it never fails runtime construction.
 
 use std::sync::Arc;
 
@@ -111,20 +113,27 @@ pub async fn attach(runtime: AgentRuntime) -> AgentRuntime {
     }
 }
 
-/// Build the knowledge embedding config from the environment. The embedding
-/// endpoint (base URL + key + model) is mandatory — its absence is how an operator
-/// opts out — so a missing value returns `None` and leaves knowledge disabled.
+/// Build the knowledge embedding config from the environment. The **key + model**
+/// are mandatory — their absence is how an operator opts out — so a missing value
+/// returns `None` and leaves knowledge disabled.
+///
+/// The base URL is OPTIONAL: `KnowledgeConfig::openai_base_url` is an `Option`
+/// whose `None` means "the embeddings client's provider default". Requiring it
+/// here contradicted that and disabled knowledge for the most common setup — a
+/// plain OpenAI embedding provider, which legitimately has no explicit endpoint.
 fn build_config() -> Option<KnowledgeConfig> {
-    let base_url = std::env::var(ENV_EMBED_BASE_URL).ok()?;
     let api_key = std::env::var(ENV_EMBED_API_KEY).ok()?;
     let model = std::env::var(ENV_EMBED_MODEL).ok()?;
+    let base_url = std::env::var(ENV_EMBED_BASE_URL)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let embedding_dim = std::env::var(ENV_EMBED_DIM)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_EMBEDDING_DIM);
 
     let mut config = KnowledgeConfig::new(embedding_dim);
-    config.openai_base_url = Some(base_url);
+    config.openai_base_url = base_url;
     config.openai_api_key = Some(api_key);
     config.embedding_model = Some(model);
     Some(config)
@@ -599,6 +608,30 @@ mod tests {
         set(ENV_EMBED_BASE_URL, "https://api.example/v1");
         set(ENV_EMBED_API_KEY, "sk-test");
         assert!(build_config().is_none());
+        clear_embed_env();
+    }
+
+    #[test]
+    #[serial]
+    fn build_config_enabled_without_base_url() {
+        // The common setup — a plain OpenAI embedding provider — carries no
+        // explicit endpoint. `openai_base_url: None` means "provider default", so
+        // key + model alone must ENABLE knowledge; requiring a base URL here
+        // silently disabled the whole tier (and the caller had already skipped the
+        // static KB injection, losing the documents entirely).
+        clear_embed_env();
+        set(ENV_EMBED_API_KEY, "sk-test");
+        set(ENV_EMBED_MODEL, "text-embedding-3-small");
+        let config = build_config().expect("key + model alone must enable knowledge");
+        assert!(
+            config.openai_base_url.is_none(),
+            "absent base URL must stay None (provider default), not be invented"
+        );
+        assert_eq!(config.openai_api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            config.embedding_model.as_deref(),
+            Some("text-embedding-3-small")
+        );
         clear_embed_env();
     }
 }
