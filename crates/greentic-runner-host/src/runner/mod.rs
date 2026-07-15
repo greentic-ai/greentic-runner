@@ -100,24 +100,7 @@ impl HostServer {
             host,
             sql,
         };
-        let router = Router::new()
-            .route("/operator/op/invoke", post(operator::invoke))
-            .route("/healthz", get(http::health::handler))
-            .route("/admin/packs/status", get(admin::status))
-            .route("/admin/packs/reload", post(admin::reload))
-            .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
-        #[cfg(feature = "agentic-worker")]
-        let router = router.route(
-            "/agent/chat/stream",
-            post(crate::http::agent_chat::agent_chat_stream),
-        );
-        let router = router
-            .route(
-                "/sql/{conn}/schema",
-                get(crate::sql::routes::schema_handler),
-            )
-            .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
-            .with_state(state.clone());
+        let router = router(state.clone());
         Ok(Self {
             addr,
             router,
@@ -136,6 +119,32 @@ impl HostServer {
         .await?;
         Ok(())
     }
+}
+
+/// Assemble the full host router for `state`.
+///
+/// Extracted from [`HostServer::with_sql`] so tests can drive the *assembled*
+/// router — route registration included — without binding a socket. Mirrors the
+/// `sql::routes::router` precedent.
+pub(crate) fn router(state: ServerState) -> Router {
+    let router = Router::new()
+        .route("/operator/op/invoke", post(operator::invoke))
+        .route("/healthz", get(http::health::handler))
+        .route("/admin/packs/status", get(admin::status))
+        .route("/admin/packs/reload", post(admin::reload))
+        .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
+    #[cfg(feature = "agentic-worker")]
+    let router = router.route(
+        "/agent/chat/stream",
+        post(crate::http::agent_chat::agent_chat_stream),
+    );
+    router
+        .route(
+            "/sql/{conn}/schema",
+            get(crate::sql::routes::schema_handler),
+        )
+        .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
+        .with_state(state)
 }
 
 #[derive(Clone)]
@@ -191,5 +200,35 @@ impl ServerState {
 impl axum::extract::FromRef<ServerState> for SqlGateway {
     fn from_ref(state: &ServerState) -> Self {
         state.sql.clone()
+    }
+}
+
+#[cfg(all(test, feature = "agentic-worker"))]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    /// `AdminGuard` 500s without `ConnectInfo`; `oneshot` does not supply it.
+    fn loopback() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap())
+    }
+
+    #[tokio::test]
+    async fn assembled_router_serves_admin_packs_status() {
+        let app = router(ServerState::for_test());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/packs/status")
+                    .extension(loopback())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
