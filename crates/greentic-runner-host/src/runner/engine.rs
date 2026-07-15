@@ -2415,6 +2415,12 @@ pub struct ExecutionState {
     /// per-node, serde-defaulted, persisted-in-snapshot pattern.
     #[serde(default)]
     pending_agent_await: HashMap<String, ()>,
+    /// Nodes that dispatched an approval request and are parked awaiting the
+    /// decision. Set on dispatch, cleared when the response re-enters the node.
+    /// Without it a stray inbound arriving mid-await would look like a first
+    /// entry and re-dispatch — a duplicate approval request to the operator.
+    #[serde(default)]
+    pending_approval_await: HashMap<String, ()>,
 }
 
 impl ExecutionState {
@@ -2429,6 +2435,7 @@ impl ExecutionState {
             vars: JsonMap::new(),
             park_turns: HashMap::new(),
             pending_agent_await: HashMap::new(),
+            pending_approval_await: HashMap::new(),
         }
     }
 
@@ -2525,6 +2532,23 @@ impl ExecutionState {
     #[cfg(any(feature = "agentic-worker", test))]
     fn take_agent_await(&mut self, node_id: &str) -> bool {
         self.pending_agent_await.remove(node_id).is_some()
+    }
+
+    /// Mark `node_id` as parked awaiting an approval decision.
+    // `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
+    // consumer and wires this in; the allow is removed there.
+    #[allow(dead_code)]
+    fn mark_approval_await(&mut self, node_id: &str) {
+        self.pending_approval_await.insert(node_id.to_string(), ());
+    }
+
+    /// Check-and-clear: returns whether `node_id` dispatched an approval and is
+    /// awaiting the decision.
+    // `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
+    // consumer and wires this in; the allow is removed there.
+    #[allow(dead_code)]
+    fn take_approval_await(&mut self, node_id: &str) -> bool {
+        self.pending_approval_await.remove(node_id).is_some()
     }
 
     fn finalize_with(mut self, final_payload: Option<Value>) -> Value {
@@ -3975,9 +3999,47 @@ fn approval_requires_human(input: &Value) -> bool {
     }
 }
 
+/// True when `entry` is a runtime-dispatch response envelope rather than a user
+/// activity. The dispatch response always carries a top-level `ok`
+/// (`{ok, output, events, error}`); an inbound activity never does. Mirrors the
+/// conversational `dw.agent` discriminator (`state.entry.get("ok").is_some()`).
+// `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
+// consumer and wires this in; the allow is removed there.
+#[allow(dead_code)]
+fn entry_is_approval_response(entry: &Value) -> bool {
+    entry.get("ok").is_some()
+}
+
+/// Map an approval response envelope to the routing outcome that becomes
+/// `event` via `NodeOutput.meta["outcome"]`.
+///
+/// A watchdog timeout arrives as `{ok: false, output: null, error: {code: "timeout"}}`
+/// and wins over any decision. Otherwise the discriminator is `output.decision`
+/// — NOT `ok`, which greentic-admin sets to `true` for approve *and* deny.
+///
+/// Fails closed: an unrecognised or absent decision is `denied`, mirroring
+/// `approval_requires_human`'s own `_ => true` fail-safe. A corrupt payload must
+/// never become a pass.
+// `allow(dead_code)`: Task 2 (`execute_approval_call` routing) is the only
+// consumer and wires this in; the allow is removed there.
+#[allow(dead_code)]
+fn approval_outcome_from_entry(entry: &Value) -> &'static str {
+    let timed_out = entry
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code.eq_ignore_ascii_case("timeout"));
+    if timed_out {
+        return "timeout";
+    }
+    match entry.pointer("/output/decision").and_then(Value::as_str) {
+        Some(decision) if decision.eq_ignore_ascii_case("approved") => "approved",
+        _ => "denied",
+    }
+}
+
 #[cfg(test)]
 mod approval_gate_tests {
-    use super::approval_requires_human;
+    use super::{approval_outcome_from_entry, approval_requires_human, entry_is_approval_response};
     use serde_json::json;
 
     #[test]
@@ -4003,6 +4065,78 @@ mod approval_gate_tests {
     fn always_and_missing_gate_require_human() {
         assert!(approval_requires_human(&json!({ "mode": "always" })));
         assert!(approval_requires_human(&json!({})));
+    }
+
+    #[test]
+    fn entry_is_a_response_only_when_the_envelope_has_ok() {
+        // The dispatch response envelope always carries a top-level `ok`.
+        assert!(entry_is_approval_response(
+            &json!({ "ok": true, "output": { "decision": "approved" } })
+        ));
+        assert!(entry_is_approval_response(
+            &json!({ "ok": false, "error": { "code": "timeout" } })
+        ));
+        // A user activity arriving mid-await has no top-level `ok`.
+        assert!(!entry_is_approval_response(
+            &json!({ "text": "hi", "metadata": { "action": "go" } })
+        ));
+        assert!(!entry_is_approval_response(&json!({})));
+    }
+
+    #[test]
+    fn outcome_reads_the_decision() {
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": true, "output": { "decision": "approved" } })
+            ),
+            "approved"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": { "decision": "denied" } })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn timeout_wins_over_the_decision() {
+        // The watchdog envelope has output: null and error.code == "timeout".
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": false, "output": null, "error": { "code": "timeout" } })
+            ),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn unknown_or_missing_decision_fails_closed_to_denied() {
+        // Fail closed: a corrupt payload must never become a pass.
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": { "decision": "maybe" } })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true, "output": {} })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": true })),
+            "denied"
+        );
+        assert_eq!(
+            approval_outcome_from_entry(&json!({ "ok": false, "error": { "code": "nats_down" } })),
+            "denied"
+        );
+    }
+
+    #[test]
+    fn decision_match_is_case_insensitive() {
+        assert_eq!(
+            approval_outcome_from_entry(
+                &json!({ "ok": true, "output": { "decision": "Approved" } })
+            ),
+            "approved"
+        );
     }
 }
 
@@ -5353,6 +5487,35 @@ mod tests {
         let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0,"vars":{},"park_turns":{}}"#;
         let mut legacy: ExecutionState = serde_json::from_str(legacy).expect("legacy decode");
         assert!(!legacy.take_agent_await("agent"), "absent key → empty");
+    }
+
+    #[test]
+    fn approval_await_mark_and_take() {
+        let mut st = ExecutionState::new(json!({}));
+        assert!(!st.take_approval_await("gate"), "unmarked node takes false");
+        st.mark_approval_await("gate");
+        assert!(st.take_approval_await("gate"), "marked node takes true");
+        assert!(!st.take_approval_await("gate"), "take clears the mark");
+    }
+
+    #[test]
+    fn approval_await_survives_snapshot_roundtrip() {
+        let mut st = ExecutionState::new(json!({}));
+        st.mark_approval_await("gate");
+        let encoded = serde_json::to_string(&st).expect("serialize");
+        let mut decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(
+            decoded.take_approval_await("gate"),
+            "the marker must survive a park/resume snapshot"
+        );
+    }
+
+    #[test]
+    fn approval_await_defaults_empty_for_old_snapshots() {
+        // Snapshots persisted before this field exists must still decode.
+        let mut decoded: ExecutionState =
+            serde_json::from_str(r#"{"entry":{},"input":{}}"#).expect("old snapshot decodes");
+        assert!(!decoded.take_approval_await("gate"));
     }
 
     #[test]
