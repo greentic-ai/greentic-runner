@@ -3685,12 +3685,14 @@ fn evaluate_custom_routing(
     );
 
     let mut has_condition = false;
+    let mut unmatched_conditions: Vec<&str> = Vec::new();
     for route in routes {
         let condition = route.get("condition").and_then(|v| v.as_str());
         let to = route.get("to").and_then(|v| v.as_str());
 
         if let Some(cond) = condition {
             has_condition = true;
+            unmatched_conditions.push(cond);
             if evaluate_simple_condition(cond, &ctx)
                 && let Some(target) = to
                 && let Ok(nid) = NodeId::new(target)
@@ -3724,9 +3726,10 @@ fn evaluate_custom_routing(
     // Routing arrays with no conditions at all (pure unconditional `out`
     // terminators) remain true ends.
     if has_condition {
-        tracing::debug!(
+        tracing::warn!(
             flow_id = %flow_ir.id,
             node_id = %node_id,
+            conditions = ?unmatched_conditions,
             "no conditional route matched; pausing run at current node for resume"
         );
         CustomRoutingDecision::Wait
