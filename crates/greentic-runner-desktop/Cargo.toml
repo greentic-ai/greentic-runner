@@ -18,6 +18,8 @@ greentic-llm-backend = ["agentic-worker", "greentic-runner-host/greentic-llm-bac
 # Activates test-mock types from greentic-aw-runtime; must NOT be in `default`
 # so the server build (agentic-worker only) never compiles the mocks.
 desktop-agent-ephemeral = ["agentic-worker", "greentic-runner-host/desktop-agent-ephemeral"]
+# See greentic-runner-host. LOCAL DEV ONLY.
+dev-allow-unsigned = ["agentic-worker", "greentic-runner-host/dev-allow-unsigned"]
 
 [dependencies]
 anyhow.workspace = true
