@@ -5,6 +5,27 @@
 **Repo:** `greentic-runner` (runner-only; the designer follow-up is out of scope here)
 **Area:** `crates/greentic-runner-host/src/runner/engine.rs`
 
+> **Line references.** The inline `engine.rs:NNN` refs in the prose below were first
+> taken against a *different* branch tip (the main checkout, mid-WIP) and are offset
+> by roughly 60-80 lines. The anchors verified against this branch's base
+> (`research` @ `b4c86e29`) are the authoritative ones:
+>
+> | Item | `engine.rs` |
+> |---|---|
+> | `execute_approval_call` | **1416** |
+> | `NodeKind::ApprovalCall` dispatch arm | **1246** |
+> | `execute_remote_dispatch` (`resume_at_self` param) | **1541** |
+> | `DispatchOutcome::await_here` | **2583** |
+> | `NodeOutput::with_meta` | **2661** |
+> | `outcome_meta` | **2759** |
+> | `ExecutionState.pending_agent_await` | **2417** |
+> | `mark_agent_await` / `take_agent_await` | **2517** / **2526** |
+> | `approval_requires_human` | **3948** |
+> | `mod approval_gate_tests` | **3979** |
+>
+> The implementation plan carries only re-verified refs. Grep the symbol, not the
+> line, if they drift again.
+
 ## Problem
 
 An `approval.call` gate cannot branch on its own decision. Today an operator can
