@@ -930,7 +930,21 @@ mod aw {
                         ),
                     }
                 }
-                tracing::info!(loaded, dir = %design_dir.display(), "loaded design extensions");
+                // Log the cap ids, not just a count: an unresolved mandatory
+                // guardrail cap blocks every agent turn, and until now the only
+                // way to see which caps a runner has was to trigger that failure.
+                let mut cap_ids: Vec<String> = runtime
+                    .capability_registry()
+                    .offerings()
+                    .map(|offering| offering.cap_id.to_string())
+                    .collect();
+                cap_ids.sort();
+                tracing::info!(
+                    loaded,
+                    dir = %design_dir.display(),
+                    caps = %cap_ids.join(","),
+                    "loaded design extensions"
+                );
             }
             Err(error) => {
                 tracing::warn!(error = %error, dir = %design_dir.display(), "scanning design extensions failed")

@@ -97,27 +97,22 @@ impl HostServer {
             // never be seen by the agent step.
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            // Built here rather than reused from `host`: the per-tenant runtimes
+            // are constructed later, inside `TenantRuntime`, with per-tenant
+            // secrets. This blocks boot on a full extra set of WASM loads,
+            // landing entirely in the pre-bind window — `/healthz` cannot answer
+            // at all until this returns. Measured: ~80s to readiness with 81
+            // extensions installed, on top of whatever the per-tenant load
+            // already costs. A deployment health-gate must tolerate that delay.
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: crate::runner::agent_node::build_ext_runtime(
+                std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
+                None,
+            ),
             host,
             sql,
         };
-        let router = Router::new()
-            .route("/operator/op/invoke", post(operator::invoke))
-            .route("/healthz", get(http::health::handler))
-            .route("/admin/packs/status", get(admin::status))
-            .route("/admin/packs/reload", post(admin::reload))
-            .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
-        #[cfg(feature = "agentic-worker")]
-        let router = router.route(
-            "/agent/chat/stream",
-            post(crate::http::agent_chat::agent_chat_stream),
-        );
-        let router = router
-            .route(
-                "/sql/{conn}/schema",
-                get(crate::sql::routes::schema_handler),
-            )
-            .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
-            .with_state(state.clone());
+        let router = router(state.clone());
         Ok(Self {
             addr,
             router,
@@ -136,6 +131,34 @@ impl HostServer {
         .await?;
         Ok(())
     }
+}
+
+/// Assemble the full host router for `state`.
+///
+/// Extracted from [`HostServer::with_sql`] so tests can drive the *assembled*
+/// router — route registration included — without binding a socket. Mirrors the
+/// `sql::routes::router` precedent.
+pub(crate) fn router(state: ServerState) -> Router {
+    let router = Router::new()
+        .route("/operator/op/invoke", post(operator::invoke))
+        .route("/healthz", get(http::health::handler))
+        .route("/admin/packs/status", get(admin::status))
+        .route("/admin/packs/reload", post(admin::reload))
+        .route("/agent/chat", post(crate::http::agent_chat::agent_chat));
+    #[cfg(feature = "agentic-worker")]
+    let router = router
+        .route(
+            "/agent/chat/stream",
+            post(crate::http::agent_chat::agent_chat_stream),
+        )
+        .route("/admin/capabilities", get(admin::capabilities));
+    router
+        .route(
+            "/sql/{conn}/schema",
+            get(crate::sql::routes::schema_handler),
+        )
+        .route("/sql/{conn}/query", post(crate::sql::routes::query_handler))
+        .with_state(state)
 }
 
 #[derive(Clone)]
@@ -159,6 +182,22 @@ pub struct ServerState {
     /// dispatching a turn.
     #[cfg(feature = "agentic-worker")]
     pub stream_observers: crate::http::agent_stream::StreamObserverRegistry,
+    /// Extension runtime backing `GET /admin/capabilities`, so an operator
+    /// console can see which capabilities this runner actually has installed.
+    ///
+    /// Built once at server-build time. This is a *separate* instance from the
+    /// per-tenant runtimes in `agent_node::build_ext_runtime`, which need
+    /// per-tenant secrets backends — so it costs one extra set of WASM loads at
+    /// boot. All tenants scan the same `GREENTIC_EXTENSIONS_DIR/design/`, so the
+    /// registries are identical and a process-level answer is correct.
+    ///
+    /// `None` only when `ExtensionRuntime::new` itself fails. A missing/absent
+    /// extension directory does NOT produce `None`: `scan_kind_dir` errors,
+    /// logs a warning, and the runtime still comes back `Some` with an empty
+    /// registry (`agent_node.rs:918-948`). Either way the handler reports an
+    /// empty list rather than failing.
+    #[cfg(feature = "agentic-worker")]
+    pub ext_runtime: Option<std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>>,
 }
 
 impl ServerState {
@@ -168,9 +207,9 @@ impl ServerState {
     /// the inline `state()` test helpers in `http/admin.rs` / `http/auth.rs`
     /// / `http/health.rs`, but lives here (next to the struct) so it's
     /// reusable from `http/agent_chat.rs`'s SSE core test.
-    // Only consumed by the `agentic-worker`-gated SSE core test in
-    // `http/agent_chat.rs` today — gating on both keeps a lean (no
-    // `agentic-worker`) test build free of dead-code warnings.
+    // Consumed by the `agentic-worker`-gated SSE core test in
+    // `http/agent_chat.rs` and by `router_tests` in this file — gating on both
+    // keeps a lean (no `agentic-worker`) test build free of dead-code warnings.
     #[cfg(all(test, feature = "agentic-worker"))]
     pub(crate) fn for_test() -> Self {
         let host = RunnerHost::for_test();
@@ -182,6 +221,8 @@ impl ServerState {
             admin: AdminAuth::default(),
             #[cfg(feature = "agentic-worker")]
             stream_observers: host.stream_observers(),
+            #[cfg(feature = "agentic-worker")]
+            ext_runtime: None,
             host,
             sql: SqlGateway::new(std::collections::HashMap::new(), String::new()),
         }
@@ -191,5 +232,63 @@ impl ServerState {
 impl axum::extract::FromRef<ServerState> for SqlGateway {
     fn from_ref(state: &ServerState) -> Self {
         state.sql.clone()
+    }
+}
+
+#[cfg(all(test, feature = "agentic-worker"))]
+mod router_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt as _;
+
+    /// `AdminGuard` 500s without `ConnectInfo`; `oneshot` does not supply it.
+    fn loopback() -> ConnectInfo<SocketAddr> {
+        ConnectInfo("127.0.0.1:8080".parse::<SocketAddr>().unwrap())
+    }
+
+    #[tokio::test]
+    async fn assembled_router_serves_admin_packs_status() {
+        let app = router(ServerState::for_test());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/packs/status")
+                    .extension(loopback())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Anti-regression for the greentic-designer #796 class of bug: a handler
+    /// that exists but is never registered. Without the `.route(...)` line this
+    /// returns 404.
+    #[tokio::test]
+    async fn assembled_router_serves_admin_capabilities() {
+        let app = router(ServerState::for_test());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/capabilities")
+                    .extension(loopback())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // `ServerState::for_test()` has no ext_runtime, so the list is empty —
+        // but the envelope key must still be present and an array.
+        assert_eq!(body, serde_json::json!({ "capabilities": [] }));
     }
 }

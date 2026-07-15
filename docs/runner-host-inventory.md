@@ -122,7 +122,10 @@ secrets are wired today.
   - `/healthz` returns watcher status, telemetry init, and secrets backend state.
   - `/admin/packs/status` lists tenants, pack versions/digests, and last reload
     timestamp/errors. `/admin/packs/reload` triggers a reload (subject to admin
-    auth). Both live behind the `AdminGuard`.
+    auth). `/admin/capabilities` (feature `agentic-worker`) lists the
+    capabilities offered by extensions installed on this runner, for
+    `greentic-designer-admin`'s guardrail-policy preflight. All three live
+    behind the `AdminGuard`.
 
 ### `runner-core`
 
