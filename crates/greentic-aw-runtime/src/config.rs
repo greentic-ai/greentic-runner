@@ -24,6 +24,10 @@ pub struct ToolRef {
     /// `None` falls back to the runtime catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+    /// Author-defined LLM usage note, appended to the tool's resolved
+    /// description at request time. `None`/blank adds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,6 +292,7 @@ mod tool_ref_author_contract_tests {
             tool_name: "look_up".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         assert!(
@@ -309,10 +314,35 @@ mod tool_ref_author_contract_tests {
             input_schema: Some(
                 serde_json::json!({"type":"object","properties":{"order_id":{"type":"string"}}}),
             ),
+            usage_note: None,
         };
         let json = serde_json::to_string(&t).unwrap();
         let back: ToolRef = serde_json::from_str(&json).unwrap();
         assert_eq!(back, t);
+    }
+
+    #[test]
+    fn tool_ref_carries_and_roundtrips_usage_note() {
+        let t = ToolRef {
+            extension_id: "greentic.hubspot".into(),
+            tool_name: "hubspot_deals".into(),
+            description: None,
+            input_schema: None,
+            usage_note: Some("Treat every deal as an order.".into()),
+        };
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains("\"usage_note\":\"Treat every deal as an order.\""));
+        let back: ToolRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.usage_note.as_deref(), Some("Treat every deal as an order."));
+    }
+
+    #[test]
+    fn tool_ref_omits_usage_note_when_none() {
+        let t = ToolRef {
+            extension_id: "e".into(), tool_name: "t".into(),
+            description: None, input_schema: None, usage_note: None,
+        };
+        assert!(!serde_json::to_string(&t).unwrap().contains("usage_note"));
     }
 }
 
@@ -351,6 +381,7 @@ mod tests {
                 tool_name: "fetch".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             }],
             guardrails: vec![],
             llm: LlmProviderRef {

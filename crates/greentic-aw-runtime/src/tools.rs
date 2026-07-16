@@ -537,6 +537,7 @@ mod tests {
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -554,6 +555,7 @@ mod tests {
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -581,6 +583,7 @@ mod tests {
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, None, &allowed);
         assert!(schemas.is_empty());
@@ -597,6 +600,7 @@ mod tests {
             tool_name: "hubspot_contacts".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let missing = missing_tools(&rt, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
@@ -617,6 +621,7 @@ mod tests {
             tool_name: "create_issue".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
         let missing = missing_tools(&rt, None, None, None, &allowed);
@@ -724,6 +729,7 @@ mod tests {
                 tool_name: "get_issue".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
@@ -731,6 +737,7 @@ mod tests {
                 tool_name: "missing".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
         ];
 
@@ -767,6 +774,7 @@ mod tests {
             tool_name: "search".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, &allowed);
         assert!(
@@ -783,6 +791,7 @@ mod tests {
             tool_name: "get_issue".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -910,6 +919,7 @@ mod tests {
             input_schema: Some(
                 serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
             ),
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
         let s = schemas
@@ -935,6 +945,7 @@ mod tests {
             tool_name: "look_up".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
         assert!(
@@ -952,6 +963,7 @@ mod tests {
             tool_name: "look_up".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), &allowed);
         assert!(
@@ -1004,6 +1016,7 @@ mod tests {
                 tool_name: "issue_refund".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
@@ -1011,6 +1024,7 @@ mod tests {
                 tool_name: "missing".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
         ];
 
@@ -1045,6 +1059,7 @@ mod tests {
             tool_name: "search".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, &allowed);
         assert!(

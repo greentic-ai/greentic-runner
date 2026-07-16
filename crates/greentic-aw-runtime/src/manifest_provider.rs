@@ -116,6 +116,7 @@ mod tests {
                     tool_name: "yaml_tool".into(),
                     description: None,
                     input_schema: None,
+                    usage_note: None,
                 }],
                 guardrails: vec![],
                 llm: LlmProviderRef {
@@ -206,6 +207,7 @@ mod tests {
                 tool_name: "web_search".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             }]
         );
         assert_eq!(cfg.system_prompt, "yaml-prompt");
@@ -228,6 +230,7 @@ mod tests {
                 tool_name: "yaml_tool".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             }]
         );
     }
@@ -280,6 +283,7 @@ mod tests {
                 tool_name: "yaml_tool".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             }]
         );
     }
