@@ -257,6 +257,9 @@ pub async fn run_step(
             )
             .await
             .unwrap_or_default();
+        // Surface the retrieval in the live trace (test-chat "Tools used") so the
+        // operator sees which chunks were pulled in. Observer-only — not the trail.
+        crate::knowledge::emit_retrieval_trace(observer.as_ref(), &user_message, &chunks);
         crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
     } else {
         system_prompt
