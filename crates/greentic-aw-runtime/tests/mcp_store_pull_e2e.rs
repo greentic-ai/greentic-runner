@@ -365,6 +365,7 @@ async fn verified_store_pull_tool_offered_and_result_in_trail() {
         tool_name: "echo".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -485,6 +486,7 @@ async fn tampered_digest_degrades_tool_not_offered() {
         tool_name: "echo".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),

@@ -30,6 +30,15 @@ use crate::mcp_source::McpToolCatalog;
 use crate::state::ToolCallRecord;
 use crate::tenant::TenantContext;
 
+/// Append an author `usage_note` to a resolved tool description. A `None` or
+/// whitespace-only note is a no-op (no trailing whitespace, no empty block).
+fn with_usage_note(description: String, note: &Option<String>) -> String {
+    match note {
+        Some(n) if !n.trim().is_empty() => format!("{description}\n\n{}", n.trim()),
+        _ => description,
+    }
+}
+
 /// Whether the agent may call this tool — exact (extension_id, tool_name) match.
 pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
     allowed
@@ -76,7 +85,7 @@ pub fn list_tools_for_llm(
                 Some(entry) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: entry.description.clone(),
+                    description: with_usage_note(entry.description.clone(), &t.usage_note),
                     parameters: entry.parameters.clone(),
                 }),
                 None => tracing::warn!(
@@ -91,7 +100,7 @@ pub fn list_tools_for_llm(
                 Some(entry) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: entry.description.clone(),
+                    description: with_usage_note(entry.description.clone(), &t.usage_note),
                     parameters: entry.parameters.clone(),
                 }),
                 None => tracing::warn!(
@@ -115,7 +124,7 @@ pub fn list_tools_for_llm(
                 (Some(description), Some(parameters)) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description,
+                    description: with_usage_note(description, &t.usage_note),
                     parameters,
                 }),
                 _ => tracing::warn!(
@@ -135,7 +144,7 @@ pub fn list_tools_for_llm(
                     out.push(LlmToolSchema {
                         extension_id: t.extension_id.clone(),
                         tool_name: t.tool_name.clone(),
-                        description: def.description,
+                        description: with_usage_note(def.description, &t.usage_note),
                         parameters,
                     });
                 } else {
@@ -531,12 +540,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn with_usage_note_appends_when_present() {
+        let d = with_usage_note(
+            "Base description.".into(),
+            &Some("Use for VIP customers.".into()),
+        );
+        assert_eq!(d, "Base description.\n\nUse for VIP customers.");
+    }
+
+    #[test]
+    fn with_usage_note_noop_when_none_or_blank() {
+        assert_eq!(with_usage_note("Base.".into(), &None), "Base.");
+        assert_eq!(
+            with_usage_note("Base.".into(), &Some("   ".into())),
+            "Base."
+        );
+    }
+
+    #[test]
     fn is_tool_allowed_returns_true_for_exact_match() {
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -554,6 +582,7 @@ mod tests {
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -581,6 +610,7 @@ mod tests {
             tool_name: "fetch".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, None, &allowed);
         assert!(schemas.is_empty());
@@ -597,6 +627,7 @@ mod tests {
             tool_name: "hubspot_contacts".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let missing = missing_tools(&rt, None, None, None, &allowed);
         assert_eq!(missing.len(), 1);
@@ -617,6 +648,7 @@ mod tests {
             tool_name: "create_issue".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         // No catalog provided → the mcp tool is unresolvable.
         let missing = missing_tools(&rt, None, None, None, &allowed);
@@ -724,6 +756,7 @@ mod tests {
                 tool_name: "get_issue".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
@@ -731,6 +764,7 @@ mod tests {
                 tool_name: "missing".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
         ];
 
@@ -767,6 +801,7 @@ mod tests {
             tool_name: "search".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, &allowed);
         assert!(
@@ -783,6 +818,7 @@ mod tests {
             tool_name: "get_issue".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -910,6 +946,7 @@ mod tests {
             input_schema: Some(
                 serde_json::json!({"type":"object","properties":{"q":{"type":"string"}}}),
             ),
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
         let s = schemas
@@ -935,12 +972,35 @@ mod tests {
             tool_name: "look_up".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
         assert!(
             schemas.iter().any(|s| s.extension_id == "flow:lookup"),
             "with no override the catalog entry must still be used to list the tool"
         );
+    }
+
+    #[test]
+    fn list_tools_appends_usage_note_for_flow_tool() {
+        // Flow branch: ToolRef.description supplies the base description
+        // directly (no live runtime needed), so this proves the usage_note
+        // reaches the LLM-facing schema without an ExtensionRuntime fixture.
+        let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(test_flow_invoker())));
+        let allowed = vec![ToolRef {
+            extension_id: "flow:lookup".into(),
+            tool_name: "look_up".into(),
+            description: Some("Base.".into()),
+            input_schema: Some(serde_json::json!({"type":"object","properties":{}})),
+            usage_note: Some("note-Z".into()),
+        }];
+        let schemas = list_tools_for_llm(&ext_runtime_stub(), None, None, Some(&flows), &allowed);
+        let s = schemas
+            .iter()
+            .find(|s| s.extension_id == "flow:lookup")
+            .expect("flow tool listed");
+        assert!(s.description.contains("Base."), "got: {}", s.description);
+        assert!(s.description.contains("note-Z"), "got: {}", s.description);
     }
 
     #[tokio::test]
@@ -952,6 +1012,7 @@ mod tests {
             tool_name: "look_up".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, None, Some(&flows), &allowed);
         assert!(
@@ -1004,6 +1065,7 @@ mod tests {
                 tool_name: "issue_refund".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
             // Absent from the catalog → dropped (warn), not panicked.
             ToolRef {
@@ -1011,6 +1073,7 @@ mod tests {
                 tool_name: "missing".into(),
                 description: None,
                 input_schema: None,
+                usage_note: None,
             },
         ];
 
@@ -1045,6 +1108,7 @@ mod tests {
             tool_name: "search".into(),
             description: None,
             input_schema: None,
+            usage_note: None,
         }];
         let schemas = list_tools_for_llm(&rt, None, Some(&catalog), None, &allowed);
         assert!(

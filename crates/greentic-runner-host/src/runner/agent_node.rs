@@ -2112,6 +2112,7 @@ mod aw {
                     tool_name: "web_search".into(),
                     description: None,
                     input_schema: None,
+                    usage_note: None,
                 }]
             );
         }

@@ -34,6 +34,7 @@ async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
         tool_name: "nope".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
 
     // A tool whose extension isn't loaded never reaches the LLM's tool list.
