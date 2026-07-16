@@ -3023,6 +3023,21 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
             || full_ref.starts_with("agentic.")
+            // Same dispatch family as sorla./operala./agentic. above, and listed in
+            // NATIVE_OP_KEYS like them. Without it an `approval.call` node — which
+            // packc emits with `operation: None` because the id is already complete
+            // — gets split into component "approval" + operation "call", and
+            // "approval" is by construction absent from the pack's component map.
+            // The gate then fails with `component 'approval' not found in pack` on a
+            // pack that is perfectly well-formed, so rebuilding never helps.
+            || full_ref.starts_with("approval.")
+            // Same dispatch family as sorla./operala./agentic. above, and listed in
+            // NATIVE_OP_KEYS like them. Without it an `approval.call` node — which
+            // packc emits with `operation: None` because the id is already complete
+            // — gets split into component "approval" + operation "call", and
+            // "approval" is by construction absent from the pack's component map.
+            // The gate then fails with `component 'approval' not found in pack` on a
+            // pack that is perfectly well-formed, so rebuilding never helps.
             || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
@@ -4690,6 +4705,49 @@ mod tests {
         }
 
         fn on_node_error(&self, _event: &NodeEvent<'_>, _error: &dyn StdError) {}
+    }
+
+    /// `approval.call` must survive lowering intact.
+    ///
+    /// packc emits the gate with `operation: None` because the id is already
+    /// complete. Before `approval.` joined the `is_builtin` allowlist, lowering
+    /// dot-split it into component `"approval"` + operation `"call"` — and
+    /// `"approval"` is by construction absent from the pack's component map,
+    /// which is keyed verbatim by `node.component.id`. Every human-approval gate
+    /// then failed at dispatch with `component 'approval' not found in pack` on a
+    /// perfectly well-formed pack, so rebuilding never helped.
+    #[test]
+    fn approval_call_component_id_is_not_dot_split() {
+        let node = Node {
+            id: NodeId::from_str("gate").unwrap(),
+            component: FlowComponentRef {
+                id: "approval.call".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "await": true, "input": { "mode": "always" } }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let host_node = HostNode::from(node);
+        assert_eq!(
+            host_node.component_id(),
+            "approval.call",
+            "approval.call must stay intact; splitting it yields 'approval', which \
+             is never a key in the pack's component map"
+        );
+        assert_eq!(
+            host_node.operation_name(),
+            None,
+            "the id is already complete — lowering must not invent an operation"
+        );
     }
 
     #[test]
