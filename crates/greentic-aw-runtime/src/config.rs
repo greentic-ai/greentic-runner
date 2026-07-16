@@ -333,14 +333,20 @@ mod tool_ref_author_contract_tests {
         let json = serde_json::to_string(&t).unwrap();
         assert!(json.contains("\"usage_note\":\"Treat every deal as an order.\""));
         let back: ToolRef = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.usage_note.as_deref(), Some("Treat every deal as an order."));
+        assert_eq!(
+            back.usage_note.as_deref(),
+            Some("Treat every deal as an order.")
+        );
     }
 
     #[test]
     fn tool_ref_omits_usage_note_when_none() {
         let t = ToolRef {
-            extension_id: "e".into(), tool_name: "t".into(),
-            description: None, input_schema: None, usage_note: None,
+            extension_id: "e".into(),
+            tool_name: "t".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
         };
         assert!(!serde_json::to_string(&t).unwrap().contains("usage_note"));
     }

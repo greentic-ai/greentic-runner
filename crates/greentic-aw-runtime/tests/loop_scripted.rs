@@ -202,6 +202,7 @@ async fn tool_dispatch_error_becomes_observation_then_reply() {
         tool_name: "fetch".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
     let script = vec![
         Ok(tool_call("c1", "http", "fetch")),
@@ -240,6 +241,7 @@ async fn tool_call_trail_carries_args_and_duration() {
         tool_name: "fetch".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
     let sent_args = serde_json::json!({ "url": "https://example.com", "method": "GET" });
     let script = vec![
@@ -316,6 +318,7 @@ async fn mixed_text_and_tool_calls_executes_tool_discards_text() {
         tool_name: "fetch".into(),
         description: None,
         input_schema: None,
+        usage_note: None,
     }];
     let mixed = LlmResponse {
         content: Some("internal reasoning".into()),
