@@ -62,6 +62,14 @@ component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspecti
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
 
+# `agentic-worker` cfg gates remain in the source but the feature declaration was
+# removed from the develop lane in d43ae4dd (main-only wiring). Whitelist the value
+# for check-cfg so `-D warnings` (unexpected_cfgs) does not fire on the dead gates.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("agentic-worker"))',
+] }
+
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
