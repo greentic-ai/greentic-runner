@@ -7,6 +7,15 @@ license = "MIT"
 homepage = "https://github.com/greentic-ai/greentic-runner"
 repository = "https://github.com/greentic-ai/greentic-runner"
 
+# agentic-worker / desktop-agent-ephemeral / greentic-llm-backend cfg gates remain in
+# the source but their feature declarations were removed from the develop lane in
+# d43ae4dd (main-only wiring). Whitelist the values for check-cfg so `-D warnings`
+# (unexpected_cfgs) does not fire on the dead gates.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("agentic-worker", "desktop-agent-ephemeral", "greentic-llm-backend"))',
+] }
+
 [dependencies]
 anyhow.workspace = true
 greentic-runner-host = { workspace = true }

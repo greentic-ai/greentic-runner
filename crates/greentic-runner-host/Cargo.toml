@@ -22,6 +22,19 @@ component-v0-6-introspection = []
 telemetry = []
 greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
+# Feature values still referenced by #[cfg(feature = "…")] gates in the source but
+# whose declarations + deps were removed from the develop lane in d43ae4dd (main-only
+# agentic-worker wiring — greentic-aw-runtime / greentic-ext-runtime pin conflicting
+# 1.1.x deps). The gated code stays permanently dead here; we cannot re-declare these
+# as real features because the gated code references the removed crates and would break
+# `--all-features` builds. Tell check-cfg the values are expected so `-D warnings`
+# (unexpected_cfgs) does not fire. Re-declare as real features when the crates publish
+# on develop and the wiring is restored.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("agentic-worker", "desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
+] }
+
 [dependencies]
 async-nats = "0.49"
 async-trait.workspace = true
