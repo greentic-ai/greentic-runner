@@ -247,6 +247,13 @@ strip = true
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
 greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
+# greentic-ext-runtime now anchors describe signatures to a TOFU publisher-key
+# store, reusing sdk-registry's `TrustStore` rather than porting it. That pulls
+# -registry (and its -state dep) into this graph; neither is on crates.io, so
+# both need the same tag redirect as -contract above. Keep all three on ONE tag:
+# they are `=`-pinned to each other, so a split resolves two crate instances.
+greentic-extension-sdk-registry = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
+greentic-extension-sdk-state = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
 # greentic-mcp-exec's `list_tools` (used by the local-wasm MCP transport) is not
 # yet on a published dev build; redirect onto the greentic-mcp branch commit that
 # carries it until it is published to crates.io (mirrors the greentic-types patch
