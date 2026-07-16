@@ -21,6 +21,7 @@
 //! knowledge tier simply stays disabled; it never fails runtime construction.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chronicle_core::driver::GraphDriver;
 use chronicle_driver_falkor::FalkorDriver;
@@ -238,13 +239,7 @@ fn resolve_backend() -> Option<BackendChoice> {
 async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
     match resolve_backend()? {
         BackendChoice::SurrealEmbedded { path } => {
-            match SurrealDriver::connect_embedded(&path, embedding_dim).await {
-                Ok(driver) => Some(Arc::new(driver)),
-                Err(err) => {
-                    tracing::warn!(error = %err, path = %path, "knowledge: embedded SurrealDB connect failed; knowledge disabled");
-                    None
-                }
-            }
+            connect_embedded_retrying(&path, embedding_dim).await
         }
         BackendChoice::SurrealMemory => {
             tracing::warn!(
@@ -281,6 +276,63 @@ async fn build_driver(embedding_dim: usize) -> Option<Arc<dyn GraphDriver>> {
             }
         }
     }
+}
+
+/// Whether a connect error is the embedded store's directory-lock contention,
+/// as opposed to a permanent failure (bad path, dim mismatch). RocksDB reports
+/// it as `No locks available` / `lock hold by current process`; matched
+/// case-insensitively so a wording change across versions still degrades to the
+/// old fail-open behaviour rather than a false retry.
+fn is_lock_contention(err_msg: &str) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+    lower.contains("no locks available") || lower.contains("lock hold")
+}
+
+/// Connect to the embedded store, retrying briefly while its directory lock is
+/// still held by a just-closed handle.
+///
+/// `ingest_corpus` opens this same store, writes the corpus, and drops its
+/// handle immediately before the serving mount ([`attach`]) opens its own — but
+/// embedded SurrealDB (RocksDB) releases the directory lock *asynchronously* as
+/// the previous handle finishes closing. So `attach`'s open can lose a short
+/// race with the ingest handle's teardown and see `No locks available`, which
+/// silently disabled the whole knowledge tier (RAG present in the store, but the
+/// serving mount never came up). The window is brief and self-clears once the
+/// close completes, so a bounded backoff turns that silent miss into a wait of a
+/// few hundred milliseconds at worst.
+///
+/// Only lock contention is retried; a permanent error returns on the first
+/// attempt so a genuine misconfiguration still fails fast into the same
+/// knowledge-disabled fallback.
+async fn connect_embedded_retrying(
+    path: &str,
+    embedding_dim: usize,
+) -> Option<Arc<dyn GraphDriver>> {
+    const MAX_ATTEMPTS: u32 = 8;
+    const MAX_DELAY: Duration = Duration::from_millis(400);
+    let mut delay = Duration::from_millis(25);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let err = match SurrealDriver::connect_embedded(path, embedding_dim).await {
+            Ok(driver) => return Some(Arc::new(driver)),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        if !is_lock_contention(&msg) || attempt == MAX_ATTEMPTS {
+            tracing::warn!(
+                error = %err, path = %path, attempt,
+                "knowledge: embedded SurrealDB connect failed; knowledge disabled"
+            );
+            return None;
+        }
+        tracing::debug!(
+            path = %path, attempt,
+            "knowledge: embedded store lock still held by the closing ingest handle; retrying"
+        );
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(MAX_DELAY);
+    }
+    None
 }
 
 /// Adapts the provider-stack [`KnowledgeChronicle`] (which implements the
@@ -395,14 +447,81 @@ pub(crate) async fn ingest_corpus(tenant: &TenantCtx, chunks: Vec<AwChunk>) {
         ),
         Err(err) => tracing::warn!(error = %err, "knowledge: baked-corpus ingest failed"),
     }
-    // `knowledge` (and its embedded-store handle) drops here, before the serving
-    // mount opens its own connection.
+    // `knowledge` (and its embedded-store handle) drops here. The directory lock
+    // is released asynchronously as that handle finishes closing, so the serving
+    // mount's open can briefly race this teardown — `connect_embedded_retrying`
+    // absorbs that window.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn is_lock_contention_matches_rocksdb_flock_messages() {
+        // The verbatim RocksDB LOG line observed when the ingest handle had not
+        // finished releasing the directory lock.
+        assert!(is_lock_contention(
+            "IO error: lock hold by current process, acquire time 1784187876 \
+             acquiring thread 1908306: /home/u/.greentic/knowledge/LOCK: No locks available"
+        ));
+        assert!(is_lock_contention("No Locks Available")); // case-insensitive
+    }
+
+    #[test]
+    fn is_lock_contention_ignores_permanent_errors() {
+        // A misconfiguration must NOT be retried — it would only delay the
+        // fail-open into the knowledge-disabled fallback.
+        assert!(!is_lock_contention("No such file or directory"));
+        assert!(!is_lock_contention(
+            "embedding dimension mismatch: 1536 vs 1024"
+        ));
+        assert!(!is_lock_contention(""));
+    }
+
+    /// The real fix, against a real embedded store: while one handle holds the
+    /// directory lock (the ingest handle mid-teardown), `connect_embedded_retrying`
+    /// must keep trying and win once that handle drops — where a single open would
+    /// have returned `No locks available` and disabled knowledge.
+    ///
+    /// Two embedded opens on one directory in the same process genuinely collide
+    /// (RocksDB reports "lock hold by current process"), which is exactly the boot
+    /// race this reproduces. Timing margin is wide (release at 100ms vs a ~1.5s
+    /// retry budget) so it is not flaky.
+    #[tokio::test]
+    async fn embedded_connect_retries_past_a_lingering_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().into_owned();
+
+        // A single second open, with the first still held, loses on lock
+        // contention — the failure this fix absorbs.
+        let first = SurrealDriver::connect_embedded(&path, 8)
+            .await
+            .expect("first open");
+        let contended = SurrealDriver::connect_embedded(&path, 8)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            contended.as_deref().is_some_and(is_lock_contention),
+            "a plain second open must fail on lock contention; got {contended:?}"
+        );
+
+        // Release the holder shortly after the retry loop starts.
+        let releaser = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(first);
+        });
+
+        let driver = connect_embedded_retrying(&path, 8).await;
+        releaser.await.expect("releaser");
+
+        assert!(
+            driver.is_some(),
+            "retry must win once the prior handle releases the lock"
+        );
+    }
 
     // `std::env::set_var`/`remove_var` are `unsafe` under edition 2024; confined to
     // tests, which run under `#[serial]` so no other thread observes the env mid-mutation.
