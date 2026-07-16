@@ -1041,6 +1041,7 @@ mod aw {
                     tool_name: tool_name.to_string(),
                     description: None,
                     input_schema: None,
+                    usage_note: None,
                 })
             }
             _ => {
@@ -1687,6 +1688,7 @@ mod aw {
                     tool_name: "dothing".into(),
                     description: None,
                     input_schema: None,
+                    usage_note: None,
                 })
             );
             assert_eq!(
@@ -1696,6 +1698,7 @@ mod aw {
                     tool_name: "list".into(),
                     description: None,
                     input_schema: None,
+                    usage_note: None,
                 })
             );
             assert_eq!(super::parse_tool_ref("noslash"), None);
@@ -1724,12 +1727,14 @@ mod aw {
                         tool_name: "dothing".into(),
                         description: None,
                         input_schema: None,
+                        usage_note: None,
                     },
                     ToolRef {
                         extension_id: "other".into(),
                         tool_name: "thing".into(),
                         description: None,
                         input_schema: None,
+                        usage_note: None,
                     },
                 ]
             );
