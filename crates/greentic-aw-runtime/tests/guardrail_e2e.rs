@@ -219,8 +219,15 @@ async fn pii_extension_registers_and_capability_appears_in_registry() {
     write_signed_extension_dir(&wasm_src, &ext_dir);
 
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
-    let mut ext_runtime =
-        ExtensionRuntime::new(RuntimeConfig::from_paths(paths)).expect("ExtensionRuntime::new");
+    // Root the trust store at the tempdir. Unset, it resolves to the real
+    // `$GREENTIC_HOME`/`~/.greentic` — the same store `gtdx install` writes —
+    // so this test would pin its throwaway fixture key against the real
+    // `greentic.guardrail-pii` id, and the next run (a fresh random key for
+    // the same id) would fail `PublisherKeyChanged`. Green once, red forever.
+    let mut ext_runtime = ExtensionRuntime::new(
+        RuntimeConfig::from_paths(paths).with_trust_root(tmp.path().to_path_buf()),
+    )
+    .expect("ExtensionRuntime::new");
 
     ext_runtime
         .register_loaded_from_dir(&ext_dir)
@@ -504,8 +511,14 @@ fn build_full_runtime(
     mode: GuardrailMode,
 ) -> (AgentRuntime, TenantContext) {
     let paths = DiscoveryPaths::new(tmp.path().to_path_buf());
-    let mut ext_runtime =
-        ExtensionRuntime::new(RuntimeConfig::from_paths(paths)).expect("ExtensionRuntime::new");
+    // Root the trust store at the tempdir — see the note on the direct
+    // construction above. Every caller of this helper registers a freshly
+    // signed fixture under a real extension id, so an unrooted store would
+    // pin throwaway keys into `~/.greentic` and self-poison the next run.
+    let mut ext_runtime = ExtensionRuntime::new(
+        RuntimeConfig::from_paths(paths).with_trust_root(tmp.path().to_path_buf()),
+    )
+    .expect("ExtensionRuntime::new");
     ext_runtime
         .register_loaded_from_dir(ext_dir)
         .expect("register_loaded_from_dir");
