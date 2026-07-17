@@ -59,6 +59,7 @@ greentic-mcp-client = { version = "=1.2.0-research", features = ["native"] }
 greentic-mcp-exec = { version = "=1.1.2" }
 greentic-state      = { workspace = true }
 greentic-telemetry  = { workspace = true }
+greentic-trust      = { workspace = true }
 redis               = { version = "1", features = ["tokio-comp", "connection-manager", "script"] }
 reqwest             = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 secrecy             = "0.10"
@@ -75,6 +76,7 @@ url                 = { workspace = true }
 uuid                = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+greentic-trust = { workspace = true, features = ["testing"] }
 semver = "1"
 serial_test = { workspace = true }
 tempfile = "3"

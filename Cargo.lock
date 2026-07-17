@@ -1280,6 +1280,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2268,6 +2277,7 @@ dependencies = [
  "greentic-secrets-lib",
  "greentic-state",
  "greentic-telemetry",
+ "greentic-trust",
  "greentic-types",
  "redis",
  "reqwest 0.12.28",
@@ -3021,6 +3031,25 @@ dependencies = [
  "tracing-error",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "greentic-trust"
+version = "0.1.0"
+source = "git+https://github.com/greenticai/greentic-trust?rev=725fb4c#725fb4c9fd457c48792703cc3dcbc0376c0dcde7"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "moka",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4183,6 +4212,26 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "moka"
+version = "0.12.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "957228ad12042ee839f93c8f257b62b4c0ab5eaae1d4fa60de53b27c9d7c5046"
+dependencies = [
+ "async-lock",
+ "crossbeam-channel",
+ "crossbeam-epoch",
+ "crossbeam-utils",
+ "equivalent",
+ "event-listener",
+ "futures-util",
+ "parking_lot",
+ "portable-atomic",
+ "smallvec",
+ "tagptr",
+ "uuid",
 ]
 
 [[package]]
@@ -6560,6 +6609,12 @@ dependencies = [
  "core-foundation-sys",
  "libc",
 ]
+
+[[package]]
+name = "tagptr"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "target-lexicon"

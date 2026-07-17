@@ -10,6 +10,12 @@ use ed25519_dalek::SigningKey;
 /// upgrades: a cached wasm is only reused when its marker equals the
 /// requested `component_digest`. Missing or mismatched => false => re-pull.
 #[test]
+fn greentic_trust_dependency_links() {
+    // Smoke: the cross-org git dependency resolves, builds, and links.
+    assert!(greentic_trust::DidWeb::parse("did:web:example.com").is_ok());
+}
+
+#[test]
 fn gtxpack_marker_matches_is_case_insensitive_and_fails_safe() {
     let dir = tempfile::tempdir().unwrap();
     let marker = dir.path().join("router_echo.wasm.gtxpack");

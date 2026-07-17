@@ -47,6 +47,7 @@ greentic-config-types = ">=1.1.0-0, <1.2.0-0"
 # two copies collide (E0308).
 greentic-deploy-spec = ">=0.2.1, <0.3.0-0"
 greentic-secrets-lib = ">=1.1.0-0, <1.2.0-0"
+greentic-trust = { git = "https://github.com/greenticai/greentic-trust", rev = "725fb4c" }
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
