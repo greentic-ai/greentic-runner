@@ -1,12 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use reqwest::Client;
+use serde_json::Value;
 use tokio::runtime::{Handle, Runtime};
 use tokio::task::JoinHandle;
 
@@ -26,33 +27,244 @@ use crate::runner::mocks::MockLayer;
 use crate::secrets::{DynSecretsManager, canonicalize_secret_key, read_secret_blocking};
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
+use crate::telemetry::RolloutIds;
 use crate::trace::PackTraceInfo;
 use crate::wasi::RunnerWasiPolicy;
+use greentic_deploy_spec::ids::{BundleId, DeploymentId, RevisionId};
 use greentic_types::SecretRequirement;
+use runner_core::packs::PackDigest;
 
 const RUNTIME_SECRETS_PACK_ID: &str = "_runner";
 
+/// Key identifying a live runtime in [`ActivePacks`].
+///
+/// Tenant-only entries use [`RuntimeKey::legacy`] (all id fields `None`);
+/// fully-qualified entries use [`RuntimeKey::revision`] (all `Some`). The two
+/// forms never collide, so both can coexist in the same map.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RuntimeKey {
+    pub tenant: String,
+    pub deployment_id: Option<DeploymentId>,
+    pub bundle_id: Option<BundleId>,
+    pub revision_id: Option<RevisionId>,
+}
+
+impl RuntimeKey {
+    /// Tenant-only key for the pre-revision-routing path.
+    pub fn legacy(tenant: impl Into<String>) -> Self {
+        Self {
+            tenant: tenant.into(),
+            deployment_id: None,
+            bundle_id: None,
+            revision_id: None,
+        }
+    }
+
+    /// Fully-qualified key for a specific deployment/bundle/revision.
+    pub fn revision(
+        tenant: impl Into<String>,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            deployment_id: Some(deployment_id),
+            bundle_id: Some(bundle_id),
+            revision_id: Some(revision_id),
+        }
+    }
+
+    /// `true` for the tenant-only key produced by [`legacy`](Self::legacy).
+    pub fn is_legacy(&self) -> bool {
+        self.deployment_id.is_none() && self.bundle_id.is_none() && self.revision_id.is_none()
+    }
+}
+
+/// Build the next runtime map for a legacy (tenant-only) reload: install the
+/// freshly-resolved `legacy` entries and carry over every revision-keyed entry
+/// untouched. Revision runtimes are owned by the deployment lifecycle, not the
+/// pack watcher, so a tenant-pack reload must not evict them.
+fn merge_legacy_reload<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    mut legacy: HashMap<RuntimeKey, V>,
+) -> HashMap<RuntimeKey, V> {
+    for (key, value) in prev {
+        if !key.is_legacy() {
+            legacy.insert(key.clone(), value.clone());
+        }
+    }
+    legacy
+}
+
+/// Pure swap helper for [`ActivePacks::remove_revision`]: clone the prev map
+/// minus `key`, return it alongside the removed value. `None` when the key was
+/// absent so the caller can skip the `ArcSwap` store. Generic over `V` so the
+/// swap logic is testable without standing up a real `TenantRuntime`.
+fn remove_keyed_entry<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    key: &RuntimeKey,
+) -> Option<(HashMap<RuntimeKey, V>, V)> {
+    let removed = prev.get(key)?.clone();
+    let mut next = prev.clone();
+    next.remove(key);
+    Some((next, removed))
+}
+
+/// Pure swap helper for [`ActivePacks::insert_revision`]: clone the prev map
+/// and insert `value` under `key`, returning the next map. Generic over `V` so
+/// the swap logic is testable without standing up a real `TenantRuntime`.
+fn insert_keyed_entry<V: Clone>(
+    prev: &HashMap<RuntimeKey, V>,
+    key: RuntimeKey,
+    value: V,
+) -> HashMap<RuntimeKey, V> {
+    let mut next = prev.clone();
+    next.insert(key, value);
+    next
+}
+
 /// Atomically swapped view of live tenant runtimes.
+///
+/// Reads are lock-free via `ArcSwap`. Mutations serialize on `write_lock` so a
+/// read-modify-write swap (e.g. a watcher reload preserving revision entries)
+/// cannot interleave with a concurrent insert and clobber the other's update.
 pub struct ActivePacks {
-    inner: ArcSwap<HashMap<String, Arc<TenantRuntime>>>,
+    inner: ArcSwap<HashMap<RuntimeKey, Arc<TenantRuntime>>>,
+    write_lock: Mutex<()>,
 }
 
 impl ActivePacks {
     pub fn new() -> Self {
         Self {
             inner: ArcSwap::from_pointee(HashMap::new()),
+            write_lock: Mutex::new(()),
         }
     }
 
-    pub fn load(&self, tenant: &str) -> Option<Arc<TenantRuntime>> {
-        self.inner.load().get(tenant).cloned()
+    /// Look up the tenant-only (legacy) runtime. Compatibility helper for the
+    /// pre-revision-routing path; see [`load_revision`](Self::load_revision).
+    pub fn load_pack(&self, tenant: &str) -> Option<Arc<TenantRuntime>> {
+        self.inner.load().get(&RuntimeKey::legacy(tenant)).cloned()
     }
 
-    pub fn snapshot(&self) -> Arc<HashMap<String, Arc<TenantRuntime>>> {
+    /// Look up the runtime for a specific deployment/bundle/revision.
+    pub fn load_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Option<Arc<TenantRuntime>> {
+        self.inner
+            .load()
+            .get(&RuntimeKey::revision(
+                tenant,
+                deployment_id,
+                bundle_id,
+                revision_id,
+            ))
+            .cloned()
+    }
+
+    pub fn snapshot(&self) -> Arc<HashMap<RuntimeKey, Arc<TenantRuntime>>> {
         self.inner.load_full()
     }
 
-    pub fn replace(&self, next: HashMap<String, Arc<TenantRuntime>>) {
+    /// Insert (or replace) a single tenant-only runtime, preserving all other
+    /// entries — including revision-keyed ones.
+    pub fn insert_pack(&self, tenant: &str, runtime: Arc<TenantRuntime>) {
+        let _guard = self.write_lock.lock();
+        let mut next = (*self.inner.load_full()).clone();
+        next.insert(RuntimeKey::legacy(tenant), runtime);
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Insert (or replace) a single revision-keyed runtime, preserving every
+    /// other entry — the tenant-only legacy entry and sibling revisions alike.
+    /// This is the producer the deployment warm path calls once a revision's
+    /// packs are loaded; the pack watcher's [`replace_legacy`](Self::replace_legacy)
+    /// then carries the entry across tenant-pack reloads untouched.
+    ///
+    /// Fails closed when the runtime's identity does not match the key it would
+    /// be stored under: a wiring bug that files one tenant's runtime under
+    /// another tenant's revision (breaking isolation) or stores a runtime whose
+    /// telemetry reports a different revision than it routes (breaking rollout
+    /// attribution) is rejected here rather than silently serving traffic under
+    /// the wrong identity. Pairs with [`TenantRuntime::load_revision`], which
+    /// derives the runtime's rollout identity from these same ids.
+    pub fn insert_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        runtime: Arc<TenantRuntime>,
+    ) -> Result<()> {
+        if runtime.tenant() != tenant {
+            bail!(
+                "revision runtime tenant `{}` does not match key tenant `{tenant}`",
+                runtime.tenant()
+            );
+        }
+        let ids = runtime.engine().rollout_ids();
+        let key_deployment = deployment_id.to_string();
+        let key_bundle = bundle_id.as_str();
+        let key_revision = revision_id.to_string();
+        if ids.deployment_id.as_deref() != Some(key_deployment.as_str())
+            || ids.bundle_id.as_deref() != Some(key_bundle)
+            || ids.revision_id.as_deref() != Some(key_revision.as_str())
+        {
+            bail!(
+                "revision runtime rollout identity (deployment={:?}, bundle={:?}, revision={:?}) \
+                 does not match key (deployment=`{key_deployment}`, bundle=`{key_bundle}`, \
+                 revision=`{key_revision}`)",
+                ids.deployment_id,
+                ids.bundle_id,
+                ids.revision_id
+            );
+        }
+        let _guard = self.write_lock.lock();
+        let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
+        let next = insert_keyed_entry(&self.inner.load_full(), key, runtime);
+        self.inner.store(Arc::new(next));
+        Ok(())
+    }
+
+    /// Swap in a freshly-resolved set of tenant-only (legacy) runtimes while
+    /// carrying over every revision-keyed entry. Used by the pack watcher, whose
+    /// index is authoritative for tenant packs but not for deployment revisions.
+    pub fn replace_legacy(&self, legacy: HashMap<RuntimeKey, Arc<TenantRuntime>>) {
+        let _guard = self.write_lock.lock();
+        let prev = self.inner.load_full();
+        let next = merge_legacy_reload(&prev, legacy);
+        self.inner.store(Arc::new(next));
+    }
+
+    /// Remove and return the runtime for a single revision-keyed entry,
+    /// preserving every other entry (legacy and revision alike). Used by the
+    /// drain coordinator (`gtc op revisions drain`) after the drain window
+    /// closes to tear down exactly the one revision being retired. `None` if
+    /// no such entry was present — idempotent for safe re-runs.
+    pub fn remove_revision(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+    ) -> Option<Arc<TenantRuntime>> {
+        let _guard = self.write_lock.lock();
+        let prev = self.inner.load_full();
+        let key = RuntimeKey::revision(tenant, deployment_id, bundle_id, revision_id);
+        let (next, removed) = remove_keyed_entry(&prev, &key)?;
+        self.inner.store(Arc::new(next));
+        Some(removed)
+    }
+
+    /// Replace the entire map, dropping every entry (legacy and revision alike).
+    /// Used for full host stop.
+    pub fn replace(&self, next: HashMap<RuntimeKey, Arc<TenantRuntime>>) {
+        let _guard = self.write_lock.lock();
         self.inner.store(Arc::new(next));
     }
 
@@ -79,6 +291,13 @@ pub struct TenantRuntime {
     digests: Vec<Option<String>>,
     engine: Arc<FlowEngine>,
     state_machine: Arc<StateMachineRuntime>,
+    /// The session store this runtime was loaded with. Shared with the inner
+    /// state machine — re-exposed here so callers outside the flow run loop
+    /// (M1.5 welcome-flow first-contact probe) can query the SAME bucket the
+    /// state machine will read/write. For revision mode each revision passes
+    /// its own store into `load_revision`; querying the RunnerHost-level
+    /// store would key the wrong bucket.
+    session_store: DynSessionStore,
     http_client: Client,
     mocks: Option<Arc<MockLayer>>,
     timer_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -93,6 +312,17 @@ pub struct ResolvedComponent {
     pub digest: String,
     pub component_ref: String,
     pub pack: Arc<PackRuntime>,
+}
+
+/// One pinned pack of a deployment revision: the on-disk path plus the
+/// `algo:value` content digest the deployment staged it under.
+/// [`TenantRuntime::load_revision`] fails closed when the file no longer
+/// matches the digest, defending the stage→warm window against a swapped or
+/// stale cache path.
+#[derive(Clone, Debug)]
+pub struct RevisionPackRef {
+    pub path: PathBuf,
+    pub digest: String,
 }
 
 /// Block on a future whether or not we're already inside a tokio runtime.
@@ -125,30 +355,20 @@ impl TenantRuntime {
             crate::http::agent_stream::StreamObserverRegistry,
         >,
     ) -> Result<Arc<Self>> {
-        let oauth_config = config.oauth_broker_config();
-        let pack = Arc::new(
-            PackRuntime::load(
-                pack_path,
-                Arc::clone(&config),
-                mocks.clone(),
-                archive_source,
-                Some(Arc::clone(&session_store)),
-                Some(Arc::clone(&state_store)),
-                Arc::clone(&wasi_policy),
-                Arc::clone(&secrets_manager),
-                oauth_config.clone(),
-                true,
-                ComponentResolution::default(),
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to load pack {} for tenant {}",
-                    pack_path.display(),
-                    config.tenant
-                )
-            })?,
-        );
+        let pack = Self::load_pack_runtime(
+            pack_path,
+            &config,
+            mocks.clone(),
+            archive_source,
+            &wasi_policy,
+            &session_store,
+            &state_store,
+            &secrets_manager,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .await?;
         Self::from_packs(
             config,
             vec![(pack, digest)],
@@ -166,8 +386,235 @@ impl TenantRuntime {
         .await
     }
 
+    /// Build a revision-keyed runtime from its pinned pack list (the resolved
+    /// `pack_list` of a deployment revision). The first entry is the main pack;
+    /// the rest are overlays.
+    ///
+    /// Fails closed if any pack file no longer matches the digest the
+    /// deployment pinned it under — defending the stage→warm window against a
+    /// swapped or stale cache path. The verified digests are threaded into the
+    /// runtime so admin status, traces, and contract hashes report the real
+    /// content (parity with the legacy index path). The rollout telemetry
+    /// identity is **derived from** `deployment_id` / `bundle_id` /
+    /// `revision_id` / `customer_id`, so the engine's attribution cannot drift
+    /// from the key the runtime is later inserted under.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn load_revision(
+        pack_refs: &[RevisionPackRef],
+        config: Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        wasi_policy: Arc<RunnerWasiPolicy>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        deployment_id: DeploymentId,
+        bundle_id: BundleId,
+        revision_id: RevisionId,
+        customer_id: Option<String>,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+    ) -> Result<Arc<Self>> {
+        if pack_refs.is_empty() {
+            bail!(
+                "revision runtime for tenant {} requires at least one pack",
+                config.tenant
+            );
+        }
+        let mut packs = Vec::with_capacity(pack_refs.len());
+        let mut seen_pack_ids = HashSet::with_capacity(pack_refs.len());
+        for pack_ref in pack_refs {
+            let expected = PackDigest::parse(&pack_ref.digest).with_context(|| {
+                format!(
+                    "revision pack `{}` has an invalid digest `{}`",
+                    pack_ref.path.display(),
+                    pack_ref.digest
+                )
+            })?;
+            // `matches_file` always hashes with SHA-256, so a digest pinned under
+            // any other algorithm could never match — reject it with a clear
+            // message rather than the misleading "does not match" below.
+            if expected.algorithm() != "sha256" {
+                bail!(
+                    "revision pack `{}` pins unsupported digest algorithm `{}`; only sha256 is supported",
+                    pack_ref.path.display(),
+                    expected.algorithm()
+                );
+            }
+            if !expected.matches_file(&pack_ref.path).with_context(|| {
+                format!(
+                    "hashing revision pack `{}` for digest verification",
+                    pack_ref.path.display()
+                )
+            })? {
+                bail!(
+                    "revision pack `{}` does not match pinned digest `{}`",
+                    pack_ref.path.display(),
+                    pack_ref.digest
+                );
+            }
+            let pack = Self::load_pack_runtime(
+                &pack_ref.path,
+                &config,
+                mocks.clone(),
+                None,
+                &wasi_policy,
+                &session_store,
+                &state_store,
+                &secrets_manager,
+                runtime_configs_by_pack_id,
+                runtime_refs_by_pack_id,
+                runtime_ref_resolver.as_ref(),
+            )
+            .await?;
+            // Reject duplicate pack_id within a single revision — two refs
+            // resolving to the same pack_id would silently share config/routing
+            // entries and produce an ambiguous runtime.
+            let pack_id = pack.metadata().pack_id.clone();
+            if !seen_pack_ids.insert(pack_id.clone()) {
+                bail!(
+                    "revision for tenant {} contains duplicate pack_id `{}` (path `{}`)",
+                    config.tenant,
+                    pack_id,
+                    pack_ref.path.display(),
+                );
+            }
+            packs.push((pack, Some(expected.raw_string())));
+        }
+        let rollout = RolloutIds {
+            customer_id,
+            deployment_id: Some(deployment_id.to_string()),
+            bundle_id: Some(bundle_id.as_str().to_string()),
+            revision_id: Some(revision_id.to_string()),
+        };
+        Self::from_packs_with_rollout(
+            config,
+            packs,
+            mocks,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            #[cfg(feature = "agentic-worker")]
+            None,
+            rollout,
+        )
+        .await
+    }
+
+    /// Load a single [`PackRuntime`] from a path, sharing the tenant's session /
+    /// state / secrets backends. Shared by [`load`](Self::load) (one pack) and
+    /// [`load_revision`](Self::load_revision) (the revision's pack list).
+    ///
+    /// `runtime_configs_by_pack_id` is consulted AFTER the pack loads (the
+    /// `pack_id` is only known after the manifest read) and BEFORE the
+    /// `Arc<PackRuntime>` is created. A matching entry is injected via
+    /// [`PackRuntime::set_runtime_config_non_secret`] so the C4.3 producer
+    /// plumbing requires no post-hoc `Arc::get_mut` dance — the single-pack
+    /// [`load`](Self::load) path just passes an empty map.
+    ///
+    /// `runtime_refs_by_pack_id` mirrors the same shape for the C5
+    /// `pack-config.v1.runtime_refs` channel; a matching entry is injected
+    /// via [`PackRuntime::set_runtime_refs`] alongside `runtime_ref_resolver`.
+    #[allow(clippy::too_many_arguments)]
+    async fn load_pack_runtime(
+        pack_path: &Path,
+        config: &Arc<HostConfig>,
+        mocks: Option<Arc<MockLayer>>,
+        archive_source: Option<&Path>,
+        wasi_policy: &Arc<RunnerWasiPolicy>,
+        session_store: &DynSessionStore,
+        state_store: &DynStateStore,
+        secrets_manager: &DynSecretsManager,
+        runtime_configs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, Value>>>,
+        runtime_refs_by_pack_id: &BTreeMap<String, Arc<BTreeMap<String, String>>>,
+        runtime_ref_resolver: Option<&Arc<dyn crate::runtime_refs::RuntimeRefResolver>>,
+    ) -> Result<Arc<PackRuntime>> {
+        let oauth_config = config.oauth_broker_config();
+        let mut pack = PackRuntime::load(
+            pack_path,
+            Arc::clone(config),
+            mocks,
+            archive_source,
+            Some(Arc::clone(session_store)),
+            Some(Arc::clone(state_store)),
+            Arc::clone(wasi_policy),
+            Arc::clone(secrets_manager),
+            oauth_config,
+            true,
+            ComponentResolution::default(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load pack {} for tenant {}",
+                pack_path.display(),
+                config.tenant
+            )
+        })?;
+        let pack_id = pack.metadata().pack_id.clone();
+        if let Some(non_secret) = runtime_configs_by_pack_id.get(pack_id.as_str()) {
+            pack.set_runtime_config_non_secret(Some(Arc::clone(non_secret)));
+        }
+        if let Some(refs) = runtime_refs_by_pack_id.get(pack_id.as_str()) {
+            let resolver = runtime_ref_resolver.ok_or_else(|| {
+                anyhow!(
+                    "pack `{}` has runtime_refs bound but no RuntimeRefResolver was provided",
+                    pack_id,
+                )
+            })?;
+            pack.set_runtime_refs(Some(crate::runtime_refs::RuntimeRefsInjection {
+                refs: Arc::clone(refs),
+                resolver: Arc::clone(resolver),
+            }));
+        }
+        Ok(Arc::new(pack))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn from_packs(
+        config: Arc<HostConfig>,
+        packs: Vec<(Arc<PackRuntime>, Option<String>)>,
+        mocks: Option<Arc<MockLayer>>,
+        session_host: Arc<dyn SessionHost>,
+        session_store: DynSessionStore,
+        state_store: DynStateStore,
+        state_host: Arc<dyn StateHost>,
+        secrets_manager: DynSecretsManager,
+        #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] stream_observers: Option<
+            crate::http::agent_stream::StreamObserverRegistry,
+        >,
+    ) -> Result<Arc<Self>> {
+        Self::from_packs_with_rollout(
+            config,
+            packs,
+            mocks,
+            session_host,
+            session_store,
+            state_store,
+            state_host,
+            secrets_manager,
+            #[cfg(feature = "agentic-worker")]
+            ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            stream_observers,
+            RolloutIds::default(),
+        )
+        .await
+    }
+
+    /// Like [`from_packs`](Self::from_packs) but stamps `rollout` onto the flow
+    /// engine so every span this runtime emits carries the deployment / bundle /
+    /// revision / customer identity. [`from_packs`](Self::from_packs) is the
+    /// legacy (tenant-only) path and passes [`RolloutIds::default`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn from_packs_with_rollout(
         config: Arc<HostConfig>,
         packs: Vec<(Arc<PackRuntime>, Option<String>)>,
         mocks: Option<Arc<MockLayer>>,
@@ -180,6 +627,7 @@ impl TenantRuntime {
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
+        rollout: RolloutIds,
     ) -> Result<Arc<Self>> {
         let operator_registry = OperatorRegistry::build(&packs)?;
         let operator_metrics = Arc::new(OperatorMetrics::default());
@@ -211,7 +659,8 @@ impl TenantRuntime {
         #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
         let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
-            .context("failed to prime flow engine")?;
+            .context("failed to prime flow engine")?
+            .with_rollout_ids(rollout);
 
         // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
         // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,
@@ -554,7 +1003,7 @@ impl TenantRuntime {
                 Arc::clone(&engine),
                 pack_trace,
                 session_host,
-                session_store,
+                Arc::clone(&session_store),
                 state_host,
                 Arc::clone(&secrets_manager),
                 mocks.clone(),
@@ -605,6 +1054,7 @@ impl TenantRuntime {
             digests,
             engine,
             state_machine,
+            session_store,
             http_client,
             mocks,
             timer_handles: Mutex::new(Vec::new()),
@@ -653,12 +1103,38 @@ impl TenantRuntime {
         self.packs.iter().skip(1).cloned().collect()
     }
 
+    /// All packs in declaration order: main pack at index 0, overlays after.
+    /// Borrowed slice — no `Arc` clones, no allocation. Use this when you only
+    /// need to iterate the full pack list; prefer [`pack`]/[`overlays`] when
+    /// you need to hand out owned `Arc`s downstream.
+    ///
+    /// [`pack`]: TenantRuntime::pack
+    /// [`overlays`]: TenantRuntime::overlays
+    pub fn all_packs(&self) -> &[Arc<PackRuntime>] {
+        &self.packs
+    }
+
+    /// Resolved content digest of each loaded pack, index-aligned with the pack
+    /// list. `Some` for revision runtimes (verified at load) and the legacy
+    /// index path; `None` only when a digest was unavailable.
+    pub fn pack_digests(&self) -> &[Option<String>] {
+        &self.digests
+    }
+
     pub fn engine(&self) -> &Arc<FlowEngine> {
         &self.engine
     }
 
     pub fn state_machine(&self) -> &Arc<StateMachineRuntime> {
         &self.state_machine
+    }
+
+    /// Shared session store. M1.5: lets `apply_welcome_flow_override`
+    /// build a `FlowResumeStore` against the SAME bucket the state machine
+    /// will read/write — important under revision mode where each revision
+    /// is given its own store via `load_revision`.
+    pub fn session_store(&self) -> &DynSessionStore {
+        &self.session_store
     }
 
     pub fn http_client(&self) -> &Client {
@@ -780,5 +1256,177 @@ impl Drop for TenantRuntime {
         for handle in self.timer_handles.lock().drain(..) {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_key_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_keys_match_only_on_tenant() {
+        assert_eq!(RuntimeKey::legacy("acme"), RuntimeKey::legacy("acme"));
+        assert_ne!(RuntimeKey::legacy("acme"), RuntimeKey::legacy("other"));
+    }
+
+    #[test]
+    fn legacy_and_revision_keys_never_collide() {
+        let key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        assert_ne!(RuntimeKey::legacy("acme"), key);
+    }
+
+    #[test]
+    fn revision_keys_distinguish_revision_id() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_b);
+        let same = RuntimeKey::revision("acme", deployment, bundle, rev_a);
+        assert_ne!(key_a, key_b);
+        assert_eq!(key_a, same);
+    }
+
+    #[test]
+    fn legacy_reload_preserves_revision_entries() {
+        let revision_key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1); // stale legacy, refreshed below
+        prev.insert(RuntimeKey::legacy("retired"), 2); // dropped: not in new index
+        prev.insert(revision_key.clone(), 99); // revision runtime: must survive
+
+        let mut legacy: HashMap<RuntimeKey, u32> = HashMap::new();
+        legacy.insert(RuntimeKey::legacy("acme"), 10);
+        legacy.insert(RuntimeKey::legacy("newcomer"), 20);
+
+        let next = merge_legacy_reload(&prev, legacy);
+
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&10));
+        assert_eq!(next.get(&RuntimeKey::legacy("newcomer")), Some(&20));
+        assert_eq!(next.get(&RuntimeKey::legacy("retired")), None);
+        assert_eq!(next.get(&revision_key), Some(&99));
+    }
+
+    #[test]
+    fn remove_keyed_entry_pops_only_the_targeted_key() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle, rev_b);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1);
+        prev.insert(key_a.clone(), 10);
+        prev.insert(key_b.clone(), 20);
+
+        let (next, removed) = remove_keyed_entry(&prev, &key_a).expect("present");
+        assert_eq!(removed, 10);
+        assert_eq!(next.get(&key_a), None);
+        assert_eq!(next.get(&key_b), Some(&20));
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&1));
+    }
+
+    #[test]
+    fn remove_keyed_entry_returns_none_for_missing_key() {
+        let prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        let ghost = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        assert!(remove_keyed_entry(&prev, &ghost).is_none());
+    }
+
+    #[test]
+    fn remove_keyed_entry_leaves_other_deployments_alone() {
+        let bundle = BundleId::from("bundle-a");
+        let dep_a = DeploymentId::new();
+        let dep_b = DeploymentId::new();
+        let rev = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", dep_a, bundle.clone(), rev);
+        let key_b = RuntimeKey::revision("acme", dep_b, bundle, rev);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(key_a.clone(), 100);
+        prev.insert(key_b.clone(), 200);
+
+        let (next, removed) = remove_keyed_entry(&prev, &key_a).expect("present");
+        assert_eq!(removed, 100);
+        assert_eq!(next.get(&key_b), Some(&200));
+        assert_eq!(next.len(), 1);
+    }
+
+    #[test]
+    fn map_lookup_separates_legacy_from_revision() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let revision = RevisionId::new();
+
+        let mut map: HashMap<RuntimeKey, u32> = HashMap::new();
+        map.insert(RuntimeKey::legacy("acme"), 1);
+        map.insert(
+            RuntimeKey::revision("acme", deployment, bundle.clone(), revision),
+            2,
+        );
+
+        assert_eq!(map.get(&RuntimeKey::legacy("acme")), Some(&1));
+        assert_eq!(
+            map.get(&RuntimeKey::revision("acme", deployment, bundle, revision)),
+            Some(&2)
+        );
+        assert_eq!(map.get(&RuntimeKey::legacy("ghost")), None);
+    }
+
+    #[test]
+    fn insert_keyed_entry_adds_revision_preserving_legacy_and_siblings() {
+        let deployment = DeploymentId::new();
+        let bundle = BundleId::from("bundle-a");
+        let rev_a = RevisionId::new();
+        let rev_b = RevisionId::new();
+        let key_a = RuntimeKey::revision("acme", deployment, bundle.clone(), rev_a);
+        let key_b = RuntimeKey::revision("acme", deployment, bundle, rev_b);
+
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(RuntimeKey::legacy("acme"), 1);
+        prev.insert(key_a.clone(), 10);
+
+        let next = insert_keyed_entry(&prev, key_b.clone(), 20);
+
+        // New revision lands; legacy entry and the sibling revision survive.
+        assert_eq!(next.get(&key_b), Some(&20));
+        assert_eq!(next.get(&key_a), Some(&10));
+        assert_eq!(next.get(&RuntimeKey::legacy("acme")), Some(&1));
+        assert_eq!(next.len(), 3);
+    }
+
+    #[test]
+    fn insert_keyed_entry_replaces_existing_revision() {
+        let key = RuntimeKey::revision(
+            "acme",
+            DeploymentId::new(),
+            BundleId::from("bundle-a"),
+            RevisionId::new(),
+        );
+        let mut prev: HashMap<RuntimeKey, u32> = HashMap::new();
+        prev.insert(key.clone(), 10);
+
+        let next = insert_keyed_entry(&prev, key.clone(), 99);
+
+        assert_eq!(next.get(&key), Some(&99));
+        assert_eq!(next.len(), 1);
     }
 }

@@ -815,6 +815,7 @@ fn build_host_config(
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         // The `agents` and `graphs` fields are present only when the host is
         // compiled with the `agentic-worker` feature, which this crate
         // propagates via its own same-named feature flag.

@@ -65,6 +65,16 @@ impl RunnerWasiPolicy {
         Self::default()
     }
 
+    /// Locked-down WASI policy for identity probes.
+    ///
+    /// No preopens, no env passthrough, no stdio inheritance. This is the
+    /// only reduced-authority boundary that the probe path can enforce today
+    /// (the linker import surface must match the full component; see
+    /// [`crate::pack::register_identity_probe`] doc comment).
+    pub fn probe() -> Self {
+        Self::new().inherit_stdio(false)
+    }
+
     pub fn allow_env(mut self, key: impl Into<String>) -> Self {
         self.env_allow.push(key.into());
         self
@@ -88,7 +98,16 @@ impl RunnerWasiPolicy {
     pub(crate) fn instantiate(&self) -> Result<WasiCtx> {
         let mut builder = WasiCtxBuilder::new();
         if self.inherit_stdio {
-            builder.inherit_stdio();
+            // Route component stdout/stderr through the telemetry scanner so
+            // structured guest fallback lines from greentic-telemetry land in
+            // the host tracing pipeline (and from there in any configured
+            // OTLP exporter) rather than escaping as free-form text. Lines
+            // that don't match the telemetry format are forwarded verbatim
+            // to the host's real stdout/stderr, preserving legacy println!
+            // visibility.
+            builder.stdout(crate::telemetry_scan::TelemetryStream::stdout());
+            builder.stderr(crate::telemetry_scan::TelemetryStream::stderr());
+            builder.inherit_stdin();
         }
         let env_pairs = self.collect_env();
         if !env_pairs.is_empty() {

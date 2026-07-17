@@ -34,6 +34,7 @@ pub struct HostConfig {
     pub trace: TraceConfig,
     pub validation: ValidationConfig,
     pub operator_policy: OperatorPolicy,
+    pub fast2flow: Fast2FlowRoutingConfig,
     /// Operator-declared Digital Worker agent configs, keyed by `agent_id`.
     /// Sourced from the `agents:` section of the bindings YAML and consumed
     /// by the production `ConfigProvider` (Task 4.3).
@@ -70,6 +71,8 @@ pub struct BindingsFile {
     pub state_store: StateStorePolicy,
     #[serde(default)]
     pub operator: OperatorPolicyConfig,
+    #[serde(default)]
+    pub fast2flow: Fast2FlowRoutingConfig,
     /// Digital Worker agent configs keyed by `agent_id`. The whole section is
     /// optional; each value must be a complete `AgentConfig` (all `limits`
     /// fields are required — `AgentLimits` has no serde defaults).
@@ -128,6 +131,50 @@ pub struct OperatorPolicy {
     allow_all: bool,
     allowed_providers: HashSet<String>,
     allowed_ops: HashMap<String, HashSet<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Fast2FlowRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_fast2flow_component_ref")]
+    pub component_ref: String,
+    #[serde(default = "default_fast2flow_operation")]
+    pub operation: String,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub registry_path: String,
+    #[serde(default)]
+    pub indexes_path: String,
+    #[serde(default = "default_fast2flow_time_budget_ms")]
+    pub time_budget_ms: u64,
+}
+
+impl Default for Fast2FlowRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            component_ref: default_fast2flow_component_ref(),
+            operation: default_fast2flow_operation(),
+            scope: None,
+            registry_path: String::new(),
+            indexes_path: String::new(),
+            time_budget_ms: default_fast2flow_time_budget_ms(),
+        }
+    }
+}
+
+fn default_fast2flow_component_ref() -> String {
+    "fast2flow-routing".to_owned()
+}
+
+fn default_fast2flow_operation() -> String {
+    "route".to_owned()
+}
+
+fn default_fast2flow_time_budget_ms() -> u64 {
+    250
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -221,6 +268,7 @@ impl HostConfig {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::from_config(bindings.operator.clone()),
+            fast2flow: bindings.fast2flow.clone(),
             #[cfg(feature = "agentic-worker")]
             agents: bindings.agents.clone(),
             #[cfg(feature = "agentic-worker")]
@@ -251,6 +299,7 @@ impl HostConfig {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            fast2flow: Fast2FlowRoutingConfig::default(),
             // TODO(phase-4): TenantBindings (gtbind) has no agents section yet.
             // When embedded gtbind hosts need Digital Worker agents, extend
             // TenantBindings to carry them and populate this map here.
@@ -563,6 +612,7 @@ mod tests {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            fast2flow: Fast2FlowRoutingConfig::default(),
             #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
             #[cfg(feature = "agentic-worker")]
@@ -619,6 +669,37 @@ agents:
         std::fs::write(&path, yaml).unwrap();
         let cfg = HostConfig::load_from_path(&path).unwrap();
         assert!(cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn host_config_loads_fast2flow_routing_block() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let path = temp.path().join("bindings.yaml");
+        std::fs::write(
+            &path,
+            r#"
+tenant: demo
+fast2flow:
+  enabled: true
+  component_ref: router.fast2flow
+  operation: handle-hook
+  scope: tenant-a
+  registry_path: /mnt/registry
+  indexes_path: /mnt/indexes
+  time_budget_ms: 750
+"#,
+        )
+        .expect("write bindings");
+
+        let cfg = HostConfig::load_from_path(&path).expect("load config");
+
+        assert!(cfg.fast2flow.enabled);
+        assert_eq!(cfg.fast2flow.component_ref, "router.fast2flow");
+        assert_eq!(cfg.fast2flow.operation, "handle-hook");
+        assert_eq!(cfg.fast2flow.scope.as_deref(), Some("tenant-a"));
+        assert_eq!(cfg.fast2flow.registry_path, "/mnt/registry");
+        assert_eq!(cfg.fast2flow.indexes_path, "/mnt/indexes");
+        assert_eq!(cfg.fast2flow.time_budget_ms, 750);
     }
 
     #[test]

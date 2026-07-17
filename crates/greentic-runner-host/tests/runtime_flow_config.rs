@@ -81,6 +81,7 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
         #[cfg(feature = "agentic-worker")]
@@ -108,6 +109,7 @@ fn build_pack_with_runtime_extension(runtime_extension: Value, pack_path: &Path)
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runtime.flow.config".parse()?,
         name: None,
@@ -133,7 +135,6 @@ fn build_pack_with_runtime_extension(runtime_extension: Value, pack_path: &Path)
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 

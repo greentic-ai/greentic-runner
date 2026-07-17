@@ -15,12 +15,10 @@ use std::time::Duration;
 use crate::secrets::SecretsBackend;
 use anyhow::{Context, Result, anyhow};
 use greentic_config::ResolvedConfig;
-#[cfg(feature = "telemetry")]
 use greentic_config_types::TelemetryExporterKind;
 use greentic_config_types::{
     NetworkConfig, PackSourceConfig, PacksConfig, PathsConfig, TelemetryConfig,
 };
-#[cfg(feature = "telemetry")]
 use greentic_telemetry::export::{ExportConfig as TelemetryExportConfig, ExportMode, Sampling};
 use runner_core::env::PackConfig;
 use serde_json::json;
@@ -33,8 +31,12 @@ pub mod config;
 pub mod engine;
 pub mod extension_provider;
 pub mod fault;
+#[cfg(feature = "greentic-x-provider")]
+pub mod greentic_x_provider;
 pub mod gtbind;
 pub mod http;
+pub mod identify_hint;
+pub mod metrics;
 pub mod operator_metrics;
 pub mod operator_registry;
 pub mod pack;
@@ -44,12 +46,14 @@ pub mod provider_core_only;
 pub mod routing;
 pub mod runner;
 pub mod runtime;
+pub mod runtime_refs;
 pub mod runtime_wasmtime;
 pub mod secrets;
 pub(crate) mod secrets_broker;
 pub mod sql;
 pub mod storage;
 pub mod telemetry;
+pub mod telemetry_scan;
 #[cfg(feature = "fault-injection")]
 pub mod testing;
 pub mod trace;
@@ -62,7 +66,7 @@ mod activity;
 mod host;
 pub mod oauth;
 
-pub use activity::{Activity, ActivityKind};
+pub use activity::{Activity, ActivityKind, WelcomeFlowHint};
 pub use config::HostConfig;
 pub use gtbind::{PackBinding, TenantBindings};
 pub use host::TelemetryCfg;
@@ -383,7 +387,6 @@ fn pack_config_from(
     Ok(cfg)
 }
 
-#[cfg(feature = "telemetry")]
 fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     if !cfg.enabled || matches!(cfg.exporter, TelemetryExporterKind::None) {
         return None;
@@ -405,11 +408,6 @@ fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
         },
         export,
     })
-}
-
-#[cfg(not(feature = "telemetry"))]
-fn telemetry_from(_cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
-    None
 }
 
 /// Spawn the in-process agentic-worker NATS service once, when opted in.
@@ -475,8 +473,6 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         trace,
         validation,
     } = cfg;
-    #[cfg(not(feature = "telemetry"))]
-    let _ = telemetry;
 
     let mut builder = HostBuilder::new();
     for bindings in tenant_bindings.into_values() {
@@ -485,7 +481,6 @@ pub async fn run(cfg: RunnerConfig) -> Result<()> {
         host_config.validation = validation.clone();
         builder = builder.with_config(host_config);
     }
-    #[cfg(feature = "telemetry")]
     if let Some(telemetry) = telemetry.clone() {
         builder = builder.with_telemetry(telemetry);
     }

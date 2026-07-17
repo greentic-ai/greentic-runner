@@ -12,11 +12,15 @@ categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
 default = ["verify", "agentic-worker", "state-disk"]
-telemetry = ["dep:greentic-telemetry"]
 verify = []
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
+# Declared but off by default. C5.4 introduced #[cfg(feature = "telemetry")]
+# gates around greentic_telemetry::annotate_span calls; turning the gate on
+# activates explicit span annotation (greentic-telemetry is always linked).
+telemetry = []
+greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 # Gates the agentic-worker (DwAgent) node implementation and its deps
 # (greentic-aw-runtime + greentic-ext-runtime). Disable this feature to
 # produce a lean, publishable build that lacks DwAgent node support.
@@ -151,9 +155,12 @@ greentic-flow.workspace = true
 greentic-interfaces-host.workspace = true
 greentic-interfaces-wasmtime.workspace = true
 greentic-interfaces.workspace = true
+greentic-x-runtime = { workspace = true, optional = true }
+greentic-x-types = { workspace = true, optional = true }
 greentic-types = { workspace = true, features = ["telemetry-autoinit"] }
 greentic_pack.workspace = true
 greentic-distributor-client.workspace = true
+greentic-deploy-spec.workspace = true
 greentic-session.workspace = true
 greentic-state.workspace = true
 greentic-secrets-lib.workspace = true
@@ -163,6 +170,7 @@ hex.workspace = true
 humantime.workspace = true
 indexmap.workspace = true
 lru.workspace = true
+opentelemetry = "0.31"
 parking_lot.workspace = true
 rand.workspace = true
 reqwest.workspace = true
@@ -211,7 +219,7 @@ wasmtime-wasi-tls = { workspace = true }
 # provider when both `aws-lc-rs` (via reqwest/hyper-rustls) and `ring`
 # (via wasmtime-wasi-tls) are linked, so the runner must pick one explicitly.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
-greentic-telemetry = { workspace = true, optional = true }
+greentic-telemetry = { workspace = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -220,6 +228,12 @@ tempfile.workspace = true
 once_cell.workspace = true
 semver.workspace = true
 proptest.workspace = true
+# C5.4 export regression (main lineage): a real OTLP exporter to prove gt.*
+# attribution reaches exported spans. Versions match greentic-telemetry's OTel
+# stack. Consumed by the `#[cfg(all(test, feature = "telemetry"))]` export_tests.
+opentelemetry_sdk = "0.31"
+tracing-opentelemetry = "0.32"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
 tower.workspace = true
 http-body-util = "0.1"
 wiremock = "0.6"

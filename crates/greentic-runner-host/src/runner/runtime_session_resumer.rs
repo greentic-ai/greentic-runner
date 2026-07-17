@@ -166,6 +166,7 @@ impl RuntimeSessionResumer {
             user,
             activity_id: None,
             timestamp: None,
+            messaging_endpoint_id: None,
             payload: output,
             metadata: None,
             // Reproduce the EXACT reply scope used at save time so

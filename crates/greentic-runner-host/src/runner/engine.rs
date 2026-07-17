@@ -18,14 +18,22 @@ use super::templating::{TemplateOptions, render_template_value};
 use crate::config::{FlowRetryConfig, HostConfig};
 use crate::pack::{FlowDescriptor, PackRuntime};
 use crate::runner::invocation::{InvocationMeta, build_invocation_envelope};
-use crate::telemetry::{FlowSpanAttributes, annotate_span, backoff_delay_ms, set_flow_context};
+use crate::telemetry::{
+    FlowSpanAttributes, RolloutIds, annotate_span, backoff_delay_ms, set_flow_context,
+};
 #[cfg(feature = "fault-injection")]
 use crate::testing::fault_injection::{FaultContext, FaultPoint, maybe_fail};
 use crate::validate::{
     ValidationConfig, ValidationIssue, ValidationMode, validate_component_envelope,
     validate_tool_envelope,
 };
+use greentic_flow::SLOT_SCHEMA_METADATA_KEY;
 use greentic_types::{Flow, Node, NodeId, Routing};
+
+/// Component ID of the slot-extractor WASM component. Used to detect
+/// slot-extractor nodes and inject flow-level `slot_schema` as
+/// `slot_definitions` into the invocation payload (Phase D).
+const SLOT_EXTRACTOR_COMPONENT_ID: &str = "ai.greentic.component-slot-extractor";
 
 /// Callback trait for resolving cross-pack provider invocations.
 ///
@@ -53,6 +61,11 @@ pub struct FlowEngine {
     default_env: String,
     validation: ValidationConfig,
     cross_pack_resolver: Option<Arc<dyn CrossPackResolver>>,
+    /// Rollout identifiers of the revision-keyed runtime this engine belongs to,
+    /// stamped onto every per-invocation `TenantCtx` for telemetry attribution
+    /// (C5.4). Empty for tenant-only (legacy) runtimes; the Phase-D revision
+    /// dispatcher supplies real IDs via [`with_rollout_ids`](Self::with_rollout_ids).
+    rollout_ids: RolloutIds,
     /// Bridges `sorla.call` flow nodes into a separate runtime over pub/sub.
     /// Not feature-gated: `sorla.call` is a core runtime-dispatch node.
     remote_dispatch_handler: Option<Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>>,
@@ -124,6 +137,9 @@ struct HostFlow {
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
     vars_init: JsonMap<String, Value>,
+    /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
+    /// Injected into slot-extractor component invocations at dispatch time (Phase D).
+    slot_schema: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +425,7 @@ impl FlowEngine {
             validation: config.validation.clone(),
             cross_pack_resolver: None,
             remote_dispatch_handler: None,
+            rollout_ids: RolloutIds::default(),
             operala_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -419,6 +436,23 @@ impl FlowEngine {
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: crate::runner::mcp_node::source_from_env(),
         })
+    }
+
+    /// Bind the rollout identifiers of the revision-keyed runtime this engine
+    /// serves, so every invocation's telemetry carries deployment/bundle/
+    /// revision attribution (C5.4). Called by the Phase-D revision dispatcher
+    /// when it constructs a revision runtime; tenant-only runtimes leave the
+    /// default (empty) IDs.
+    pub fn with_rollout_ids(mut self, rollout_ids: RolloutIds) -> Self {
+        self.rollout_ids = rollout_ids;
+        self
+    }
+
+    /// The rollout identifiers bound to this engine (read counterpart to
+    /// [`with_rollout_ids`](Self::with_rollout_ids)). Empty by default for the
+    /// legacy tenant-only path.
+    pub fn rollout_ids(&self) -> &RolloutIds {
+        &self.rollout_ids
     }
 
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
@@ -520,7 +554,13 @@ impl FlowEngine {
         Ok(host_flow)
     }
 
-    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    /// Create the `flow.execute` span and install per-invocation telemetry:
+    /// declared span fields, the task-local tenant context, and the **exported**
+    /// `gt.*` attribution — the live `pack_id` plus any rollout identifiers from
+    /// the owning revision runtime (C5.4). Returned for the caller to
+    /// `.instrument()`. Both `execute` and `resume` route through here so every
+    /// per-invocation entry point carries the same attribution.
+    fn flow_execute_span(&self, ctx: &FlowContext<'_>) -> tracing::Span {
         let span = tracing::info_span!(
             "flow.execute",
             tenant = tracing::field::Empty,
@@ -540,17 +580,28 @@ impl FlowEngine {
             },
         );
         set_flow_context(
+            &span,
             &self.default_env,
             ctx.tenant,
             ctx.flow_id,
             ctx.node_id,
             ctx.provider_id,
             ctx.session_id,
+            ctx.pack_id,
+            &self.rollout_ids,
         );
+        span
+    }
+
+    pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
         let mut ctx = ctx;
-        async move {
+        let metric_tenant = ctx.tenant.to_string();
+        let metric_flow_id = ctx.flow_id.to_string();
+        let started = std::time::Instant::now();
+        let result = async move {
             let mut attempt = 0u32;
             loop {
                 attempt += 1;
@@ -570,6 +621,22 @@ impl FlowEngine {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
+                            // User-facing session flows surface the terminal
+                            // error as a metadata-only Ok envelope so the
+                            // messaging provider renders it instead of leaking
+                            // raw engine text to the chat.
+                            if ctx.session_id.is_some() {
+                                return Ok(FlowExecution::completed(
+                                    json!({
+                                        "metadata": {
+                                            "error_kind": "flow_execution_failed",
+                                            "error_message": err.to_string(),
+                                            "flow_id": ctx.flow_id,
+                                        }
+                                    }),
+                                    Default::default(),
+                                ));
+                            }
                             return Err(err);
                         }
                         let delay = backoff_delay_ms(retry_config.base_delay_ms, attempt - 1);
@@ -588,7 +655,11 @@ impl FlowEngine {
             }
         }
         .instrument(span)
-        .await
+        .await;
+        let status = if result.is_ok() { "ok" } else { "err" };
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        crate::metrics::record_flow_execution(&metric_tenant, &metric_flow_id, status, duration_ms);
+        result
     }
 
     pub async fn resume(
@@ -621,7 +692,9 @@ impl FlowEngine {
         // entry is non-null.
         state.replace_input(input.clone());
         state.entry = input;
+        let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
+            .instrument(span)
             .await
     }
 
@@ -695,11 +768,25 @@ impl FlowEngine {
                 maybe_fail(FaultPoint::TemplateRender, fault_ctx)
                     .map_err(|err| anyhow!(err.to_string()))?;
             }
-            let payload =
+            let mut payload =
                 render_template_value(&payload_template, &ctx_value, TemplateOptions::default())
                     .context("failed to render node input template")?;
-            let observed_payload = payload.clone();
             let node_id = current.clone();
+
+            // Phase D: inject flow-level slot_schema as slot_definitions into
+            // the slot-extractor's input when the author omitted inline
+            // definitions. Explicit inline `slot_definitions` win
+            // (back-compat with M2.4 NDA demo).
+            if let NodeKind::Exec { target_component } = &node.kind
+                && target_component == SLOT_EXTRACTOR_COMPONENT_ID
+                && let Some(schema) = flow_ir.slot_schema.as_ref()
+                && let Some(map) = payload.as_object_mut()
+            {
+                let input = map.entry("input").or_insert(Value::Null);
+                inject_slot_definitions(input, schema, step_ctx.flow_id, node_id.as_str());
+            }
+
+            let observed_payload = payload.clone();
             let event = NodeEvent {
                 context: &step_ctx,
                 node_id: node_id.as_str(),
@@ -725,6 +812,9 @@ impl FlowEngine {
                     if let Some(observer) = step_ctx.observer {
                         observer.on_node_error(&event, err.as_ref());
                     }
+                    // Propagate so `execute()`'s retry loop can retry transient
+                    // failures, then convert to a metadata-only Ok envelope at
+                    // the top level once retries are exhausted (session flows).
                     return Err(err);
                 }
             };
@@ -780,8 +870,10 @@ impl FlowEngine {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
                             let node_outputs = state.outputs_map();
+                            let nodes_snapshot = state.nodes.clone();
+                            let final_output = state.finalize_with(Some(output.payload.clone()));
                             return Ok(FlowExecution::completed(
-                                state.finalize_with(Some(output.payload.clone())),
+                                lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
                                 node_outputs,
                             ));
                         }
@@ -938,8 +1030,10 @@ impl FlowEngine {
                     });
                     state.push_egress(response);
                     let node_outputs = state.outputs_map();
+                    let nodes_snapshot = state.nodes.clone();
+                    let final_output = state.finalize_with(None);
                     return Ok(FlowExecution::completed(
-                        state.finalize_with(None),
+                        lift_first_node_error_from_nodes(final_output, &nodes_snapshot),
                         node_outputs,
                     ));
                 }
@@ -1940,6 +2034,7 @@ impl FlowEngine {
             overrides.operation,
             node.operation_in_mapping.as_deref(),
         )?;
+
         let call = ComponentCall {
             component_ref,
             operation,
@@ -2090,6 +2185,19 @@ impl FlowEngine {
                 message
             );
         }
+        // MCP-shaped tool errors (greentic-mcp-generator's tool_error_with_status)
+        // come back as a top-level `{ "error": { "code", "message", "status" } }`
+        // value with the WIT envelope still ok=true (because the wasm guest
+        // returned normally). Treat them the same as a component_error so the
+        // engine error-envelope lift path surfaces the failure to the user.
+        if let Some((code, message)) = mcp_tool_error(&value) {
+            bail!(
+                "component {} returned tool error: {}: {}",
+                call.component_ref,
+                code,
+                message
+            );
+        }
         let meta = outcome_meta(&value);
         Ok(NodeOutput::with_meta(value, meta))
     }
@@ -2205,9 +2313,24 @@ impl FlowEngine {
             maybe_fail(FaultPoint::BeforeToolCall, fault_ctx)
                 .map_err(|err| anyhow!(err.to_string()))?;
         }
-        let result = pack
+        let provider_metric_id = payload
+            .provider_id
+            .as_deref()
+            .or(payload.provider_type.as_deref())
+            .unwrap_or("unknown");
+        let invoke_started = std::time::Instant::now();
+        let invoke_result = pack
             .invoke_provider(&binding, exec_ctx, &op, input_json)
-            .await?;
+            .await;
+        let invoke_duration_ms = invoke_started.elapsed().as_secs_f64() * 1000.0;
+        crate::metrics::record_provider_invocation(
+            ctx.tenant,
+            provider_metric_id,
+            &op,
+            if invoke_result.is_ok() { "ok" } else { "err" },
+            invoke_duration_ms,
+        );
+        let result = invoke_result?;
         #[cfg(feature = "fault-injection")]
         {
             let fault_ctx = FaultContext {
@@ -2617,6 +2740,24 @@ impl NodeOutput {
             meta: Value::Null,
         }
     }
+
+    /// `ok=false` output stashing error context in `meta.error`. Currently
+    /// only used by `lift_first_node_error_from_nodes` tests — kept around so
+    /// drive_flow can resume populating it once we have a hook for it.
+    #[allow(dead_code)]
+    fn with_error(node_id: &str, err: &(dyn std::error::Error + 'static)) -> Self {
+        Self {
+            ok: false,
+            payload: Value::Null,
+            meta: json!({
+                "error": {
+                    "kind": "flow_node_failed",
+                    "message": err.to_string(),
+                    "node_id": node_id,
+                }
+            }),
+        }
+    }
 }
 
 struct DispatchOutcome {
@@ -2840,6 +2981,33 @@ fn component_error(value: &Value) -> Option<(String, String)> {
     Some((code.to_string(), message.to_string()))
 }
 
+/// MCP tool-error wire shape from greentic-mcp-generator's `tool_error_with_status`:
+/// `{ "error": { "code", "message", "status" } }`. The component returned ok=true at
+/// the WIT level (the HTTP failure was caught and serialized), so the regular
+/// component_error path doesn't catch it.
+fn mcp_tool_error(value: &Value) -> Option<(String, String)> {
+    let obj = value.as_object()?;
+    // Must be the error shape: no `result` field, just `error`.
+    if obj.contains_key("result") {
+        return None;
+    }
+    let err = obj.get("error")?.as_object()?;
+    let code = err
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_error");
+    let raw_message = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("tool returned an error");
+    let status = err.get("status").and_then(Value::as_u64);
+    let message = match status {
+        Some(s) => format!("{raw_message} (status {s})"),
+        None => raw_message.to_string(),
+    };
+    Some((code.to_string(), message))
+}
+
 fn extract_wait_reason(payload: &Value) -> Option<String> {
     match payload {
         Value::String(s) => Some(s.clone()),
@@ -3000,11 +3168,21 @@ impl From<Flow> for HostFlow {
                     .collect::<JsonMap<String, Value>>()
             })
             .unwrap_or_default();
+        // Extract flow-level slot_schema from metadata.extra (Phase D).
+        // The producer side (greentic-flow compile_flow) stores it under
+        // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
+        let slot_schema = value
+            .metadata
+            .extra
+            .get(SLOT_SCHEMA_METADATA_KEY)
+            .filter(|v| !v.is_null())
+            .cloned();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
             vars_init,
+            slot_schema,
         }
     }
 }
@@ -3012,8 +3190,15 @@ impl From<Flow> for HostFlow {
 impl From<Node> for HostNode {
     fn from(node: Node) -> Self {
         let full_ref = node.component.id.as_str().to_string();
-        // When the pack compiler stores "component.operation" as a single ID
-        // without a separate operation field, split on the last dot.
+        let operation_in_mapping = extract_operation_from_mapping(&node.input.mapping);
+        // A dotted component id is only a packed "<component>.<operation>" string
+        // when the operation isn't carried structurally elsewhere. greentic-pack
+        // resolves a component node to a bare component symbol (e.g.
+        // `ai.greentic.component-templates`) and keeps the operation in the input
+        // mapping, so splitting on the last dot here would corrupt the reference
+        // (→ `ai.greentic`, "not found in pack"). Prefer the structured operation —
+        // from `component.operation` or the input mapping — and only fall back to
+        // the legacy single-ID split when neither is present.
         let is_builtin = full_ref.starts_with("component.exec")
             || full_ref.starts_with("flow.")
             || full_ref.starts_with("emit.")
@@ -3031,27 +3216,20 @@ impl From<Node> for HostNode {
             // The gate then fails with `component 'approval' not found in pack` on a
             // pack that is perfectly well-formed, so rebuilding never helps.
             || full_ref.starts_with("approval.")
-            // Same dispatch family as sorla./operala./agentic. above, and listed in
-            // NATIVE_OP_KEYS like them. Without it an `approval.call` node — which
-            // packc emits with `operation: None` because the id is already complete
-            // — gets split into component "approval" + operation "call", and
-            // "approval" is by construction absent from the pack's component map.
-            // The gate then fails with `component 'approval' not found in pack` on a
-            // pack that is perfectly well-formed, so rebuilding never helps.
             || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
-        let (component_ref, raw_operation) = if node.component.operation.is_some() || is_builtin {
-            (full_ref, node.component.operation.clone())
-        } else if let Some(dot) = full_ref.rfind('.') {
-            let comp = full_ref[..dot].to_string();
-            let op = full_ref[dot + 1..].to_string();
-            (comp, Some(op))
-        } else {
-            (full_ref, None)
-        };
-        let operation_in_mapping = extract_operation_from_mapping(&node.input.mapping);
+        let (component_ref, raw_operation) =
+            if node.component.operation.is_some() || is_builtin || operation_in_mapping.is_some() {
+                (full_ref, node.component.operation.clone())
+            } else if let Some(dot) = full_ref.rfind('.') {
+                let comp = full_ref[..dot].to_string();
+                let op = full_ref[dot + 1..].to_string();
+                (comp, Some(op))
+            } else {
+                (full_ref, None)
+            };
         let operation_is_component_exec = raw_operation.as_deref() == Some("component.exec");
         let operation_is_emit = raw_operation
             .as_deref()
@@ -3480,6 +3658,35 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if let Some(locale) = locale {
         map.insert("locale".into(), Value::String(locale.to_string()));
     }
+}
+
+/// Inject flow-level `slot_schema` as `slot_definitions` into the
+/// slot-extractor component's input value. Skips injection when the input
+/// already contains an explicit `slot_definitions` key (back-compat with
+/// M2.4 NDA demo inline definitions). When the input is `Null`, promotes it
+/// to an empty object first.
+fn inject_slot_definitions(input: &mut Value, slot_schema: &Value, flow_id: &str, node_id: &str) {
+    if input.is_null() {
+        *input = Value::Object(serde_json::Map::new());
+    }
+    let Some(map) = input.as_object_mut() else {
+        tracing::warn!(
+            flow_id,
+            node_id,
+            "slot-extractor input is not an object; cannot inject slot_definitions"
+        );
+        return;
+    };
+    if map.contains_key("slot_definitions") {
+        return;
+    }
+    let slot_count = slot_schema.as_array().map_or(0, Vec::len);
+    tracing::debug!(
+        flow_id,
+        slot_count,
+        "injecting flow-level slot_schema as slot_definitions into slot-extractor input"
+    );
+    map.insert("slot_definitions".to_string(), slot_schema.clone());
 }
 
 /// Pre-resolve `card_source: "asset"` entries by reading the referenced JSON
@@ -4247,6 +4454,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -4802,6 +5010,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -4858,6 +5067,73 @@ mod tests {
         assert_eq!(starts.len(), 1);
         assert_eq!(ends.len(), 1);
         assert_eq!(ends[0], json!({ "message": "logged" }));
+    }
+
+    #[test]
+    fn dotted_component_id_with_mapping_operation_is_not_split() {
+        // greentic-pack resolves a component node to a bare component symbol and
+        // keeps the operation in the input mapping. The runtime must NOT split the
+        // dotted symbol on the last dot (which would yield `ai.greentic`, "not
+        // found in pack"); the structured mapping operation makes the id a
+        // complete reference.
+        let node = Node {
+            conversational: false,
+            id: NodeId::from_str("render").unwrap(),
+            component: FlowComponentRef {
+                id: "ai.greentic.component-templates".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "operation": "handle_message", "input": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let host = HostNode::from(node);
+        assert!(
+            matches!(&host.kind, NodeKind::PackComponent { component_ref } if component_ref == "ai.greentic.component-templates"),
+            "dotted component id must stay intact, got kind {:?}",
+            host.kind
+        );
+        assert_eq!(host.component, "ai.greentic.component-templates");
+        assert_eq!(host.operation_in_mapping(), Some("handle_message"));
+    }
+
+    #[test]
+    fn packed_component_operation_id_still_splits_without_mapping_operation() {
+        // Legacy encoding: the operation is packed into the id as
+        // `<component>.<operation>` and absent from the mapping. The last-dot
+        // split must still recover it.
+        let node = Node {
+            conversational: false,
+            id: NodeId::from_str("render").unwrap(),
+            component: FlowComponentRef {
+                id: "templating.handlebars".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "text": "hello" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+        };
+        let host = HostNode::from(node);
+        assert!(
+            matches!(&host.kind, NodeKind::PackComponent { component_ref } if component_ref == "templating"),
+            "packed <component>.<operation> id must split, got kind {:?}",
+            host.kind
+        );
+        assert_eq!(host.operation_name(), Some("handlebars"));
     }
 
     #[cfg(feature = "agentic-worker")]
@@ -4977,6 +5253,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -5119,6 +5396,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -5291,6 +5569,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: Some(dispatcher.clone() as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>),
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: DwAgentDispatch::Nats,
@@ -5411,6 +5690,7 @@ mod tests {
                 mode: ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: None,
             #[cfg(feature = "agentic-worker")]
             dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
@@ -5443,6 +5723,20 @@ mod tests {
             observer: None,
             mocks: None,
         }
+    }
+
+    #[test]
+    fn with_rollout_ids_binds_revision_identity() {
+        let engine = minimal_engine().with_rollout_ids(RolloutIds {
+            customer_id: Some("cust-acme".into()),
+            deployment_id: Some("01JTKS".into()),
+            bundle_id: Some("customer.support".into()),
+            revision_id: Some("01JTKR".into()),
+        });
+        assert_eq!(engine.rollout_ids.revision_id.as_deref(), Some("01JTKR"));
+        assert_eq!(engine.rollout_ids.deployment_id.as_deref(), Some("01JTKS"));
+        // A freshly-built engine carries no rollout identity (legacy runtime).
+        assert!(minimal_engine().rollout_ids.is_empty());
     }
 
     #[test]
@@ -5684,6 +5978,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            slot_schema: None,
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -5709,6 +6004,425 @@ mod tests {
         }
     }
 
+    #[test]
+    fn node_output_with_error_marks_ok_false_and_stashes_in_meta() {
+        let err: Box<dyn std::error::Error + 'static> =
+            Box::<dyn std::error::Error + 'static>::from("weatherapi returned 401 Unauthorized");
+        let out = NodeOutput::with_error("call_weather", err.as_ref());
+        assert!(!out.ok);
+        assert_eq!(out.payload, Value::Null);
+        assert_eq!(out.meta["error"]["kind"], "flow_node_failed");
+        assert_eq!(out.meta["error"]["node_id"], "call_weather");
+        assert_eq!(
+            out.meta["error"]["message"],
+            "weatherapi returned 401 Unauthorized"
+        );
+    }
+
+    #[test]
+    fn lift_first_node_error_promotes_node_meta_to_output_metadata() {
+        // Two nodes ran; the first failed, the second produced a default-
+        // looking output (flow author wrote no error routing). The executor
+        // must lift the first failure into output.metadata so the messaging
+        // provider renders the error card without any flow-author changes.
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        let err: Box<dyn std::error::Error + 'static> =
+            Box::<dyn std::error::Error + 'static>::from("weatherapi returned 401 Unauthorized");
+        nodes.insert(
+            "call_weather".to_string(),
+            NodeOutput::with_error("call_weather", err.as_ref()),
+        );
+        nodes.insert(
+            "render_current_card".to_string(),
+            NodeOutput::new(json!({ "text": "message" })),
+        );
+
+        let final_output = json!({ "text": "message" });
+        let enriched = lift_first_node_error_from_nodes(final_output, &nodes);
+        assert_eq!(
+            enriched["metadata"]["error_kind"], "flow_node_failed",
+            "first failing node's kind must be lifted"
+        );
+        assert_eq!(
+            enriched["metadata"]["error_message"],
+            "weatherapi returned 401 Unauthorized"
+        );
+        assert_eq!(enriched["metadata"]["node_id"], "call_weather");
+        // Preserves the original payload bits so downstream renderers still
+        // see what the flow produced.
+        assert_eq!(enriched["text"], "message");
+    }
+
+    #[test]
+    fn lift_first_node_error_is_noop_when_all_nodes_ok() {
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert(
+            "ok_node".to_string(),
+            NodeOutput::new(json!({ "text": "all good" })),
+        );
+        let output = json!({ "text": "all good" });
+        let lifted = lift_first_node_error_from_nodes(output.clone(), &nodes);
+        assert_eq!(lifted, output);
+    }
+
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
+        // Flow whose start node is missing — drive_flow will return Err on
+        // node lookup. With session_id present, execute() must convert that
+        // to a Completed FlowExecution carrying error_kind/error_message in
+        // output.metadata so the chat user sees the error card.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
+        let engine = FlowEngine {
+            operala_node_handler: None,
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: pack_id_str.to_string(),
+                    flow_id: flow_id_str.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: pack_id_str,
+            flow_id: flow_id_str,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("conv-1"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result = engine
+            .execute(ctx, Value::Null)
+            .await
+            .expect("must not propagate Err");
+        assert!(matches!(result.status, FlowStatus::Completed));
+        assert_eq!(
+            result.output["metadata"]["error_kind"],
+            "flow_execution_failed"
+        );
+        let msg = result.output["metadata"]["error_message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!msg.is_empty(), "error_message must be populated");
+        assert_eq!(result.output["metadata"]["flow_id"], "broken.flow");
+    }
+
+    #[test]
+    fn mcp_tool_error_recognises_generator_error_shape() {
+        // greentic-mcp-generator's tool_error_with_status emits this exact
+        // shape when the upstream HTTP call to weatherapi.com returns 401.
+        let value = json!({
+            "error": {
+                "code": "tool_error",
+                "message": "API request returned status 401",
+                "status": 401
+            }
+        });
+        let (code, message) = mcp_tool_error(&value).expect("must detect MCP error shape");
+        assert_eq!(code, "tool_error");
+        assert!(message.contains("API request returned status 401"));
+        assert!(message.contains("(status 401)"));
+    }
+
+    #[test]
+    fn mcp_tool_error_skips_success_responses() {
+        // A success response uses `result`, not `error`.
+        let value = json!({ "result": { "current": { "temp_c": 19.0 } } });
+        assert!(mcp_tool_error(&value).is_none());
+    }
+
+    #[test]
+    fn mcp_tool_error_skips_non_object_and_unrelated_shapes() {
+        assert!(mcp_tool_error(&Value::Null).is_none());
+        assert!(mcp_tool_error(&json!({"unrelated": true})).is_none());
+        // `error` must be an object; a string isn't enough.
+        assert!(mcp_tool_error(&json!({"error": "oops"})).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_non_user_facing_flow_failure_still_propagates() {
+        // No session_id => internal job. Errors still propagate as Err so
+        // operator alerting / metrics pipelines stay intact.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
+        let engine = FlowEngine {
+            operala_node_handler: None,
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: pack_id_str.to_string(),
+                    flow_id: flow_id_str.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: pack_id_str,
+            flow_id: flow_id_str,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result = engine.execute(ctx, Value::Null).await;
+        assert!(result.is_err(), "non-user-facing flow must propagate Err");
+    }
+
+    // ---- Phase D: slot_schema injection tests ----
+
+    #[test]
+    fn host_flow_extracts_slot_schema_from_metadata_extra() {
+        use greentic_types::FlowMetadata;
+        use std::collections::BTreeSet;
+
+        let schema = json!([
+            {"name": "counterparty", "slot_type": "string", "required": true},
+            {"name": "due_date", "slot_type": "date", "required": true}
+        ]);
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: BTreeSet::new(),
+                extra: json!({(SLOT_SCHEMA_METADATA_KEY): schema}),
+            },
+        };
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&schema),
+            "HostFlow must extract slot_schema from metadata.extra"
+        );
+    }
+
+    #[test]
+    fn host_flow_slot_schema_is_none_when_absent() {
+        let flow = Flow {
+            schema_version: "flow-v1".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: IndexMap::default(),
+            metadata: Default::default(),
+        };
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when metadata.extra has no greentic.slot_schema"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_adds_to_object_input() {
+        let schema = json!([
+            {"name": "city", "slot_type": "string"}
+        ]);
+        let mut input = json!({"utterance": "hello"});
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"utterance": "hello", "slot_definitions": schema}),
+            "slot_definitions must be injected into existing object"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_wraps_null_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = Value::Null;
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!({"slot_definitions": schema}),
+            "null input must become an object with slot_definitions"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_preserves_explicit_inline() {
+        let flow_schema = json!([{"name": "city", "slot_type": "string"}]);
+        let inline_defs = json!([{"name": "country", "slot_type": "string"}]);
+        let mut input = json!({
+            "utterance": "hello",
+            "slot_definitions": inline_defs
+        });
+        inject_slot_definitions(&mut input, &flow_schema, "f", "n");
+        assert_eq!(
+            input["slot_definitions"], inline_defs,
+            "explicit inline slot_definitions must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_slot_definitions_skips_non_object_input() {
+        let schema = json!([{"name": "x", "slot_type": "string"}]);
+        let mut input = json!("a string");
+        inject_slot_definitions(&mut input, &schema, "f", "n");
+        assert_eq!(
+            input,
+            json!("a string"),
+            "non-object input must be left unchanged"
+        );
+    }
+
+    fn make_flow_doc_for_test(
+        id: &str,
+        node_name: &str,
+        component: &str,
+        slot_schema: Option<Value>,
+    ) -> greentic_flow::model::FlowDoc {
+        use greentic_flow::model::{FlowDoc, NodeDoc};
+
+        let mut nodes = IndexMap::new();
+        nodes.insert(
+            node_name.to_string(),
+            NodeDoc {
+                raw: {
+                    let mut m = IndexMap::new();
+                    m.insert(
+                        "component.exec".to_string(),
+                        json!({ "component": component }),
+                    );
+                    m
+                },
+                routing: json!([{ "out": true }]),
+                ..Default::default()
+            },
+        );
+
+        FlowDoc {
+            id: id.into(),
+            title: None,
+            description: None,
+            flow_type: "messaging".into(),
+            start: Some(node_name.into()),
+            parameters: json!({}),
+            tags: Vec::new(),
+            schema_version: None,
+            entrypoints: IndexMap::new(),
+            meta: None,
+            slot_schema,
+            nodes,
+        }
+    }
+
+    /// Integration test: exercises the real `greentic_flow::compile_flow`
+    /// producer path with a `FlowDoc` carrying `slot_schema`, then converts
+    /// through `HostFlow::from` and verifies the runtime-side `slot_schema`
+    /// field is populated — closing the gap Codex flagged where the existing
+    /// unit tests constructed `FlowMetadata` directly.
+    #[test]
+    fn compile_flow_round_trips_slot_schema_into_host_flow() {
+        let slot_defs = json!([
+            { "name": "counterparty", "slot_type": "string", "required": true,
+              "pattern": ".+" },
+            { "name": "due_date", "slot_type": "date", "required": true,
+              "pattern": "\\d{4}-\\d{2}-\\d{2}" }
+        ]);
+        let doc = make_flow_doc_for_test(
+            "slot-test",
+            "extractor",
+            "slot-extractor",
+            Some(slot_defs.clone()),
+        );
+
+        let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
+        assert_eq!(
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY),
+            Some(&slot_defs),
+            "compile_flow must forward slot_schema into metadata.extra"
+        );
+
+        let host = HostFlow::from(flow);
+        assert_eq!(
+            host.slot_schema.as_ref(),
+            Some(&slot_defs),
+            "HostFlow.slot_schema must survive the compile_flow -> HostFlow round-trip"
+        );
+    }
+
+    /// Verify that `compile_flow` without `slot_schema` produces a `Flow`
+    /// whose `metadata.extra` has no `greentic.slot_schema` key, and that
+    /// `HostFlow.slot_schema` stays `None` through the real compile path.
+    #[test]
+    fn compile_flow_without_slot_schema_leaves_host_flow_none() {
+        let doc = make_flow_doc_for_test("no-slots", "echo", "echo", None);
+
+        let flow = greentic_flow::compile_flow(doc).expect("compile_flow must succeed");
+        assert!(
+            flow.metadata.extra.get(SLOT_SCHEMA_METADATA_KEY).is_none(),
+            "metadata.extra must not contain greentic.slot_schema when FlowDoc.slot_schema is None"
+        );
+
+        let host = HostFlow::from(flow);
+        assert!(
+            host.slot_schema.is_none(),
+            "HostFlow.slot_schema must be None when FlowDoc has no slot_schema"
+        );
+    }
+
     /// A node with 2+ outgoing edges compiles (in the designer) to
     /// `event == "<outcome>"` conditions. The runner must inject `event` into
     /// the routing context — from the node's emitted outcome, else a default
@@ -5726,6 +6440,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -5756,6 +6471,7 @@ mod tests {
             { "condition": "event == \"timeout\"", "to": "escalate" }
         ]);
         let flow_ir = HostFlow {
+            slot_schema: None,
             id: "flow.test".to_string(),
             start: None,
             nodes: IndexMap::new(),
@@ -5795,6 +6511,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -5850,6 +6567,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6002,6 +6720,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6288,6 +7007,7 @@ mod tests {
                 mode: crate::validate::ValidationMode::Off,
             },
             cross_pack_resolver: None,
+            rollout_ids: RolloutIds::default(),
             remote_dispatch_handler: Some(
                 nats_engine_dispatcher
                     as Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
@@ -6513,6 +7233,7 @@ mod tests {
         let host_flow = HostFlow::from(flow);
 
         let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
@@ -6656,6 +7377,7 @@ mod tests {
     fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
         let host_flow = HostFlow::from(flow);
         let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -7156,6 +7878,7 @@ mod tests {
         let flow_id = "vars.survive.flow";
         let pack_id = "test-pack";
         let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -7323,6 +8046,7 @@ mod tests {
             },
         );
         HostFlow {
+            slot_schema: None,
             id: "conv.flow".to_string(),
             start: Some(agent_id),
             nodes,
@@ -7335,6 +8059,7 @@ mod tests {
     #[cfg(feature = "agentic-worker")]
     fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
         FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -7541,6 +8266,7 @@ mod tests {
         dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
     ) -> FlowEngine {
         FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -8096,6 +8822,7 @@ mod tests {
         handler: std::sync::Arc<ScriptedAgentHandler>,
     ) -> FlowEngine {
         FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -8164,6 +8891,7 @@ mod tests {
             },
         );
         HostFlow {
+            slot_schema: None,
             id: "operala.flow".to_string(),
             start: Some(node_id),
             nodes,
@@ -8179,6 +8907,7 @@ mod tests {
         handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
     ) -> FlowEngine {
         FlowEngine {
+            rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
@@ -8245,14 +8974,25 @@ mod tests {
     #[test]
     fn operala_call_without_handler_or_nats_fails() {
         let engine = operala_engine(operala_flow("deep_worker"), None);
-        let err = tokio::runtime::Runtime::new()
+        let execution = tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(engine.execute(operala_ctx(), Value::Null))
-            .expect_err("operala.call with no in-process handler and no NATS must fail");
+            .expect("session flow returns a completed error envelope, not an Err");
+        // `operala_ctx` carries a `session_id`, so main's retry-exhaustion policy
+        // wraps the execution error into a `Completed` flow carrying the
+        // `flow_execution_failed` envelope (graceful degradation for session
+        // flows) rather than propagating an `Err`. The operala misconfiguration
+        // is still surfaced loudly — in the error payload.
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        let msg = execution.output["metadata"]["error_message"]
+            .as_str()
+            .unwrap_or_default();
         assert!(
-            err.to_string()
-                .contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
-            "unexpected error: {err}"
+            msg.contains(
+                "operala.call node dispatched but no RemoteDispatchHandler configured"
+            ),
+            "unexpected output: {:?}",
+            execution.output
         );
     }
 }
@@ -8286,6 +9026,65 @@ pub struct FlowContext<'a> {
 pub struct RetryConfig {
     pub max_attempts: u32,
     pub base_delay_ms: u64,
+}
+
+/// Look across all node outputs, find the first one that finished with
+/// `ok=false`, and lift its `meta.error` fields into
+/// `output.metadata.error_kind` / `.error_message` / `.node_id`. Returns the
+/// (possibly enriched) output unchanged otherwise.
+///
+/// This is how the executor "shows" an unhandled flow-node failure to the
+/// caller without the flow author having to add error routing: the chat-side
+/// provider (messaging-providers `extract_error_envelope`) picks the lifted
+/// fields off `output.metadata` and renders a styled error card.
+///
+/// Takes a borrow of the node-output map rather than the whole
+/// `ExecutionState` because the callers have already consumed `state` via
+/// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
+/// front and pass it in here.
+fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
+    let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
+        return output;
+    };
+    let err_meta = failed.meta.get("error");
+    let message = err_meta
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("flow node failed");
+    let kind = err_meta
+        .and_then(|e| e.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("flow_node_failed");
+
+    let mut output = match output {
+        Value::Object(map) => map,
+        Value::Null => JsonMap::new(),
+        other => {
+            let mut wrap = JsonMap::new();
+            wrap.insert("payload".to_string(), other);
+            wrap
+        }
+    };
+    let metadata_entry = output
+        .entry("metadata".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    let metadata_map = match metadata_entry {
+        Value::Object(map) => map,
+        _ => {
+            *metadata_entry = Value::Object(JsonMap::new());
+            metadata_entry.as_object_mut().unwrap()
+        }
+    };
+    metadata_map
+        .entry("error_kind".to_string())
+        .or_insert(Value::String(kind.to_string()));
+    metadata_map
+        .entry("error_message".to_string())
+        .or_insert(Value::String(message.to_string()));
+    metadata_map
+        .entry("node_id".to_string())
+        .or_insert(Value::String(node_id.clone()));
+    Value::Object(output)
 }
 
 fn should_retry(err: &anyhow::Error) -> bool {

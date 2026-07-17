@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -104,7 +105,8 @@ async fn trace_written_on_failure() -> Result<()> {
         .with_tenant("acme")
         .from_user("user-1");
     let result = host.handle_activity("acme", activity).await;
-    assert!(result.is_err(), "expected flow to fail");
+    // Session flows surface node failures as Ok with an error envelope.
+    assert!(result.is_ok(), "session flow should not Err: {result:?}");
 
     assert!(
         trace_path.exists(),
@@ -150,7 +152,8 @@ async fn fault_injection_drops_state_write() -> Result<()> {
         .with_tenant("acme")
         .from_user("user-1");
     let result = host.handle_activity("acme", activity).await;
-    assert!(result.is_err(), "expected state store read to fail");
+    // Session flows surface node failures as Ok with an error envelope.
+    assert!(result.is_ok(), "session flow should not Err: {result:?}");
 
     let bytes = fs::read(&trace_path).context("read trace.json")?;
     let trace: serde_json::Value = serde_json::from_slice(&bytes)?;
@@ -344,6 +347,7 @@ fn build_runner_components_pack(pack_path: &std::path::Path) -> Result<()> {
     let (_bundle, flow) = load_and_validate_bundle_with_flow(&flow_yaml, None)?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.components.test".parse()?,
         name: None,
@@ -390,7 +394,6 @@ fn build_runner_components_pack(pack_path: &std::path::Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
 
@@ -432,6 +435,7 @@ nodes:
     let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.components.test".parse()?,
         name: None,
@@ -463,7 +467,6 @@ nodes:
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
 
@@ -532,6 +535,7 @@ nodes:
         ..ComponentCapabilities::default()
     };
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.state-store.fault".parse()?,
         name: None,
@@ -563,7 +567,6 @@ nodes:
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
 

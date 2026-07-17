@@ -13,7 +13,7 @@ use crate::host::RunnerHost;
 use crate::http::health::HealthState;
 use crate::pack::{ComponentResolution, PackRuntime};
 use crate::runner::adapt_timer;
-use crate::runtime::{ActivePacks, TenantRuntime};
+use crate::runtime::{ActivePacks, RuntimeKey, TenantRuntime};
 use crate::secrets::DynSecretsManager;
 use crate::storage::session::DynSessionStore;
 use crate::storage::state::DynStateStore;
@@ -230,9 +230,9 @@ async fn reload_once(
         let timers = adapt_timer::spawn_timers(Arc::clone(&runtime))?;
         runtime.register_timers(timers);
 
-        next.insert(tenant.clone(), runtime);
+        next.insert(RuntimeKey::legacy(tenant.clone()), runtime);
     }
-    active.replace(next);
+    active.replace_legacy(next);
     health.record_reload_success();
     tracing::info!("pack reload completed successfully");
     Ok(())

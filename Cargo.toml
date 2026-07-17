@@ -37,6 +37,10 @@ greentic-state = "=1.3.0-research.1"
 greentic-config = "=1.3.0-research.1"
 greentic-config-types = "=1.3.0-research.1"
 greentic-secrets-lib = "=1.3.0-research.1"
+# Additive (from main): runner-host uses `greentic_deploy_spec::ids::{RevisionId,BundleId}`.
+# Pinned to the research line so it unifies with greentic-start/greentic-deployer
+# (which cross deploy-spec types with runner-host) instead of forking a 0.2.x copy.
+greentic-deploy-spec = "=1.3.0-research.1"
 hex = "0.4"
 humantime = "2.1"
 lru = "0.16"
@@ -65,7 +69,9 @@ tempfile = "3"
 tiny_http = "0.12"
 serial_test = "3"
 toml = "1"
-greentic-telemetry = ">=1.1.0-dev, <1.2.0-0"
+# Floor pinned to the C5.1 publish: `TelemetryCtx::kv()` must include
+# `gt.pack_id` for the C5.4 export path; earlier dev publishes lack it.
+greentic-telemetry = ">=1.1.0-0, <1.2.0-0"
 walkdir = "2"
 wasmtime-wasi-http = "45"
 wasmtime-wasi-tls = "45"
@@ -100,6 +106,11 @@ features = [
     "pkcs8",
 ]
 
+# Floor pinned to the M1.4b-ii publish (PR #134): adds
+# `attr_keys::MESSAGING_ENDPOINT_ID` and the `tenant_ctx_to_telemetry` bridge
+# mapping it onto `TelemetryCtx::messaging_endpoint_id`. Earlier dev publishes
+# (incl. M1.1a) lack the const, so `tenant_ctx()` in
+# `engine::runtime::IngressEnvelope` would fail to compile.
 [workspace.dependencies.greentic-types]
 version = "=1.3.0-research.1"
 default-features = false
@@ -137,11 +148,17 @@ version = "=1.3.0-research.1"
 [workspace.dependencies.greentic-interfaces-wasmtime]
 version = "=1.3.0-research.1"
 
+[workspace.dependencies.greentic-x-runtime]
+version = "0.4.20"
+
+[workspace.dependencies.greentic-x-types]
+version = "0.4.20"
+
 [workspace.dependencies.greentic-oauth-sdk]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-oauth-host]
-version = ">=1.1.0-dev, <1.2.0-0"
+version = ">=1.1.0-0, <1.2.0-0"
 
 [workspace.dependencies.greentic-runner-host]
 path = "crates/greentic-runner-host"
@@ -163,6 +180,11 @@ features = [
     "rustls",
     "blocking",
 ]
+
+[workspace.dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws_lc_rs"]
 
 [workspace.dependencies.serde]
 version = "1.0"

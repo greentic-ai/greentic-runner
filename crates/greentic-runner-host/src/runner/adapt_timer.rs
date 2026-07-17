@@ -69,6 +69,8 @@ pub fn spawn_timers(runtime: Arc<TenantRuntime>) -> Result<Vec<JoinHandle<()>>> 
                     action: Some("timer".into()),
                     session_hint: Some(schedule_id.clone()),
                     provider: Some("timer".into()),
+                    // Timers fire without a messaging endpoint by definition.
+                    messaging_endpoint_id: None,
                     channel: Some(schedule_id.clone()),
                     conversation: Some(schedule_id.clone()),
                     user: None,

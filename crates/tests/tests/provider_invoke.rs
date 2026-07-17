@@ -1,9 +1,9 @@
+use std::str::FromStr;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -306,6 +306,7 @@ fn build_pack(component_path: &Path, pack_path: &Path, flows: &[Flow]) -> Result
         .collect::<Vec<_>>();
     let supported_kinds = flows.iter().map(|flow| flow.kind).collect::<Vec<_>>();
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "provider.test".parse()?,
         name: None,
@@ -331,7 +332,6 @@ fn build_pack(component_path: &Path, pack_path: &Path, flows: &[Flow]) -> Result
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: Some(extensions),
     };
 
@@ -369,6 +369,7 @@ fn build_component_pack(
         .collect::<Vec<_>>();
     let supported_kinds = flows.iter().map(|flow| flow.kind).collect::<Vec<_>>();
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: pack_id.parse()?,
         name: None,
@@ -398,7 +399,6 @@ fn build_component_pack(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
 

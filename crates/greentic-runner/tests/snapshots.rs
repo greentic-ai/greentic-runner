@@ -93,6 +93,7 @@ fn host_config(tenant: &str, retry: FlowRetryConfig) -> HostConfig {
         trace: TraceConfig::from_env().with_overrides(TraceMode::Off, None),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         #[cfg(feature = "agentic-worker")]
         agents: HashMap::new(),
         #[cfg(feature = "agentic-worker")]
@@ -110,6 +111,7 @@ fn build_pack(
     let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: pack_id.parse()?,
         name: None,
@@ -132,7 +134,6 @@ fn build_pack(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
 

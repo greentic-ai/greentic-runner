@@ -1,4 +1,8 @@
 #![forbid(unsafe_code)]
+// The merged `run_http_host` future nests the research agentic-dispatch path and
+// main's revision/fast2flow path in one async body, whose layout exceeds the
+// default query depth (128). 256 covers the combined nesting.
+#![recursion_limit = "256"]
 //! Canonical entrypoint for embedding the Greentic runner.
 //!
 //! This crate provides two supported integration paths:
@@ -69,6 +73,7 @@ mod tests {
             trace: TraceConfig::from_env(),
             validation: ValidationConfig::from_env(),
             operator_policy: OperatorPolicy::allow_all(),
+            fast2flow: Default::default(),
             #[cfg(feature = "agentic-worker")]
             agents: HashMap::new(),
             #[cfg(feature = "agentic-worker")]

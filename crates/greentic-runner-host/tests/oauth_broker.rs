@@ -49,6 +49,8 @@ fn make_host_state_no_oauth() -> Result<HostState> {
         None,
         None,
         false,
+        None,
+        None,
     )
 }
 
@@ -71,6 +73,8 @@ fn make_host_state_http_oauth() -> Result<HostState> {
         None,
         None,
         false,
+        None,
+        None,
     )
 }
 
@@ -170,6 +174,8 @@ fn instantiate_component(wasm: &Path, config: Arc<HostConfig>) -> Result<()> {
         None,
         None,
         false,
+        None,
+        None,
     )?;
     let policy = Arc::new(RunnerWasiPolicy::default());
     let state = ComponentState::new(host_state, policy)?;

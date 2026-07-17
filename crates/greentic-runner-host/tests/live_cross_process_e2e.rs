@@ -135,6 +135,7 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
         #[cfg(feature = "agentic-worker")]
@@ -273,6 +274,7 @@ fn sorla_inbound_envelope_for(flow_id: &str) -> IngressEnvelope {
         user: Some("user".into()),
         activity_id: Some("activity-1".into()),
         timestamp: None,
+        messaging_endpoint_id: None,
         payload: json!({ "text": "start" }),
         metadata: None,
         reply_scope: Some(ReplyScope {

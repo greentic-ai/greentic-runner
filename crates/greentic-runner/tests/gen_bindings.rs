@@ -37,6 +37,7 @@ fn write_manifest_cbor(dir: &Path) -> PathBuf {
         metadata: Default::default(),
     };
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "greentic.pack-manifest.v1".to_string(),
         pack_id: "demo.pack".parse::<PackId>().expect("pack id"),
         name: None,
@@ -56,7 +57,6 @@ fn write_manifest_cbor(dir: &Path) -> PathBuf {
         secret_requirements: Vec::new(),
         signatures: PackSignatures::default(),
         bootstrap: None,
-        agents: Default::default(),
         extensions: None,
     };
     let bytes = encode_pack_manifest(&manifest).expect("encode manifest");

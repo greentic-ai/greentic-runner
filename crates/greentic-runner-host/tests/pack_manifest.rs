@@ -57,6 +57,7 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
         #[cfg(feature = "agentic-worker")]
@@ -71,6 +72,7 @@ fn build_pack(pack_path: &Path) -> Result<()> {
     let (_bundle, flow) = load_and_validate_bundle_with_flow(&flow_yaml, None)?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.components.test".parse()?,
         name: None,
@@ -124,7 +126,6 @@ fn build_pack(pack_path: &Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -157,6 +158,7 @@ fn build_pack_with_component_sources(
     let (_bundle, flow) = load_and_validate_bundle_with_flow(&flow_yaml, None)?;
 
     let mut manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.components.remote".parse()?,
         name: None,
@@ -210,7 +212,6 @@ fn build_pack_with_component_sources(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
     manifest.set_component_sources_v1(sources_payload)?;
@@ -247,6 +248,7 @@ fn build_pack_with_component_sources_only(
     let (_bundle, flow) = load_and_validate_bundle_with_flow(&flow_yaml, None)?;
 
     let mut manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "runner.components.sources-only".parse()?,
         name: None,
@@ -266,7 +268,6 @@ fn build_pack_with_component_sources_only(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
     manifest.set_component_sources_v1(sources_payload)?;
@@ -446,6 +447,7 @@ fn build_state_store_pack(pack_path: &Path, include_state_capability: bool) -> R
     };
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "state.store.test".parse()?,
         name: None,
@@ -471,7 +473,6 @@ fn build_state_store_pack(pack_path: &Path, include_state_capability: bool) -> R
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -893,6 +894,7 @@ fn gtpack_cbor_only_pack_loads() -> Result<()> {
     std::fs::write(&bindings_path, b"tenant: demo")?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "cbor.only.test".parse()?,
         name: None,
@@ -906,7 +908,6 @@ fn gtpack_cbor_only_pack_loads() -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -984,6 +985,7 @@ fn gtpack_legacy_artifacts_are_ignored() -> Result<()> {
     std::fs::write(&bindings_path, b"tenant: demo")?;
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "legacy.ignore.test".parse()?,
         name: None,
@@ -997,7 +999,6 @@ fn gtpack_legacy_artifacts_are_ignored() -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 

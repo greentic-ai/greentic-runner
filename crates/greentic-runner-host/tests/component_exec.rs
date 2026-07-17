@@ -138,6 +138,7 @@ fn host_config(bindings_path: &Path) -> HostConfig {
         trace: TraceConfig::from_env(),
         validation: ValidationConfig::from_env(),
         operator_policy: OperatorPolicy::allow_all(),
+        fast2flow: Default::default(),
         #[cfg(feature = "agentic-worker")]
         agents: std::collections::HashMap::new(),
         #[cfg(feature = "agentic-worker")]
@@ -210,6 +211,7 @@ fn build_pack(flow_yaml: &str, pack_path: &Path) -> Result<()> {
     )?;
     let (_bundle, flow) = load_and_validate_bundle_with_flow(flow_yaml, None)?;
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "component.exec.test".parse()?,
         name: None,
@@ -241,7 +243,6 @@ fn build_pack(flow_yaml: &str, pack_path: &Path) -> Result<()> {
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -298,6 +299,7 @@ fn build_pack_with_flow_id(pack_id: &str, flow: Flow, pack_path: &Path) -> Resul
             .expect("pack path should have parent for temp dir"),
     )?;
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: pack_id.parse()?,
         name: None,
@@ -329,7 +331,6 @@ fn build_pack_with_flow_id(pack_id: &str, flow: Flow, pack_path: &Path) -> Resul
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: None,
     };
 
@@ -382,6 +383,7 @@ fn build_pack_with_runtime_extension(
     );
 
     let manifest = PackManifest {
+        agents: Default::default(),
         schema_version: "1.0".into(),
         pack_id: "component.exec.runtime".parse()?,
         name: None,
@@ -407,7 +409,6 @@ fn build_pack_with_runtime_extension(
         signatures: Default::default(),
         secret_requirements: Vec::new(),
         bootstrap: None,
-        agents: BTreeMap::new(),
         extensions: Some(extensions),
     };
 
