@@ -3220,6 +3220,11 @@ impl From<Node> for HostNode {
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
+        // packc emits `operation: None` to mean "the id is already complete" and
+        // carries the operation in input.mapping instead. Splitting such an id would
+        // produce a prefix that is never a key in the pack's component map (the map is
+        // keyed verbatim by `node.component.id`), so only split when the mapping does
+        // not tell us the operation.
         let (component_ref, raw_operation) =
             if node.component.operation.is_some() || is_builtin || operation_in_mapping.is_some() {
                 (full_ref, node.component.operation.clone())
@@ -7767,6 +7772,59 @@ mod tests {
                 .and_then(Value::as_str),
             Some("hello"),
             "real input fields must remain in payload_expr"
+        );
+    }
+
+    #[test]
+    fn dotted_component_id_is_not_split_when_mapping_carries_operation() {
+        // packc sets `node.component.operation = None` to mean "the id is already
+        // complete" (normalize_legacy_component_exec_ids), and puts the operation in
+        // input.mapping. Lowering must therefore keep the reverse-DNS id intact and
+        // take the operation from the mapping. Splitting on the last dot yields a
+        // component_ref that is by construction absent from the pack's component map,
+        // so the node fails with "component '<truncated>' not found in pack".
+        let node_id = NodeId::from_str("present_koncar").unwrap();
+        let node = Node {
+            id: node_id,
+            component: FlowComponentRef {
+                id: "ai.greentic.koncar.component-present".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "component": "ai.greentic.koncar.component-present",
+                    "operation": "present",
+                    "query": "hello"
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let host_node = HostNode::from(node);
+
+        assert_eq!(
+            host_node.component_id(),
+            "ai.greentic.koncar.component-present",
+            "dotted component id must survive lowering intact"
+        );
+        match &host_node.kind {
+            NodeKind::PackComponent { component_ref } => assert_eq!(
+                component_ref, "ai.greentic.koncar.component-present",
+                "PackComponent must look up the full id, not a dot-split prefix"
+            ),
+            other => panic!("expected NodeKind::PackComponent, got {other:?}"),
+        }
+        assert_eq!(
+            host_node.operation_in_mapping(),
+            Some("present"),
+            "the operation must still be readable from the mapping"
         );
     }
 
