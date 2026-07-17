@@ -49,6 +49,11 @@ pub(crate) const TRUSTED_SIGNERS_ENV: &str = "GREENTIC_MCP_TRUSTED_SIGNERS";
 pub(crate) const STORE_URL_ENV: &str = "GREENTIC_STORE_URL";
 /// Optional `gts_` service token sent as a bearer credential.
 pub(crate) const STORE_TOKEN_ENV: &str = "GREENTIC_STORE_TOKEN";
+/// did:web DID whose published root anchors publisher-certificate verification.
+/// When set, the store-pull path verifies the embedded `signature.certificate`
+/// (cert -> root -> binding -> signature) instead of the flat allowlist.
+#[allow(dead_code)] // consumed by the verification gate in a later task
+pub(crate) const TRUST_DID_ENV: &str = "GREENTIC_RUNNER_TRUST_DID";
 
 /// The ZIP entry names this loader looks for inside the `.gtxpack`.
 const DESCRIBE_ENTRY: &str = "describe.json";
@@ -295,6 +300,25 @@ pub fn trusted_signers() -> Vec<VerifyingKey> {
     raw.split(',')
         .filter_map(|entry| parse_trusted_signer(entry.trim()))
         .collect()
+}
+
+/// The configured trusted DID, or `None` when unset or empty. An empty value
+/// is treated as unset so a blank deployment override does not half-enable the
+/// cert path.
+#[allow(dead_code)] // consumed by the verification gate in a later task
+pub(crate) fn trust_did() -> Option<String> {
+    match std::env::var(TRUST_DID_ENV) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// Fold a `greentic_trust::TrustError` into the store-pull authenticity error,
+/// preserving the specific reason (cert-missing, foreign-root, expired,
+/// key-mismatch, bad-signature, unreachable DID) in the message.
+#[allow(dead_code)] // consumed by the verification gate in a later task
+pub(crate) fn map_trust_error(err: greentic_trust::TrustError) -> StorePullError {
+    StorePullError::Signature(format!("did:web trust verification failed: {err}"))
 }
 
 /// Parse a single `ed25519:<base64>` (or bare `<base64>`) allowlist entry into
