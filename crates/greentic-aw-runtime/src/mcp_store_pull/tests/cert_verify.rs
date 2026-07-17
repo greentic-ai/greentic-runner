@@ -64,7 +64,7 @@ async fn mount_did_document(server: &MockServer, did: &str, root: &SigningKey) {
 }
 
 #[tokio::test]
-async fn certified_describe_verifies_through_the_pull_path() {
+async fn certified_describe_verifies_through_verify_certified() {
     // The star: cert minted (S3a), embedded (S3b-style), verified (S4) — all
     // through greentic-trust, end to end within the runner's boundary.
     let server = MockServer::start().await;
