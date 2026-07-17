@@ -167,6 +167,24 @@ fn trust_did_returns_the_configured_did() {
 }
 
 #[test]
+#[serial_test::serial]
+fn trust_did_trims_surrounding_whitespace() {
+    // A file-sourced (e.g. mounted-secret) value can carry a trailing
+    // newline; that must never reach `DidWeb::parse`.
+    unsafe {
+        std::env::set_var(
+            crate::mcp_store_pull::TRUST_DID_ENV,
+            "  did:web:trust.greentic.cloud\n",
+        )
+    };
+    assert_eq!(
+        crate::mcp_store_pull::trust_did(),
+        Some("did:web:trust.greentic.cloud".to_string())
+    );
+    unsafe { std::env::remove_var(crate::mcp_store_pull::TRUST_DID_ENV) };
+}
+
+#[test]
 fn map_trust_error_folds_into_signature() {
     let mapped = crate::mcp_store_pull::map_trust_error(greentic_trust::TrustError::CertMissing);
     match mapped {

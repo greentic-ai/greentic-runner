@@ -8,6 +8,7 @@ use std::io::Write as _;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+pub(super) mod cert_verify;
 pub(super) mod pull;
 pub(super) mod unit;
 
