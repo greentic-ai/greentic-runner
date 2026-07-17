@@ -71,6 +71,14 @@ pub struct AgentTurnRequest {
     /// `None` when the field is absent (existing graphs) — the host maps
     /// `None` to `"openai"` for backward compatibility.
     pub provider: Option<String>,
+    /// Tool references declared on the node's `tools` field, in
+    /// `"<extension_id>/<tool_name>"` form. Empty when the field is absent
+    /// (existing graphs) — the host resolves these against the registered
+    /// design extensions / MCP tool sources.
+    pub tools: Vec<String>,
+    /// Referenced published-agent id (from the node's `agent_ref`); when Some,
+    /// the host runs that agent's full config instead of the inline fields.
+    pub agent_ref: Option<String>,
 }
 
 /// Result returned by an injected agent-turn closure.
@@ -545,6 +553,8 @@ impl GraphExecutor {
                     system_prompt,
                     model,
                     provider,
+                    tools,
+                    agent_ref,
                     ..
                 } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
@@ -552,6 +562,8 @@ impl GraphExecutor {
                     // Pre-clone so the closure can own the values it needs.
                     let node_id_for_err = cursor.clone();
                     let provider_clone = provider.clone();
+                    let tools_clone = tools.clone();
+                    let agent_ref_clone = agent_ref.clone();
                     let (raw, replayed) = self
                         .visit_effect(tenant, run_id, &cursor, attempt, || {
                             let req = AgentTurnRequest {
@@ -560,6 +572,8 @@ impl GraphExecutor {
                                 model: model.clone(),
                                 state: state.clone(),
                                 provider: provider_clone,
+                                tools: tools_clone,
+                                agent_ref: agent_ref_clone,
                             };
                             let fut = (self.agent_turn)(req);
                             Box::pin(async move {
@@ -1351,6 +1365,8 @@ impl GraphExecutor {
                         system_prompt,
                         model,
                         provider,
+                        tools,
+                        agent_ref,
                         ..
                     } => {
                         let attempt = *visits.get(&bc.cursor).unwrap_or(&0) + 1;
@@ -1358,6 +1374,8 @@ impl GraphExecutor {
                         let sp = system_prompt.clone();
                         let md = model.clone();
                         let pv = provider.clone();
+                        let tl = tools.clone();
+                        let ar = agent_ref.clone();
                         let state_for_call = state.clone();
                         let (raw, replayed) = self
                             .visit_effect(tenant, run_id, &bc.cursor, attempt, || {
@@ -1367,6 +1385,8 @@ impl GraphExecutor {
                                     model: md,
                                     state: state_for_call,
                                     provider: pv,
+                                    tools: tl,
+                                    agent_ref: ar,
                                 };
                                 let fut = (self.agent_turn)(req);
                                 Box::pin(async move {
@@ -2480,6 +2500,126 @@ mod tests {
         assert_eq!(
             got, None,
             "AgentTurnRequest.provider must be None when the node has no provider field"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tools threading tests (graph-node-agent-tools Task 1)
+    // -----------------------------------------------------------------------
+
+    /// Test: when an agent node declares `"tools": ["myext/dothing"]`, the
+    /// `AgentTurnRequest` delivered to the closure must carry
+    /// `tools == vec!["myext/dothing"]`.
+    #[tokio::test]
+    async fn agent_turn_request_carries_node_tools_when_set() {
+        use std::sync::Mutex;
+
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let captured: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+
+        let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+            *cap.lock().unwrap() = Some(req.tools.clone());
+            Box::pin(async move {
+                Ok(AgentTurnResult {
+                    reply: "ok".into(),
+                    resolved: true,
+                })
+            })
+        });
+
+        // Graph with tools declared on the agent node.
+        let cfg_json = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "agent",
+            "nodes": [
+                {
+                    "id": "agent",
+                    "kind": "agent",
+                    "systemPrompt": "You help.",
+                    "model": "gpt-4o-mini",
+                    "tools": ["myext/dothing"]
+                },
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [
+                {"from": "agent", "to": "respond"}
+            ]
+        })
+        .to_string();
+        let cfg = GraphConfig::from_json(&cfg_json).expect("fixture valid");
+
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
+            supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
+        );
+        exec.start(&tenant(), "run-tools-set", &cfg, "hi")
+            .await
+            .expect("run should succeed");
+
+        let got = captured.lock().unwrap().take().expect("agent was called");
+        assert_eq!(
+            got,
+            vec!["myext/dothing".to_string()],
+            "AgentTurnRequest.tools must equal the node's declared tools"
+        );
+    }
+
+    /// Test: when an agent node has NO `"tools"` field, the
+    /// `AgentTurnRequest.tools` must be an empty vec (backward compat).
+    #[tokio::test]
+    async fn agent_turn_request_tools_is_empty_when_absent() {
+        use std::sync::Mutex;
+
+        let store = Arc::new(InMemoryCheckpointStore::default());
+        let captured: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let cap = captured.clone();
+
+        let agent: AgentTurnFn = Arc::new(move |req: AgentTurnRequest| {
+            *cap.lock().unwrap() = Some(req.tools.clone());
+            Box::pin(async move {
+                Ok(AgentTurnResult {
+                    reply: "ok".into(),
+                    resolved: true,
+                })
+            })
+        });
+
+        // Graph WITHOUT tools — no tools field on the agent node.
+        let exec = GraphExecutor::new(
+            store.clone(),
+            agent,
+            Arc::new(|_| Box::pin(async { Ok(serde_json::json!({})) })),
+            supervisor_fn_unreachable(),
+            approval_fn_awaiting(),
+        );
+        let cfg_json = serde_json::json!({
+            "schemaVersion": 1,
+            "entry": "agent",
+            "nodes": [
+                {
+                    "id": "agent",
+                    "kind": "agent",
+                    "systemPrompt": "You help.",
+                    "model": "gpt-4o-mini"
+                },
+                {"id": "respond", "kind": "respond"}
+            ],
+            "edges": [{"from": "agent", "to": "respond"}]
+        })
+        .to_string();
+        let cfg = GraphConfig::from_json(&cfg_json).expect("fixture valid");
+        exec.start(&tenant(), "run-tools-absent", &cfg, "hi")
+            .await
+            .expect("run should succeed");
+
+        let got = captured.lock().unwrap().take().expect("agent was called");
+        assert!(
+            got.is_empty(),
+            "AgentTurnRequest.tools must be empty when the node has no tools field"
         );
     }
 

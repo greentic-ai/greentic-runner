@@ -83,11 +83,11 @@ use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{
     WasiHttpCtxView, WasiHttpView, add_only_http_to_linker_sync as add_wasi_http_to_linker,
 };
-use wasmtime_wasi_tls::p2::LinkOptions;
+use wasmtime_wasi_tls::p2::{LinkOptions, add_to_linker as add_wasi_tls_to_linker};
 use wasmtime_wasi_tls::{WasiTlsCtx, WasiTlsCtxBuilder, WasiTlsCtxView, WasiTlsView};
 use zip::ZipArchive;
 
-use crate::runner::engine::{FlowContext, FlowEngine, FlowStatus};
+use crate::runner::engine::{FlowContext, FlowEngine, FlowExecution, FlowStatus};
 use crate::runner::flow_adapter::{FlowIR, flow_doc_to_ir, flow_ir_to_flow, is_native_op_key};
 use crate::runner::mocks::{HttpDecision, HttpMockRequest, HttpMockResponse, MockLayer};
 #[cfg(feature = "fault-injection")]
@@ -1603,7 +1603,7 @@ pub fn register_all(linker: &mut Linker<ComponentState>, allow_state_store: bool
     // Add wasi-tls types and turn on the feature in linker
     let mut opts = LinkOptions::default();
     opts.tls(true);
-    wasmtime_wasi_tls::p2::add_to_linker(linker, &opts)?;
+    add_wasi_tls_to_linker(linker, &opts)?;
 
     // Add wasi-http types and turn on the feature in linker
     add_wasi_http_to_linker(linker)?;
@@ -2194,12 +2194,44 @@ impl PackRuntime {
         Ok(Vec::new())
     }
 
-    #[allow(dead_code)]
-    pub async fn run_flow(
+    /// Synchronous accessor for the cached flow descriptors. Reads the same
+    /// in-memory fields as `list_flows` but without `.await`, so it is safe to
+    /// call from a synchronous context (e.g. `FlowInvoker::list_flows`).
+    /// This avoids a `block_on`-in-async-context panic on the runner thread.
+    ///
+    /// Its only caller is `runner::flow_invoker::PackRuntimeFlowInvoker`,
+    /// which is entirely `#![cfg(feature = "agentic-worker")]`; gate this the
+    /// same way so it isn't flagged dead when that feature is off.
+    #[cfg(feature = "agentic-worker")]
+    pub(crate) fn flow_descriptors(&self) -> Vec<FlowDescriptor> {
+        if let Some(cache) = &self.flows {
+            return cache.descriptors.clone();
+        }
+        if let Some(manifest) = &self.manifest {
+            return manifest
+                .flows
+                .iter()
+                .map(|flow| FlowDescriptor {
+                    id: flow.id.as_str().to_string(),
+                    flow_type: flow_kind_to_str(flow.kind).to_string(),
+                    pack_id: manifest.pack_id.as_str().to_string(),
+                    profile: manifest.pack_id.as_str().to_string(),
+                    version: manifest.version.to_string(),
+                    description: None,
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Shared load + engine + execute body for `run_flow` and
+    /// `run_flow_for_tool`. Returns the raw `FlowExecution` so each caller can
+    /// match on `FlowStatus` according to its own contract.
+    async fn execute_flow_inner(
         &self,
         flow_id: &str,
         input: serde_json::Value,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<FlowExecution> {
         let pack = Arc::new(
             PackRuntime::load(
                 &self.path,
@@ -2238,7 +2270,16 @@ impl PackRuntime {
             mocks,
         };
 
-        let execution = engine.execute(ctx, input).await?;
+        engine.execute(ctx, input).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn run_flow(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let execution = self.execute_flow_inner(flow_id, input).await?;
         match execution.status {
             FlowStatus::Completed => Ok(execution.output),
             FlowStatus::Waiting(wait) => Ok(serde_json::json!({
@@ -2247,6 +2288,30 @@ impl PackRuntime {
                 "resume": wait.snapshot,
                 "response": execution.output,
             })),
+        }
+    }
+
+    /// Non-interactive flow execution for use as an agent tool. Identical to
+    /// `run_flow` in its load + execute path, but `FlowStatus::Waiting` is an
+    /// error because agent tools must be non-interactive (they cannot pause and
+    /// resume mid-LLM-turn).
+    ///
+    /// Returns `Ok(output)` on `Completed`, `Err(message)` on any failure.
+    pub async fn run_flow_for_tool(
+        &self,
+        flow_id: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let execution = self
+            .execute_flow_inner(flow_id, input)
+            .await
+            .map_err(|e| e.to_string())?;
+        match execution.status {
+            FlowStatus::Completed => Ok(execution.output),
+            FlowStatus::Waiting(wait) => Err(format!(
+                "flow '{flow_id}' tried to pause ({:?}); agent tools must be non-interactive",
+                wait.reason
+            )),
         }
     }
 
@@ -3834,6 +3899,10 @@ fn runtime_flow_to_flow(runtime: RuntimeFlow) -> Result<Flow> {
                 err_map: None,
                 routing,
                 telemetry,
+                // Pack-manifest component nodes are not conversational chat
+                // segments; the SP3 flag flows via the flow-doc parse path
+                // (greentic_flow -> types::Node.conversational).
+                conversational: false,
             },
         );
     }

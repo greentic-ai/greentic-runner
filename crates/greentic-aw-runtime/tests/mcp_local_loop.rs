@@ -124,6 +124,8 @@ fn build_agent_config(allowed_tools: Vec<ToolRef>) -> AgentConfig {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     }
 }
 
@@ -253,6 +255,9 @@ async fn local_wasm_mcp_tool_offered_called_and_result_in_trail() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -261,7 +266,15 @@ async fn local_wasm_mcp_tool_offered_called_and_result_in_trail() {
     );
 
     let output = runtime
-        .step(tenant_ctx, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tenant_ctx,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .expect("agent step must succeed");
 
@@ -316,6 +329,9 @@ async fn local_wasm_unreachable_component_degrades_no_tool_offered() {
     let allowed_tools = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "echo".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (runtime, tenant_ctx) = build_runtime(
         llm.clone(),
@@ -324,7 +340,15 @@ async fn local_wasm_unreachable_component_degrades_no_tool_offered() {
     );
 
     let output = runtime
-        .step(tenant_ctx, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tenant_ctx,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .expect("agent step must succeed even when local-wasm component is missing");
 

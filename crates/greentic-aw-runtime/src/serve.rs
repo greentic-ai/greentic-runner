@@ -144,6 +144,14 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
         let user_text = extract_user_text(&input);
         let session_id = resolve_session_id(&input, idempotency_key);
         let tenant_ctx = TenantContext::new(tenant, env);
+        // Forward-compatible: honour a `conversational` flag on the dispatch
+        // input if the caller (engine remote-dispatch) supplies it, so the
+        // out-of-process path can offer `end_conversation` for a conversational
+        // flow node too. Defaults false when absent.
+        let conversational = input
+            .get("conversational")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
 
         let output = self
             .runtime
@@ -151,7 +159,10 @@ impl AgentDispatchInvoker for RuntimeAgentDispatchInvoker {
                 tenant_ctx,
                 &session_id,
                 target,
-                AgentInput { text: user_text },
+                AgentInput {
+                    text: user_text,
+                    conversational,
+                },
             )
             .await
             .with_context(|| format!("agentic step failed for agent '{target}'"))?;
@@ -327,6 +338,8 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
         limits: AgentLimits::default(),
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     };
     for (tenant, env) in [
         ("default", "default"),

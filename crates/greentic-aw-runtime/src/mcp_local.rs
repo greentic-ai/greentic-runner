@@ -119,6 +119,10 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 }
 
 /// List a local component's tools. Returns an empty vec and emits a `warn` on any failure.
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a warn here); boxing
+// it would touch `list_tools`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
     let config = exec_config_for(component_ref);
@@ -145,6 +149,10 @@ pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
 }
 
 /// Call a local component's tool. Returns `{"error": ...}` on any failure; never panics.
+// pre-existing: the spawned closure returns `greentic_mcp_exec::ExecError`, a large
+// external error variant we neither own nor propagate (mapped to a JSON error here);
+// boxing it would touch `exec`'s public signature, so we scope-allow instead.
+#[allow(clippy::result_large_err)]
 pub async fn local_call_tool(component_ref: &str, tool: &str, args: &Value) -> Value {
     let component = component_ref.to_string();
     let action = tool.to_string();

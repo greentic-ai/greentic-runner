@@ -30,6 +30,11 @@ pub struct KnowledgeChunk {
     pub text: String,
     #[serde(default)]
     pub metadata: serde_json::Map<String, serde_json::Value>,
+    /// Optional pre-computed embedding vector for this chunk. When present,
+    /// backends should use this vector directly instead of embedding `text`;
+    /// `None` preserves the existing backend-computed-embedding behavior.
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
 }
 
 /// Outcome of an ingest: the backend-assigned id for each stored chunk.
@@ -156,6 +161,48 @@ pub(crate) fn augment_system_prompt(base: &str, chunks: &[RetrievedChunk]) -> St
     out
 }
 
+/// Surface an auto knowledge retrieval as a trace step, so the UI can show which
+/// corpus chunks were pulled into context — doc id, chunk index, score, and text.
+///
+/// Emitted through the tool-call observer seam ONLY, and deliberately NOT pushed
+/// onto `AgentOutput.trail`. Retrieval is automatic pre-context, not a
+/// model-invoked tool: it belongs in the live trace the test-chat UI streams, but
+/// must stay out of the flow trail / metering, whose consumers treat each entry
+/// as a real agent action. A no-op when nothing was retrieved (no empty step).
+///
+/// The synthetic `call_id` is per-call so the UI pairs this result with its own
+/// call and never a neighbouring tool's. `doc`/`index` ride through as JSON `null`
+/// when the backend did not supply them (`RetrievedChunk`'s `Option` fields).
+pub(crate) fn emit_retrieval_trace(
+    observer: &dyn crate::StepObserver,
+    query: &str,
+    chunks: &[RetrievedChunk],
+) {
+    if chunks.is_empty() {
+        return;
+    }
+    const NAME: &str = "search_knowledge";
+    let call_id = uuid::Uuid::new_v4().to_string();
+    observer.on_tool_call(NAME, &call_id, &serde_json::json!({ "query": query }));
+
+    let hits: Vec<serde_json::Value> = chunks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "doc": c.doc_id,
+                "index": c.chunk_index,
+                "score": c.score,
+                "text": c.text,
+            })
+        })
+        .collect();
+    observer.on_tool_result(
+        NAME,
+        &call_id,
+        &serde_json::json!({ "chunks": hits, "count": chunks.len() }),
+    );
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -202,6 +249,8 @@ mod tests {
                 top_k: top_k.unwrap_or_else(crate::config::default_knowledge_top_k),
             }),
             guardrails: vec![],
+            conversational: false,
+            opening_message: None,
         }
     }
 
@@ -304,6 +353,7 @@ mod tests {
                     chunk_index: 0,
                     text: "Refunds within 5 days.".into(),
                     metadata: serde_json::Map::new(),
+                    embedding: None,
                 }],
             )
             .await
@@ -322,5 +372,76 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "retrieved for: refund policy");
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        // (event, tool_name, payload) per observer call.
+        calls: std::sync::Mutex<Vec<(&'static str, String, serde_json::Value)>>,
+    }
+    impl crate::StepObserver for RecordingObserver {
+        fn on_tool_call(&self, name: &str, _call_id: &str, args: &serde_json::Value) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("call", name.to_string(), args.clone()));
+        }
+        fn on_tool_result(&self, name: &str, _call_id: &str, result: &serde_json::Value) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(("result", name.to_string(), result.clone()));
+        }
+    }
+
+    #[test]
+    fn emit_retrieval_trace_reports_chunk_fields_as_a_tool_step() {
+        let rec = RecordingObserver::default();
+        let chunks = vec![RetrievedChunk {
+            text: "Agentic worker adalah komponen...".into(),
+            score: 0.89,
+            doc_id: Some("greentic.pdf".into()),
+            chunk_index: Some(3),
+            metadata: serde_json::Map::new(),
+        }];
+        emit_retrieval_trace(&rec, "Apa itu agentic?", &chunks);
+
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "one on_tool_call + one on_tool_result");
+        assert_eq!(calls[0].0, "call");
+        assert_eq!(calls[0].1, "search_knowledge");
+        assert_eq!(calls[0].2["query"], "Apa itu agentic?");
+
+        assert_eq!(calls[1].0, "result");
+        assert_eq!(calls[1].2["count"], 1);
+        let hit = &calls[1].2["chunks"][0];
+        assert_eq!(hit["doc"], "greentic.pdf");
+        assert_eq!(hit["index"], 3);
+        assert_eq!(hit["score"], 0.89);
+        assert_eq!(hit["text"], "Agentic worker adalah komponen...");
+    }
+
+    /// Backends that leave `doc_id`/`chunk_index` unset must not break the step —
+    /// they ride through as JSON `null`, which the UI tolerates.
+    #[test]
+    fn emit_retrieval_trace_carries_null_for_missing_doc_and_index() {
+        let rec = RecordingObserver::default();
+        emit_retrieval_trace(&rec, "q", &[chunk("no metadata", 0.5)]);
+
+        let calls = rec.calls.lock().unwrap();
+        let hit = &calls[1].2["chunks"][0];
+        assert!(hit["doc"].is_null());
+        assert!(hit["index"].is_null());
+        assert_eq!(hit["score"], 0.5);
+    }
+
+    #[test]
+    fn emit_retrieval_trace_is_noop_without_chunks() {
+        let rec = RecordingObserver::default();
+        emit_retrieval_trace(&rec, "q", &[]);
+        assert!(
+            rec.calls.lock().unwrap().is_empty(),
+            "no chunks retrieved => no trace step at all"
+        );
     }
 }

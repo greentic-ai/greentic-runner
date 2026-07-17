@@ -92,6 +92,8 @@ fn cfg(tools: Vec<ToolRef>) -> AgentConfig {
         },
         memory: None,
         knowledge: None,
+        conversational: false,
+        opening_message: None,
     }
 }
 
@@ -233,11 +235,22 @@ async fn mcp_tool_offered_called_and_result_in_trail() {
     let allowed = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "get_issue".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 
@@ -287,11 +300,22 @@ async fn mcp_unreachable_server_degrades_no_tool_offered() {
     let allowed = vec![ToolRef {
         extension_id: "mcp:s1".into(),
         tool_name: "get_issue".into(),
+        description: None,
+        input_schema: None,
+        usage_note: None,
     }];
     let (rt, tc) = build_runtime(llm.clone(), Some(source), cfg(allowed));
 
     let out = rt
-        .step(tc, "s", "a", AgentInput { text: "go".into() })
+        .step(
+            tc,
+            "s",
+            "a",
+            AgentInput {
+                text: "go".into(),
+                conversational: false,
+            },
+        )
         .await
         .unwrap();
 
