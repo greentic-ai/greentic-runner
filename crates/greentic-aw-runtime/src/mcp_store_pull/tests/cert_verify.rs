@@ -151,3 +151,35 @@ async fn did_unset_uses_the_legacy_allowlist() {
 
     unsafe { std::env::remove_var("GREENTIC_MCP_TRUSTED_SIGNERS") };
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn did_set_routes_through_the_cert_path() {
+    use crate::mcp_store_pull::{TRUST_DID_ENV, verify_authenticity_for_test};
+
+    // Locks the gate direction: with the DID set, `verify_authenticity` must
+    // route to the cert path, NOT the legacy allowlist. The did:web is an
+    // unreachable `.invalid` host (RFC 6761 — never resolves, so this is
+    // offline-safe and fails fast), so verification fails at resolution and is
+    // mapped by `map_trust_error`. That mapping's prefix is what discriminates:
+    // only the cert path yields "did:web trust verification failed"; the legacy
+    // path (were the gate inverted) would report "no trusted signers".
+    unsafe { std::env::remove_var("GREENTIC_MCP_TRUSTED_SIGNERS") };
+    unsafe { std::env::set_var(TRUST_DID_ENV, "did:web:did-set-routing.invalid") };
+
+    let publisher = SigningKey::from_bytes(&[9u8; 32]);
+    let describe = signed_describe_with_cert(&publisher, None);
+
+    let err = verify_authenticity_for_test(&describe)
+        .await
+        .expect_err("an unreachable trusted DID must fail closed via the cert path");
+    unsafe { std::env::remove_var(TRUST_DID_ENV) };
+
+    match err {
+        StorePullError::Signature(msg) => assert!(
+            msg.contains("did:web trust verification failed"),
+            "expected the cert-path error mapping, got: {msg}"
+        ),
+        other => panic!("expected Signature from the cert path, got {other:?}"),
+    }
+}
