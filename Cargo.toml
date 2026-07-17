@@ -37,6 +37,7 @@ greentic-state = "=1.3.0-research.1"
 greentic-config = "=1.3.0-research.1"
 greentic-config-types = "=1.3.0-research.1"
 greentic-secrets-lib = "=1.3.0-research.1"
+greentic-trust = { git = "https://github.com/greenticai/greentic-trust", rev = "725fb4c" }
 # Additive (from main): runner-host uses `greentic_deploy_spec::ids::{RevisionId,BundleId}`.
 # Pinned to the research line so it unifies with greentic-start/greentic-deployer
 # (which cross deploy-spec types with runner-host) instead of forking a 0.2.x copy.
