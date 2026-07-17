@@ -40,7 +40,20 @@ greentic-session = ">=1.2.0-dev, <1.3.0-0"
 greentic-state = ">=1.2.0-dev, <1.3.0-0"
 greentic-config = ">=1.2.0-dev, <1.3.0-0"
 greentic-config-types = ">=1.2.0-dev, <1.3.0-0"
-greentic-deploy-spec = ">=0.1.0-0, <0.2.0-0"
+# Bumped to the deploy-spec 0.2 line (deployer#432 minor bump so the deployer
+# stable crate publish could escape dev-lane 0.1.<runid> pollution). runner-host
+# only uses `greentic_deploy_spec::ids::*` (RevisionId/BundleId), which are
+# unchanged across 0.1->0.2, but the whole runtime tree must share ONE
+# deploy-spec copy: greentic-start crosses deploy-spec types with runner-host
+# AND greentic-deployer (now 0.2.x), so runner-host must be on 0.2.x too or the
+# two copies collide (E0308).
+#
+# This is NOT a dev-lane range like its neighbours, and must not be rewritten
+# into one: deploy-spec's dev lane publishes 0.2.<runid>, which this already
+# admits. The 07-15 forward-port merge resolved this line to develop's stale
+# 0.1 side and silently reverted the migration, which is what broke the
+# greentic-operator and greentic-start nightly lock PRs (E0308) until 07-17.
+greentic-deploy-spec = ">=0.2.1, <0.3.0-0"
 greentic-secrets-lib = ">=1.2.0-dev, <1.3.0-0"
 hex = "0.4"
 humantime = "2.1"
