@@ -67,6 +67,17 @@ pub enum NodeKind {
         /// maps to `"openai"` for backward compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// When set, inherit the referenced agent's **guardrails** from the
+        /// pack's merged agents.
+        ///
+        /// Deliberately narrower than [`NodeKind::Agent`]'s `agent_ref`, which
+        /// adopts the referenced agent's full config: a supervisor routes, it
+        /// does not work, so it stays tool-free and gains no memory or
+        /// knowledge. Guardrails are the exception because a supervisor reads
+        /// the operator's raw input — it is the first place sensitive data
+        /// arrives, so inbound content-safety hooks must run there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_ref: Option<String>,
     },
     /// Fan-out node — spawns one branch per outgoing edge.
     ///

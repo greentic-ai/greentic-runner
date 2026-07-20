@@ -503,6 +503,7 @@ mod aw {
                 self.telemetry.clone(),
                 self.token_meter.clone(),
                 self.ledger.clone(),
+                self.merged_agents.clone(),
                 audit_sink,
                 real_tenant,
             )
@@ -1256,10 +1257,12 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<AuditSink>,
         real_tenant: greentic_types::TenantCtx,
     ) -> SupervisorFn {
         Arc::new(move |req: SupervisorRequest| {
+            let merged_agents = merged_agents.clone();
             let state_store = state_store.clone();
             let ext_runtime = ext_runtime.clone();
             let llm = llm.clone();
@@ -1277,12 +1280,43 @@ mod aw {
                     telemetry,
                     token_meter,
                     ledger,
+                    merged_agents,
                     audit_sink.as_ref(),
                     &real_tenant,
                 )
                 .await
             }) as BoxFut<'static, Result<SupervisorResult, GraphExecError>>
         })
+    }
+
+    /// Resolve the guardrails a supervisor node runs under.
+    ///
+    /// A supervisor inherits its worker's GUARDRAILS and nothing else — it
+    /// routes, it does not work, so tools, memory and knowledge stay unset.
+    /// Guardrails are the exception because this node sees the operator's raw
+    /// input first: it is where inbound content-safety has to run.
+    ///
+    /// An `agent_ref` that does not resolve FAILS the turn rather than routing
+    /// unguarded. A supervisor believed to be protected but running bare is the
+    /// precise failure this inheritance exists to prevent, and a silent
+    /// downgrade would be indistinguishable from success.
+    fn resolve_supervisor_guardrails(
+        agent_ref: Option<&str>,
+        merged: &HashMap<String, AgentConfig>,
+        node_id: &str,
+    ) -> Result<Vec<greentic_aw_runtime::config::GuardrailRef>, GraphExecError> {
+        let Some(id) = agent_ref else {
+            return Ok(vec![]);
+        };
+        merged
+            .get(id)
+            .map(|parent| parent.guardrails.clone())
+            .ok_or_else(|| {
+                GraphExecError::Supervisor(format!(
+                    "node '{node_id}': agent_ref '{id}' not found in merged agents; \
+                     refusing to route without its guardrails"
+                ))
+            })
     }
 
     /// Drive one supervisor routing turn via [`AgentRuntime::step`].
@@ -1315,6 +1349,7 @@ mod aw {
         telemetry: Arc<dyn Telemetry>,
         token_meter: Arc<dyn TokenMeter>,
         ledger: Arc<dyn ToolLedger>,
+        merged_agents: Arc<HashMap<String, AgentConfig>>,
         audit_sink: Option<&AuditSink>,
         real_tenant: &greentic_types::TenantCtx,
     ) -> Result<SupervisorResult, GraphExecError> {
@@ -1338,11 +1373,14 @@ mod aw {
             )));
         }
 
+        let guardrails =
+            resolve_supervisor_guardrails(req.agent_ref.as_deref(), &merged_agents, &req.node_id)?;
+
         let cfg = AgentConfig {
             agent_id: agent_id.clone(),
             system_prompt: routing_system_prompt,
             tools: vec![],
-            guardrails: vec![],
+            guardrails,
             llm: LlmProviderRef {
                 provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
                 model: req.model.clone(),
@@ -1357,7 +1395,6 @@ mod aw {
         let mut provider = InMemoryConfigProvider::new();
         provider.insert(&tenant, &agent_id, cfg);
 
-        // TODO(guardrail): inline graph-node AgentRuntime bypasses guardrails (v1 scope is dw.agent flow nodes only).
         let runtime = AgentRuntime::new(
             Arc::new(provider),
             state_store,
@@ -3099,6 +3136,78 @@ mod aw {
             );
         }
 
+        /// A supervisor with no `agent_ref` keeps today's behaviour: no
+        /// guardrails, and nothing fails.
+        #[test]
+        fn supervisor_without_agent_ref_resolves_no_guardrails() {
+            let merged = HashMap::new();
+            let got = resolve_supervisor_guardrails(None, &merged, "router")
+                .expect("absent agent_ref is not an error");
+            assert!(got.is_empty());
+        }
+
+        /// The point of the whole change: a supervisor pointed at its worker
+        /// runs under that worker's guardrails.
+        #[test]
+        fn supervisor_with_agent_ref_inherits_the_parent_guardrails() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let got = resolve_supervisor_guardrails(Some("faq"), &merged, "router")
+                .expect("a resolvable agent_ref must succeed");
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].cap_id, "greentic:guardrail/pii");
+        }
+
+        /// An unresolvable `agent_ref` FAILS rather than routing unguarded — a
+        /// supervisor believed to be protected but running bare is exactly what
+        /// this inheritance exists to prevent.
+        #[test]
+        fn supervisor_with_unresolvable_agent_ref_fails_rather_than_routing_bare() {
+            let merged = HashMap::new();
+            let err = resolve_supervisor_guardrails(Some("ghost"), &merged, "router")
+                .expect_err("an unknown agent_ref must not silently succeed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ghost") && msg.contains("refusing to route"),
+                "error should name the id and say it refused: {msg}"
+            );
+        }
+
+        /// A supervisor inherits guardrails ONLY — the referenced worker's
+        /// memory and knowledge are deliberately left behind. It routes, it
+        /// does not work.
+        #[test]
+        fn supervisor_inherits_guardrails_but_not_memory_or_knowledge() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            assert!(parent.memory.is_some(), "fixture should carry memory");
+            assert!(parent.knowledge.is_some(), "fixture should carry knowledge");
+
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let got =
+                resolve_supervisor_guardrails(Some("faq"), &merged, "router").expect("resolvable");
+            assert_eq!(got.len(), 1, "guardrails come across");
+        }
+
         #[tokio::test]
         async fn run_one_supervisor_turn_without_audit_sink_completes_unchanged() {
             let (state_store, ext_runtime, telemetry, token_meter, ledger) = agent_turn_effects();
@@ -3120,6 +3229,7 @@ mod aw {
                 routes,
                 state: GraphRunState::default(),
                 provider: None,
+                agent_ref: None,
             };
 
             // No [[ROUTE:..]] sentinel in the reply -> falls back to the
@@ -3132,6 +3242,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                Arc::new(HashMap::new()),
                 None,
                 &real_tenant,
             )
@@ -3164,6 +3275,7 @@ mod aw {
                 routes,
                 state: GraphRunState::default(),
                 provider: None,
+                agent_ref: None,
             };
 
             let result = run_one_supervisor_turn(
@@ -3174,6 +3286,7 @@ mod aw {
                 telemetry,
                 token_meter,
                 ledger,
+                Arc::new(HashMap::new()),
                 Some(&sink),
                 &real_tenant,
             )
