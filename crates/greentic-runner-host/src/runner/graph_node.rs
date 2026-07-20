@@ -1078,6 +1078,42 @@ mod aw {
                 GraphExecError::AgentTurn(format!("referenced agent '{id}' not found"))
             });
         }
+        // `inherit_from` is the specialist case: keep this node's own prompt and
+        // model — that is what makes a specialist a specialist — but adopt the
+        // referenced worker's capability surface. Using `agent_ref` here instead
+        // would overwrite the prompt and collapse every specialist in a
+        // generated graph into an identical copy of its parent.
+        //
+        // Like the supervisor path, an id that does not resolve FAILS rather
+        // than running stripped: a specialist believed to be guarded and
+        // tool-equipped but running bare is worse than one that never claimed
+        // to be.
+        if let Some(id) = req.inherit_from.as_deref() {
+            let parent = merged.get(id).ok_or_else(|| {
+                GraphExecError::AgentTurn(format!(
+                    "node '{}': inherit_from '{}' not found in merged agents; \
+                     refusing to run without its tools and guardrails",
+                    req.node_id, id
+                ))
+            })?;
+            return Ok(AgentConfig {
+                agent_id: agent_id.to_string(),
+                system_prompt: req.system_prompt.clone(),
+                llm: LlmProviderRef {
+                    provider: req.provider.clone().unwrap_or_else(|| "openai".into()),
+                    model: req.model.clone(),
+                    credential_ref: None,
+                },
+                // Inherited capability surface.
+                tools: parent.tools.clone(),
+                guardrails: parent.guardrails.clone(),
+                memory: parent.memory.clone(),
+                knowledge: parent.knowledge.clone(),
+                limits: parent.limits.clone(),
+                conversational: false,
+                opening_message: None,
+            });
+        }
         Ok(AgentConfig {
             agent_id: agent_id.to_string(),
             system_prompt: req.system_prompt.clone(),
@@ -2783,6 +2819,7 @@ mod aw {
                 provider: None,
                 tools: vec![],
                 agent_ref: None,
+                inherit_from: None,
             }
         }
 
@@ -3133,6 +3170,73 @@ mod aw {
                 err.to_string()
                     .contains("referenced agent 'missing' not found"),
                 "unexpected error message: {err}"
+            );
+        }
+
+        /// The specialist case: `inherit_from` adopts the worker's capability
+        /// surface WITHOUT overwriting the node's own prompt. If this ever
+        /// regressed to `agent_ref` semantics, every specialist in a generated
+        /// graph would collapse into an identical copy of its parent.
+        #[test]
+        fn inherit_from_keeps_the_node_prompt_and_adopts_the_capability_surface() {
+            use greentic_aw_runtime::config::GuardrailRef;
+
+            let mut parent = faq_bot_agent_config();
+            parent.guardrails = vec![GuardrailRef {
+                cap_id: "greentic:guardrail/pii".to_string(),
+                offer_id: None,
+                config: serde_json::json!({}),
+                mode: Default::default(),
+            }];
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), parent);
+
+            let mut req = agent_turn_request("spec-billing", "You handle billing only.");
+            req.inherit_from = Some("faq".to_string());
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.spec-billing")
+                .expect("a resolvable inherit_from must succeed");
+
+            assert_eq!(
+                cfg.system_prompt, "You handle billing only.",
+                "the specialist keeps its OWN prompt — this is the whole point"
+            );
+            assert_eq!(cfg.guardrails.len(), 1, "guardrails are inherited");
+            assert!(cfg.memory.is_some(), "memory is inherited");
+            assert!(cfg.knowledge.is_some(), "knowledge is inherited");
+        }
+
+        /// An unresolvable `inherit_from` fails rather than running stripped.
+        #[test]
+        fn inherit_from_unresolvable_fails_rather_than_running_stripped() {
+            let merged = HashMap::new();
+            let mut req = agent_turn_request("spec", "Specialist prompt.");
+            req.inherit_from = Some("ghost".to_string());
+
+            let err = resolve_turn_config(&req, &merged, "graph.spec")
+                .expect_err("an unknown inherit_from must not silently succeed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ghost") && msg.contains("refusing to run"),
+                "error should name the id and say it refused: {msg}"
+            );
+        }
+
+        /// `agent_ref` still wins when both are set — it already takes
+        /// everything, including the prompt.
+        #[test]
+        fn agent_ref_takes_precedence_over_inherit_from() {
+            let mut merged = HashMap::new();
+            merged.insert("faq".to_string(), faq_bot_agent_config());
+
+            let mut req = agent_turn_request("spec", "Specialist prompt.");
+            req.agent_ref = Some("faq".to_string());
+            req.inherit_from = Some("faq".to_string());
+
+            let cfg = resolve_turn_config(&req, &merged, "graph.spec").expect("resolvable");
+            assert_eq!(
+                cfg.system_prompt, "You are FAQ-BOT. Answer only from the knowledge base.",
+                "agent_ref adopts the referenced prompt wholesale"
             );
         }
 

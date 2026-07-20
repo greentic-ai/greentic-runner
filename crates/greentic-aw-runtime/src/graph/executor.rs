@@ -79,6 +79,11 @@ pub struct AgentTurnRequest {
     /// Referenced published-agent id (from the node's `agent_ref`); when Some,
     /// the host runs that agent's full config instead of the inline fields.
     pub agent_ref: Option<String>,
+    /// Referenced agent id (from the node's `inherit_from`); when Some, the
+    /// host keeps this node's own prompt/model but inherits that agent's
+    /// tools, memory, knowledge and guardrails. Ignored when `agent_ref` is
+    /// set — that already takes everything.
+    pub inherit_from: Option<String>,
 }
 
 /// Result returned by an injected agent-turn closure.
@@ -559,7 +564,7 @@ impl GraphExecutor {
                     provider,
                     tools,
                     agent_ref,
-                    ..
+                    inherit_from,
                 } => {
                     let attempt = *visits.get(&cursor).unwrap_or(&0) + 1;
 
@@ -568,6 +573,7 @@ impl GraphExecutor {
                     let provider_clone = provider.clone();
                     let tools_clone = tools.clone();
                     let agent_ref_clone = agent_ref.clone();
+                    let inherit_from_clone = inherit_from.clone();
                     let (raw, replayed) = self
                         .visit_effect(tenant, run_id, &cursor, attempt, || {
                             let req = AgentTurnRequest {
@@ -578,6 +584,7 @@ impl GraphExecutor {
                                 provider: provider_clone,
                                 tools: tools_clone,
                                 agent_ref: agent_ref_clone,
+                                inherit_from: inherit_from_clone,
                             };
                             let fut = (self.agent_turn)(req);
                             Box::pin(async move {
@@ -1374,7 +1381,7 @@ impl GraphExecutor {
                         provider,
                         tools,
                         agent_ref,
-                        ..
+                        inherit_from,
                     } => {
                         let attempt = *visits.get(&bc.cursor).unwrap_or(&0) + 1;
                         let node_id = bc.cursor.clone();
@@ -1383,6 +1390,7 @@ impl GraphExecutor {
                         let pv = provider.clone();
                         let tl = tools.clone();
                         let ar = agent_ref.clone();
+                        let ih = inherit_from.clone();
                         let state_for_call = state.clone();
                         let (raw, replayed) = self
                             .visit_effect(tenant, run_id, &bc.cursor, attempt, || {
@@ -1394,6 +1402,7 @@ impl GraphExecutor {
                                     provider: pv,
                                     tools: tl,
                                     agent_ref: ar,
+                                    inherit_from: ih,
                                 };
                                 let fut = (self.agent_turn)(req);
                                 Box::pin(async move {

@@ -42,6 +42,19 @@ pub enum NodeKind {
         /// agents, instead of the inline system_prompt/model/tools.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_ref: Option<String>,
+        /// When set, keep this node's OWN `system_prompt` and `model` but
+        /// inherit the referenced agent's tools, memory, knowledge and
+        /// guardrails.
+        ///
+        /// This is the specialist case, and it is why `agent_ref` alone is not
+        /// enough: `agent_ref` adopts the referenced config wholesale, prompt
+        /// included, which would make every specialist in a generated graph an
+        /// identical copy of its parent worker. `inherit_from` keeps what makes
+        /// a specialist a specialist and inherits only the capability surface.
+        ///
+        /// Ignored when `agent_ref` is set — that already takes everything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inherit_from: Option<String>,
     },
     /// A deterministic tool call node.
     #[serde(rename_all = "camelCase")]
@@ -1237,6 +1250,7 @@ mod tests {
                 tools: vec![],
                 provider: None,
                 agent_ref: None,
+                inherit_from: None,
             },
         };
         let value = serde_json::to_value(&node).expect("serialization must succeed");
