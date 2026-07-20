@@ -9046,9 +9046,7 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(
-            msg.contains(
-                "operala.call node dispatched but no RemoteDispatchHandler configured"
-            ),
+            msg.contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
             "unexpected output: {:?}",
             execution.output
         );
