@@ -309,7 +309,8 @@ async fn dispatch_route_calls_server_and_wraps() {
     let catalog = source.catalog(&tenant()).await;
     let route = catalog.route("s1", "get_issue").expect("route present");
 
-    let out = dispatch_route(route, "{}").await;
+    let scope = crate::mcp_scope::McpCallScope::new(TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{}", &scope).await;
     // `ToolOutput::to_value` unwraps `structuredContent`, so the value is
     // the server's structured payload itself.
     assert_eq!(out, json!({ "ok": 1 }), "got: {out}");
@@ -335,6 +336,7 @@ async fn dispatch_route_calls_server_and_wraps() {
     let source_err = McpToolSource::new(admin_err.uri(), "gtc_live_x");
     let catalog_err = source_err.catalog(&TenantContext::new("acme", "stg")).await;
     let route_err = catalog_err.route("s1", "get_issue").expect("route present");
-    let out_err = dispatch_route(route_err, "{}").await;
+    let scope_err = crate::mcp_scope::McpCallScope::new(TenantContext::new("acme", "prod"));
+    let out_err = dispatch_route(route_err, "{}", &scope_err).await;
     assert!(out_err.to_string().contains("error"), "got: {out_err}");
 }

@@ -84,7 +84,8 @@ mod aw {
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
         let args_str = arguments.to_string();
-        dispatch_route(route, &args_str).await
+        let scope = greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx.clone());
+        dispatch_route(route, &args_str, &scope).await
     }
 }
 

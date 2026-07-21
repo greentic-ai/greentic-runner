@@ -147,7 +147,9 @@ async fn local_wasm_server_lists_and_dispatches_in_process() {
     let route = catalog
         .route("local", "echo")
         .expect("route for echo must exist");
-    let out = dispatch_route(route, "{\"message\":\"hi\"}").await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{\"message\":\"hi\"}", &scope).await;
     assert!(
         !out.to_string().contains("\"error\""),
         "dispatch must succeed; got: {out}"
@@ -245,7 +247,9 @@ async fn lazy_pull_on_catalog_miss_and_dispatch() {
 
     // Dispatch must succeed (lazy pull no-ops on cache hit, sidecar pins digest).
     let route = catalog.route("local", "echo").expect("route for echo");
-    let out = dispatch_route(route, "{\"message\":\"world\"}").await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{\"message\":\"world\"}", &scope).await;
     assert!(
         !out.to_string().contains("\"error\""),
         "dispatch must succeed after lazy pull; got: {out}"
@@ -374,7 +378,9 @@ async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
         component_digest: Some(wrong_digest),
     };
 
-    let result = dispatch_route(&route, r#"{"message":"degrade-test"}"#).await;
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let result = dispatch_route(&route, r#"{"message":"degrade-test"}"#, &scope).await;
 
     // Clean up before asserting (to avoid leaking env state on failure).
     unsafe {

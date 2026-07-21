@@ -297,7 +297,8 @@ pub async fn dispatch_tool_call(
         {
             Some(route) => {
                 let args = call.args.to_string();
-                crate::mcp_source::dispatch_route(route, &args).await
+                let scope = crate::mcp_scope::McpCallScope::new(tenant.clone());
+                crate::mcp_source::dispatch_route(route, &args, &scope).await
             }
             None => {
                 tracing::warn!(
