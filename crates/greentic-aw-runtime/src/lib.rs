@@ -41,6 +41,7 @@ pub mod r#loop;
 pub mod manifest_provider;
 pub mod manifest_tools;
 pub mod mcp_local;
+pub mod mcp_scope;
 pub mod mcp_secrets;
 pub mod mcp_source;
 pub mod mcp_store_pull;
