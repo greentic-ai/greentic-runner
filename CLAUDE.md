@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, exposes HTTP ingress adapters for messaging providers (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron), and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`).
+greentic-runner is the production runtime for the Greentic platform. It loads `.gtpack` archives containing WebAssembly components and flow definitions, exposes HTTP ingress adapters for messaging providers (Telegram, Teams, Slack, WebChat, Webex, WhatsApp, generic webhook, timer/cron), and executes flows with pause/resume session semantics. The workspace produces three binaries (`greentic-runner`, `greentic-runner-cli`, `greentic-gen-bindings`) and a library crate (`greentic_runner`). Workspace version 1.2.0-dev.0.
 
 ## Build & Test
 
@@ -221,6 +221,7 @@ Pack index (JSON, local/HTTPS/cloud) polled at `PACK_REFRESH_INTERVAL` (default 
 |--------|---------------|
 | `http/mod.rs` | Axum router assembly (ingress adapters, admin, health) |
 | `http/admin.rs` | Admin API endpoints |
+| `http/auth.rs` | `AdminAuth` extractor: bearer-token or loopback-only gating for admin routes |
 | `http/health.rs` | Health/readiness probes |
 
 **Cross-cutting**
@@ -275,8 +276,8 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | Binary | Purpose |
 |--------|---------|
 | `greentic-runner` | Main HTTP host (pack watcher + ingress) |
-| `greentic-runner-cli` | CLI companion |
-| `greentic-gen-bindings` | Inspects a `.gtpack` and emits a `bindings.yaml` seed |
+| `greentic-runner-cli` | CLI companion (`required-features = ["legacy-gen-bindings"]`) |
+| `greentic-gen-bindings` | Inspects a `.gtpack` and emits a `bindings.yaml` seed (`required-features = ["legacy-gen-bindings"]`) |
 
 ## Key Environment Variables
 
