@@ -38,7 +38,17 @@ impl McpCallScope {
     /// satisfy the shared format — the call then behaves exactly as it does
     /// today (no secrets), rather than failing the tool call.
     pub fn types_tenant(&self) -> Option<TenantCtx> {
-        crate::knowledge::to_types_tenant(&self.tenant).ok()
+        crate::knowledge::to_types_tenant(&self.tenant)
+            .inspect_err(|e| {
+                tracing::warn!(
+                    tenant_id = %self.tenant.tenant_id,
+                    env_id = %self.tenant.env_id,
+                    error = %e,
+                    "tenant ids do not satisfy the greentic-types tenant format; \
+                     secret_get will report missing-tenant-ctx for this call"
+                );
+            })
+            .ok()
     }
 
     pub fn exec_secrets_store(&self) -> Option<DynSecretsStore> {
@@ -52,6 +62,7 @@ impl McpCallScope {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
 
     #[test]
     fn scope_without_secrets_yields_no_store() {
@@ -64,5 +75,27 @@ mod tests {
     fn invalid_tenant_ids_yield_no_types_tenant() {
         let scope = McpCallScope::new(TenantContext::new("", ""));
         assert!(scope.types_tenant().is_none());
+    }
+
+    struct FakeSecrets;
+
+    #[async_trait]
+    impl SecretsManager for FakeSecrets {
+        async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(b"fake-secret".to_vec())
+        }
+        async fn write(&self, _path: &str, _value: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scope_with_secrets_yields_exec_secrets_store() {
+        let scope =
+            McpCallScope::with_secrets(TenantContext::new("acme", "prod"), Arc::new(FakeSecrets));
+        assert!(scope.exec_secrets_store().is_some());
     }
 }
