@@ -994,6 +994,57 @@ mod tests {
         ));
     }
 
+    /// An empty wallet must stop the run BEFORE any LLM spend. The mock backend is
+    /// primed with zero responses: if the gate were removed, the loop would reach
+    /// the LLM and fail with an LLM error instead of `CreditBudgetExceeded`.
+    #[tokio::test]
+    async fn empty_wallet_refuses_the_run_before_any_llm_call() {
+        let llm = Arc::new(MockLlmBackend::new(vec![]));
+        let store = Arc::new(MockAgentStateStore::new());
+        let telemetry = Arc::new(MockTelemetry::new());
+        let cp = MockConfigProvider::new();
+        let tc = TenantContext::new("acme", "prod");
+        cp.insert(&tc, "a", cfg());
+        let cp = Arc::new(cp);
+
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
+        let ledger = Arc::new(crate::mock::NoopToolLedger);
+        let runtime = AgentRuntime::new(
+            cp,
+            store,
+            ext,
+            llm,
+            telemetry.clone(),
+            token_meter,
+            ledger,
+            None,
+        )
+        .with_billing_meter(Arc::new(crate::mock::MockBillingMeter::new(true)));
+
+        let err = runtime
+            .step(
+                tc.clone(),
+                "sess-1",
+                "a",
+                AgentInput {
+                    text: "hello".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("an empty wallet must refuse the run");
+
+        assert!(
+            matches!(err, AgentError::CreditBudgetExceeded),
+            "expected CreditBudgetExceeded, got {err:?}"
+        );
+        assert!(
+            telemetry.recorded.lock().unwrap().is_empty(),
+            "nothing should have been executed"
+        );
+    }
+
     #[tokio::test]
     async fn opening_message_short_circuits_first_empty_turn() {
         // The mock LLM would reply "from llm" if called — but an opening message
