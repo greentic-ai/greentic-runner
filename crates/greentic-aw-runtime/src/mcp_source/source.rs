@@ -10,6 +10,7 @@ use serde_json::json;
 
 use greentic_mcp_client::{McpAuth, McpClientOptions, McpHttpClient, McpToolDef};
 
+use crate::mcp_scope::McpCallScope;
 use crate::tenant::TenantContext;
 
 use super::types::{
@@ -28,6 +29,7 @@ pub struct McpToolSource {
     token: String,
     client: reqwest::Client,
     cache: DashMap<String, Arc<McpToolCatalog>>,
+    secrets: Option<Arc<dyn greentic_secrets_lib::SecretsManager>>,
 }
 
 impl McpToolSource {
@@ -45,7 +47,25 @@ impl McpToolSource {
             token: token.into(),
             client,
             cache: DashMap::new(),
+            secrets: None,
         }
+    }
+
+    /// Same as [`McpToolSource::new`] plus the tenant secrets manager, so
+    /// `local-wasm` components dispatched from this source's catalogs can read
+    /// their credentials.
+    pub fn with_secrets(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        secrets: Arc<dyn greentic_secrets_lib::SecretsManager>,
+    ) -> Self {
+        let mut source = Self::new(base_url, token);
+        source.secrets = Some(secrets);
+        source
+    }
+
+    pub fn secrets(&self) -> Option<Arc<dyn greentic_secrets_lib::SecretsManager>> {
+        self.secrets.clone()
     }
 
     /// Stable per-tenant, per-role cache key. `TenantContext` exposes no single
@@ -107,11 +127,14 @@ impl McpToolSource {
                     error = %e,
                     "mcp-servers fetch failed; serving empty MCP catalog"
                 );
-                return McpToolCatalog::empty();
+                let mut catalog = McpToolCatalog::empty();
+                catalog.secrets = self.secrets();
+                return catalog;
             }
         };
 
         let mut catalog = McpToolCatalog::empty();
+        catalog.secrets = self.secrets();
         for server in &servers {
             if !server.roles.iter().any(|r| r == role) {
                 continue;
@@ -318,13 +341,17 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
 /// Invoke an MCP tool through its route. Always returns a JSON [`Value`],
 /// never panics — bad arguments, connection failures, and timeouts all become
 /// `{"error": "..."}`.
-pub async fn dispatch_route(route: &McpRoute, args: &str) -> serde_json::Value {
+pub async fn dispatch_route(
+    route: &McpRoute,
+    args: &str,
+    scope: &McpCallScope,
+) -> serde_json::Value {
     let parsed: serde_json::Value = match serde_json::from_str(args) {
         Ok(v) => v,
         Err(e) => return json!({ "error": format!("invalid tool arguments: {e}") }),
     };
 
-    match tokio::time::timeout(SERVER_TIMEOUT, call_route(route, &parsed)).await {
+    match tokio::time::timeout(SERVER_TIMEOUT, call_route(route, &parsed, scope)).await {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => json!({ "error": e }),
         Err(_) => json!({
@@ -342,6 +369,7 @@ pub async fn dispatch_route(route: &McpRoute, args: &str) -> serde_json::Value {
 async fn call_route(
     route: &McpRoute,
     args: &serde_json::Value,
+    scope: &McpCallScope,
 ) -> Result<serde_json::Value, String> {
     match route.transport {
         Transport::Http => {
@@ -382,7 +410,10 @@ async fn call_route(
                         component
                     )
                 })?;
-            Ok(crate::mcp_local::local_call_tool(component, &route.raw_tool_name, args).await)
+            Ok(
+                crate::mcp_local::local_call_tool(component, &route.raw_tool_name, args, scope)
+                    .await,
+            )
         }
     }
 }

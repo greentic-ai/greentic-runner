@@ -17,7 +17,7 @@
 //! successful call, so downstream nodes can branch on the `error` key.
 
 #[cfg(feature = "agentic-worker")]
-mod aw {
+pub(crate) mod aw {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
@@ -46,6 +46,39 @@ mod aw {
             .filter(|s| !s.is_empty())?;
         tracing::info!(endpoint = %endpoint, "flow MCP node source constructed");
         Some(Arc::new(McpToolSource::new(endpoint, token)))
+    }
+
+    /// Build the secrets manager for the flow MCP path from the same
+    /// `SECRETS_BACKEND` environment the host uses. Pure builder — no
+    /// caching — so it can be exercised directly by unit tests. A failure
+    /// returns `None` so an MCP tool call degrades to "no secrets" rather
+    /// than failing the node.
+    fn build_secrets_manager() -> Option<crate::secrets::DynSecretsManager> {
+        match crate::secrets::SecretsBackend::from_env(std::env::var("SECRETS_BACKEND").ok())
+            .and_then(|backend| backend.build_manager())
+        {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "flow MCP secrets manager unavailable; local-wasm tools will run without secrets"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build the secrets manager for the flow MCP path once per process and
+    /// reuse it thereafter. Mirrors [`source_from_env`]'s boot-once
+    /// semantics (see `runner/engine.rs`, constructed once at engine
+    /// creation): the underlying manager (and, for the broker backend, its
+    /// `reqwest::Client`) is built exactly once via [`build_secrets_manager`]
+    /// and memoized in a process-level `OnceLock`; every call after the
+    /// first returns a cheap clone of the cached `Arc`.
+    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
+        static CACHED: std::sync::OnceLock<Option<crate::secrets::DynSecretsManager>> =
+            std::sync::OnceLock::new();
+        CACHED.get_or_init(build_secrets_manager).clone()
     }
 
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
@@ -84,7 +117,125 @@ mod aw {
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
         let args_str = arguments.to_string();
-        dispatch_route(route, &args_str).await
+        let scope = match secrets_from_env() {
+            Some(manager) => greentic_aw_runtime::mcp_scope::McpCallScope::with_secrets(
+                tenant_ctx.clone(),
+                manager,
+            ),
+            None => greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx.clone()),
+        };
+        dispatch_route(route, &args_str, &scope).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::build_secrets_manager;
+        use serial_test::serial;
+        use std::env;
+
+        // The crate denies unsafe, but `std::env::set_var`/`remove_var` are
+        // `unsafe` as of edition 2024. These helpers are only reachable from
+        // `#[serial]` tests, so no other thread observes the environment
+        // mid-mutation.
+        #[allow(unsafe_code)]
+        fn set(key: &str, val: &str) {
+            // SAFETY: env-mutating tests are serialized via `#[serial]`.
+            unsafe { env::set_var(key, val) };
+        }
+        #[allow(unsafe_code)]
+        fn unset(key: &str) {
+            // SAFETY: env-mutating tests are serialized via `#[serial]`.
+            unsafe { env::remove_var(key) };
+        }
+
+        /// Restores a snapshot of env vars on drop, so a panicking assertion
+        /// partway through a test body still restores `SECRETS_BACKEND`/
+        /// `GREENTIC_ENV` and cannot leak state into other tests running in
+        /// the same process (even under `#[serial]`, an unwind must not skip
+        /// cleanup).
+        struct EnvRestoreGuard {
+            previous: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl Drop for EnvRestoreGuard {
+            fn drop(&mut self) {
+                for (k, v) in &self.previous {
+                    match v {
+                        Some(value) => set(k, value),
+                        None => unset(k),
+                    }
+                }
+            }
+        }
+
+        /// Snapshot + apply a small set of env vars around a test body,
+        /// restoring the snapshot via [`EnvRestoreGuard::drop`] even if the
+        /// body panics.
+        fn with_env<F: FnOnce()>(vars: &[(&'static str, Option<&str>)], body: F) {
+            let _guard = EnvRestoreGuard {
+                previous: vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect(),
+            };
+            for (k, v) in vars {
+                match v {
+                    Some(value) => set(k, value),
+                    None => unset(k),
+                }
+            }
+            body();
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_none_when_backend_unsupported() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("vault")),
+                    ("GREENTIC_ENV", Some("local")),
+                ],
+                || {
+                    assert!(
+                        build_secrets_manager().is_none(),
+                        "an unsupported SECRETS_BACKEND must degrade to no-secrets, not panic"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_none_when_env_backend_disallowed_in_prod() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("env")),
+                    ("GREENTIC_ENV", Some("prod")),
+                ],
+                || {
+                    assert!(
+                        build_secrets_manager().is_none(),
+                        "the env secrets backend is dev/test-only; prod must yield no-secrets \
+                         rather than failing the MCP node"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_some_when_env_backend_allowed() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("env")),
+                    ("GREENTIC_ENV", Some("local")),
+                ],
+                || {
+                    assert!(
+                        build_secrets_manager().is_some(),
+                        "a valid SECRETS_BACKEND in an allowed env must produce a manager, \
+                         so local-wasm tools actually gain secrets access"
+                    );
+                },
+            );
+        }
     }
 }
 

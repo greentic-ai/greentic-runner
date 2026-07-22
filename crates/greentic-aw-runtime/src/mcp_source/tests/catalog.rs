@@ -309,7 +309,8 @@ async fn dispatch_route_calls_server_and_wraps() {
     let catalog = source.catalog(&tenant()).await;
     let route = catalog.route("s1", "get_issue").expect("route present");
 
-    let out = dispatch_route(route, "{}").await;
+    let scope = crate::mcp_scope::McpCallScope::new(TenantContext::new("acme", "prod"));
+    let out = dispatch_route(route, "{}", &scope).await;
     // `ToolOutput::to_value` unwraps `structuredContent`, so the value is
     // the server's structured payload itself.
     assert_eq!(out, json!({ "ok": 1 }), "got: {out}");
@@ -335,6 +336,106 @@ async fn dispatch_route_calls_server_and_wraps() {
     let source_err = McpToolSource::new(admin_err.uri(), "gtc_live_x");
     let catalog_err = source_err.catalog(&TenantContext::new("acme", "stg")).await;
     let route_err = catalog_err.route("s1", "get_issue").expect("route present");
-    let out_err = dispatch_route(route_err, "{}").await;
+    let scope_err = crate::mcp_scope::McpCallScope::new(TenantContext::new("acme", "prod"));
+    let out_err = dispatch_route(route_err, "{}", &scope_err).await;
     assert!(out_err.to_string().contains("error"), "got: {out_err}");
+}
+
+#[test]
+fn source_carries_secrets_into_its_catalog() {
+    use crate::mcp_source::source::McpToolSource;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct FakeSecrets;
+    #[async_trait]
+    impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+        async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(b"v".to_vec())
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    let source = McpToolSource::with_secrets("http://admin.test", "tok", Arc::new(FakeSecrets));
+    assert!(
+        source.secrets().is_some(),
+        "a source built with secrets must expose them to the catalogs it builds"
+    );
+}
+
+/// A fake [`greentic_secrets_lib::SecretsManager`] used to prove the manager
+/// itself (not just `Option::is_some`) rides from the source into a
+/// real, network-built catalog.
+struct FakeSecrets;
+
+#[async_trait::async_trait]
+impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+    async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        Ok(b"v".to_vec())
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+}
+
+/// `build_catalog`'s normal-build branch (admin responds 200 with zero
+/// servers) must still copy the source's secrets manager onto the catalog it
+/// returns. This drives a REAL catalog through `catalog_for_role` against a
+/// mock admin — unlike `source_carries_secrets_into_its_catalog`, which only
+/// checks the source itself and never builds a catalog, so it stays green
+/// even if the `catalog.secrets = self.secrets();` copy in `build_catalog` is
+/// deleted.
+#[tokio::test]
+async fn build_catalog_normal_branch_carries_secrets() {
+    use std::sync::Arc;
+
+    let admin = MockServer::start().await;
+    mount_admin(&admin, json!({ "servers": [] })).await;
+
+    let source = McpToolSource::with_secrets(admin.uri(), "gtc_live_x", Arc::new(FakeSecrets));
+    let catalog = source
+        .catalog_for_role(&tenant(), MCP_ROLE_AGENTIC_WORKER)
+        .await;
+
+    assert!(catalog.is_empty());
+    assert!(
+        catalog.secrets().is_some(),
+        "build_catalog's normal-build branch must copy the source's secrets \
+         manager onto the returned catalog"
+    );
+}
+
+/// `build_catalog`'s early-return "fetch failed" branch (admin responds
+/// non-200) must ALSO copy the source's secrets manager onto the empty
+/// catalog it returns.
+#[tokio::test]
+async fn build_catalog_fetch_failed_branch_carries_secrets() {
+    use std::sync::Arc;
+
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&admin)
+        .await;
+
+    let source = McpToolSource::with_secrets(admin.uri(), "gtc_live_x", Arc::new(FakeSecrets));
+    let catalog = source
+        .catalog_for_role(&tenant(), MCP_ROLE_AGENTIC_WORKER)
+        .await;
+
+    assert!(catalog.is_empty());
+    assert!(
+        catalog.secrets().is_some(),
+        "build_catalog's fetch-failed branch must copy the source's secrets \
+         manager onto the empty catalog it returns"
+    );
 }
