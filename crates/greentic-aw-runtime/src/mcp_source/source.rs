@@ -29,6 +29,7 @@ pub struct McpToolSource {
     token: String,
     client: reqwest::Client,
     cache: DashMap<String, Arc<McpToolCatalog>>,
+    secrets: Option<Arc<dyn greentic_secrets_lib::SecretsManager>>,
 }
 
 impl McpToolSource {
@@ -46,7 +47,25 @@ impl McpToolSource {
             token: token.into(),
             client,
             cache: DashMap::new(),
+            secrets: None,
         }
+    }
+
+    /// Same as [`McpToolSource::new`] plus the tenant secrets manager, so
+    /// `local-wasm` components dispatched from this source's catalogs can read
+    /// their credentials.
+    pub fn with_secrets(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        secrets: Arc<dyn greentic_secrets_lib::SecretsManager>,
+    ) -> Self {
+        let mut source = Self::new(base_url, token);
+        source.secrets = Some(secrets);
+        source
+    }
+
+    pub fn secrets(&self) -> Option<Arc<dyn greentic_secrets_lib::SecretsManager>> {
+        self.secrets.clone()
     }
 
     /// Stable per-tenant, per-role cache key. `TenantContext` exposes no single
@@ -108,11 +127,14 @@ impl McpToolSource {
                     error = %e,
                     "mcp-servers fetch failed; serving empty MCP catalog"
                 );
-                return McpToolCatalog::empty();
+                let mut catalog = McpToolCatalog::empty();
+                catalog.secrets = self.secrets();
+                return catalog;
             }
         };
 
         let mut catalog = McpToolCatalog::empty();
+        catalog.secrets = self.secrets();
         for server in &servers {
             if !server.roles.iter().any(|r| r == role) {
                 continue;

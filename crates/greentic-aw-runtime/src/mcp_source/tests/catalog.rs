@@ -340,3 +340,30 @@ async fn dispatch_route_calls_server_and_wraps() {
     let out_err = dispatch_route(route_err, "{}", &scope_err).await;
     assert!(out_err.to_string().contains("error"), "got: {out_err}");
 }
+
+#[test]
+fn source_carries_secrets_into_its_catalog() {
+    use crate::mcp_source::source::McpToolSource;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    struct FakeSecrets;
+    #[async_trait]
+    impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+        async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+            Ok(b"v".to_vec())
+        }
+        async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+            Ok(())
+        }
+    }
+
+    let source = McpToolSource::with_secrets("http://admin.test", "tok", Arc::new(FakeSecrets));
+    assert!(
+        source.secrets().is_some(),
+        "a source built with secrets must expose them to the catalogs it builds"
+    );
+}

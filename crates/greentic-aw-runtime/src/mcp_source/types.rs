@@ -4,8 +4,10 @@
 //! ([`McpToolCatalog`]). Transport and dispatch logic lives in `source.rs`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use greentic_secrets_lib::SecretsManager;
 use secrecy::SecretString;
 use serde::Deserialize;
 
@@ -138,6 +140,11 @@ pub struct McpToolCatalog {
     /// `(server_id, raw_tool_name)` → dispatch route.
     pub(super) routes: HashMap<(String, String), McpRoute>,
     pub(super) fetched_at: Instant,
+    /// Tenant secrets manager carried over from the [`super::McpToolSource`]
+    /// that built this catalog, if any, so a `local-wasm` dispatch route
+    /// reached through this catalog can build a secrets-bearing
+    /// [`crate::mcp_scope::McpCallScope`].
+    pub(super) secrets: Option<Arc<dyn SecretsManager>>,
 }
 
 impl McpToolCatalog {
@@ -146,6 +153,7 @@ impl McpToolCatalog {
             tools: HashMap::new(),
             routes: HashMap::new(),
             fetched_at: Instant::now(),
+            secrets: None,
         }
     }
 
@@ -175,6 +183,13 @@ impl McpToolCatalog {
         self.routes.get(&(server_id.to_string(), tool.to_string()))
     }
 
+    /// Tenant secrets manager carried over from the source that built this
+    /// catalog, if any. `local-wasm` dispatch call sites use this to build a
+    /// secrets-bearing [`crate::mcp_scope::McpCallScope`].
+    pub fn secrets(&self) -> Option<Arc<dyn SecretsManager>> {
+        self.secrets.clone()
+    }
+
     /// Build a catalog directly from tool/route maps, bypassing the admin +
     /// MCP probe. Test-only: lets downstream crates (e.g. `tools.rs`) exercise
     /// the list/dispatch seams without standing up a wiremock pair.
@@ -187,6 +202,7 @@ impl McpToolCatalog {
             tools,
             routes,
             fetched_at: Instant::now(),
+            secrets: None,
         }
     }
 }

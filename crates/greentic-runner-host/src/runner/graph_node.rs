@@ -587,7 +587,10 @@ mod aw {
             let tool = build_tool(ext_runtime.clone());
             // Built once here (like the other Arcs) so the MCP catalog cache +
             // HTTP client are reused across every graph-agent turn.
-            let mcp_source = super::super::agent_node::mcp_source_from_env();
+            // No per-tenant secrets manager reachable in this constructor
+            // (out of scope for this task — see `agent_node::mcp_source_from_env`'s
+            // doc comment); matches this path's pre-existing behavior.
+            let mcp_source = super::super::agent_node::mcp_source_from_env(None);
             let turn_source: Arc<dyn TurnEffectSource> = Arc::new(RuntimeTurnSource {
                 state_store: state_store.clone(),
                 ext_runtime,

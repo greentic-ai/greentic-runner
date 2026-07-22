@@ -297,7 +297,12 @@ pub async fn dispatch_tool_call(
         {
             Some(route) => {
                 let args = call.args.to_string();
-                let scope = crate::mcp_scope::McpCallScope::new(tenant.clone());
+                let scope = match mcp.as_deref().and_then(|c| c.secrets()) {
+                    Some(manager) => {
+                        crate::mcp_scope::McpCallScope::with_secrets(tenant.clone(), manager)
+                    }
+                    None => crate::mcp_scope::McpCallScope::new(tenant.clone()),
+                };
                 crate::mcp_source::dispatch_route(route, &args, &scope).await
             }
             None => {

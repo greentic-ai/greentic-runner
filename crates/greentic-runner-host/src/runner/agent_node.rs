@@ -470,8 +470,16 @@ mod aw {
     /// tenant-registered MCP servers must stay disabled. Returns `None` on
     /// opt-out or when either credential is missing/empty.
     ///
+    /// `secrets`, when `Some`, is threaded into [`McpToolSource::with_secrets`]
+    /// so `local-wasm` tools dispatched from this source's catalogs can read
+    /// their tenant credentials. Callers with no per-tenant secrets context
+    /// (the process-level serve path) pass `None`, matching prior behavior.
+    ///
     /// [`McpToolSource`]: greentic_aw_runtime::McpToolSource
-    pub(crate) fn mcp_source_from_env() -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+    /// [`McpToolSource::with_secrets`]: greentic_aw_runtime::McpToolSource::with_secrets
+    pub(crate) fn mcp_source_from_env(
+        secrets: Option<crate::secrets::DynSecretsManager>,
+    ) -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
         if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
             tracing::info!("GREENTIC_AW_MCP=0; MCP tool source disabled");
             return None;
@@ -483,9 +491,13 @@ mod aw {
             .ok()
             .filter(|s| !s.is_empty())?;
         tracing::info!(endpoint = %endpoint, "MCP tool source constructed");
-        Some(Arc::new(greentic_aw_runtime::McpToolSource::new(
-            endpoint, token,
-        )))
+        let source = match secrets {
+            Some(manager) => {
+                greentic_aw_runtime::McpToolSource::with_secrets(endpoint, token, manager)
+            }
+            None => greentic_aw_runtime::McpToolSource::new(endpoint, token),
+        };
+        Some(Arc::new(source))
     }
 
     /// Build the component tool source from the operator's loaded packs, gated
@@ -1250,7 +1262,7 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            mcp_source_from_env(),
+            mcp_source_from_env(Some(secrets.clone())),
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant));
@@ -1514,7 +1526,10 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            mcp_source_from_env(),
+            // No per-tenant secrets context on this process-level serve path
+            // (see the `ext_runtime`/`llm` construction above): `local-wasm`
+            // MCP tools here run without tenant secrets, same as before.
+            mcp_source_from_env(None),
         )
         .with_guardrails(
             {
@@ -2359,7 +2374,7 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
             }
             assert!(
-                super::mcp_source_from_env().is_some(),
+                super::mcp_source_from_env(None).is_some(),
                 "MCP is on by default when admin credentials are configured"
             );
 
@@ -2368,7 +2383,7 @@ mod aw {
                 std::env::set_var("GREENTIC_AW_MCP", "0");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "GREENTIC_AW_MCP=0 disables MCP regardless of credentials"
             );
 
@@ -2376,7 +2391,7 @@ mod aw {
             unsafe {
                 std::env::set_var("GREENTIC_AW_MCP", "1");
             }
-            assert!(super::mcp_source_from_env().is_some());
+            assert!(super::mcp_source_from_env(None).is_some());
 
             // (c) Missing credential → None even without an opt-out.
             unsafe {
@@ -2384,7 +2399,7 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "no endpoint → no MCP source"
             );
 
@@ -2393,7 +2408,7 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
             assert!(
-                super::mcp_source_from_env().is_none(),
+                super::mcp_source_from_env(None).is_none(),
                 "no token → no MCP source"
             );
 
