@@ -22,10 +22,17 @@ use greentic_types::TenantCtx;
 /// Category segment admin uses for MCP secrets.
 const MCP_CATEGORY: &str = "mcp";
 
+/// Env segment for MCP secrets. Admin pins ALL MCP secrets to `default`
+/// regardless of the tenant's flow env — both when sealing (`mcp_scope`) and
+/// resolving (`ResolveCtx`) in greentic-designer-admin. The reader must match,
+/// or it would look under the flow env (`prod`/`local`) and silently miss
+/// admin's write.
+const MCP_ENV_SEGMENT: &str = "default";
+
 /// Build the secret URI for an MCP component's key, byte-for-byte compatible
-/// with admin's `SecretScope::uri` for the `mcp` category: key and team are
-/// emitted verbatim, absent team becomes `_`. An empty key is rejected as a
-/// caller error rather than producing a trailing-slash URI.
+/// with admin's `SecretScope::uri` for the `mcp` category: env pinned to
+/// `default`, key and team emitted verbatim, absent team becomes `_`. An empty
+/// key is rejected as a caller error rather than producing a trailing-slash URI.
 pub(crate) fn mcp_secret_uri(ctx: &TenantCtx, key: &str) -> Result<String, String> {
     if key.trim().is_empty() {
         return Err("secret key must not be empty".to_string());
@@ -38,7 +45,7 @@ pub(crate) fn mcp_secret_uri(ctx: &TenantCtx, key: &str) -> Result<String, Strin
         .unwrap_or("_");
     Ok(format!(
         "secrets://{}/{}/{}/{}/{}",
-        ctx.env.as_str(),
+        MCP_ENV_SEGMENT,
         ctx.tenant.as_str(),
         team,
         MCP_CATEGORY,
@@ -100,11 +107,24 @@ mod tests {
 
     #[test]
     fn uri_matches_admin_shape_without_team() {
-        // Raw key, exactly as admin's `SecretScope::uri` (mcp category) writes
-        // it — no lowercasing.
+        // env is pinned to `default` (admin's convention), NOT the flow env, and
+        // the key is raw — exactly as admin's `SecretScope::uri` (mcp category)
+        // writes it.
         assert_eq!(
             mcp_secret_uri(&ctx(), "EXAMPLE_KEY").unwrap(),
-            "secrets://prod/acme/_/mcp/EXAMPLE_KEY"
+            "secrets://default/acme/_/mcp/EXAMPLE_KEY"
+        );
+    }
+
+    #[test]
+    fn uri_pins_env_to_default_ignoring_flow_env() {
+        // `ctx()` has env `prod`, but admin seals MCP secrets at env `default`
+        // regardless of the tenant's flow env. Teeth guard against reading at
+        // `ctx.env`, which would silently miss admin's write.
+        let uri = mcp_secret_uri(&ctx(), "K").unwrap();
+        assert!(
+            uri.starts_with("secrets://default/"),
+            "env must be pinned to `default` to match admin, got: {uri}"
         );
     }
 
@@ -115,7 +135,7 @@ mod tests {
         // guard against reintroducing lowercase/`_`-substitution.
         assert_eq!(
             mcp_secret_uri(&ctx(), "Petstore-API.key").unwrap(),
-            "secrets://prod/acme/_/mcp/Petstore-API.key"
+            "secrets://default/acme/_/mcp/Petstore-API.key"
         );
     }
 
@@ -127,7 +147,7 @@ mod tests {
         with_team.team_id = Some(greentic_types::TeamId::new("Sales").unwrap());
         assert_eq!(
             mcp_secret_uri(&with_team, "K").unwrap(),
-            "secrets://prod/acme/Sales/mcp/K"
+            "secrets://default/acme/Sales/mcp/K"
         );
     }
 
@@ -147,7 +167,7 @@ mod tests {
         assert_eq!(got, b"sk-live".to_vec());
         assert_eq!(
             fake.seen.lock().unwrap().as_slice(),
-            &["secrets://prod/acme/_/mcp/EXAMPLE_KEY".to_string()]
+            &["secrets://default/acme/_/mcp/EXAMPLE_KEY".to_string()]
         );
     }
 }
