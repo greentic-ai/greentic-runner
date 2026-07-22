@@ -3,11 +3,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use tempfile::TempDir;
 
-use crate::cache::CacheManager;
-use crate::cache::config::CacheConfig;
 use crate::cache::engine_profile::{CpuPolicy, EngineProfile};
 use crate::cache::keys::ArtifactKey;
 use crate::cache::metadata::ArtifactMetadata;
+use crate::cache::{CacheConfig, CacheManager};
 
 fn fixture_bytes() -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
