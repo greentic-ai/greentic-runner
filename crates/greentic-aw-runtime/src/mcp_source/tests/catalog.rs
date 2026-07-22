@@ -367,3 +367,75 @@ fn source_carries_secrets_into_its_catalog() {
         "a source built with secrets must expose them to the catalogs it builds"
     );
 }
+
+/// A fake [`greentic_secrets_lib::SecretsManager`] used to prove the manager
+/// itself (not just `Option::is_some`) rides from the source into a
+/// real, network-built catalog.
+struct FakeSecrets;
+
+#[async_trait::async_trait]
+impl greentic_secrets_lib::SecretsManager for FakeSecrets {
+    async fn read(&self, _: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        Ok(b"v".to_vec())
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+}
+
+/// `build_catalog`'s normal-build branch (admin responds 200 with zero
+/// servers) must still copy the source's secrets manager onto the catalog it
+/// returns. This drives a REAL catalog through `catalog_for_role` against a
+/// mock admin — unlike `source_carries_secrets_into_its_catalog`, which only
+/// checks the source itself and never builds a catalog, so it stays green
+/// even if the `catalog.secrets = self.secrets();` copy in `build_catalog` is
+/// deleted.
+#[tokio::test]
+async fn build_catalog_normal_branch_carries_secrets() {
+    use std::sync::Arc;
+
+    let admin = MockServer::start().await;
+    mount_admin(&admin, json!({ "servers": [] })).await;
+
+    let source = McpToolSource::with_secrets(admin.uri(), "gtc_live_x", Arc::new(FakeSecrets));
+    let catalog = source
+        .catalog_for_role(&tenant(), MCP_ROLE_AGENTIC_WORKER)
+        .await;
+
+    assert!(catalog.is_empty());
+    assert!(
+        catalog.secrets().is_some(),
+        "build_catalog's normal-build branch must copy the source's secrets \
+         manager onto the returned catalog"
+    );
+}
+
+/// `build_catalog`'s early-return "fetch failed" branch (admin responds
+/// non-200) must ALSO copy the source's secrets manager onto the empty
+/// catalog it returns.
+#[tokio::test]
+async fn build_catalog_fetch_failed_branch_carries_secrets() {
+    use std::sync::Arc;
+
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&admin)
+        .await;
+
+    let source = McpToolSource::with_secrets(admin.uri(), "gtc_live_x", Arc::new(FakeSecrets));
+    let catalog = source
+        .catalog_for_role(&tenant(), MCP_ROLE_AGENTIC_WORKER)
+        .await;
+
+    assert!(catalog.is_empty());
+    assert!(
+        catalog.secrets().is_some(),
+        "build_catalog's fetch-failed branch must copy the source's secrets \
+         manager onto the empty catalog it returns"
+    );
+}
