@@ -48,6 +48,25 @@ mod aw {
         Some(Arc::new(McpToolSource::new(endpoint, token)))
     }
 
+    /// Build the secrets manager for the flow MCP path from the same
+    /// `SECRETS_BACKEND` environment the host uses. Mirrors
+    /// [`source_from_env`]: a failure returns `None` so an MCP tool call
+    /// degrades to "no secrets" rather than failing the node.
+    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
+        match crate::secrets::SecretsBackend::from_env(std::env::var("SECRETS_BACKEND").ok())
+            .and_then(|backend| backend.build_manager())
+        {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "flow MCP secrets manager unavailable; local-wasm tools will run without secrets"
+                );
+                None
+            }
+        }
+    }
+
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
     /// reusing the flow-editor MCP catalog.
     ///
@@ -84,8 +103,110 @@ mod aw {
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
         let args_str = arguments.to_string();
-        let scope = greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx.clone());
+        let scope = match secrets_from_env() {
+            Some(manager) => greentic_aw_runtime::mcp_scope::McpCallScope::with_secrets(
+                tenant_ctx.clone(),
+                manager,
+            ),
+            None => greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx.clone()),
+        };
         dispatch_route(route, &args_str, &scope).await
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::secrets_from_env;
+        use serial_test::serial;
+        use std::env;
+
+        // The crate denies unsafe, but `std::env::set_var`/`remove_var` are
+        // `unsafe` as of edition 2024. These helpers are only reachable from
+        // `#[serial]` tests, so no other thread observes the environment
+        // mid-mutation.
+        #[allow(unsafe_code)]
+        fn set(key: &str, val: &str) {
+            // SAFETY: env-mutating tests are serialized via `#[serial]`.
+            unsafe { env::set_var(key, val) };
+        }
+        #[allow(unsafe_code)]
+        fn unset(key: &str) {
+            // SAFETY: env-mutating tests are serialized via `#[serial]`.
+            unsafe { env::remove_var(key) };
+        }
+
+        /// Snapshot + restore a small set of env vars around a test body so
+        /// tests running in the same process don't leak `SECRETS_BACKEND`/
+        /// `GREENTIC_ENV` state into each other despite `#[serial]`.
+        fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], body: F) {
+            let previous: Vec<(&str, Option<String>)> =
+                vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
+            for (k, v) in vars {
+                match v {
+                    Some(value) => set(k, value),
+                    None => unset(k),
+                }
+            }
+            body();
+            for (k, v) in previous {
+                match v {
+                    Some(value) => set(k, &value),
+                    None => unset(k),
+                }
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_none_when_backend_unsupported() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("vault")),
+                    ("GREENTIC_ENV", Some("local")),
+                ],
+                || {
+                    assert!(
+                        secrets_from_env().is_none(),
+                        "an unsupported SECRETS_BACKEND must degrade to no-secrets, not panic"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_none_when_env_backend_disallowed_in_prod() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("env")),
+                    ("GREENTIC_ENV", Some("prod")),
+                ],
+                || {
+                    assert!(
+                        secrets_from_env().is_none(),
+                        "the env secrets backend is dev/test-only; prod must yield no-secrets \
+                         rather than failing the MCP node"
+                    );
+                },
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn secrets_from_env_some_when_env_backend_allowed() {
+            with_env(
+                &[
+                    ("SECRETS_BACKEND", Some("env")),
+                    ("GREENTIC_ENV", Some("local")),
+                ],
+                || {
+                    assert!(
+                        secrets_from_env().is_some(),
+                        "a valid SECRETS_BACKEND in an allowed env must produce a manager, \
+                         so local-wasm tools actually gain secrets access"
+                    );
+                },
+            );
+        }
     }
 }
 
