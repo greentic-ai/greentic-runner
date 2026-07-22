@@ -2198,6 +2198,14 @@ impl ExecutionState {
             match value {
                 Value::Null => {}
                 Value::Array(items) => emitted.extend(items),
+                // A terminal `emit.response` node BOTH pushes its payload to
+                // egress (see `push_egress` in `dispatch_node`) AND returns that
+                // same payload as its node output, which the `End` path passes
+                // here as `final_payload`. Appending it unconditionally would
+                // emit the response twice (the webchat "double card"). Skip the
+                // re-append when it merely repeats the last emitted response;
+                // a genuinely distinct terminal output is still appended.
+                other if emitted.last() == Some(&other) => {}
                 other => emitted.push(other),
             }
         }
@@ -3865,6 +3873,32 @@ mod tests {
                 { "text": "second" },
                 { "text": "final" }
             ])
+        );
+    }
+
+    #[test]
+    fn finalize_does_not_double_terminal_emit_response() {
+        // Regression: a terminal `emit.response` node pushes its card to egress
+        // AND returns it as the node output, which the `End` path passes as
+        // `final_payload`. The card must appear ONCE, not twice (the webchat
+        // "double card").
+        let card = json!({ "renderedCard": { "type": "AdaptiveCard" } });
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(card.clone());
+        let result = state.finalize_with(Some(card.clone()));
+        assert_eq!(result, json!([card]));
+    }
+
+    #[test]
+    fn finalize_still_appends_distinct_terminal_output() {
+        // A terminal output that differs from the last emitted response is a
+        // genuine additional reply and must still be appended.
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "emitted" }));
+        let result = state.finalize_with(Some(json!({ "text": "final" })));
+        assert_eq!(
+            result,
+            json!([{ "text": "emitted" }, { "text": "final" }])
         );
     }
 
