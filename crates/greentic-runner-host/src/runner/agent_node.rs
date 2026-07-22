@@ -1526,10 +1526,14 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            // No per-tenant secrets context on this process-level serve path
-            // (see the `ext_runtime`/`llm` construction above): `local-wasm`
-            // MCP tools here run without tenant secrets, same as before.
-            mcp_source_from_env(None),
+            // This process-level serve path has no per-tenant secrets context
+            // (see the `ext_runtime`/`llm` construction above), but a `local-wasm`
+            // MCP tool still needs to read its tenant secret — the tenant arrives
+            // per call and the URI is built from it. So supply the same
+            // env-built, tenant-agnostic secrets manager the flow-node path uses
+            // (`mcp_node::aw::secrets_from_env`, memoized once per process); the
+            // http transport ignores it, the local-wasm transport consumes it.
+            mcp_source_from_env(crate::runner::mcp_node::aw::secrets_from_env()),
         )
         .with_guardrails(
             {

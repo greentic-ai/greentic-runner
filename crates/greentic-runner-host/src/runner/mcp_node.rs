@@ -17,7 +17,7 @@
 //! successful call, so downstream nodes can branch on the `error` key.
 
 #[cfg(feature = "agentic-worker")]
-mod aw {
+pub(crate) mod aw {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
