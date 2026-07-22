@@ -2573,11 +2573,31 @@ fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
     }
 }
 
+/// Make `in.input.*` resolve even when the flow entry IS the message (the
+/// env/revision path passes `envelope.payload` — the message — directly), not
+/// the legacy `{ "input": <message> }` wrapper. Packs are compiled against the
+/// legacy shape and read `in.input.metadata.*` (e.g. a card button's dispatch
+/// `flow_{{in.input.metadata.operation}}`); on the direct path `in.input` was
+/// null, so metadata-based routing fell through to the entry/welcome flow.
+///
+/// When the entry is an object without an `input` key, alias `input` to the
+/// entry itself so both `in.input.X` and `in.X` resolve. Entries that already
+/// carry an explicit `input` (the legacy wrapper) are left untouched.
+fn alias_input_to_entry(mut entry: Value) -> Value {
+    if let Value::Object(map) = &mut entry
+        && !map.contains_key("input")
+    {
+        let base = Value::Object(map.clone());
+        map.insert("input".into(), base);
+    }
+    entry
+}
+
 fn template_context(state: &ExecutionState, prev: Value) -> Value {
     let entry = if state.entry.is_null() {
         Value::Object(JsonMap::new())
     } else {
-        state.entry.clone()
+        alias_input_to_entry(state.entry.clone())
     };
     let mut ctx = JsonMap::new();
     ctx.insert("entry".into(), entry.clone());
@@ -3538,7 +3558,11 @@ fn build_routing_context(
         _ => JsonMap::new(),
     };
 
-    let entry = &state.entry;
+    // Alias `in.input` to the entry itself when the entry is the bare message
+    // (env/revision path) so routing templates that read `in.input.*` resolve,
+    // mirroring `template_context`. Legacy `{input: <message>}` entries are
+    // left untouched.
+    let entry = alias_input_to_entry(state.entry.clone());
     ctx.insert("entry".into(), entry.clone());
     ctx.insert("in".into(), entry.clone());
 
@@ -3900,6 +3924,36 @@ mod tests {
             result,
             json!([{ "text": "emitted" }, { "text": "final" }])
         );
+    }
+
+    #[test]
+    fn alias_input_to_entry_exposes_input_for_bare_message() {
+        // Env/revision path: the flow entry IS the message — metadata at the
+        // top level, no `input` wrapper. After aliasing, the pack's
+        // `in.input.metadata.*` template resolves the same as `in.metadata.*`.
+        let msg = json!({ "text": "hi", "metadata": { "operation": "get_weather" } });
+        let aliased = alias_input_to_entry(msg);
+        assert_eq!(
+            aliased.pointer("/metadata/operation"),
+            Some(&json!("get_weather"))
+        );
+        assert_eq!(
+            aliased.pointer("/input/metadata/operation"),
+            Some(&json!("get_weather"))
+        );
+    }
+
+    #[test]
+    fn alias_input_to_entry_preserves_explicit_input_wrapper() {
+        // Legacy `{input: <message>}` entries must not be double-wrapped.
+        let wrapped = json!({ "input": { "metadata": { "operation": "x" } } });
+        assert_eq!(alias_input_to_entry(wrapped.clone()), wrapped);
+    }
+
+    #[test]
+    fn alias_input_to_entry_ignores_non_objects() {
+        assert_eq!(alias_input_to_entry(json!("hi")), json!("hi"));
+        assert_eq!(alias_input_to_entry(json!(null)), json!(null));
     }
 
     #[test]
