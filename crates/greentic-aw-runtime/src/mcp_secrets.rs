@@ -4,9 +4,14 @@
 //!
 //! The URI shape is dictated by greentic-designer-admin, which writes these
 //! secrets: `secrets://<env>/<tenant>/<team>/mcp/<name>`
-//! (parity source: `greentic-designer-admin/src/secrets/scope.rs`).
-//! Team and key normalization mirror
-//! `greentic-runner-host/src/secrets.rs` verbatim.
+//! (parity source: `greentic-designer-admin/src/secrets/scope.rs`
+//! `SecretScope::uri`). That `mcp`-category writer emits the name and team
+//! **verbatim** — it does NOT canonicalize. This reader matches it exactly:
+//! the key and team pass through unchanged, and an absent team becomes `_`
+//! (`team.unwrap_or("_")`). Canonicalizing here would read a different URI
+//! than admin wrote — and admin already keys the http-transport auth token by
+//! a hyphenated UUID that lowercasing/`_`-substitution would corrupt. Only
+//! admin's separate *pack* path canonicalizes; the `mcp` category does not.
 
 use std::sync::Arc;
 
@@ -17,46 +22,27 @@ use greentic_types::TenantCtx;
 /// Category segment admin uses for MCP secrets.
 const MCP_CATEGORY: &str = "mcp";
 
-/// Lowercase and replace every character outside `[a-z0-9_]` with `_`.
-fn canonicalize_secret_key(raw: &str) -> String {
-    raw.trim()
-        .chars()
-        .map(|ch| {
-            let ch = ch.to_ascii_lowercase();
-            match ch {
-                'a'..='z' | '0'..='9' | '_' => ch,
-                _ => '_',
-            }
-        })
-        .collect()
-}
-
-/// Absent, empty, or `default` team collapses to the `_` segment.
-fn normalize_team_segment(team: Option<&str>) -> String {
-    match team
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
-    {
-        Some(value) => value.to_string(),
-        None => "_".to_string(),
-    }
-}
-
-/// Build the admin-compatible secret URI for an MCP component's key.
+/// Build the secret URI for an MCP component's key, byte-for-byte compatible
+/// with admin's `SecretScope::uri` for the `mcp` category: key and team are
+/// emitted verbatim, absent team becomes `_`. An empty key is rejected as a
+/// caller error rather than producing a trailing-slash URI.
 pub(crate) fn mcp_secret_uri(ctx: &TenantCtx, key: &str) -> Result<String, String> {
-    let key = key.trim();
-    if key.is_empty() {
+    if key.trim().is_empty() {
         return Err("secret key must not be empty".to_string());
     }
-    let team = ctx.team_id.as_ref().or(ctx.team.as_ref());
-    let team_segment = normalize_team_segment(team.map(|value| value.as_str()));
+    let team = ctx
+        .team_id
+        .as_ref()
+        .or(ctx.team.as_ref())
+        .map(|value| value.as_str())
+        .unwrap_or("_");
     Ok(format!(
         "secrets://{}/{}/{}/{}/{}",
         ctx.env.as_str(),
         ctx.tenant.as_str(),
-        team_segment,
+        team,
         MCP_CATEGORY,
-        canonicalize_secret_key(key)
+        key
     ))
 }
 
@@ -114,17 +100,34 @@ mod tests {
 
     #[test]
     fn uri_matches_admin_shape_without_team() {
+        // Raw key, exactly as admin's `SecretScope::uri` (mcp category) writes
+        // it — no lowercasing.
         assert_eq!(
             mcp_secret_uri(&ctx(), "EXAMPLE_KEY").unwrap(),
-            "secrets://prod/acme/_/mcp/example_key"
+            "secrets://prod/acme/_/mcp/EXAMPLE_KEY"
         );
     }
 
     #[test]
-    fn uri_canonicalizes_punctuation_in_key() {
+    fn uri_preserves_key_case_and_punctuation_verbatim() {
+        // The admin `mcp` category writer does NOT canonicalize; canonicalizing
+        // here would read a different URI than admin wrote. This is the teeth
+        // guard against reintroducing lowercase/`_`-substitution.
         assert_eq!(
-            mcp_secret_uri(&ctx(), "petstore-api.key").unwrap(),
-            "secrets://prod/acme/_/mcp/petstore_api_key"
+            mcp_secret_uri(&ctx(), "Petstore-API.key").unwrap(),
+            "secrets://prod/acme/_/mcp/Petstore-API.key"
+        );
+    }
+
+    #[test]
+    fn uri_emits_team_segment_verbatim_matching_admin() {
+        // Admin uses `team.unwrap_or("_")` — a raw passthrough, no empty/default
+        // folding. A team is emitted as-is.
+        let mut with_team = ctx();
+        with_team.team_id = Some(greentic_types::TeamId::new("Sales").unwrap());
+        assert_eq!(
+            mcp_secret_uri(&with_team, "K").unwrap(),
+            "secrets://prod/acme/Sales/mcp/K"
         );
     }
 
@@ -144,7 +147,7 @@ mod tests {
         assert_eq!(got, b"sk-live".to_vec());
         assert_eq!(
             fake.seen.lock().unwrap().as_slice(),
-            &["secrets://prod/acme/_/mcp/example_key".to_string()]
+            &["secrets://prod/acme/_/mcp/EXAMPLE_KEY".to_string()]
         );
     }
 }
