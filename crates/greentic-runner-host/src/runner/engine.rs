@@ -2056,6 +2056,27 @@ impl FlowEngine {
         Some(first)
     }
 
+    /// Resolve a flow by type, considering only entrypoint flows.
+    ///
+    /// Used to disambiguate an inbound provider event (routed by flow type,
+    /// with no explicit `pack_id`/`flow_id`) when a pack registers one public
+    /// entrypoint plus internal helper flows of the same type — the common
+    /// "dispatcher + sub-flows" shape. Internal flows are only reachable via
+    /// `flow.call`, so they must never win a type-only route. Returns `None`
+    /// when zero or more than one *entry* flow of the type exists (genuinely
+    /// ambiguous — the caller must then require a `pack_id`).
+    pub fn entry_flow_by_type(&self, flow_type: &str) -> Option<&FlowDescriptor> {
+        let mut matches = self
+            .flows
+            .iter()
+            .filter(|descriptor| descriptor.flow_type == flow_type && descriptor.entry);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     pub fn flow_by_id(&self, flow_id: &str) -> Option<&FlowDescriptor> {
         let mut matches = self
             .flows
@@ -3674,6 +3695,71 @@ mod tests {
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
         }
+    }
+
+    fn flow_desc(id: &str, pack_id: &str, flow_type: &str, entry: bool) -> FlowDescriptor {
+        FlowDescriptor {
+            id: id.into(),
+            flow_type: flow_type.into(),
+            pack_id: pack_id.into(),
+            profile: pack_id.into(),
+            version: "0.0.0".into(),
+            description: None,
+            entry,
+        }
+    }
+
+    #[test]
+    fn entry_flow_by_type_disambiguates_entrypoint_from_internal_helpers() {
+        // Regression: a pack with one public messaging entrypoint (`default`)
+        // plus internal helper flows of the same type (dispatcher sub-flows)
+        // must route an inbound, type-only provider event to the entrypoint —
+        // NOT fail as "flow type messaging is ambiguous; pack_id is required".
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("default", "weatherapi-pack", "messaging", true),
+            flow_desc("flow_", "weatherapi-pack", "messaging", false),
+            flow_desc("flow_error", "weatherapi-pack", "messaging", false),
+            flow_desc("flow_get_weather", "weatherapi-pack", "messaging", false),
+        ];
+
+        // Multiple flows of the type => the plain lookup is ambiguous...
+        assert!(
+            engine.flow_by_type("messaging").is_none(),
+            "multiple messaging flows must be ambiguous for the plain lookup"
+        );
+        // ...but exactly one is an entrypoint, so entry-aware routing resolves.
+        let resolved = engine
+            .entry_flow_by_type("messaging")
+            .expect("single entry flow must resolve");
+        assert_eq!(resolved.id, "default");
+        assert_eq!(resolved.pack_id, "weatherapi-pack");
+    }
+
+    #[test]
+    fn entry_flow_by_type_still_ambiguous_across_two_entrypoints() {
+        // Two entrypoints of the same type across packs is genuinely ambiguous
+        // and must still require a pack_id (no silent, arbitrary pick).
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("default", "pack.a", "messaging", true),
+            flow_desc("default", "pack.b", "messaging", true),
+            flow_desc("helper", "pack.a", "messaging", false),
+        ];
+        assert!(engine.entry_flow_by_type("messaging").is_none());
+    }
+
+    #[test]
+    fn entry_flow_by_type_matches_plain_lookup_for_single_flow() {
+        // Backward-compat: a lone flow of a type resolves the same way through
+        // both paths, tagged entry or not.
+        let mut engine = minimal_engine();
+        engine.flows = vec![flow_desc("only", "pack.a", "messaging", true)];
+        assert_eq!(engine.flow_by_type("messaging").map(|f| f.id.as_str()), Some("only"));
+        assert_eq!(
+            engine.entry_flow_by_type("messaging").map(|f| f.id.as_str()),
+            Some("only")
+        );
     }
 
     #[test]

@@ -1075,6 +1075,15 @@ fn resolve_flow_id(runtime: &TenantRuntime, activity: &Activity) -> Result<(Stri
         if let Some(flow) = engine.flow_by_type(flow_type) {
             return Ok((flow.pack_id.clone(), flow.id.clone()));
         }
+        // More than one flow of this type exists. Provider ingress is routed by
+        // type alone (no flow_id/pack_id), so a pack with one public entrypoint
+        // plus internal helper flows of the same type would otherwise be
+        // rejected as ambiguous. Narrow to entrypoint flows before giving up:
+        // internal flows are only reachable via `flow.call` and must never be
+        // selected for an inbound event.
+        if let Some(flow) = engine.entry_flow_by_type(flow_type) {
+            return Ok((flow.pack_id.clone(), flow.id.clone()));
+        }
         bail!("flow type {flow_type} is ambiguous; pack_id is required");
     }
 

@@ -1433,6 +1433,7 @@ mod tests {
             profile: "default".into(),
             version: "1.0.0".into(),
             description: None,
+            entry: true,
         }];
 
         assert_eq!(
