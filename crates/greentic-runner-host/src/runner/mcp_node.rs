@@ -49,10 +49,11 @@ mod aw {
     }
 
     /// Build the secrets manager for the flow MCP path from the same
-    /// `SECRETS_BACKEND` environment the host uses. Mirrors
-    /// [`source_from_env`]: a failure returns `None` so an MCP tool call
-    /// degrades to "no secrets" rather than failing the node.
-    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
+    /// `SECRETS_BACKEND` environment the host uses. Pure builder — no
+    /// caching — so it can be exercised directly by unit tests. A failure
+    /// returns `None` so an MCP tool call degrades to "no secrets" rather
+    /// than failing the node.
+    fn build_secrets_manager() -> Option<crate::secrets::DynSecretsManager> {
         match crate::secrets::SecretsBackend::from_env(std::env::var("SECRETS_BACKEND").ok())
             .and_then(|backend| backend.build_manager())
         {
@@ -65,6 +66,19 @@ mod aw {
                 None
             }
         }
+    }
+
+    /// Build the secrets manager for the flow MCP path once per process and
+    /// reuse it thereafter. Mirrors [`source_from_env`]'s boot-once
+    /// semantics (see `runner/engine.rs`, constructed once at engine
+    /// creation): the underlying manager (and, for the broker backend, its
+    /// `reqwest::Client`) is built exactly once via [`build_secrets_manager`]
+    /// and memoized in a process-level `OnceLock`; every call after the
+    /// first returns a cheap clone of the cached `Arc`.
+    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
+        static CACHED: std::sync::OnceLock<Option<crate::secrets::DynSecretsManager>> =
+            std::sync::OnceLock::new();
+        CACHED.get_or_init(build_secrets_manager).clone()
     }
 
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
@@ -115,7 +129,7 @@ mod aw {
 
     #[cfg(test)]
     mod tests {
-        use super::secrets_from_env;
+        use super::build_secrets_manager;
         use serial_test::serial;
         use std::env;
 
@@ -134,12 +148,33 @@ mod aw {
             unsafe { env::remove_var(key) };
         }
 
-        /// Snapshot + restore a small set of env vars around a test body so
-        /// tests running in the same process don't leak `SECRETS_BACKEND`/
-        /// `GREENTIC_ENV` state into each other despite `#[serial]`.
-        fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], body: F) {
-            let previous: Vec<(&str, Option<String>)> =
-                vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
+        /// Restores a snapshot of env vars on drop, so a panicking assertion
+        /// partway through a test body still restores `SECRETS_BACKEND`/
+        /// `GREENTIC_ENV` and cannot leak state into other tests running in
+        /// the same process (even under `#[serial]`, an unwind must not skip
+        /// cleanup).
+        struct EnvRestoreGuard {
+            previous: Vec<(&'static str, Option<String>)>,
+        }
+
+        impl Drop for EnvRestoreGuard {
+            fn drop(&mut self) {
+                for (k, v) in &self.previous {
+                    match v {
+                        Some(value) => set(k, value),
+                        None => unset(k),
+                    }
+                }
+            }
+        }
+
+        /// Snapshot + apply a small set of env vars around a test body,
+        /// restoring the snapshot via [`EnvRestoreGuard::drop`] even if the
+        /// body panics.
+        fn with_env<F: FnOnce()>(vars: &[(&'static str, Option<&str>)], body: F) {
+            let _guard = EnvRestoreGuard {
+                previous: vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect(),
+            };
             for (k, v) in vars {
                 match v {
                     Some(value) => set(k, value),
@@ -147,12 +182,6 @@ mod aw {
                 }
             }
             body();
-            for (k, v) in previous {
-                match v {
-                    Some(value) => set(k, &value),
-                    None => unset(k),
-                }
-            }
         }
 
         #[test]
@@ -165,7 +194,7 @@ mod aw {
                 ],
                 || {
                     assert!(
-                        secrets_from_env().is_none(),
+                        build_secrets_manager().is_none(),
                         "an unsupported SECRETS_BACKEND must degrade to no-secrets, not panic"
                     );
                 },
@@ -182,7 +211,7 @@ mod aw {
                 ],
                 || {
                     assert!(
-                        secrets_from_env().is_none(),
+                        build_secrets_manager().is_none(),
                         "the env secrets backend is dev/test-only; prod must yield no-secrets \
                          rather than failing the MCP node"
                     );
@@ -200,7 +229,7 @@ mod aw {
                 ],
                 || {
                     assert!(
-                        secrets_from_env().is_some(),
+                        build_secrets_manager().is_some(),
                         "a valid SECRETS_BACKEND in an allowed env must produce a manager, \
                          so local-wasm tools actually gain secrets access"
                     );
