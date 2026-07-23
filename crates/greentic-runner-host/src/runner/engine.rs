@@ -137,6 +137,14 @@ struct HostFlow {
     start: Option<NodeId>,
     nodes: IndexMap<NodeId, HostNode>,
     vars_init: JsonMap<String, Value>,
+    /// Names of `vars_init` declarations whose decl has `"required": true`.
+    /// Parsed from `metadata.extra.vars_init`; order follows the map iteration.
+    /// Not yet read by production dispatch code — this is Task 1 of the
+    /// "required flow-var fail-fast" plan; a later task consumes it to reject
+    /// flow execution when a required var has no value at start. Exercised by
+    /// `from_flow_collects_required_vars` in the meantime.
+    #[allow(dead_code)]
+    required_vars: Vec<String>,
     /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
     /// Injected into slot-extractor component invocations at dispatch time (Phase D).
     slot_schema: Option<Value>,
@@ -3168,6 +3176,19 @@ impl From<Flow> for HostFlow {
                     .collect::<JsonMap<String, Value>>()
             })
             .unwrap_or_default();
+        let required_vars = value
+            .metadata
+            .extra
+            .get("vars_init")
+            .and_then(|v| v.as_object())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .filter(|(_, decl)| decl.get("required") == Some(&Value::Bool(true)))
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
         // Extract flow-level slot_schema from metadata.extra (Phase D).
         // The producer side (greentic-flow compile_flow) stores it under
         // "greentic.slot_schema" when the FlowDoc has a `slot_schema` field.
@@ -3182,6 +3203,7 @@ impl From<Flow> for HostFlow {
             start,
             nodes,
             vars_init,
+            required_vars,
             slot_schema,
         }
     }
@@ -5983,6 +6005,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
             slot_schema: None,
         };
         let current_node = NodeId::from_str("current").unwrap();
@@ -6445,6 +6468,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
             slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
@@ -6481,6 +6505,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
         };
         let current = NodeId::from_str("gate").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6516,6 +6541,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
             slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
@@ -6572,6 +6598,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
             slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
@@ -6725,6 +6752,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
             slot_schema: None,
         };
         let current = NodeId::from_str("current").unwrap();
@@ -7186,6 +7214,19 @@ mod tests {
         let flow = flow_with_extra(serde_json::json!({}));
         let host: HostFlow = HostFlow::from(flow);
         assert!(host.vars_init.is_empty());
+    }
+
+    #[test]
+    fn from_flow_collects_required_vars() {
+        let flow = flow_with_extra(serde_json::json!({
+            "vars_init": {
+                "name":   { "type": "string", "required": true },
+                "region": { "type": "string", "default": "us-east-1" },
+                "note":   { "type": "string", "required": false }
+            }
+        }));
+        let host: HostFlow = HostFlow::from(flow);
+        assert_eq!(host.required_vars, vec!["name".to_string()]);
     }
 
     #[test]
@@ -8109,6 +8150,7 @@ mod tests {
             start: Some(agent_id),
             nodes,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
         }
     }
 
@@ -8954,6 +8996,7 @@ mod tests {
             start: Some(node_id),
             nodes,
             vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
         }
     }
 
