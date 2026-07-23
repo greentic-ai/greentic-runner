@@ -938,6 +938,7 @@ impl FlowEngine {
         event: &NodeEvent<'_>,
     ) -> Result<DispatchOutcome> {
         inject_card_locale(&mut payload, &state.entry);
+        inject_card_route(&mut payload, &state.entry, node);
         match &node.kind {
             NodeKind::Exec { target_component } => self
                 .execute_component_exec(
@@ -3095,6 +3096,55 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
         .and_then(Value::as_str);
     if let Some(locale) = locale {
         map.insert("locale".into(), Value::String(locale.to_string()));
+    }
+}
+
+/// Select an adaptive-card node's card from a `routeToCardId`/`toCardId`/
+/// `nextCardId` carried on the flow entry (a card button's submit), so the flow
+/// renders the routed card instead of the node's `default_card_asset`.
+///
+/// This keeps card navigation *inside* the flow — the runner sets the node's
+/// `card_spec.asset_path` from the routing key, which makes
+/// [`promote_card_config_to_invocation`] treat the input as an explicit card
+/// invocation (so it does not overwrite it with the default), and
+/// [`resolve_card_assets`] then inlines the routed card. It replaces the legacy
+/// host-side "read the card from the pack and bypass the flow" shortcut.
+///
+/// No-ops (leaving the node's default card) when: the node is not the
+/// adaptive-card component, the payload already carries an explicit
+/// `card_source`/`card_spec` (author-set), or no routing key is present.
+fn inject_card_route(payload: &mut Value, entry: &Value, node: &HostNode) {
+    let is_adaptive_card =
+        node.component_id().contains("adaptive-card") || node.component.contains("adaptive-card");
+    if !is_adaptive_card || is_card_invocation(payload) {
+        return;
+    }
+    let route = entry
+        .pointer("/input/metadata/routeToCardId")
+        .or_else(|| entry.pointer("/metadata/routeToCardId"))
+        .or_else(|| entry.pointer("/input/metadata/toCardId"))
+        .or_else(|| entry.pointer("/metadata/toCardId"))
+        .or_else(|| entry.pointer("/input/metadata/nextCardId"))
+        .or_else(|| entry.pointer("/metadata/nextCardId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(route) = route else {
+        return;
+    };
+
+    if !matches!(payload, Value::Object(_)) {
+        *payload = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = payload {
+        let mut card_spec = serde_json::Map::new();
+        card_spec.insert(
+            "asset_path".into(),
+            Value::String(format!("assets/cards/{route}.json")),
+        );
+        map.insert("card_source".into(), Value::String("asset".into()));
+        map.insert("card_spec".into(), Value::Object(card_spec));
+        tracing::debug!(route_to_card = %route, "inject_card_route: routed card asset selected");
     }
 }
 
