@@ -57,6 +57,13 @@ pub struct FlowEngine {
     packs: Vec<Arc<PackRuntime>>,
     flows: Vec<FlowDescriptor>,
     flow_sources: HashMap<FlowKey, usize>,
+    /// Pack ids whose manifest declares a `messaging.*` provider. Such a pack's
+    /// flows are that provider's own ingress plumbing, not the application
+    /// entrypoint, so they are excluded from type-only entry-flow resolution.
+    /// Without this, a multi-provider bundle (app pack + `messaging-*` provider
+    /// packs) registers several entry `messaging` flows and
+    /// `entry_flow_by_type("messaging")` bails "ambiguous; pack_id is required".
+    messaging_provider_pack_ids: std::collections::HashSet<String>,
     flow_cache: RwLock<HashMap<FlowKey, HostFlow>>,
     default_env: String,
     validation: ValidationConfig,
@@ -288,6 +295,8 @@ impl FlowExecution {
 impl FlowEngine {
     pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
         let mut flow_sources: HashMap<FlowKey, usize> = HashMap::new();
+        let mut messaging_provider_pack_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut descriptors = Vec::new();
         let mut bindings = HashMap::new();
         for pack in &config.pack_bindings {
@@ -298,6 +307,23 @@ impl FlowEngine {
             let pack_id = pack.metadata().pack_id.clone();
             if enforce_bindings && !bindings.contains_key(&pack_id) {
                 bail!("no gtbind entries found for pack {}", pack_id);
+            }
+            // Mark packs that declare a `messaging.*` provider so their ingress
+            // flows are excluded from type-only entry-flow routing (see
+            // `messaging_provider_pack_ids`). Derived once here, off the hot path.
+            let declares_messaging_provider = pack
+                .provider_registry_optional()
+                .ok()
+                .flatten()
+                .map(|registry| {
+                    registry
+                        .operator_metadata()
+                        .iter()
+                        .any(|meta| meta.provider_type.starts_with("messaging."))
+                })
+                .unwrap_or(false);
+            if declares_messaging_provider {
+                messaging_provider_pack_ids.insert(pack_id.clone());
             }
             let flows = pack.list_flows().await?;
             let allowed = bindings.get(&pack_id).map(|flows| {
@@ -389,6 +415,7 @@ impl FlowEngine {
             packs,
             flows: descriptors,
             flow_sources,
+            messaging_provider_pack_ids,
             flow_cache: RwLock::new(flow_map),
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
@@ -2056,20 +2083,31 @@ impl FlowEngine {
         Some(first)
     }
 
-    /// Resolve a flow by type, considering only entrypoint flows.
+    /// Resolve a flow by type, considering only application entrypoint flows.
     ///
     /// Used to disambiguate an inbound provider event (routed by flow type,
     /// with no explicit `pack_id`/`flow_id`) when a pack registers one public
     /// entrypoint plus internal helper flows of the same type — the common
     /// "dispatcher + sub-flows" shape. Internal flows are only reachable via
-    /// `flow.call`, so they must never win a type-only route. Returns `None`
-    /// when zero or more than one *entry* flow of the type exists (genuinely
-    /// ambiguous — the caller must then require a `pack_id`).
+    /// `flow.call`, so they must never win a type-only route.
+    ///
+    /// Flows owned by a messaging **provider** pack (its manifest declares a
+    /// `messaging.*` provider) are also excluded: a provider ships its own
+    /// ingress `main`/`default` flow that is plumbing for *that provider*, not
+    /// the application. In a multi-provider bundle that flow would otherwise
+    /// compete with the app's real entrypoint and make the route ambiguous.
+    ///
+    /// Returns `None` when zero or more than one *application* entry flow of the
+    /// type exists (genuinely ambiguous — the caller must then require a
+    /// `pack_id`).
     pub fn entry_flow_by_type(&self, flow_type: &str) -> Option<&FlowDescriptor> {
-        let mut matches = self
-            .flows
-            .iter()
-            .filter(|descriptor| descriptor.flow_type == flow_type && descriptor.entry);
+        let mut matches = self.flows.iter().filter(|descriptor| {
+            descriptor.flow_type == flow_type
+                && descriptor.entry
+                && !self
+                    .messaging_provider_pack_ids
+                    .contains(&descriptor.pack_id)
+        });
         let first = matches.next()?;
         if matches.next().is_some() {
             return None;
@@ -3710,6 +3748,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::new()),
             default_env: "local".to_string(),
             validation: ValidationConfig {
@@ -3782,14 +3821,47 @@ mod tests {
     }
 
     #[test]
+    fn entry_flow_by_type_excludes_messaging_provider_pack_flows() {
+        // Multi-provider bundle: the app pack's entry flow AND a messaging
+        // *provider* pack's ingress `main` are both entry `messaging` flows.
+        // The provider flow is that provider's plumbing, not the application
+        // entrypoint, so a type-only webchat event must resolve to the app flow
+        // — not bail "flow type messaging is ambiguous; pack_id is required".
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("main", "hr-onboarding-pack", "messaging", true),
+            flow_desc("main", "messaging-teams", "messaging", true),
+        ];
+        // `messaging-teams` declares a `messaging.*` provider in its manifest;
+        // the engine records that at build time.
+        engine
+            .messaging_provider_pack_ids
+            .insert("messaging-teams".to_string());
+
+        // Plain lookup is still ambiguous (two flows of the type)...
+        assert!(engine.flow_by_type("messaging").is_none());
+        // ...but only the app pack's flow is an *application* entrypoint.
+        let resolved = engine
+            .entry_flow_by_type("messaging")
+            .expect("app entry flow must resolve past the provider flow");
+        assert_eq!(resolved.id, "main");
+        assert_eq!(resolved.pack_id, "hr-onboarding-pack");
+    }
+
+    #[test]
     fn entry_flow_by_type_matches_plain_lookup_for_single_flow() {
         // Backward-compat: a lone flow of a type resolves the same way through
         // both paths, tagged entry or not.
         let mut engine = minimal_engine();
         engine.flows = vec![flow_desc("only", "pack.a", "messaging", true)];
-        assert_eq!(engine.flow_by_type("messaging").map(|f| f.id.as_str()), Some("only"));
         assert_eq!(
-            engine.entry_flow_by_type("messaging").map(|f| f.id.as_str()),
+            engine.flow_by_type("messaging").map(|f| f.id.as_str()),
+            Some("only")
+        );
+        assert_eq!(
+            engine
+                .entry_flow_by_type("messaging")
+                .map(|f| f.id.as_str()),
             Some("only")
         );
     }
@@ -3920,10 +3992,7 @@ mod tests {
         let mut state = ExecutionState::new(json!({}));
         state.push_egress(json!({ "text": "emitted" }));
         let result = state.finalize_with(Some(json!({ "text": "final" })));
-        assert_eq!(
-            result,
-            json!([{ "text": "emitted" }, { "text": "final" }])
-        );
+        assert_eq!(result, json!([{ "text": "emitted" }, { "text": "final" }]));
     }
 
     #[test]
@@ -4334,6 +4403,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -4555,6 +4625,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -4696,6 +4767,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -4866,6 +4938,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -4985,6 +5058,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -5257,6 +5331,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: pack_id_str.to_string(),
@@ -5357,6 +5432,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: pack_id_str.to_string(),
@@ -6057,6 +6133,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "e2e-pack".to_string(),
