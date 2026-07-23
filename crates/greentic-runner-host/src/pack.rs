@@ -20,7 +20,7 @@ use crate::provider_core::{
 };
 use crate::provider_core_only;
 use crate::runtime_refs::RuntimeRefsInjection;
-use crate::runtime_wasmtime::{Component, Engine, InstancePre, Linker, ResourceTable};
+use crate::runtime_wasmtime::{Component, Engine, Linker, ResourceTable};
 use anyhow::{Context, Result, anyhow, bail};
 use futures::executor::block_on;
 use greentic_distributor_client::dist::{
@@ -124,7 +124,6 @@ pub struct PackRuntime {
     flows: Option<PackFlows>,
     components: HashMap<String, PackComponent>,
     http_client: Arc<BlockingClient>,
-    pre_cache: Mutex<HashMap<String, InstancePre<ComponentState>>>,
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
     wasi_policy: Arc<RunnerWasiPolicy>,
@@ -2130,7 +2129,6 @@ impl PackRuntime {
             flows,
             components,
             http_client,
-            pre_cache: Mutex::new(HashMap::new()),
             session_store,
             state_store,
             wasi_policy,
@@ -3305,7 +3303,6 @@ impl PackRuntime {
             flows: Some(flows_cache),
             components: component_map,
             http_client: Arc::clone(&HTTP_CLIENT),
-            pre_cache: Mutex::new(HashMap::new()),
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
@@ -5326,7 +5323,6 @@ mod tests {
             flows: None,
             components: HashMap::new(),
             http_client: Arc::clone(&HTTP_CLIENT),
-            pre_cache: Mutex::new(HashMap::new()),
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
