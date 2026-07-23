@@ -709,11 +709,20 @@ impl FlowEngine {
     async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
-        for (name, default) in flow_ir.vars_init.iter() {
-            state
-                .vars
-                .entry(name.clone())
-                .or_insert_with(|| default.clone());
+        let missing = seed_vars_and_collect_missing_required(
+            &flow_ir.vars_init,
+            &flow_ir.required_vars,
+            &mut state.vars,
+        );
+        if !missing.is_empty() {
+            // Non-retryable by design: the message avoids should_retry's trigger
+            // words (transient/unavailable/internal/timeout).
+            let label = crate::runner::i18n::resolve_message(
+                "runner.flow.required_var_missing",
+                "required flow variable not provided",
+                "en",
+            );
+            anyhow::bail!("{label}: {}", missing.join(", "));
         }
         self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
             .await
@@ -3148,6 +3157,28 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("state".into(), state.context());
     ctx.insert("vars".into(), Value::Object(state.vars.clone()));
     Value::Object(ctx)
+}
+
+/// Seed declared flow variables into `target` (entry-or-insert; never
+/// overwrites an already-present key), then return the `required` names that
+/// remain absent from `target`. A required var is satisfied by either a
+/// declared default (seeded here) or a value already placed in `target`
+/// (e.g. an operator-provided demo value).
+fn seed_vars_and_collect_missing_required(
+    vars_init: &JsonMap<String, Value>,
+    required: &[String],
+    target: &mut JsonMap<String, Value>,
+) -> Vec<String> {
+    for (name, default) in vars_init.iter() {
+        target
+            .entry(name.clone())
+            .or_insert_with(|| default.clone());
+    }
+    required
+        .iter()
+        .filter(|name| !target.contains_key(name.as_str()))
+        .cloned()
+        .collect()
 }
 
 impl From<Flow> for HostFlow {
@@ -7194,6 +7225,51 @@ mod tests {
     }
 
     #[test]
+    fn seed_vars_seeds_defaults_and_reports_missing_required() {
+        use serde_json::json;
+        let mut vars_init = JsonMap::new();
+        vars_init.insert("region".into(), json!("us-east-1"));
+
+        // "name" is required but has no default; "region" required WITH a default.
+        let required = vec!["name".to_string(), "region".to_string()];
+        let mut target = JsonMap::new();
+
+        let missing = seed_vars_and_collect_missing_required(&vars_init, &required, &mut target);
+
+        assert_eq!(
+            target.get("region"),
+            Some(&json!("us-east-1")),
+            "default seeded"
+        );
+        assert_eq!(
+            missing,
+            vec!["name".to_string()],
+            "only the defaultless required var is missing"
+        );
+    }
+
+    #[test]
+    fn seed_vars_respects_preexisting_value_for_required() {
+        use serde_json::json;
+        let vars_init = JsonMap::new(); // no defaults declared
+        let required = vec!["name".to_string()];
+        let mut target = JsonMap::new();
+        target.insert("name".into(), json!("Budi")); // operator-provided value already present
+
+        let missing = seed_vars_and_collect_missing_required(&vars_init, &required, &mut target);
+
+        assert!(
+            missing.is_empty(),
+            "a required var with a provided value is not missing"
+        );
+        assert_eq!(
+            target.get("name"),
+            Some(&json!("Budi")),
+            "provided value not overwritten"
+        );
+    }
+
+    #[test]
     fn from_flow_extracts_vars_init() {
         let flow = flow_with_extra(serde_json::json!({
             "vars_init": {
@@ -7227,6 +7303,116 @@ mod tests {
         }));
         let host: HostFlow = HostFlow::from(flow);
         assert_eq!(host.required_vars, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn execute_once_fails_on_missing_required_var() {
+        let node_id = NodeId::from_str("n1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "{{vars.region}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "region": { "type": "string", "required": true }
+                    }
+                }),
+            },
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "vars.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        };
+
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "vars.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(engine.execute(ctx, Value::Null))
+            .expect_err("a required var with no default and no value must fail the run");
+        let msg = err.to_string();
+        assert!(msg.contains("region"), "error names the missing var: {msg}");
+        assert!(
+            !should_retry(&err),
+            "missing-required-var is deterministic and must not be retried"
+        );
+        assert!(
+            observer.ends.lock().unwrap().is_empty(),
+            "flow aborted before the node ran"
+        );
     }
 
     #[test]
