@@ -111,6 +111,7 @@ fn english_message(key: &str) -> Option<&'static str> {
         "runner.schema.unsupported_constraint" => Some("schema includes unsupported constraint"),
         "runner.schema.invalid_schema" => Some("invalid schema document"),
         "runner.schema.validation_failed" => Some("schema validation failed"),
+        "runner.flow.required_var_missing" => Some("required flow variable not provided"),
         _ => None,
     }
 }
