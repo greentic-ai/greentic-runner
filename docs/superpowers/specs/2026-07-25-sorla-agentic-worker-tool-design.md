@@ -73,9 +73,9 @@ HTTP/SoRX dependency (it sees only a trait + JSON, per `component_source.rs`'s s
           -> Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + Send + 'a>>;
   }
   ```
-  where `SorxOperation` carries `{ sor_id, action, description, input_schema_json,
-  output_schema_json, capabilities, agentic_worker_metadata }` (the fields the surfacing side needs;
-  mirrors `ComponentOperation`).
+  where `SorxOperation` mirrors `ComponentOperation` minimally: `{ pack, action, description,
+  parameters, cap_uri }` (`extension_id = "sorla:<pack>"`, `tool_name = <action>`). The richer
+  `agentic_worker_metadata` mapping is a designer-surfacing concern (PR-2), not the runtime catalog.
 - `SorlaToolSource` / `SorlaToolCatalog` — mirror `ComponentToolSource` / `ComponentToolCatalog`
   (per-tenant TTL cache over `list_operations`; infallible `catalog()`).
 - `AgentRuntime` — add `sorla: Option<Arc<SorlaToolSource>>` field + `#[must_use]
@@ -136,13 +136,29 @@ opaque to the prefix, exactly as for `component:`).
 
 ## Addressing (design decision, flagged for review)
 
-The `sorla:` catalog entry / packaged binding must carry enough for `SorxHttpInvoker` to reach the
-right SoR and cap URI. SP1: the `SorxOperation` (and thus the binding, via metadata) carries
-`sor_id`, the SoRX `cap://` capability string, and `sorx_base_url`; `SorxHttpInvoker` resolves
-`(sor_id, action)` → `cap://` from its catalog, POSTs to `{sorx_base_url}/admin/v1/capabilities/
-invoke`. Env fallback `GREENTIC_AW_SORX_URL` when the binding lacks an address. **Limitation
-(documented):** the SoRX address is captured at authoring/packaging time; if a deployment moves, the
-binding is stale. Dynamic resolution via a SoR-deployment registry is a follow-up, out of SP1.
+`ToolRef` (`greentic-aw-runtime/src/config.rs:16`) carries only
+`{extension_id, tool_name, description?, input_schema?, usage_note?}` — no slot for a SoRX address
+or `cap://`, and widening it would cascade into `greentic-dw-authoring`'s `ExtensionToolBinding`.
+The trait's `list_operations()` is also **sync** (called inside `ComponentToolCatalog::from_invoker`).
+
+SP1 therefore mirrors the `component:` precedent exactly — the invoker enumerates the universe, and
+listing filters by the agent's `allowed` bindings — with a **single SoR per worker**:
+
+- `sorla_source_from_env()` (runner-host, async) reads `GREENTIC_AW_SORX_URL`; if set, it performs
+  the one-time `GET {base}/admin/v1/capabilities`, keeps business-action offers, and constructs
+  `SorxHttpInvoker { base_url, ops: Vec<SorxOperation>, cap_map: (pack, action) → cap:// }`. If unset
+  → `None` (no `sorla:` tools).
+- `SorxInvoker::list_operations()` returns the captured `ops` synchronously (no re-fetch — the SoR's
+  action set is stable per deployment; TTL re-list just returns the same cached ops).
+  Each `SorxOperation` → `extension_id = "sorla:<pack>"`, `action = <action_id>`, plus
+  `description`/`parameters` from the offer.
+- `SorxInvoker::invoke(pack, action, args)` (async) resolves `cap://` from `cap_map`, POSTs to
+  `{base_url}/admin/v1/capabilities/invoke`.
+
+**Limitations (documented, follow-up):** one SoR per worker (env-scoped); capability set captured at
+worker start (no live TTL re-fetch). Multi-SoR + per-binding addressing (which requires widening
+`ToolRef`/`ExtensionToolBinding` to carry `{base_url, cap://}`) and dynamic deployment-registry
+resolution are deferred out of SP1.
 
 ## Sequencing (release-train coupling)
 
