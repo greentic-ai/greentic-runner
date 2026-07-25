@@ -89,8 +89,11 @@ HTTP/SoRX dependency (it sees only a trait + JSON, per `component_source.rs`'s s
   aw-runtime stays client-free.
 - Wire `.with_sorla_source(sorla_source_from_env())` onto the `AgentRuntime` builder in
   `build_runtime_with_stores` (`runner/agent_node.rs`, beside the existing `.with_component_source`
-  / `.with_flow_source` chain). This single site covers both the in-process `dw.agent` path and the
-  NATS `agentic.call` serve path.
+  / `.with_flow_source` chain). This wires `sorla:` **exactly where `component:`/`flow:` are wired**
+  — the in-process `dw.agent` path (incl. the sidecar, which is a real runner-host). The separate
+  NATS `agentic.call` serve constructor (`build_agent_runtime`) wires none of `component`/`flow`/
+  `sorla`; serve-path parity for all three is a shared known limitation, out of SP1 (the serve path
+  still degrades safely — the tool is reported missing and dispatch returns an error value).
 
 **`SorxHttpInvoker`** (runner-host): for each `invoke(sor_id, action, args_json)` it POSTs to
 `{sorx_base_url}/admin/v1/capabilities/invoke` with body:
@@ -119,7 +122,11 @@ Mirror the admin `component:` tools feed end-to-end (`src/ui/component_catalog/b
 - **Snapshot + cache**: `SorlaToolSnapshot` on `AppState`, same TTL/stale-on-error discipline as
   `ComponentToolsSnapshot`.
 - **Mapper** `sorla_action_to_dto()` next to `component_tool_to_dto()`: one `ExtensionToolDto` per
-  offer — `extension_id = "sorla:<deployment_id>"`, `tool_name = <action_id>`,
+  offer — `extension_id = "sorla:<pack>"`, `tool_name = <action_id>`
+  (**MUST be `sorla:<pack>` where `<pack>` is the pack name from the offer's `cap://greentic/
+  business-functions/<pack>/<action>/...` URI — this is the exact key PR-1's runtime catalog uses;
+  a `sorla:<deployment_id>` binding with `deployment_id != pack` would be reported missing and never
+  dispatch**),
   `capabilities = ["agentic_worker"]`, `input_schema_json` from the offer, and
   `agentic_worker_metadata` mapped from the offer metadata:
   `action.risk` → `cost` (low/medium/high) + `side_effects` (read/write/external heuristic),
@@ -130,7 +137,7 @@ Mirror the admin `component:` tools feed end-to-end (`src/ui/component_catalog/b
 
 ### 3. Packaging — no change
 
-A `sorla:<deployment_id>` binding travels through `dw_authoring_adapter::worker_spec_from_form` →
+A `sorla:<pack>` binding travels through `dw_authoring_adapter::worker_spec_from_form` →
 `WorkerSpec.extension_tools` → `.gtpack` → runner `AgentConfig.tools` **unchanged** (the mapper is
 opaque to the prefix, exactly as for `component:`).
 
