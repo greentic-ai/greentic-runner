@@ -98,6 +98,9 @@ pub use mcp_source::{
     McpToolSource, dispatch_route,
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
+pub use sorla_source::{
+    SorlaToolCatalog, SorlaToolEntry, SorlaToolSource, SorxInvoker, SorxOperation,
+};
 pub use state::{AgentStateStore, ChatMessage, ConversationState, SessionLock};
 pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
@@ -196,6 +199,12 @@ pub struct AgentRuntime {
     /// runner-host pack flow runtime) is injected at the runner-host edge, never
     /// compiled in.
     pub(crate) flows: Option<Arc<crate::flow_source::FlowToolSource>>,
+    /// Per-tenant agentic-worker SoRLa SoR tool source. `None` disables sorla
+    /// tools entirely (`sorla:`-prefixed tool refs then resolve to nothing).
+    /// Set via [`AgentRuntime::with_sorla_source`]; the concrete invoker (over
+    /// the host SoRX interact client) is injected at the runner-host edge,
+    /// never compiled in.
+    pub(crate) sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
     /// Episodic long-term memory backend (e.g. Chronicle). `None` disables the
     /// long-term tier. Set via [`AgentRuntime::with_long_term_memory`]; the
     /// concrete backend is injected at the runner-host edge, never compiled in.
@@ -241,6 +250,7 @@ impl AgentRuntime {
             guardrail_evaluator: Arc::new(crate::guardrail::AcceptAllEvaluator),
             components: None,
             flows: None,
+            sorla: None,
             long_term_memory: None,
             knowledge: None,
             short_term_memory: None,
@@ -294,6 +304,18 @@ impl AgentRuntime {
         flows: Option<Arc<crate::flow_source::FlowToolSource>>,
     ) -> Self {
         self.flows = flows;
+        self
+    }
+
+    /// Attach a per-tenant SoRLa SoR tool source: `sorla:<pack>` tool refs
+    /// resolve to a SoR BusinessAction invoked over the host SoRX interact
+    /// client. Coexists with the mcp/component/flow sources.
+    #[must_use]
+    pub fn with_sorla_source(
+        mut self,
+        sorla: Option<Arc<crate::sorla_source::SorlaToolSource>>,
+    ) -> Self {
+        self.sorla = sorla;
         self
     }
 
