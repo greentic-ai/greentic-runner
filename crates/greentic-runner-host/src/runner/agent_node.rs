@@ -552,6 +552,32 @@ mod aw {
         Some(Arc::new(greentic_aw_runtime::FlowToolSource::new(invoker)))
     }
 
+    /// Build the sorla (SoR BusinessAction) tool source from a configured
+    /// SoRX deployment, gated by `GREENTIC_AW_SORLA_TOOLS` (set to "0" to
+    /// disable) and addressed by `GREENTIC_AW_SORX_URL`. Returns `None` when
+    /// disabled or when no SoRX URL is configured, so `sorla:` tool refs then
+    /// resolve to nothing. Mirrors [`component_source_from_packs`] but
+    /// discovers tools from a deployed SoR's capability-admin API rather than
+    /// in-pack components.
+    ///
+    /// The capability fetch (`SorxHttpInvoker::fetch`) is infallible: a
+    /// down/unreachable SoR degrades to an empty operation set (logged)
+    /// rather than blocking worker startup, so this still returns `Some`
+    /// whenever a URL is configured.
+    pub(crate) async fn sorla_source_from_env() -> Option<Arc<greentic_aw_runtime::SorlaToolSource>>
+    {
+        if std::env::var("GREENTIC_AW_SORLA_TOOLS").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_SORLA_TOOLS=0; sorla tool source disabled");
+            return None;
+        }
+        let base = std::env::var("GREENTIC_AW_SORX_URL")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let invoker = Arc::new(crate::runner::sorx_invoker::SorxHttpInvoker::fetch(base).await);
+        tracing::info!("sorla tool source constructed");
+        Some(Arc::new(greentic_aw_runtime::SorlaToolSource::new(invoker)))
+    }
+
     /// Build the production [`greentic_ext_runtime::ExtensionRuntime`] used for
     /// tool dispatch, wrapped in an [`Arc`] for sharing with [`AgentRuntime`].
     ///
@@ -1265,7 +1291,8 @@ mod aw {
             mcp_source_from_env(Some(secrets.clone())),
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
-        .with_flow_source(flow_source_from_packs(&packs, &tenant));
+        .with_flow_source(flow_source_from_packs(&packs, &tenant))
+        .with_sorla_source(sorla_source_from_env().await);
 
         // Mount the long-term-memory and knowledge (RAG) seams so IN-PROCESS
         // `dw.agent` workers ground on the ingested corpus exactly as the
@@ -2702,6 +2729,64 @@ mod aw {
             assert!(
                 super::flow_source_from_packs(&[], "acme").is_none(),
                 "empty packs => None even when gate is unset"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_none_when_gate_opted_out() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_SORLA_TOOLS", "0");
+                std::env::set_var("GREENTIC_AW_SORX_URL", "http://localhost:9999");
+            }
+            assert!(
+                super::sorla_source_from_env().await.is_none(),
+                "GREENTIC_AW_SORLA_TOOLS=0 must disable the sorla tool source even with a URL set"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_none_when_url_unset() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+            assert!(
+                super::sorla_source_from_env().await.is_none(),
+                "no GREENTIC_AW_SORX_URL => no sorla source"
+            );
+        }
+
+        #[tokio::test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        async fn sorla_source_from_env_some_when_url_set_even_if_sor_unreachable() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORLA_TOOLS");
+                // Nothing listens here: `SorxHttpInvoker::fetch` must degrade to an
+                // empty-ops invoker (logged) rather than failing, so the source is
+                // still `Some` — a down/unreachable SoR must never block startup.
+                std::env::set_var("GREENTIC_AW_SORX_URL", "http://127.0.0.1:1");
+            }
+            let source = super::sorla_source_from_env().await;
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_SORX_URL");
+            }
+            assert!(
+                source.is_some(),
+                "a configured URL yields Some(source) even when the SoR is unreachable"
             );
         }
 
