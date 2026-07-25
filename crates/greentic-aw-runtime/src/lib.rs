@@ -47,6 +47,7 @@ pub mod mcp_source;
 pub mod mcp_store_pull;
 pub mod memory;
 pub mod short_term;
+pub mod sorla_source;
 pub mod state;
 pub mod state_kv;
 pub mod state_redis;
