@@ -189,7 +189,7 @@ impl RunnerConfig {
             .dev
             .as_ref()
             .map(|dev| dev.default_tenant.clone())
-            .unwrap_or_else(|| "demo".into());
+            .unwrap_or_else(|| crate::routing::DEFAULT_TENANT.into());
         let routing = RoutingConfig::from_env_with_default(default_tenant);
         let paths = &resolved_config.config.paths;
         ensure_paths_exist(paths)?;
