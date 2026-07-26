@@ -298,6 +298,14 @@ pub async fn run_step(
         None => None,
     };
 
+    // Resolve the per-tenant SoRLa SoR tool catalog once per step (mirrors the
+    // component/flow catalogs above). Infallible + TTL-cached; `None` source →
+    // no `sorla:` tools at all.
+    let sorla_catalog = match runtime.sorla.as_ref() {
+        Some(src) => Some(src.catalog(&tenant).await),
+        None => None,
+    };
+
     // Preflight: surface declared tools that won't reach the LLM. Without this
     // the runtime drops unresolved tools silently (per-tool debug warns) and the
     // agent runs with a smaller — or empty — tool set, then hallucinates tool
@@ -309,6 +317,7 @@ pub async fn run_step(
             mcp_catalog.as_deref(),
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
+            sorla_catalog.as_deref(),
             &config.tools,
         ),
         config.tools.len(),
@@ -350,6 +359,7 @@ pub async fn run_step(
             mcp_catalog.as_deref(),
             component_catalog.as_deref(),
             flow_catalog.as_deref(),
+            sorla_catalog.as_deref(),
             &config.tools,
         );
         if lt_active {
@@ -601,6 +611,7 @@ pub async fn run_step(
                     mcp_catalog.clone(),
                     component_catalog.clone(),
                     flow_catalog.clone(),
+                    sorla_catalog.clone(),
                     call.clone(),
                     &tenant,
                 )

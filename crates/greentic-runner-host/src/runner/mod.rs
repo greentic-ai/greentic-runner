@@ -29,6 +29,8 @@ pub mod operator;
 pub mod remote_dispatch;
 pub mod runtime_session_resumer;
 pub mod schema_validator;
+#[cfg(feature = "agentic-worker")]
+pub mod sorx_invoker;
 pub mod templating;
 
 use std::net::SocketAddr;

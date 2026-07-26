@@ -1591,14 +1591,15 @@ mod aw {
             args: json!({}),
         };
 
-        // Graph Tool nodes never carry mcp: or component: ids (they use
-        // 'extension_id/tool' syntax over the WASM runtime), so neither the MCP
-        // nor the component catalog is threaded here.
+        // Graph Tool nodes never carry mcp:, component:, or sorla: ids (they
+        // use 'extension_id/tool' syntax over the WASM runtime), so neither
+        // the MCP, component, nor sorla catalog is threaded here — the
+        // agent-graph path does not wire a sorla source in SP1.
         // No per-request TenantContext is available at the graph-node layer;
         // use a no-op placeholder so the extension's host-LLM port receives an
         // empty context (equivalent to the previous `invoke_tool` default).
         let tenant = TenantContext::new("", "");
-        dispatch_tool_call(ext_runtime, None, None, None, call, &tenant)
+        dispatch_tool_call(ext_runtime, None, None, None, None, call, &tenant)
             .await
             .map_err(|e| GraphExecError::Tool(format!("dispatch '{}': {e}", req.tool_name)))
     }
