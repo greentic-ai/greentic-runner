@@ -113,11 +113,12 @@ fn describe_agent_endpoint(metadata: &Value, pack: &str, id: &str) -> String {
         .unwrap_or_else(|| format!("Invoke SoR agent endpoint '{id}' of pack '{pack}'."))
 }
 
-/// LLM-facing JSON-schema parameters for one SoR BusinessAction. SP1's
-/// capability offers carry no explicit input-schema field (see design doc);
-/// this checks the couple of plausible slots first so a future SoRX release
-/// that adds one is picked up automatically, then falls back to an
-/// unconstrained object schema.
+/// LLM-facing JSON-schema parameters for one SoR offer — BusinessAction or
+/// agent-endpoint alike (namespace-neutral: nothing here depends on which
+/// contract the offer carries). SP1's capability offers carry no explicit
+/// input-schema field (see design doc); this checks the couple of plausible
+/// slots first so a future SoRX release that adds one is picked up
+/// automatically, then falls back to an unconstrained object schema.
 fn business_action_parameters(offer: &Value, metadata: &Value) -> Value {
     metadata
         .pointer("/execution/input_schema")
@@ -143,10 +144,12 @@ pub(crate) struct SorxHttpInvoker {
 impl SorxHttpInvoker {
     /// Fetch `GET {base_url}/admin/v1/capabilities` once, keep the
     /// BusinessAction offers (those whose `contracts` include
-    /// [`BUSINESS_ACTION_CONTRACT`]), and build the `ops`/`cap_by_key` this
-    /// invoker serves. Any fetch/parse failure (down SoR, network error,
-    /// malformed body) is logged and yields an invoker with empty ops rather
-    /// than propagating — a down SoR must never crash worker startup.
+    /// [`BUSINESS_ACTION_CONTRACT`]) and the agent-endpoint offers (those
+    /// whose `contracts` include [`AGENT_ENDPOINT_CONTRACT`]), and build the
+    /// `ops`/`cap_by_key` this invoker serves. Any fetch/parse failure (down
+    /// SoR, network error, malformed body) is logged and yields an invoker
+    /// with empty ops rather than propagating — a down SoR must never crash
+    /// worker startup.
     pub(crate) async fn fetch(base_url: String) -> Self {
         let url = format!("{}/admin/v1/capabilities", base_url.trim_end_matches('/'));
         let (ops, cap_by_key) = match reqwest::get(&url).await {
@@ -183,9 +186,11 @@ impl SorxHttpInvoker {
     }
 
     /// Extract `(ops, cap_by_key)` from a parsed `GET /admin/v1/capabilities`
-    /// body, keeping only BusinessAction offers with a well-formed `cap://`
-    /// capability URI. Malformed/unparsable offers are skipped (logged), not
-    /// fatal.
+    /// body, keeping both BusinessAction and agent-endpoint offers — each
+    /// with a well-formed `cap://` capability URI of its own kind
+    /// (`business-functions`/`agent-endpoints` respectively). Any other
+    /// contract (business-event topics, unknown kinds) is dropped.
+    /// Malformed/unparsable offers are skipped (logged), not fatal.
     fn parse_capabilities(body: &Value) -> (Vec<SorxOperation>, HashMap<(String, String), String>) {
         let mut ops = Vec::new();
         let mut cap_by_key = HashMap::new();
