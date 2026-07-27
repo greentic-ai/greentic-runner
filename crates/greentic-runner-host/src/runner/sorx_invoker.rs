@@ -26,7 +26,6 @@ const BUSINESS_ACTION_CONTRACT: &str = "greentic.sorx.business-action.invoke.v1"
 /// to the capability surface in greentic-sorx #60). Distinct from
 /// [`BUSINESS_ACTION_CONTRACT`]; both are dispatched through the same invoke
 /// route with the cap URI sent verbatim.
-#[allow(dead_code)] // consumed by Task 2 (agent-endpoint discovery in parse_capabilities)
 const AGENT_ENDPOINT_CONTRACT: &str = "greentic.sorx.agent-endpoint.invoke.v1";
 
 /// Caller identity stamped on every capability invocation. SP1 has no
@@ -85,7 +84,6 @@ fn parse_business_action_cap_uri(cap_uri: &str) -> Option<(String, String)> {
 
 /// Parse an agent-endpoint capability URI
 /// (`cap://greentic/agent-endpoints/<pack>/<endpoint_id>/v<version>`).
-#[allow(dead_code)] // consumed by Task 2 (agent-endpoint discovery in parse_capabilities)
 fn parse_agent_endpoint_cap_uri(cap_uri: &str) -> Option<(String, String)> {
     parse_cap_uri(cap_uri, "agent-endpoints")
 }
@@ -100,6 +98,19 @@ fn describe_business_action(metadata: &Value, pack: &str, action: &str) -> Strin
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("Invoke SoR business action '{action}' of pack '{pack}'."))
+}
+
+/// LLM-facing description for one SoR agent-endpoint. Prefers the offer's
+/// `metadata.endpoint.intent`, then `title`; falls back to a generated
+/// description so an omission never blanks the tool out of the catalog.
+fn describe_agent_endpoint(metadata: &Value, pack: &str, id: &str) -> String {
+    metadata
+        .pointer("/endpoint/intent")
+        .or_else(|| metadata.pointer("/endpoint/title"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Invoke SoR agent endpoint '{id}' of pack '{pack}'."))
 }
 
 /// LLM-facing JSON-schema parameters for one SoR BusinessAction. SP1's
@@ -184,29 +195,38 @@ impl SorxHttpInvoker {
             .cloned()
             .unwrap_or_default();
         for offer in offers {
-            let is_business_action = offer
-                .get("contracts")
-                .and_then(Value::as_array)
-                .is_some_and(|contracts| {
-                    contracts
-                        .iter()
-                        .any(|c| c.as_str() == Some(BUSINESS_ACTION_CONTRACT))
-                });
-            if !is_business_action {
-                continue;
-            }
+            let contracts = offer.get("contracts").and_then(Value::as_array);
+            let has =
+                |c: &str| contracts.is_some_and(|cs| cs.iter().any(|v| v.as_str() == Some(c)));
             let Some(cap_uri) = offer.get("capability").and_then(Value::as_str) else {
                 continue;
             };
-            let Some((pack, action)) = parse_business_action_cap_uri(cap_uri) else {
-                tracing::warn!(
-                    cap_uri,
-                    "sorla: skipping capability offer with an unparsable capability uri"
-                );
-                continue;
-            };
             let metadata = offer.get("metadata").cloned().unwrap_or(Value::Null);
-            let description = describe_business_action(&metadata, &pack, &action);
+
+            let (pack, action, description) = if has(BUSINESS_ACTION_CONTRACT) {
+                let Some((pack, action)) = parse_business_action_cap_uri(cap_uri) else {
+                    tracing::warn!(
+                        cap_uri,
+                        "sorla: skipping business-action offer with an unparsable capability uri"
+                    );
+                    continue;
+                };
+                let description = describe_business_action(&metadata, &pack, &action);
+                (pack, action, description)
+            } else if has(AGENT_ENDPOINT_CONTRACT) {
+                let Some((pack, id)) = parse_agent_endpoint_cap_uri(cap_uri) else {
+                    tracing::warn!(
+                        cap_uri,
+                        "sorla: skipping agent-endpoint offer with an unparsable capability uri"
+                    );
+                    continue;
+                };
+                let description = describe_agent_endpoint(&metadata, &pack, &id);
+                (pack, id, description)
+            } else {
+                continue; // business-event topics and any other kind are ignored
+            };
+
             let parameters = business_action_parameters(&offer, &metadata);
             cap_by_key.insert((pack.clone(), action.clone()), cap_uri.to_string());
             ops.push(SorxOperation {
@@ -339,6 +359,68 @@ mod tests {
             ],
             "requires": []
         })
+    }
+
+    /// A `GET /admin/v1/capabilities` response with one business-action offer,
+    /// one agent-endpoint offer (greentic-sorx #60 shape), and one
+    /// business-event offer that must still be dropped.
+    fn caps_response_mixed() -> serde_json::Value {
+        json!({
+            "schema": "greentic.capabilities.v1",
+            "offers": [
+                {
+                    "capability": "cap://greentic/business-functions/landlord/record_rent_payment/v0.1.0",
+                    "contracts": ["greentic.sorx.business-action.invoke.v1"],
+                    "metadata": { "action": { "id": "record_rent_payment", "label": "Record a rent payment" } }
+                },
+                {
+                    "capability": "cap://greentic/agent-endpoints/landlord/tenants.create/v0.1.0",
+                    "contracts": ["greentic.sorx.agent-endpoint.invoke.v1"],
+                    "metadata": {
+                        "kind": "agent_endpoint",
+                        "pack": { "name": "landlord", "version": "0.1.0" },
+                        "endpoint": { "id": "tenants.create", "intent": "Create a tenant record", "approval": "required" }
+                    }
+                },
+                {
+                    "capability": "cap://greentic/events/landlord/rent_paid",
+                    "contracts": ["greentic.sorx.business-event.publish.v1"],
+                    "metadata": {}
+                }
+            ],
+            "requires": []
+        })
+    }
+
+    #[tokio::test]
+    async fn fetch_surfaces_agent_endpoint_alongside_business_action() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(caps_response_mixed()))
+            .mount(&server)
+            .await;
+
+        let invoker = SorxHttpInvoker::fetch(server.uri()).await;
+        let mut ops = invoker.list_operations();
+        ops.sort_by(|a, b| a.action.cmp(&b.action));
+
+        assert_eq!(
+            ops.len(),
+            2,
+            "business-action + agent-endpoint; event dropped"
+        );
+        // agent-endpoint op keyed by (pack, endpoint_id), cap stored verbatim.
+        let ep = ops
+            .iter()
+            .find(|o| o.action == "tenants.create")
+            .expect("agent-endpoint op");
+        assert_eq!(ep.pack, "landlord");
+        assert_eq!(
+            ep.cap_uri,
+            "cap://greentic/agent-endpoints/landlord/tenants.create/v0.1.0"
+        );
+        assert_eq!(ep.description, "Create a tenant record");
     }
 
     #[tokio::test]
