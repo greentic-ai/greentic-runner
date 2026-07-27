@@ -333,7 +333,7 @@ mod tests {
     use super::SorxHttpInvoker;
     use greentic_aw_runtime::SorxInvoker;
     use serde_json::json;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A `GET /admin/v1/capabilities` response with one business-action offer
@@ -640,6 +640,38 @@ mod tests {
             .await
             .expect_err("no capability registered => Err");
         assert!(err.contains("no capability"));
+    }
+
+    #[tokio::test]
+    async fn invoke_dispatches_agent_endpoint_cap_verbatim_and_parses_result() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/admin/v1/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(caps_response_mixed()))
+            .mount(&server)
+            .await;
+        // The invoke MUST carry the agent-endpoint cap URI verbatim in the body.
+        Mock::given(method("POST"))
+            .and(path("/admin/v1/capabilities/invoke"))
+            .and(body_partial_json(json!({
+                "capability": "cap://greentic/agent-endpoints/landlord/tenants.create/v0.1.0"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "schema": "greentic.sorx.agent-endpoint-invoke-result.v1",
+                "result": {"tenant_id": "t-1"},
+                "events": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let invoker = SorxHttpInvoker::fetch(server.uri()).await;
+        let out = invoker
+            .invoke("landlord", "tenants.create", "{}")
+            .await
+            .expect("agent-endpoint invoke should succeed");
+        assert_eq!(out, json!({"tenant_id": "t-1"}));
     }
 
     #[test]
