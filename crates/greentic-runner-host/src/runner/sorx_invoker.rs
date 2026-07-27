@@ -21,6 +21,14 @@ use serde_json::{Value, json};
 /// opposed to a business-event topic offer, which this invoker ignores).
 const BUSINESS_ACTION_CONTRACT: &str = "greentic.sorx.business-action.invoke.v1";
 
+/// The `contracts` entry a SoRX capability offer carries when it is a SoRLa
+/// agent-endpoint reachable via `POST /admin/v1/capabilities/invoke` (added
+/// to the capability surface in greentic-sorx #60). Distinct from
+/// [`BUSINESS_ACTION_CONTRACT`]; both are dispatched through the same invoke
+/// route with the cap URI sent verbatim.
+#[allow(dead_code)] // consumed by Task 2 (agent-endpoint discovery in parse_capabilities)
+const AGENT_ENDPOINT_CONTRACT: &str = "greentic.sorx.agent-endpoint.invoke.v1";
+
 /// Caller identity stamped on every capability invocation. SP1 has no
 /// per-agent caller identity to thread through `SorxInvoker::invoke` (the
 /// trait carries only `(pack, action, args_json)`), so a fixed identity is
@@ -51,22 +59,35 @@ fn sorla_headers(tenant: &str) -> [(&'static str, String); 3] {
     ]
 }
 
-/// Parse a SoRX BusinessAction capability URI
-/// (`cap://greentic/business-functions/<pack>/<action>/v<version>`) into its
-/// `(pack, action)` identity. `None` on any shape mismatch — never panics.
-fn parse_business_action_cap_uri(cap_uri: &str) -> Option<(String, String)> {
+/// Parse a SoRX capability URI `cap://greentic/<kind>/<pack>/<id>/v<version>`
+/// into its `(pack, id)` identity, requiring the namespace `greentic` and the
+/// given `kind` segment. `None` on any shape mismatch — never panics.
+fn parse_cap_uri(cap_uri: &str, kind: &str) -> Option<(String, String)> {
     let rest = cap_uri.strip_prefix("cap://")?;
     let segments: Vec<&str> = rest.split('/').collect();
-    let [namespace, kind, pack, action, _version] = segments[..] else {
+    let [namespace, uri_kind, pack, id, _version] = segments[..] else {
         return None;
     };
-    if namespace != "greentic" || kind != "business-functions" {
+    if namespace != "greentic" || uri_kind != kind {
         return None;
     }
-    if pack.is_empty() || action.is_empty() {
+    if pack.is_empty() || id.is_empty() {
         return None;
     }
-    Some((pack.to_string(), action.to_string()))
+    Some((pack.to_string(), id.to_string()))
+}
+
+/// Parse a BusinessAction capability URI
+/// (`cap://greentic/business-functions/<pack>/<action>/v<version>`).
+fn parse_business_action_cap_uri(cap_uri: &str) -> Option<(String, String)> {
+    parse_cap_uri(cap_uri, "business-functions")
+}
+
+/// Parse an agent-endpoint capability URI
+/// (`cap://greentic/agent-endpoints/<pack>/<endpoint_id>/v<version>`).
+#[allow(dead_code)] // consumed by Task 2 (agent-endpoint discovery in parse_capabilities)
+fn parse_agent_endpoint_cap_uri(cap_uri: &str) -> Option<(String, String)> {
+    parse_cap_uri(cap_uri, "agent-endpoints")
 }
 
 /// LLM-facing description for one SoR BusinessAction. Prefers the offer's
@@ -532,5 +553,38 @@ mod tests {
             .await
             .expect_err("no capability registered => Err");
         assert!(err.contains("no capability"));
+    }
+
+    #[test]
+    fn parses_agent_endpoint_cap_uri_and_rejects_wrong_namespace() {
+        use super::parse_agent_endpoint_cap_uri;
+        assert_eq!(
+            parse_agent_endpoint_cap_uri(
+                "cap://greentic/agent-endpoints/landlord/tenants.create/v0.1.0"
+            ),
+            Some(("landlord".to_string(), "tenants.create".to_string()))
+        );
+        // Wrong namespace (business-functions) → None.
+        assert_eq!(
+            parse_agent_endpoint_cap_uri(
+                "cap://greentic/business-functions/landlord/record_rent_payment/v0.1.0"
+            ),
+            None
+        );
+        // Missing trailing version segment → None.
+        assert_eq!(
+            parse_agent_endpoint_cap_uri("cap://greentic/agent-endpoints/landlord/tenants.create"),
+            None
+        );
+        // Empty pack/id → None.
+        assert_eq!(
+            parse_agent_endpoint_cap_uri("cap://greentic/agent-endpoints//tenants.create/v0.1.0"),
+            None
+        );
+        // Missing scheme prefix → None.
+        assert_eq!(
+            parse_agent_endpoint_cap_uri("greentic/agent-endpoints/a/b/v1"),
+            None
+        );
     }
 }
