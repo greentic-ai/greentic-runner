@@ -1,12 +1,10 @@
 ---
 source: crates/greentic-runner/tests/snapshots.rs
+assertion_line: 392
 expression: normalized_actual
 ---
 {
   "output": [
-    {
-      "status": "ok"
-    },
     {
       "status": "ok"
     }

@@ -1,5 +1,6 @@
 ---
 source: crates/greentic-runner/tests/snapshots.rs
+assertion_line: 392
 expression: normalized_actual
 ---
 {
@@ -26,9 +27,6 @@ expression: normalized_actual
     }
   ],
   "output": [
-    {
-      "text": "Echo: hello"
-    },
     {
       "text": "Echo: hello"
     }
