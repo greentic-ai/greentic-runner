@@ -4433,6 +4433,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -4531,6 +4532,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let host = HostNode::from(node);
         assert!(
@@ -4563,6 +4565,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let host = HostNode::from(node);
         assert!(
@@ -5085,6 +5088,7 @@ mod tests {
                 err_map: None,
                 routing: Routing::End,
                 telemetry: TelemetryHints::default(),
+                conversational: false,
             };
             nodes.insert(id, node);
         }
