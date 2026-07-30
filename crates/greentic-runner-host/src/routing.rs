@@ -13,6 +13,18 @@ use serde_json::json;
 use crate::runner::ServerState;
 use crate::runtime::TenantRuntime;
 
+/// Tenant a request resolves to when nothing else names one.
+///
+/// Must equal `greentic_types::DEFAULT_TENANT`. It is duplicated rather than
+/// imported because this crate is transitively pinned to greentic-types
+/// `=1.1.2` by `greentic-ext-runtime =1.2.24`, so the floor cannot move until
+/// that is republished. `routing_defaults_to_the_fleet_tenant_not_demo` guards
+/// the copy; delete it in favour of the import once the pin is free.
+///
+/// Was `demo`, which disagreed with greentic-deployer and greentic-setup — the
+/// host served requests in one namespace and read secrets from another.
+pub const DEFAULT_TENANT: &str = "default";
+
 #[derive(Clone)]
 pub struct RoutingConfig {
     pub resolver: TenantResolver,
@@ -21,7 +33,7 @@ pub struct RoutingConfig {
 
 impl RoutingConfig {
     pub fn from_env() -> Self {
-        Self::from_env_with_default("demo".into())
+        Self::from_env_with_default(DEFAULT_TENANT.into())
     }
 
     pub fn from_env_with_default(default_tenant: String) -> Self {
@@ -44,7 +56,7 @@ impl Default for RoutingConfig {
     fn default() -> Self {
         Self {
             resolver: TenantResolver::Env,
-            default_tenant: "demo".into(),
+            default_tenant: DEFAULT_TENANT.into(),
         }
     }
 }
@@ -236,6 +248,19 @@ mod tests {
             .into_parts();
         let tenant = routing.resolve(&parts).unwrap();
         assert_eq!(tenant, "demo");
+    }
+
+    /// The tenant a request resolves to when nothing else names one. It was
+    /// `demo` while greentic-deployer and greentic-setup bound deployments
+    /// under `default`, so the host served requests in one namespace and read
+    /// secrets from another.
+    #[test]
+    fn routing_defaults_to_the_fleet_tenant_not_demo() {
+        assert_eq!(RoutingConfig::default().default_tenant, DEFAULT_TENANT);
+        assert_ne!(RoutingConfig::default().default_tenant, "demo");
+        // Pin the literal too: this is a copy of greentic_types::DEFAULT_TENANT
+        // that exists only because the greentic-types floor is pinned.
+        assert_eq!(DEFAULT_TENANT, "default");
     }
 
     #[test]
