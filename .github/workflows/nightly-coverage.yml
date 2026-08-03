@@ -43,7 +43,18 @@ jobs:
       - name: Install coverage tools
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo binstall --no-confirm greentic-dev cargo-nextest cargo-llvm-cov
+        # `--disable-strategies compile` makes a failed prebuilt-binary lookup a hard
+        # error instead of a silent fallback. Without it, a 403 from api.github.com
+        # (anonymous rate limit or a transient) does not fail binstall — it degrades to
+        # `cargo install <tool>` without `--locked`, and cargo-nextest has a deliberate
+        # compile_error! rejecting exactly that, so the job spends ~11 minutes compiling
+        # and then exits 70 looking like a Rust build break. All three tools publish
+        # prebuilt binaries, so disabling the compile strategy costs nothing.
+        run: |
+          cargo binstall --no-confirm --disable-strategies compile greentic-dev cargo-nextest cargo-llvm-cov
+          command -v greentic-dev
+          command -v cargo-nextest
+          command -v cargo-llvm-cov
 
       - uses: Swatinem/rust-cache@v2
         with:
