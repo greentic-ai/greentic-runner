@@ -325,6 +325,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     entry_flows: meta.entry_flows.clone(),
                     secret_requirements: Vec::new(),
                 });
+                note_verify_outcome(&recorder, VerifyOutcome::Unverified(&load.report));
                 if let Some(manifest) = load.gpack_manifest.as_ref() {
                     pack_http_flags = manifest
                         .components
@@ -343,17 +344,14 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             Err(err) => {
                 recorder.record_verify_event("error", &err.message)?;
                 if opts.signing == SigningPolicy::DevOk && is_signature_error(&err.message) {
-                    warn!(error = %err.message, "continuing despite signature error (dev policy)");
+                    note_verify_outcome(&recorder, VerifyOutcome::Downgraded(&err.message));
                 } else {
                     return Err(anyhow!("pack verification failed: {}", err.message));
                 }
             }
         }
     } else {
-        tracing::debug!(
-            path = %pack_path.display(),
-            "skipping pack verification for directory input"
-        );
+        note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
     }
 
     let kill_switch = desktop_http_kill_switch_active();
@@ -727,6 +725,7 @@ fn is_signature_error(message: &str) -> bool {
 /// pack, a real profile and a temp directory to reach.
 enum VerifyOutcome<'a> {
     /// The signature verified. Nothing to say.
+    #[allow(dead_code)]
     Verified,
     /// The pack loaded but its signature did not verify. Under the default
     /// `DevOk` policy this is what a missing, incomplete or invalid signature
@@ -762,10 +761,24 @@ fn verify_event(outcome: VerifyOutcome<'_>) -> Option<(&'static str, String)> {
         )),
         VerifyOutcome::Downgraded(err) => Some((
             "downgraded",
-            format!(
-                "continuing despite error, matched as signature-related by substring: {err}"
-            ),
+            format!("continuing despite error, matched as signature-related by substring: {err}"),
         )),
+    }
+}
+
+/// Record a verification outcome, if there is one worth recording.
+///
+/// Deliberately swallows a recording failure. All three call sites fire on the
+/// success path, and observability added by this change must not be able to turn
+/// a run that works into a run that fails. The pre-existing call on the error
+/// path keeps its `?` — that run is already failing.
+fn note_verify_outcome(recorder: &RunRecorder, outcome: VerifyOutcome<'_>) {
+    let Some((status, message)) = verify_event(outcome) else {
+        return;
+    };
+    warn!(status, message = %message, "pack verification");
+    if let Err(err) = recorder.record_verify_event(status, &message) {
+        warn!(error = %err, "could not record the pack verification event");
     }
 }
 
@@ -1621,7 +1634,10 @@ mod tests {
         let r = report(false, &[]);
         let (status, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
         assert_eq!(status, "unverified");
-        assert!(!message.is_empty(), "an empty message is as invisible as no event");
+        assert!(
+            !message.is_empty(),
+            "an empty message is as invisible as no event"
+        );
     }
 
     #[test]
