@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use greentic_pack::reader::open_pack;
+use greentic_pack::reader::{VerifyReport, open_pack};
 use greentic_runner_host::RunnerWasiPolicy;
 use greentic_runner_host::config::{
     FlowRetryConfig, HostConfig, OperatorPolicy, RateLimits, SecretsPolicy, StateStorePolicy,
@@ -718,6 +718,55 @@ fn resolve_entry_flow(
 
 fn is_signature_error(message: &str) -> bool {
     message.to_ascii_lowercase().contains("signature")
+}
+
+/// What a verification outcome is worth recording, if anything.
+///
+/// Kept separate from the call sites so the decision can be tested directly —
+/// the call sites live deep inside `run_pack_with_options`, which needs a real
+/// pack, a real profile and a temp directory to reach.
+enum VerifyOutcome<'a> {
+    /// The signature verified. Nothing to say.
+    Verified,
+    /// The pack loaded but its signature did not verify. Under the default
+    /// `DevOk` policy this is what a missing, incomplete or invalid signature
+    /// looks like: `open_pack` returns `Ok` with `signature_ok: false` and an
+    /// explanatory warning, and until now the whole report was discarded.
+    Unverified(&'a VerifyReport),
+    /// The input was a directory, so verification never ran at all.
+    DirectorySkipped,
+    /// An error was downgraded to a warning by `is_signature_error`.
+    Downgraded(&'a str),
+}
+
+/// `None` when there is nothing worth recording; otherwise the event status and
+/// its message.
+fn verify_event(outcome: VerifyOutcome<'_>) -> Option<(&'static str, String)> {
+    match outcome {
+        VerifyOutcome::Verified => None,
+        VerifyOutcome::Unverified(report) if report.signature_ok => None,
+        VerifyOutcome::Unverified(report) => {
+            // Fall back to a fixed sentence rather than an empty message: an
+            // empty event is as invisible as no event, which is the defect this
+            // exists to close.
+            let message = if report.warnings.is_empty() {
+                "pack signature did not verify; the loader reported no detail".to_string()
+            } else {
+                report.warnings.join("; ")
+            };
+            Some(("unverified", message))
+        }
+        VerifyOutcome::DirectorySkipped => Some((
+            "skipped",
+            "pack verification skipped: input is a directory, not a signed archive".to_string(),
+        )),
+        VerifyOutcome::Downgraded(err) => Some((
+            "downgraded",
+            format!(
+                "continuing despite error, matched as signature-related by substring: {err}"
+            ),
+        )),
+    }
 }
 
 fn to_reader_policy(policy: SigningPolicy) -> greentic_pack::reader::SigningPolicy {
@@ -1527,6 +1576,70 @@ mod tests {
         assert_eq!(event["session_id"], "session-1");
         assert_eq!(event["flow_id"], "flow.demo");
         assert_eq!(event["redactions"][0], "$.token");
+    }
+
+    fn report(signature_ok: bool, warnings: &[&str]) -> VerifyReport {
+        VerifyReport {
+            signature_ok,
+            sbom_ok: true,
+            warnings: warnings.iter().map(|w| (*w).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_verified_pack_has_nothing_to_report() {
+        assert!(verify_event(VerifyOutcome::Verified).is_none());
+        // A report that verified is equally silent even if it carried unrelated
+        // warnings — this function speaks only about signature state.
+        assert!(verify_event(VerifyOutcome::Unverified(&report(true, &["noise"]))).is_none());
+    }
+
+    #[test]
+    fn an_unverified_pack_reports_the_crates_own_diagnosis() {
+        // greentic-pack already distinguishes missing / incomplete / invalid.
+        // Surfacing its wording rather than re-deriving one keeps the two in step.
+        let r = report(false, &["signature files missing; skipping verification"]);
+        let (status, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        assert_eq!(status, "unverified");
+        assert!(
+            message.contains("signature files missing"),
+            "the crate's own warning must survive verbatim: {message}"
+        );
+    }
+
+    #[test]
+    fn several_warnings_are_all_kept() {
+        let r = report(false, &["first problem", "second problem"]);
+        let (_, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        assert!(message.contains("first problem"), "{message}");
+        assert!(message.contains("second problem"), "{message}");
+    }
+
+    #[test]
+    fn an_unverified_pack_with_no_warnings_still_reports() {
+        // Silence here would recreate the very defect this work closes.
+        let r = report(false, &[]);
+        let (status, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        assert_eq!(status, "unverified");
+        assert!(!message.is_empty(), "an empty message is as invisible as no event");
+    }
+
+    #[test]
+    fn a_directory_input_reports_that_it_was_skipped() {
+        let (status, message) = verify_event(VerifyOutcome::DirectorySkipped).expect("reports");
+        assert_eq!(status, "skipped");
+        assert!(message.contains("director"), "{message}");
+    }
+
+    #[test]
+    fn a_downgraded_error_names_itself_and_how_it_was_matched() {
+        let (status, message) =
+            verify_event(VerifyOutcome::Downgraded("boom: bad signature")).expect("reports");
+        assert_eq!(status, "downgraded");
+        assert!(message.contains("boom: bad signature"), "{message}");
+        // The substring match is the reason this downgrade happened at all, and
+        // it is known to be an unreliable classifier — say so where it is seen.
+        assert!(message.contains("substring"), "{message}");
     }
 
     #[test]
