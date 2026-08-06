@@ -121,7 +121,19 @@ Expected: FAIL to compile — `verify_event`, `VerifyOutcome` and `VerifyReport`
 
 - [ ] **Step 3: Add the import**
 
-`VerifyReport` is not currently imported. Find the existing `greentic_pack` import in `crates/greentic-runner-desktop/src/lib.rs` (it already brings in `open_pack` and `SigningPolicy`) and add `VerifyReport` to it, keeping the existing style of that `use` statement.
+`VerifyReport` is not currently imported. Line 2 of `crates/greentic-runner-desktop/src/lib.rs` reads:
+
+```rust
+use greentic_pack::reader::open_pack;
+```
+
+Change it to:
+
+```rust
+use greentic_pack::reader::{VerifyReport, open_pack};
+```
+
+Note that `SigningPolicy` is **not** imported from `greentic_pack` — the runner declares its own `pub enum SigningPolicy` at line 171 and converts with `to_reader_policy()` before calling `open_pack`. Leave both alone; this task needs only the report type.
 
 - [ ] **Step 4: Write the decision function**
 
