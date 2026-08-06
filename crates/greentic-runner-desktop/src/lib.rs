@@ -724,10 +724,7 @@ fn is_signature_error(message: &str) -> bool {
 /// the call sites live deep inside `run_pack_with_options`, which needs a real
 /// pack, a real profile and a temp directory to reach.
 enum VerifyOutcome<'a> {
-    /// A pack that loaded, carrying its verification report. Whether the
-    /// signature verified is decided by `verify_event`, which returns `None` when
-    /// `report.signature_ok` is true, and falls through to the message
-    /// construction otherwise.
+    /// A pack that loaded, carrying its verification report.
     Loaded(&'a VerifyReport),
     /// The input was a directory, so verification never ran at all.
     DirectorySkipped,
@@ -764,10 +761,10 @@ fn verify_event(outcome: VerifyOutcome<'_>) -> Option<(&'static str, String)> {
 
 /// Record a verification outcome, if there is one worth recording.
 ///
-/// Deliberately swallows a recording failure. All three call sites fire on the
-/// success path, and observability added by this change must not be able to turn
-/// a run that works into a run that fails. The pre-existing call on the error
-/// path keeps its `?` — that run is already failing.
+/// Deliberately swallows a recording failure. All three call sites fire on paths
+/// where the run continues, and observability added by this change must not be
+/// able to turn a run that works into a run that fails. The pre-existing call on
+/// the error path keeps its `?` — that run is already failing.
 fn note_verify_outcome(recorder: &RunRecorder, outcome: VerifyOutcome<'_>) {
     let Some((status, message)) = verify_event(outcome) else {
         return;
@@ -1640,6 +1637,40 @@ mod tests {
         let (status, message) = verify_event(VerifyOutcome::DirectorySkipped).expect("reports");
         assert_eq!(status, "skipped");
         assert!(message.contains("director"), "{message}");
+    }
+
+    #[test]
+    fn note_verify_outcome_writes_verification_events_to_transcript() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path().join("artifacts");
+        let dirs = prepare_run_dirs(Some(root.clone())).expect("run dirs");
+        let profile = sample_profile();
+
+        let recorder = RunRecorder::new(
+            dirs,
+            &profile,
+            None,
+            PackMetadata::fallback(&PathBuf::from("test.gtpack")),
+            None,
+        )
+        .expect("recorder");
+
+        // Fire the event through the recorder-level helper, not just verify_event.
+        note_verify_outcome(&recorder, VerifyOutcome::DirectorySkipped);
+
+        // Read back and verify the event landed in the transcript with the expected shape.
+        let transcript_path = root.join("transcript.jsonl");
+        let transcript = std::fs::read_to_string(&transcript_path).expect("read transcript");
+
+        // The event should be a JSON line with component == "verify.pack" and status == "skipped".
+        let line = transcript
+            .lines()
+            .find(|line| line.contains("\"verify.pack\""))
+            .expect("verify.pack event found");
+
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("parse transcript event");
+        assert_eq!(parsed["component"], "verify.pack");
+        assert_eq!(parsed["status"], "skipped");
     }
 
     #[test]

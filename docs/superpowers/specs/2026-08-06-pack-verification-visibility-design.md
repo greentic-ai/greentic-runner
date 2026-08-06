@@ -80,9 +80,12 @@ change, no new dependency, no default changed.
 
 **3.1 Read the report that is already in hand.** On the `Ok(load)` arm, when
 `load.report.signature_ok == false`, emit a `warn!` and record a verify event
-carrying `load.report.warnings`. `greentic-pack` has already distinguished
-missing from incomplete from invalid; this surfaces that distinction rather than
-re-deriving it.
+carrying `load.report.warnings`. The event exposes a `status == "unverified"` that
+can be counted as a filter; the sub-classification (missing vs incomplete vs
+invalid) survives only as the loader's prose text in the warnings, and
+distinguishing it requires substring matching — the technique §6 already
+notes is not the proper approach. A typed reason would require `greentic-pack`
+to expose a `PackVerifyReason` enum, listed in §6 as its own task.
 
 **3.2 Make the directory bypass visible.** Replace the `tracing::debug!` in the
 `else` branch with a `warn!` plus a recorded verify event stating that
@@ -146,12 +149,26 @@ and content, not merely that the run succeeded.
   let the runner classify errors properly instead of matching substrings. That is
   the real fix for §3.3, and it is a public-API change to a published crate — its
   own task, in its own repo.
+- **SBOM verification state is not surfaced.** A pack with a valid signature but
+  a failed SBOM check produces no verify event, and SBOM warnings from an invalid
+  signature are folded into the `"unverified"` message. Intentional — this spec
+  records signature state only — but calls out that the two concerns are not
+  independently visible at the event level.
+- **`record_verify_event` hardcodes an `error` object even for successful outcomes.**
+  The event schema is optimized for the error case (built for `record_verify_event("error",
+  &err.message)?` on the failing path). Under `DevOk` the common case is now
+  `status: "unverified"` or `"skipped"`, written with a non-null `error` field.
+  Nothing in this repo reads it as failure, but a public `TranscriptHook` will see
+  events it never did before, and the field name will be misread elsewhere.
 
 ## 7. Known cost
 
 Every dev run against an unpacked directory will now emit a `warn!` where it
 previously emitted `debug!`. That is intended — the bypass is currently invisible
 to the people best placed to notice it — but it is a real change in log noise for
-the most common local workflow. If it proves too loud in practice, the answer is
-to lower the log level while keeping the recorded event, since the event is what
-the counting depends on.
+the most common local workflow. If the directory noise proves too loud in practice,
+the remedy is per-outcome, not a single-line change: all three outcomes
+(`Loaded`, `DirectorySkipped`, `Downgraded`) share a single `warn!` call, so
+lowering its log level would silence the important `Loaded` and `Downgraded` cases
+along with the noisy `DirectorySkipped` one. A targeted fix would gate the
+`DirectorySkipped` case to a lower level while keeping the event recorded.
