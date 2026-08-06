@@ -325,7 +325,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     entry_flows: meta.entry_flows.clone(),
                     secret_requirements: Vec::new(),
                 });
-                note_verify_outcome(&recorder, VerifyOutcome::Unverified(&load.report));
+                note_verify_outcome(&recorder, VerifyOutcome::Loaded(&load.report));
                 if let Some(manifest) = load.gpack_manifest.as_ref() {
                     pack_http_flags = manifest
                         .components
@@ -724,14 +724,11 @@ fn is_signature_error(message: &str) -> bool {
 /// the call sites live deep inside `run_pack_with_options`, which needs a real
 /// pack, a real profile and a temp directory to reach.
 enum VerifyOutcome<'a> {
-    /// The signature verified. Nothing to say.
-    #[allow(dead_code)]
-    Verified,
-    /// The pack loaded but its signature did not verify. Under the default
-    /// `DevOk` policy this is what a missing, incomplete or invalid signature
-    /// looks like: `open_pack` returns `Ok` with `signature_ok: false` and an
-    /// explanatory warning, and until now the whole report was discarded.
-    Unverified(&'a VerifyReport),
+    /// A pack that loaded, carrying its verification report. Whether the
+    /// signature verified is decided by `verify_event`, which returns `None` when
+    /// `report.signature_ok` is true, and falls through to the message
+    /// construction otherwise.
+    Loaded(&'a VerifyReport),
     /// The input was a directory, so verification never ran at all.
     DirectorySkipped,
     /// An error was downgraded to a warning by `is_signature_error`.
@@ -742,9 +739,8 @@ enum VerifyOutcome<'a> {
 /// its message.
 fn verify_event(outcome: VerifyOutcome<'_>) -> Option<(&'static str, String)> {
     match outcome {
-        VerifyOutcome::Verified => None,
-        VerifyOutcome::Unverified(report) if report.signature_ok => None,
-        VerifyOutcome::Unverified(report) => {
+        VerifyOutcome::Loaded(report) if report.signature_ok => None,
+        VerifyOutcome::Loaded(report) => {
             // Fall back to a fixed sentence rather than an empty message: an
             // empty event is as invisible as no event, which is the defect this
             // exists to close.
@@ -1601,10 +1597,9 @@ mod tests {
 
     #[test]
     fn a_verified_pack_has_nothing_to_report() {
-        assert!(verify_event(VerifyOutcome::Verified).is_none());
         // A report that verified is equally silent even if it carried unrelated
         // warnings — this function speaks only about signature state.
-        assert!(verify_event(VerifyOutcome::Unverified(&report(true, &["noise"]))).is_none());
+        assert!(verify_event(VerifyOutcome::Loaded(&report(true, &["noise"]))).is_none());
     }
 
     #[test]
@@ -1612,7 +1607,7 @@ mod tests {
         // greentic-pack already distinguishes missing / incomplete / invalid.
         // Surfacing its wording rather than re-deriving one keeps the two in step.
         let r = report(false, &["signature files missing; skipping verification"]);
-        let (status, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        let (status, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
         assert_eq!(status, "unverified");
         assert!(
             message.contains("signature files missing"),
@@ -1623,7 +1618,7 @@ mod tests {
     #[test]
     fn several_warnings_are_all_kept() {
         let r = report(false, &["first problem", "second problem"]);
-        let (_, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        let (_, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
         assert!(message.contains("first problem"), "{message}");
         assert!(message.contains("second problem"), "{message}");
     }
@@ -1632,7 +1627,7 @@ mod tests {
     fn an_unverified_pack_with_no_warnings_still_reports() {
         // Silence here would recreate the very defect this work closes.
         let r = report(false, &[]);
-        let (status, message) = verify_event(VerifyOutcome::Unverified(&r)).expect("reports");
+        let (status, message) = verify_event(VerifyOutcome::Loaded(&r)).expect("reports");
         assert_eq!(status, "unverified");
         assert!(
             !message.is_empty(),
