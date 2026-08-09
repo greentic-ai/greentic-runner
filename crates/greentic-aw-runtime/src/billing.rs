@@ -41,6 +41,11 @@ pub enum BillingError {
 /// parse failure must return `false` (fail-open) so a billing outage never
 /// halts real work. Implementations should cache the result per tenant with a
 /// short TTL to avoid a round-trip on every LLM call.
+///
+/// `model` is the LLM model id the call was made against, taken from the
+/// agent's `LlmProviderRef` at the call site. It is part of the cross-emitter
+/// metadata contract (see [`build_worker_batch`]) — cloud-commerce cannot
+/// group worker spend by model unless every emitter reports it.
 pub trait BillingMeter: Send + Sync {
     fn emit<'a>(
         &'a self,
@@ -48,6 +53,7 @@ pub trait BillingMeter: Send + Sync {
         input_tokens: u64,
         output_tokens: u64,
         agent_id: &'a str,
+        model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>>;
 
     fn over_budget<'a>(
@@ -73,6 +79,7 @@ impl BillingMeter for NoopBillingMeter {
         _input_tokens: u64,
         _output_tokens: u64,
         _agent_id: &'a str,
+        _model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
@@ -120,24 +127,55 @@ pub(crate) struct WorkerMeteringBatch {
 /// Build the three-event (input / output / total tokens) metering batch for
 /// one agent LLM iteration. Pure function; used by [`HttpBillingMeter::emit`]
 /// and directly in unit tests.
+///
+/// # Metadata contract
+///
+/// cloud-commerce (greentic-billing) groups usage by whatever metadata keys a
+/// `?group_by=` query names, so a dimension only exists in reporting if every
+/// emitter writes the same key. These keys are shared with the
+/// greentic-designer emitter (which meters authoring-time LLM calls):
+///
+/// | key          | worker value                     | designer value      |
+/// |--------------|----------------------------------|---------------------|
+/// | `model`      | model id of the call             | model id of the call|
+/// | `env_id`     | deployed environment id          | `"design-time"`     |
+/// | `project_id` | agent id (see below)             | session id          |
+/// | `surface`    | `"worker"`                       | LLM role name       |
+/// | `user_email` | session user, omitted if unknown | authoring user      |
+///
+/// `project_id` is the agent id: the runtime has no narrower "project" notion
+/// at the emit site — an `AgentRuntime` is built from many packs at once and
+/// `AgentConfig` carries no pack reference, so the agent is the most stable
+/// identity for "the thing this spend belongs to". `agent_id` and `source` are
+/// kept alongside for existing consumers; this addition is purely additive.
 pub(crate) fn build_worker_batch(
-    tenant_id: &str,
-    env_id: &str,
+    tenant: &TenantContext,
     input_tokens: u64,
     output_tokens: u64,
     agent_id: &str,
+    model: &str,
     idem_base: &str,
 ) -> WorkerMeteringBatch {
     let timestamp = chrono::Utc::now().to_rfc3339();
-    let metadata = serde_json::json!({
-        "env_id": env_id,
+    let mut metadata = serde_json::json!({
+        "model": model,
+        "env_id": tenant.env_id,
+        "project_id": agent_id,
+        "surface": "worker",
         "agent_id": agent_id,
         "source": "worker"
     });
+    // Omitted rather than null when unknown: the contract says `user_email`
+    // may be absent, and a null would create a bogus grouping bucket.
+    if let Some(email) = tenant.user_email.as_deref()
+        && let Some(map) = metadata.as_object_mut()
+    {
+        map.insert("user_email".to_string(), email.into());
+    }
     let events = METERS
         .iter()
         .map(|(meter, quantity_fn)| WorkerMeteringEvent {
-            tenant_id: tenant_id.to_string(),
+            tenant_id: tenant.tenant_id.clone(),
             product_id: PRODUCT_ID.to_string(),
             meter: (*meter).to_string(),
             quantity: quantity_fn(input_tokens, output_tokens),
@@ -222,18 +260,12 @@ impl BillingMeter for HttpBillingMeter {
         input_tokens: u64,
         output_tokens: u64,
         agent_id: &'a str,
+        model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), BillingError>> + Send + 'a>> {
         // Build idempotency key and batch synchronously so we own all data
         // before spawning — the spawned future must be 'static.
         let idem = uuid::Uuid::new_v4().to_string();
-        let batch = build_worker_batch(
-            &tenant.tenant_id,
-            &tenant.env_id,
-            input_tokens,
-            output_tokens,
-            agent_id,
-            &idem,
-        );
+        let batch = build_worker_batch(tenant, input_tokens, output_tokens, agent_id, model, &idem);
         let url = format!("{}/v1/metering/events/batch", self.base_url);
         let http = self.http.clone();
         let bearer = self.bearer.clone();
@@ -309,7 +341,7 @@ mod tests {
     async fn noop_meter_is_ok() {
         let m = NoopBillingMeter;
         let t = TenantContext::new("acme", "prod");
-        assert!(m.emit(&t, 10, 5, "agent-1").await.is_ok());
+        assert!(m.emit(&t, 10, 5, "agent-1", "gpt-4o-mini").await.is_ok());
     }
 
     #[tokio::test]
@@ -338,7 +370,8 @@ mod tests {
 
     #[test]
     fn builds_three_worker_token_events() {
-        let batch = build_worker_batch("acme", "prod", 10, 5, "agent-1", "idem-1");
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "gpt-4o-mini", "idem-1");
         assert_eq!(batch.events.len(), 3);
         let by = |m: &str| batch.events.iter().find(|e| e.meter == m).unwrap();
         assert_eq!(by("llm_input_tokens").quantity, 10);
@@ -355,11 +388,88 @@ mod tests {
 
     #[test]
     fn builds_zero_token_batch() {
-        let batch = build_worker_batch("t", "e", 0, 0, "a", "base");
+        let tenant = TenantContext::new("t", "e");
+        let batch = build_worker_batch(&tenant, 0, 0, "a", "m", "base");
         let by = |m: &str| batch.events.iter().find(|e| e.meter == m).unwrap();
         assert_eq!(by("llm_input_tokens").quantity, 0);
         assert_eq!(by("llm_output_tokens").quantity, 0);
         assert_eq!(by("llm_total_tokens").quantity, 0);
+    }
+
+    // ── Cross-emitter metadata contract (shared with greentic-designer) ─────
+    //
+    // cloud-commerce groups by arbitrary metadata keys, so a `?group_by=model`
+    // report only sees worker spend if these exact key names are emitted.
+
+    #[test]
+    fn metadata_carries_model_from_the_llm_call_site() {
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "claude-3-haiku", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["model"], "claude-3-haiku");
+        }
+    }
+
+    #[test]
+    fn metadata_carries_project_id_from_the_agent_identity() {
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["project_id"], "agent-1");
+        }
+    }
+
+    #[test]
+    fn metadata_carries_worker_surface() {
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["surface"], "worker");
+        }
+    }
+
+    #[test]
+    fn metadata_carries_user_email_when_tenant_context_has_one() {
+        let tenant = TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into()));
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["user_email"], "u@x.com");
+        }
+    }
+
+    #[test]
+    fn metadata_omits_user_email_when_unknown() {
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert!(
+                event.metadata.get("user_email").is_none(),
+                "user_email must be absent, not null, when not known"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_keeps_pre_existing_agent_id_and_source_keys() {
+        // Additive only: existing consumers may already read these.
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["agent_id"], "agent-1");
+            assert_eq!(event.metadata["source"], "worker");
+            assert_eq!(event.metadata["env_id"], "prod");
+        }
+    }
+
+    #[test]
+    fn rating_mode_stays_ingest_only() {
+        // Out of scope for the dimensions work; asserted so a future change
+        // to worker rating is a deliberate, visible decision.
+        let tenant = TenantContext::new("acme", "prod");
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.rating_mode, "ingest_only");
+        }
     }
 
     // ── HttpBillingMeter tests ──────────────────────────────────────────────
@@ -418,7 +528,7 @@ mod tests {
         }
         let meter = HttpBillingMeter::from_env().unwrap();
         let t = TenantContext::new("acme", "prod");
-        let result = meter.emit(&t, 100, 50, "agent-1").await;
+        let result = meter.emit(&t, 100, 50, "agent-1", "gpt-4o-mini").await;
         assert!(result.is_ok());
         // Give the spawned fire-and-forget task time to deliver.
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
