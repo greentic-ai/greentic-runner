@@ -436,6 +436,7 @@ pub async fn run_step(
                 u64::from(response.tokens_in),
                 u64::from(response.tokens_out),
                 agent_id,
+                &config.llm.model,
             )
             .await
         {
