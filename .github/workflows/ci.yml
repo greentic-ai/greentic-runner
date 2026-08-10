@@ -20,16 +20,56 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # NOTE: this repo does NOT use the shared greenticai/.github pr-ci.yml for
-  # clippy/test. Those jobs build the workspace, and cargo clones EVERY git
-  # dependency during resolution to read its manifest — including the optional,
-  # default-OFF `knowledge-chronicle` deps (chronicle-core / chronicle-driver-*)
-  # that live in the CROSS-ORG private repo `greentic-biz/greentic-chronicle-ext`.
-  # PR CI only has `greenticai`-org credentials, so the clone fails auth and the
-  # job dies at dependency-fetch before compiling — on every PR, regardless of
-  # features. Until a cross-org deploy-key/PAT is provisioned for that repo, we
-  # run fmt + toolchain-check here and rely on local `ci/local_check.sh` (which
-  # has cross-org credentials) for clippy/test coverage.
+  # HISTORY: this repo used to run fmt + toolchain-check ONLY, on the grounds
+  # that cargo clones EVERY git dependency during resolution to read its
+  # manifest — including the optional, default-OFF `knowledge-chronicle` deps
+  # (chronicle-core / chronicle-driver-*) that live in the CROSS-ORG private
+  # repo `greentic-biz/greentic-chronicle-ext` — so any compiling job would die
+  # at dependency-fetch with `greenticai`-only credentials.
+  #
+  # That reasoning is LANE-SPECIFIC, and it does not apply here. Measured:
+  #   develop   `grep -c 'source = "git' Cargo.lock` -> 0   (no git deps at all)
+  #   main      same, 0                                      -> gated in #662
+  #   research  38 git deps, 6 of them on greentic-biz       -> still blocked
+  # So `develop` and `main` can and do run a compile gate; `research` genuinely
+  # cannot until a cross-org deploy key / PAT is provisioned, and is the only
+  # lane the original comment still describes.
+  #
+  # Why it matters: #653 landed a `#[cfg(feature = "desktop-agent-ephemeral")]`
+  # -gated call site that did not compile. It went green on `main` and was only
+  # caught by Nightly Coverage the next morning (fixed in #659). Nothing on a PR
+  # built it, because nothing on a PR built anything.
+  #
+  # `clippy --all-targets --all-features` is the gate rather than a plain
+  # `cargo check`: it compiles every target including test code, which is where
+  # feature-gated breaks hide, and it enforces the same `-D warnings` bar as
+  # `ci/local_check.sh`. Test *execution* stays with Nightly Coverage — this job
+  # answers "does it build", which is the gap.
+  #
+  # If a chronicle dep is ever added to this lane, this job will fail at
+  # dependency-fetch. That is the signal to provision the cross-org key, not to
+  # delete the gate.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-wasip2
+          components: clippy
+
+      - name: Install wasm32-wasip2 target
+        run: rustup target add wasm32-wasip2 --toolchain 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Clippy (all targets, all features, warnings denied)
+        run: cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
+
   fmt:
     runs-on: ubuntu-latest
     steps:
