@@ -122,7 +122,11 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
     let config = exec_config_for(component_ref);
-    let res = tokio::task::spawn_blocking(move || list_tools(&component, &config)).await;
+    // Box the error: `ExecError` is ≥144 bytes, which trips `clippy::result_large_err`
+    // on the closure's return type. It is only ever read for its `Display` here.
+    let res =
+        tokio::task::spawn_blocking(move || list_tools(&component, &config).map_err(Box::new))
+            .await;
     match res {
         Ok(Ok(tools)) => tools,
         Ok(Err(e)) => {
@@ -156,7 +160,8 @@ pub async fn local_call_tool(component_ref: &str, tool: &str, args: &Value) -> V
         args: cloned_args,
         tenant: None,
     };
-    let res = tokio::task::spawn_blocking(move || exec(req, &config)).await;
+    // Boxed for the same reason as in `local_list_tools` above.
+    let res = tokio::task::spawn_blocking(move || exec(req, &config).map_err(Box::new)).await;
     match res {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => json!({ "error": format!("local mcp call failed: {e}") }),

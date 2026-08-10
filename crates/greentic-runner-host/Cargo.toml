@@ -33,6 +33,23 @@ greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-bac
 # in the server binary — the server always uses the Redis path.
 desktop-agent-ephemeral = ["agentic-worker", "greentic-aw-runtime?/test-mock", "greentic-aw-runtime?/dev-allow-unsigned"]
 
+[lints.rust]
+# `long-term-chronicle` and `knowledge-chronicle` gate real in-tree modules
+# (runner/long_term_memory.rs, runner/knowledge_mount.rs, runner/knowledge_corpus.rs)
+# but are declared as features only on the `research` lane. Their optional deps
+# (chronicle-core, chronicle-driver-{surreal,neo4j,falkor}) are git deps on the
+# CROSS-ORG PRIVATE repo greentic-biz/greentic-chronicle-ext, and this lane's CI
+# holds `greenticai`-org credentials only. Declaring them here would make cargo
+# clone that repo during resolution — which happens regardless of whether the
+# feature is switched on — and every `--all-features` build (Nightly Coverage,
+# ci/local_check.sh) would die at dependency-fetch. So tell check-cfg the values
+# are expected rather than declaring them, and keep the gated code compiling on
+# `research` where the deps resolve. Re-declare as real features once a cross-org
+# deploy key / PAT is provisioned. Mirrors the same allowlist on `develop`.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("knowledge-chronicle", "long-term-chronicle"))',
+] }
+
 [dependencies]
 async-nats = "0.49"
 async-trait.workspace = true

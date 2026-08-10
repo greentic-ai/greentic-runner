@@ -250,7 +250,6 @@ mod tests {
         assert_eq!(tenant, "demo");
     }
 
-    #[test]
     /// The tenant a request resolves to when nothing else names one. It was
     /// `demo` while greentic-deployer and greentic-setup bound deployments
     /// under `default`, so the host served requests in one namespace and read
