@@ -656,6 +656,15 @@ impl TenantRuntime {
                 },
             );
         }
+        // The deployed unit's identity, used as the `project_id` billing
+        // dimension for this runtime's agentic-worker spend. It is exactly what
+        // greentic-designer records as `pack_name`, so authoring-time and
+        // runtime spend join on it. Captured BEFORE `rollout` moves into the
+        // engine; `None` on the legacy tenant-only path (no bundle is pinned
+        // there), which makes billing omit the dimension rather than fall back
+        // to a non-unique in-pack agent id.
+        #[cfg(feature = "agentic-worker")]
+        let agent_project_id = rollout.bundle_id.clone();
         #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
         let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
@@ -805,6 +814,7 @@ impl TenantRuntime {
                     pack_runtimes.clone(),
                     agent_audit_sink.clone(),
                     stream_observers.clone(),
+                    agent_project_id.clone(),
                 )
                 .await
             } else {
@@ -818,6 +828,7 @@ impl TenantRuntime {
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
                         stream_observers.clone(),
+                        agent_project_id.clone(),
                     )
                     .await
                 }
@@ -831,6 +842,7 @@ impl TenantRuntime {
                         pack_runtimes.clone(),
                         agent_audit_sink.clone(),
                         stream_observers.clone(),
+                        agent_project_id.clone(),
                     )
                     .await
                 }
