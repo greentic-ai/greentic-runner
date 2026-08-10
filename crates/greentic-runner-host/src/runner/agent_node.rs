@@ -2091,6 +2091,9 @@ mod aw {
                 secrets,
                 Vec::new(),
                 None,
+                // project_id: no pack identity to attribute billing to, matching
+                // the desktop ephemeral call site in greentic-runner-desktop.
+                None,
             )
             .await;
             assert!(
