@@ -97,6 +97,18 @@ jobs:
             diff rustfmt.toml /tmp/canonical-rustfmt.toml || true
           fi
 
+  # The crates.io publish list is duplicated across release-binaries.yml (tag
+  # `v*`) and crates-publish.yml (tag `runnercrates-v*`) with nothing keeping
+  # the two in sync. #655 fixed the drift that half-published v1.1.10; this
+  # gate is what stops it recurring. Cheap (no toolchain, no build), so it runs
+  # on every PR rather than waiting for a release to expose the mismatch.
+  publish-lanes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert both publish lanes list the same crates
+        run: ./ci/assert_publish_crate_lists_match.sh
+
   heavy_wasm:
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_heavy_wasm == true)
     runs-on: ubuntu-latest
