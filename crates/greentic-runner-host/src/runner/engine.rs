@@ -4635,7 +4635,7 @@ mod tests {
             None,
         ));
         let handler: Arc<dyn AgentNodeHandler> =
-            Arc::new(RuntimeAgentNodeHandler::new(runtime, None));
+            Arc::new(RuntimeAgentNodeHandler::new(runtime, None, None));
 
         // --- flow with a single dw.agent node (operation = agent_id) ---
         let node_id = NodeId::from_str("agent").unwrap();
