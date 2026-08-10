@@ -402,6 +402,7 @@ mod inner {
             _input_tokens: u64,
             _output_tokens: u64,
             _agent_id: &'a str,
+            _model: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<(), crate::billing::BillingError>> + Send + 'a>>
         {
             Box::pin(async { Ok(()) })

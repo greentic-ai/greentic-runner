@@ -191,6 +191,15 @@ mod aw {
         /// up `session_id` in the registry on every call; a miss (no active
         /// SSE stream for that session) behaves exactly like `None`.
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        /// Identity of the deployed unit these agents were loaded from — the
+        /// revision's `bundle_id`, stamped onto every step's
+        /// [`TenantContext`] so billing can attribute spend to a project.
+        ///
+        /// `None` on the tenant-only (legacy, non-revision) pack path, where no
+        /// bundle is pinned. Billing then OMITS the `project_id` dimension
+        /// rather than substituting the agent id, which is not unique across
+        /// packs — see [`greentic_aw_runtime::TenantContext::project_id`].
+        project_id: Option<String>,
     }
 
     impl RuntimeAgentNodeHandler {
@@ -207,15 +216,21 @@ mod aw {
         /// the step's token/tool callbacks out to that observer alongside the
         /// audit observer (via [`crate::http::agent_stream::CompositeObserver`]
         /// when both are present).
+        ///
+        /// `project_id` is the deployed unit's `bundle_id` (`None` on the
+        /// legacy tenant-only path); it becomes the `project_id` billing
+        /// dimension of every step this handler runs.
         pub fn new(
             runtime: Arc<AgentRuntime>,
             audit_sink: Option<AuditSink>,
             stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+            project_id: Option<String>,
         ) -> Self {
             Self {
                 runtime,
                 audit_sink,
                 stream_observers,
+                project_id,
             }
         }
     }
@@ -250,7 +265,8 @@ mod aw {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let tenant = TenantContext::new(tenant_id, env_id);
+            let tenant =
+                TenantContext::new(tenant_id, env_id).with_project_id(self.project_id.clone());
             let input = AgentInput {
                 text: user_text,
                 conversational,
@@ -1329,6 +1345,10 @@ mod aw {
     /// plain [`AgentRuntime::step`] path. `stream_observers` (R2) is likewise
     /// forwarded verbatim — `None` keeps `execute` from consulting the
     /// session-keyed streaming-observer registry at all.
+    ///
+    /// `project_id` is the deployed unit's `bundle_id`, forwarded verbatim so
+    /// billing can attribute this runtime's spend to a project. `None` on the
+    /// legacy tenant-only path, where the dimension is omitted entirely.
     #[allow(clippy::too_many_arguments)]
     async fn build_runtime_handler_with_stores(
         merged_agents: HashMap<String, AgentConfig>,
@@ -1341,6 +1361,7 @@ mod aw {
         ledger: Arc<dyn greentic_aw_runtime::tools::ToolLedger>,
         audit_sink: Option<AuditSink>,
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         let runtime = build_runtime_with_stores(
             merged_agents,
@@ -1357,6 +1378,7 @@ mod aw {
             runtime,
             audit_sink,
             stream_observers,
+            project_id,
         )))
     }
 
@@ -1390,6 +1412,13 @@ mod aw {
     /// configured) keeps `dw.agent` execution on the plain
     /// [`greentic_aw_runtime::AgentRuntime::step`] path — zero behaviour
     /// change from before this parameter existed.
+    ///
+    /// `project_id` is the deployed unit's `bundle_id` — the value
+    /// greentic-designer records as `pack_name` — used as the `project_id`
+    /// billing dimension. Pass `None` when no bundle is pinned (the legacy
+    /// tenant-only pack path); billing then omits the dimension instead of
+    /// attributing spend to a non-unique agent id.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_agent_node_handler(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
@@ -1398,6 +1427,7 @@ mod aw {
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use crate::runner::aw_backends::{AwBackends, build_aw_backends};
 
@@ -1423,6 +1453,7 @@ mod aw {
             ledger,
             audit_sink,
             stream_observers,
+            project_id,
         )
         .await
     }
@@ -1435,7 +1466,12 @@ mod aw {
     /// runtime fails to initialise. Unlike [`build_agent_node_handler`] this
     /// function never returns `None` due to a missing Redis URL, making it safe
     /// for desktop environments where no Redis is available.
+    ///
+    /// `project_id` mirrors [`build_agent_node_handler`]: the deployed unit's
+    /// `bundle_id`, or `None` when none is pinned (billing then omits the
+    /// dimension).
     #[cfg(feature = "desktop-agent-ephemeral")]
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_agent_node_handler_ephemeral(
         merged_agents: HashMap<String, AgentConfig>,
         tenant: String,
@@ -1444,6 +1480,7 @@ mod aw {
         packs: Vec<Arc<crate::pack::PackRuntime>>,
         audit_sink: Option<AuditSink>,
         stream_observers: Option<crate::http::agent_stream::StreamObserverRegistry>,
+        project_id: Option<String>,
     ) -> Option<Arc<dyn AgentNodeHandler>> {
         use greentic_aw_runtime::cost::MockTokenMeter;
         use greentic_aw_runtime::mock::{MockAgentStateStore, NoopToolLedger};
@@ -1482,6 +1519,7 @@ mod aw {
             ledger,
             audit_sink,
             stream_observers,
+            project_id,
         )
         .await
     }
@@ -1842,7 +1880,7 @@ mod aw {
                 ledger,
                 None,
             ));
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None, None);
 
             let output = handler
                 .execute(
@@ -1857,6 +1895,119 @@ mod aw {
                 .expect("execute should succeed");
 
             assert_eq!(output["reply"].as_str(), Some("pong"));
+        }
+
+        // -------------------------------------------------------------------
+        // `project_id` billing dimension = the deployed unit's bundle id
+        // -------------------------------------------------------------------
+
+        /// Captures the `TenantContext.project_id` of every billing emit the
+        /// agent loop makes, so a test can assert what `execute` actually
+        /// handed the sink rather than what it looks like it should have.
+        #[derive(Default)]
+        struct RecordingBillingMeter {
+            project_ids: std::sync::Mutex<Vec<Option<String>>>,
+        }
+
+        impl greentic_aw_runtime::billing::BillingMeter for RecordingBillingMeter {
+            fn emit<'a>(
+                &'a self,
+                tenant: &'a TenantContext,
+                _input_tokens: u64,
+                _output_tokens: u64,
+                _agent_id: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<(), greentic_aw_runtime::billing::BillingError>,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                self.project_ids
+                    .lock()
+                    .expect("recording meter lock poisoned")
+                    .push(tenant.project_id.clone());
+                Box::pin(async { Ok(()) })
+            }
+
+            fn over_budget<'a>(
+                &'a self,
+                _tenant: &'a TenantContext,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>
+            {
+                Box::pin(std::future::ready(false))
+            }
+        }
+
+        /// Run one `execute` through a handler built with `project_id` and
+        /// return the project ids the billing sink observed.
+        async fn project_ids_seen_by_billing(project_id: Option<String>) -> Vec<Option<String>> {
+            let llm = Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
+                content: Some("pong".into()),
+                tool_calls: vec![],
+                tokens_in: 1,
+                tokens_out: 1,
+            })]));
+            let config_provider = MockConfigProvider::new();
+            config_provider.insert(
+                &TenantContext::new("t", "e"),
+                "greeter",
+                sample_agent_config("greeter"),
+            );
+            let meter = Arc::new(RecordingBillingMeter::default());
+            let runtime = Arc::new(
+                AgentRuntime::new(
+                    Arc::new(config_provider),
+                    Arc::new(MockAgentStateStore::new()),
+                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+                    llm,
+                    Arc::new(MockTelemetry::new()),
+                    Arc::new(MockTokenMeter::new(0)),
+                    Arc::new(NoopToolLedger),
+                    None,
+                )
+                .with_billing_meter(meter.clone()),
+            );
+
+            RuntimeAgentNodeHandler::new(runtime, None, None, project_id)
+                .execute(
+                    "t",
+                    "e",
+                    "greeter",
+                    "sess-1",
+                    &json!({"user_text": "ping"}),
+                    false,
+                )
+                .await
+                .expect("execute should succeed");
+
+            let seen = meter
+                .project_ids
+                .lock()
+                .expect("recording meter lock poisoned");
+            seen.clone()
+        }
+
+        #[tokio::test]
+        async fn execute_bills_the_pack_identity_as_project_id() {
+            let seen = project_ids_seen_by_billing(Some("customer.support".into())).await;
+            assert_eq!(
+                seen,
+                vec![Some("customer.support".to_string())],
+                "the deployed bundle id must reach the billing sink, not the in-pack agent id"
+            );
+        }
+
+        #[tokio::test]
+        async fn execute_bills_no_project_id_when_the_pack_identity_is_unknown() {
+            let seen = project_ids_seen_by_billing(None).await;
+            assert_eq!(
+                seen,
+                vec![None],
+                "an unknown pack identity must stay absent — never fall back to the agent id"
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -1934,7 +2085,7 @@ mod aw {
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let sink = AuditSink::from_sender(tx);
-            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink), None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, Some(sink), None, None);
 
             let output = handler
                 .execute(
@@ -2018,7 +2169,7 @@ mod aw {
             let rec = Arc::new(Rec::default());
             registry.insert("sess-1".to_string(), rec.clone() as Arc<dyn StepObserver>);
 
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry));
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry), None);
             let output = handler
                 .execute(
                     "t1",
@@ -2053,7 +2204,7 @@ mod aw {
             let runtime = runtime_with_scripted_remember_call("t1", "e1");
             let registry: StreamObserverRegistry = Arc::new(dashmap::DashMap::new());
 
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry));
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, Some(registry), None);
             let output = handler
                 .execute(
                     "t1",
@@ -2076,7 +2227,7 @@ mod aw {
             // the tool call and returns the same reply, exactly as it did
             // before AgentAuditObserver existed.
             let runtime = runtime_with_scripted_remember_call("t1", "e1");
-            let handler = RuntimeAgentNodeHandler::new(runtime, None, None);
+            let handler = RuntimeAgentNodeHandler::new(runtime, None, None, None);
 
             let output = handler
                 .execute(
@@ -2493,6 +2644,7 @@ mod aw {
                 secrets,
                 None,
                 Vec::new(),
+                None,
                 None,
                 None,
             )

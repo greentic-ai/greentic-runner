@@ -455,6 +455,11 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
             let redis_set = std::env::var("GREENTIC_AW_REDIS_URL")
                 .map(|v| !v.is_empty())
                 .unwrap_or(false);
+            // `project_id` (billing) is `None` here: the desktop runner loads a
+            // single local `.gtpack` directly, with no deployment revision and
+            // therefore no pinned `bundle_id`. Billing omits the dimension
+            // rather than falling back to an in-pack agent id, which is not
+            // unique across packs.
             let handler = if redis_set {
                 build_agent_node_handler(
                     merged,
@@ -462,6 +467,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                     sm,
                     None,
                     vec![Arc::clone(&pack)],
+                    None,
                     None,
                     None,
                 )
@@ -475,6 +481,7 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
                         sm,
                         None,
                         vec![Arc::clone(&pack)],
+                        None,
                         None,
                         None,
                     )
