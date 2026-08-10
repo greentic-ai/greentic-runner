@@ -135,19 +135,28 @@ pub(crate) struct WorkerMeteringBatch {
 /// emitter writes the same key. These keys are shared with the
 /// greentic-designer emitter (which meters authoring-time LLM calls):
 ///
-/// | key          | worker value                     | designer value      |
-/// |--------------|----------------------------------|---------------------|
-/// | `model`      | model id of the call             | model id of the call|
-/// | `env_id`     | deployed environment id          | `"design-time"`     |
-/// | `project_id` | agent id (see below)             | session id          |
-/// | `surface`    | `"worker"`                       | LLM role name       |
-/// | `user_email` | session user, omitted if unknown | authoring user      |
+/// | key          | worker value                       | designer value      |
+/// |--------------|------------------------------------|---------------------|
+/// | `model`      | model id of the call               | model id of the call|
+/// | `env_id`     | deployed environment id            | `"design-time"`     |
+/// | `project_id` | pack identity, omitted if unknown  | pack identity       |
+/// | `surface`    | `"worker"`                         | LLM role name       |
+/// | `user_email` | session user, omitted if unknown   | authoring user      |
 ///
-/// `project_id` is the agent id: the runtime has no narrower "project" notion
-/// at the emit site — an `AgentRuntime` is built from many packs at once and
-/// `AgentConfig` carries no pack reference, so the agent is the most stable
-/// identity for "the thing this spend belongs to". `agent_id` and `source` are
-/// kept alongside for existing consumers; this addition is purely additive.
+/// `project_id` is the PACK identity — [`TenantContext::project_id`], which the
+/// host fills from the deployed revision's `bundle_id`. That is the same value
+/// greentic-designer records as `pack_name` in `published_workers`, so a
+/// product's authoring spend and its runtime spend land on the same project row.
+///
+/// It is deliberately NOT the agent id. An agent id is the key inside
+/// `manifest.agents` and is not unique across packs, so two packs each shipping
+/// an `assistant` would collapse into one bogus project with summed credits.
+/// When the pack identity is unknown the key is OMITTED rather than filled with
+/// a fallback: cloud-commerce groups a missing key under `"unknown"`, which is
+/// honest, whereas any fallback silently reintroduces that collision.
+///
+/// `agent_id` and `source` are unchanged and still carried alongside —
+/// `agent_id` remains the right answer to "which agent ran".
 pub(crate) fn build_worker_batch(
     tenant: &TenantContext,
     input_tokens: u64,
@@ -160,17 +169,21 @@ pub(crate) fn build_worker_batch(
     let mut metadata = serde_json::json!({
         "model": model,
         "env_id": tenant.env_id,
-        "project_id": agent_id,
         "surface": "worker",
         "agent_id": agent_id,
         "source": "worker"
     });
-    // Omitted rather than null when unknown: the contract says `user_email`
-    // may be absent, and a null would create a bogus grouping bucket.
-    if let Some(email) = tenant.user_email.as_deref()
-        && let Some(map) = metadata.as_object_mut()
-    {
-        map.insert("user_email".to_string(), email.into());
+    // Both optional dimensions are omitted rather than nulled or defaulted when
+    // unknown: the contract says they may be absent, a null would create a
+    // bogus grouping bucket, and for `project_id` a fallback to `agent_id`
+    // would collapse same-named agents from different packs into one project.
+    if let Some(map) = metadata.as_object_mut() {
+        if let Some(email) = tenant.user_email.as_deref() {
+            map.insert("user_email".to_string(), email.into());
+        }
+        if let Some(project_id) = tenant.project_id.as_deref() {
+            map.insert("project_id".to_string(), project_id.into());
+        }
     }
     let events = METERS
         .iter()
@@ -411,12 +424,62 @@ mod tests {
     }
 
     #[test]
-    fn metadata_carries_project_id_from_the_agent_identity() {
+    fn metadata_carries_project_id_from_the_pack_identity() {
+        let tenant =
+            TenantContext::new("acme", "prod").with_project_id(Some("customer.support".into()));
+        let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
+        for event in &batch.events {
+            assert_eq!(event.metadata["project_id"], "customer.support");
+            // The in-pack agent id is a DIFFERENT dimension and must not leak
+            // into project_id — that conflation is the bug this test pins shut.
+            assert_eq!(event.metadata["agent_id"], "agent-1");
+        }
+    }
+
+    #[test]
+    fn metadata_omits_project_id_when_pack_identity_is_unknown() {
+        // Omitted, never a fallback to agent_id and never a placeholder string:
+        // cloud-commerce groups a missing key under "unknown", which is the
+        // honest answer. A fallback would reintroduce the cross-pack collision.
         let tenant = TenantContext::new("acme", "prod");
         let batch = build_worker_batch(&tenant, 10, 5, "agent-1", "m", "idem-1");
         for event in &batch.events {
-            assert_eq!(event.metadata["project_id"], "agent-1");
+            assert!(
+                event.metadata.get("project_id").is_none(),
+                "project_id must be ABSENT when the pack identity is unknown, got {:?}",
+                event.metadata.get("project_id")
+            );
         }
+    }
+
+    #[test]
+    fn two_packs_sharing_an_agent_id_get_distinct_project_ids() {
+        // Regression: before the pack identity existed, both packs emitted
+        // `project_id = "assistant"` and cloud-commerce summed their credits
+        // into one bogus project row.
+        let shared_agent_id = "assistant";
+        let sales = TenantContext::new("acme", "prod").with_project_id(Some("sales.bot".into()));
+        let support =
+            TenantContext::new("acme", "prod").with_project_id(Some("support.bot".into()));
+
+        let sales_batch = build_worker_batch(&sales, 10, 5, shared_agent_id, "m", "idem-1");
+        let support_batch = build_worker_batch(&support, 10, 5, shared_agent_id, "m", "idem-2");
+
+        assert_eq!(sales_batch.events[0].metadata["project_id"], "sales.bot");
+        assert_eq!(
+            support_batch.events[0].metadata["project_id"],
+            "support.bot"
+        );
+        assert_ne!(
+            sales_batch.events[0].metadata["project_id"],
+            support_batch.events[0].metadata["project_id"],
+            "same in-pack agent id in two packs must NOT collapse to one project"
+        );
+        // ...while `agent_id` still answers "which agent ran" identically.
+        assert_eq!(
+            sales_batch.events[0].metadata["agent_id"],
+            support_batch.events[0].metadata["agent_id"]
+        );
     }
 
     #[test]
