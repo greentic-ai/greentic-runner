@@ -324,6 +324,34 @@ impl FlowExecution {
     }
 }
 
+/// What a chat user is told when a flow fails terminally.
+///
+/// Deliberately generic. The engine's own error text stays in
+/// `metadata.error_message` for logs, the conformance harness and richer
+/// clients — putting it in `text` is what the surrounding code exists to
+/// prevent ("instead of leaking raw engine text to the chat").
+///
+/// It is NOT optional, and that is the point. A terminal failure on a session
+/// flow used to be reported as an `Ok` whose payload carried metadata ONLY, and
+/// every messaging provider refuses a payload with no `text`/card:
+/// `messaging-provider-telegram` returns `"text required"`, slack/teams/whatsapp
+/// /email/webex behave the same, and even `messaging-provider-webchat` — the one
+/// provider with an `extract_error_envelope` error-card path — rejects it at its
+/// `"text, adaptive_card, attachments, or extensions required"` guard BEFORE
+/// that path is reached. So a failing flow was silent on every channel: no
+/// reply, no error, nothing. The worst case is an `approval.call` gate with
+/// `mode: always`, which must reach a human and instead failed invisibly.
+///
+/// webchat still renders its styled card rather than this string: it checks the
+/// envelope first and only falls back to `text`. This value is what the other
+/// twelve providers send.
+///
+/// Not localized. The engine has no per-conversation locale here, so a tenant
+/// serving non-English users sees English. Worth fixing by threading locale or
+/// making this host-configurable; silence was worse.
+const USER_FACING_FLOW_FAILURE_TEXT: &str =
+    "Sorry — something went wrong while handling that. Please try again.";
+
 impl FlowEngine {
     pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
         let mut flow_sources: HashMap<FlowKey, usize> = HashMap::new();
@@ -636,6 +664,10 @@ impl FlowEngine {
                             if ctx.session_id.is_some() {
                                 return Ok(FlowExecution::completed(
                                     json!({
+                                        "text": USER_FACING_FLOW_FAILURE_TEXT,
+                                        // Generic, user-safe, and REQUIRED for the
+                                        // failure to reach anyone. See
+                                        // `USER_FACING_FLOW_FAILURE_TEXT`.
                                         "metadata": {
                                             "error_kind": "flow_execution_failed",
                                             "error_message": err.to_string(),
@@ -6193,6 +6225,24 @@ mod tests {
             .unwrap_or("");
         assert!(!msg.is_empty(), "error_message must be populated");
         assert_eq!(result.output["metadata"]["flow_id"], "broken.flow");
+        // Without a `text`, this envelope reaches nobody: every messaging
+        // provider refuses a payload with no text/card, webchat included (its
+        // required-content guard runs BEFORE its error-card path). The comment
+        // above once claimed the user "sees the error card"; that only held for
+        // the `lift_first_node_error_from_nodes` envelope, which enriches an
+        // output that already carries text.
+        assert_eq!(
+            result.output["text"], USER_FACING_FLOW_FAILURE_TEXT,
+            "a terminal session-flow failure must carry user-safe text or it is silent on every channel"
+        );
+        // And the engine's own wording must NOT be what the user is shown.
+        assert!(
+            !result.output["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("does-not-exist"),
+            "raw engine text must stay in metadata.error_message"
+        );
     }
 
     #[test]
