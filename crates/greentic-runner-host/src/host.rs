@@ -44,6 +44,13 @@ pub struct TelemetryCfg {
 #[cfg(feature = "agentic-worker")]
 pub type ExtLlmPort = Arc<dyn greentic_ext_runtime::host_ports::LlmPort>;
 
+/// An MCP tool source an embedding host can inject so `mcp` flow nodes resolve
+/// their catalog through the host's own per-tenant admin path instead of the
+/// process-global `GREENTIC_AW_*` environment. See
+/// [`HostBuilder::with_mcp_source`].
+#[cfg(feature = "agentic-worker")]
+pub type McpSource = Arc<greentic_aw_runtime::McpToolSource>;
+
 /// Builder for composing multi-tenant host instances.
 pub struct HostBuilder {
     configs: HashMap<String, HostConfig>,
@@ -52,6 +59,8 @@ pub struct HostBuilder {
     secrets: Option<DynSecretsManager>,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
 }
 
 impl HostBuilder {
@@ -63,6 +72,8 @@ impl HostBuilder {
             secrets: None,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
         }
     }
 
@@ -99,6 +110,22 @@ impl HostBuilder {
         self
     }
 
+    /// Inject a host-built MCP tool source for this host's flow engines.
+    ///
+    /// When `Some`, `mcp` flow nodes resolve their catalog through it. When
+    /// `None`, each engine keeps deriving one from the process-global
+    /// `GREENTIC_AW_*` environment — the standalone runner path, unchanged.
+    ///
+    /// A host that serves many tenants from one process must inject: the
+    /// environment names a single tenant, so it cannot express a per-tenant
+    /// catalog. Build one source per tenant, identified with
+    /// `greentic_aw_runtime::McpCallerIdentity`.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_source(mut self, source: Option<McpSource>) -> Self {
+        self.mcp_source = source;
+        self
+    }
+
     pub fn build(self) -> Result<RunnerHost> {
         if self.configs.is_empty() {
             bail!("at least one tenant configuration is required");
@@ -129,6 +156,8 @@ impl HostBuilder {
             secrets_manager: secrets,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: self.ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: self.mcp_source,
             #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: self.telemetry,
@@ -172,6 +201,10 @@ pub struct RunnerHost {
     secrets_manager: DynSecretsManager,
     #[cfg(feature = "agentic-worker")]
     ext_llm_port: Option<ExtLlmPort>,
+    /// MCP tool source injected by an embedding host, or `None` to let each
+    /// flow engine derive one from `GREENTIC_AW_*` env (standalone runners).
+    #[cfg(feature = "agentic-worker")]
+    mcp_source: Option<McpSource>,
     /// Session-id → active streaming observer, shared by every `dw.agent`
     /// node handler this host builds (writer: the `POST /agent/chat/stream`
     /// SSE handler via `ServerState`; reader: `RuntimeAgentNodeHandler::execute`).
@@ -776,6 +809,14 @@ impl RunnerHost {
         self.ext_llm_port.clone()
     }
 
+    /// The host-injected MCP tool source, if any. `None` for standalone
+    /// runners, in which case each flow engine derives one from
+    /// `GREENTIC_AW_*` env.
+    #[cfg(feature = "agentic-worker")]
+    pub fn mcp_source(&self) -> Option<McpSource> {
+        self.mcp_source.clone()
+    }
+
     /// The shared session-keyed streaming-observer registry (R2). Cloning
     /// this `Arc` and handing it to both `TenantRuntime` construction (so
     /// `RuntimeAgentNodeHandler::execute` can read it) and `ServerState` (so
@@ -842,6 +883,8 @@ impl RunnerHost {
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
             #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
+            #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             telemetry: None,
         })
@@ -878,6 +921,8 @@ impl RunnerHost {
             self.secrets_manager(),
             #[cfg(feature = "agentic-worker")]
             self.ext_llm_port(),
+            #[cfg(feature = "agentic-worker")]
+            self.mcp_source(),
             #[cfg(feature = "agentic-worker")]
             Some(self.stream_observers()),
         )
@@ -1561,6 +1606,8 @@ mod identify_endpoints_tests {
         RunnerHost {
             #[cfg(feature = "agentic-worker")]
             ext_llm_port: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source: None,
             #[cfg(feature = "agentic-worker")]
             stream_observers: Arc::new(dashmap::DashMap::new()),
             configs: HashMap::new(),

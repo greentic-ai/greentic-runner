@@ -27,6 +27,48 @@ pub const MCP_ROLE_AGENTIC_WORKER: &str = "agentic_worker";
 /// surface without the other.
 pub const MCP_ROLE_FLOW_EDITOR: &str = "flow_editor";
 
+/// Who an [`McpToolSource`] is asking the admin on behalf of.
+///
+/// The admin resolves RBAC from request headers, so a caller that sends only a
+/// bearer forces that bearer to imply the tenant — i.e. a tenant-scoped
+/// `gtc_live_*` token per tenant, captured once at construction. That works for
+/// a runner process dedicated to one tenant and does NOT work for an embedding
+/// host serving many tenants from one process (the designer): its Run Demo
+/// builds a host per tenant, but a process-global token can only name one of
+/// them, so every tenant would read the same tenant's servers.
+///
+/// Supplying an identity moves the tenant from the credential to the request,
+/// letting such a host present the service key it already holds and say per
+/// call who it is acting for.
+///
+/// [`McpToolSource`]: super::source::McpToolSource
+#[derive(Clone, Debug)]
+pub struct McpCallerIdentity {
+    pub tenant_slug: String,
+    pub user_email: String,
+    /// The caller's team. `None` for a caller that belongs to no team (an
+    /// operator session spans tenants), which sends no team header at all.
+    pub team_slug: Option<String>,
+}
+
+impl McpCallerIdentity {
+    pub fn new(tenant_slug: impl Into<String>, user_email: impl Into<String>) -> Self {
+        Self {
+            tenant_slug: tenant_slug.into(),
+            user_email: user_email.into(),
+            team_slug: None,
+        }
+    }
+
+    /// Name the team this caller is acting in. MCP servers are stored per-team
+    /// on the admin, so omitting a team the caller really has resolves a
+    /// different server set than that team's authoring UI listed.
+    pub fn with_team(mut self, team_slug: impl Into<String>) -> Self {
+        self.team_slug = Some(team_slug.into());
+        self
+    }
+}
+
 /// Which transport backs an MCP server row. `http` is the default (existing
 /// remote behavior); `local-wasm` runs a `wasix:mcp` component in-process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize)]

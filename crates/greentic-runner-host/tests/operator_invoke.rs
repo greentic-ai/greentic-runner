@@ -590,6 +590,8 @@ async fn setup_runtime_with_state(
         None,
         #[cfg(feature = "agentic-worker")]
         None,
+        #[cfg(feature = "agentic-worker")]
+        None,
     )
     .await?;
     Ok((runtime, state_store))
