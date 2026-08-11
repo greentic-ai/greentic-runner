@@ -384,6 +384,22 @@ fn pack_config_from(
 }
 
 fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
+    telemetry_from_env(
+        cfg,
+        std::env::var("OTLP_HEADERS").ok(),
+        std::env::var("OTEL_SERVICE_NAME").ok(),
+    )
+}
+
+/// The pure half of [`telemetry_from`]: the two environment variables are
+/// parameters so this can be tested without mutating process-wide state
+/// (`std::env::set_var` is `unsafe` under edition 2024, and this crate denies
+/// `unsafe_code`).
+fn telemetry_from_env(
+    cfg: &TelemetryConfig,
+    otlp_headers: Option<String>,
+    service_name: Option<String>,
+) -> Option<TelemetryCfg> {
     if !cfg.enabled || matches!(cfg.exporter, TelemetryExporterKind::None) {
         return None;
     }
@@ -398,9 +414,55 @@ fn telemetry_from(cfg: &TelemetryConfig) -> Option<TelemetryCfg> {
     };
     export.endpoint = cfg.endpoint.clone();
     export.sampling = Sampling::TraceIdRatio(cfg.sampling as f64);
+
+    // `OTLP_HEADERS` is how an authenticated collector is reached — Honeycomb,
+    // Grafana Cloud and most hosted OTLP endpoints need an auth header, and
+    // without one they reject every export.
+    //
+    // This config is built from `json_default()`, which starts with no headers,
+    // and only `ExportConfig::from_env()` reads that variable — a function this
+    // crate never calls. So the header was silently dropped and no exporter
+    // that needs one could work at all. Callers that resolve a credential and
+    // set the variable (greentic-designer resolves one through its admin
+    // secret broker on every deploy) were doing that work for nothing.
+    //
+    // `from_env()` is deliberately NOT used here: it also runs preset detection
+    // and would overwrite the mode, endpoint and sampling this function has
+    // just derived from the operator's own configuration. The public
+    // `parse_headers_from_env` is the same parser without that side effect.
+    match greentic_telemetry::presets::parse_headers_from_env(otlp_headers) {
+        Ok(headers) => {
+            if !headers.is_empty() {
+                export.headers = headers;
+            }
+        }
+        // Malformed input must degrade to unauthenticated export rather than
+        // killing telemetry outright, and it must say so: an exporter that
+        // silently sends nothing is the failure this whole change is about.
+        // The error names the offending ENTRY, never its value.
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "OTLP_HEADERS could not be parsed; exporting without headers"
+            );
+        }
+    }
+
     Some(TelemetryCfg {
         config: greentic_telemetry::TelemetryConfig {
-            service_name: "greentic-runner".into(),
+            // `OTEL_SERVICE_NAME` is the standard way to name a service, and a
+            // hardcoded value here silently defeated it: the SDK's own
+            // `SdkProvidedResourceDetector` reads that variable, but
+            // `with_service_name` is applied afterwards and merges
+            // last-writer-wins, so setting it had no effect and produced no
+            // error to notice. Several runners deployed side by side were
+            // therefore indistinguishable in the collector.
+            //
+            // The literal stays as the fallback, so nothing changes for a
+            // deployment that does not set it.
+            service_name: service_name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "greentic-runner".into()),
         },
         export,
     })
@@ -655,5 +717,51 @@ mod tests {
     #[test]
     fn telemetry_from_is_disabled_without_exporter() {
         assert!(telemetry_from(&TelemetryConfig::default()).is_none());
+    }
+
+    #[test]
+    fn telemetry_from_env_honours_the_telemetry_environment() {
+        fn enabled() -> TelemetryConfig {
+            TelemetryConfig {
+                enabled: true,
+                exporter: TelemetryExporterKind::Otlp,
+                ..Default::default()
+            }
+        }
+
+        // Neither variable set: a deployment that configures nothing must
+        // behave exactly as it did before this change.
+        let bare = telemetry_from_env(&enabled(), None, None).expect("enabled yields a config");
+        assert!(bare.export.headers.is_empty());
+        assert_eq!(bare.config.service_name, "greentic-runner");
+
+        let set = telemetry_from_env(
+            &enabled(),
+            Some("authorization=Bearer tok,x-team=alpha".into()),
+            Some("greentic-designer-worker".into()),
+        )
+        .expect("enabled yields a config");
+        assert_eq!(
+            set.export.headers.get("authorization").map(String::as_str),
+            Some("Bearer tok"),
+            "an authenticated collector cannot be reached without this header"
+        );
+        assert_eq!(
+            set.export.headers.get("x-team").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(set.config.service_name, "greentic-designer-worker");
+
+        // A blank name falls back rather than registering an unnamed service.
+        let blank = telemetry_from_env(&enabled(), None, Some("   ".into()))
+            .expect("enabled yields a config");
+        assert_eq!(blank.config.service_name, "greentic-runner");
+
+        // Malformed headers degrade to unauthenticated export — never a panic,
+        // and never telemetry dropped entirely.
+        let malformed =
+            telemetry_from_env(&enabled(), Some("this-has-no-equals-sign".into()), None)
+                .expect("malformed headers must not disable telemetry");
+        assert!(malformed.export.headers.is_empty());
     }
 }
