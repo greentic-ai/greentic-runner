@@ -15,7 +15,7 @@ use crate::tenant::TenantContext;
 
 use super::types::{
     CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpRoute, McpToolCatalog,
-    McpToolEntry, ParsedServer, SERVER_TIMEOUT, Transport, WireBody,
+    McpToolEntry, PROBE_TIMEOUT, ParsedServer, Transport, WireBody, call_timeout,
 };
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
@@ -199,7 +199,7 @@ impl McpToolSource {
         server: &ParsedServer,
         tenant_key: &str,
     ) {
-        match tokio::time::timeout(SERVER_TIMEOUT, list_server_tools(server)).await {
+        match tokio::time::timeout(PROBE_TIMEOUT, list_server_tools(server)).await {
             Ok(Ok(defs)) => ingest_server_tools(catalog, server, &defs),
             Ok(Err(e)) => tracing::warn!(
                 tenant = %tenant_key,
@@ -211,7 +211,7 @@ impl McpToolSource {
                 tenant = %tenant_key,
                 server = %server.id,
                 "mcp server probe timed out after {}s; skipping its tools",
-                SERVER_TIMEOUT.as_secs()
+                PROBE_TIMEOUT.as_secs()
             ),
         }
     }
@@ -284,9 +284,9 @@ fn build_auth(token: Option<&secrecy::SecretString>, header_name: Option<&str>) 
     })
 }
 
-fn client_opts() -> McpClientOptions {
+fn client_opts(timeout: std::time::Duration) -> McpClientOptions {
     McpClientOptions {
-        timeout: SERVER_TIMEOUT,
+        timeout,
         client_name: "greentic-aw-runtime".to_string(),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     }
@@ -301,7 +301,7 @@ fn connect(server: &ParsedServer) -> Result<McpHttpClient, String> {
         server.auth_token.as_ref(),
         server.auth_header_name.as_deref(),
     );
-    McpHttpClient::new(endpoint, auth, client_opts()).map_err(|e| e.to_string())
+    McpHttpClient::new(endpoint, auth, client_opts(PROBE_TIMEOUT)).map_err(|e| e.to_string())
 }
 
 /// Construct a client from a dispatch route.
@@ -309,7 +309,10 @@ fn connect_route(route: &McpRoute) -> Result<McpHttpClient, String> {
     let endpoint = url::Url::parse(&route.transport_url)
         .map_err(|e| format!("invalid transport_url '{}': {e}", route.transport_url))?;
     let auth = build_auth(route.auth_token.as_ref(), route.auth_header_name.as_deref());
-    McpHttpClient::new(endpoint, auth, client_opts()).map_err(|e| e.to_string())
+    // The CALL budget, not the probe budget: this client carries the tool's own
+    // work, and reqwest would otherwise cut it off at the probe's 5s regardless
+    // of the outer timeout.
+    McpHttpClient::new(endpoint, auth, client_opts(call_timeout())).map_err(|e| e.to_string())
 }
 
 /// Connect, handshake, and list a server's tools. Errors are stringified.
@@ -373,11 +376,12 @@ pub async fn dispatch_route(
         Err(e) => return json!({ "error": format!("invalid tool arguments: {e}") }),
     };
 
-    match tokio::time::timeout(SERVER_TIMEOUT, call_route(route, &parsed, scope)).await {
+    let budget = call_timeout();
+    match tokio::time::timeout(budget, call_route(route, &parsed, scope)).await {
         Ok(Ok(value)) => value,
         Ok(Err(e)) => json!({ "error": e }),
         Err(_) => json!({
-            "error": format!("tool call timed out after {}s", SERVER_TIMEOUT.as_secs())
+            "error": format!("tool call timed out after {}s", budget.as_secs())
         }),
     }
 }
