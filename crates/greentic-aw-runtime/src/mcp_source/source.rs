@@ -14,8 +14,8 @@ use crate::mcp_scope::McpCallScope;
 use crate::tenant::TenantContext;
 
 use super::types::{
-    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpRoute, McpToolCatalog, McpToolEntry, ParsedServer,
-    SERVER_TIMEOUT, Transport, WireBody,
+    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpRoute, McpToolCatalog,
+    McpToolEntry, ParsedServer, SERVER_TIMEOUT, Transport, WireBody,
 };
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
@@ -24,9 +24,14 @@ use super::types::{
 /// a tenant `gtc_live_*` bearer token are captured at construction; the tenant
 /// is implied by the token, with the [`TenantContext`] used only as the cache
 /// key.
+///
+/// An embedding host that serves many tenants from one process cannot use a
+/// tenant-implying token; it attaches an [`McpCallerIdentity`] instead, which
+/// names the tenant per request. See [`McpToolSource::with_identity`].
 pub struct McpToolSource {
     base_url: String,
     token: String,
+    identity: Option<McpCallerIdentity>,
     client: reqwest::Client,
     cache: DashMap<String, Arc<McpToolCatalog>>,
     secrets: Option<Arc<dyn greentic_secrets_lib::SecretsManager>>,
@@ -45,10 +50,21 @@ impl McpToolSource {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token: token.into(),
+            identity: None,
             client,
             cache: DashMap::new(),
             secrets: None,
         }
+    }
+
+    /// Name the tenant + user this source asks the admin on behalf of, so the
+    /// bearer no longer has to imply them (see [`McpCallerIdentity`]).
+    ///
+    /// Without this the source keeps its existing behaviour exactly: bearer
+    /// only, tenant implied by the token.
+    pub fn with_identity(mut self, identity: McpCallerIdentity) -> Self {
+        self.identity = Some(identity);
+        self
     }
 
     /// Same as [`McpToolSource::new`] plus the tenant secrets manager, so
@@ -148,10 +164,16 @@ impl McpToolSource {
     /// any network failure or non-200 status (the caller degrades to empty).
     async fn fetch_servers(&self) -> Result<Vec<ParsedServer>, String> {
         let url = format!("{}/api/v1/designer/tenant/me/mcp-servers", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.token)
+        let mut req = self.client.get(&url).bearer_auth(&self.token);
+        if let Some(identity) = &self.identity {
+            req = req
+                .header("X-Greentic-Tenant", &identity.tenant_slug)
+                .header("X-Greentic-User", &identity.user_email);
+            if let Some(team) = &identity.team_slug {
+                req = req.header("X-Greentic-Team", team);
+            }
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| format!("request failed: {e}"))?;

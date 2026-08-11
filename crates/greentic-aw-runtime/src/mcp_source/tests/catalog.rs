@@ -9,7 +9,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::mcp_source::source::{McpToolSource, dispatch_route};
-use crate::mcp_source::types::{MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR};
+use crate::mcp_source::types::{MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity};
 use crate::tenant::TenantContext;
 
 // --- Shared helpers ---
@@ -437,5 +437,116 @@ async fn build_catalog_fetch_failed_branch_carries_secrets() {
         catalog.secrets().is_some(),
         "build_catalog's fetch-failed branch must copy the source's secrets \
          manager onto the empty catalog it returns"
+    );
+}
+
+/// A source built with an identity must send the `X-Greentic-Tenant` /
+/// `X-Greentic-User` headers the admin resolves RBAC from.
+///
+/// Without them the bearer alone has to imply the tenant, which forces a
+/// tenant-scoped `gtc_live_*` token per tenant — unusable from an embedding
+/// host that serves many tenants from ONE process (the designer, whose Run
+/// Demo builds a host per tenant but reads a single process-global env). With
+/// them the same `gts_` service key the designer already holds works, and the
+/// tenant travels per request instead of per process.
+///
+/// The assertion is behavioural, not a spy: the mock only answers when both
+/// headers match, so a source that fails to send them gets no response, the
+/// fetch fails, and `build_catalog` degrades to an EMPTY catalog.
+#[tokio::test]
+async fn identity_headers_are_sent_so_the_admin_can_resolve_the_tenant() {
+    let mcp = fake_mcp_server(two_tools(), json!({})).await;
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .and(header("authorization", "Bearer gts_x"))
+        .and(header("x-greentic-tenant", "acme"))
+        .and(header("x-greentic-user", "ops@acme.test"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "servers": [{
+                "id": "worker", "name": "Worker", "transport_url": mcp.uri(),
+                "auth_header_name": null, "auth_token": null,
+                "allowed_tools": null, "roles": ["agentic_worker"]
+            }]
+        })))
+        .mount(&admin)
+        .await;
+
+    let source = McpToolSource::new(admin.uri(), "gts_x")
+        .with_identity(McpCallerIdentity::new("acme", "ops@acme.test"));
+    let catalog = source.catalog(&tenant()).await;
+
+    assert_eq!(
+        catalog.len(),
+        2,
+        "the admin only answers when both identity headers are present; an \
+         empty catalog means the source authenticated without saying which \
+         tenant it was asking for"
+    );
+}
+
+/// MCP servers are stored per-team on the admin, so an identity carrying a
+/// team must say so — otherwise an embedding host resolves a DIFFERENT server
+/// set at run time than the one its authoring UI listed, and the mismatch is
+/// silent (a tool simply reports "not found in the catalog").
+#[tokio::test]
+async fn team_header_is_sent_when_the_identity_carries_a_team() {
+    let mcp = fake_mcp_server(two_tools(), json!({})).await;
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .and(header("x-greentic-team", "support"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "servers": [{
+                "id": "worker", "name": "Worker", "transport_url": mcp.uri(),
+                "auth_header_name": null, "auth_token": null,
+                "allowed_tools": null, "roles": ["agentic_worker"]
+            }]
+        })))
+        .mount(&admin)
+        .await;
+
+    let source = McpToolSource::new(admin.uri(), "gts_x")
+        .with_identity(McpCallerIdentity::new("acme", "ops@acme.test").with_team("support"));
+    let catalog = source.catalog(&tenant()).await;
+
+    assert_eq!(
+        catalog.len(),
+        2,
+        "the admin only answers when the team header names the caller's team"
+    );
+}
+
+/// An identity with no team must send NO team header at all, rather than an
+/// empty one. The designer leaves `team_slug` unset for operator sessions,
+/// which span tenants and belong to no team; an empty `X-Greentic-Team` is a
+/// different assertion from an absent one and the admin is entitled to reject
+/// it.
+#[tokio::test]
+async fn a_team_less_identity_sends_no_team_header() {
+    let mcp = fake_mcp_server(two_tools(), json!({})).await;
+    let admin = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/designer/tenant/me/mcp-servers"))
+        .and(|req: &wiremock::Request| req.headers.get("x-greentic-team").is_none())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "servers": [{
+                "id": "worker", "name": "Worker", "transport_url": mcp.uri(),
+                "auth_header_name": null, "auth_token": null,
+                "allowed_tools": null, "roles": ["agentic_worker"]
+            }]
+        })))
+        .mount(&admin)
+        .await;
+
+    let source = McpToolSource::new(admin.uri(), "gts_x")
+        .with_identity(McpCallerIdentity::new("acme", "ops@acme.test"));
+    let catalog = source.catalog(&tenant()).await;
+
+    assert_eq!(
+        catalog.len(),
+        2,
+        "a team-less identity must send no team header; an empty one is a \
+         different claim and the admin may reject it"
     );
 }
