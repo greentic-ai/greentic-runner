@@ -324,7 +324,8 @@ impl FlowExecution {
     }
 }
 
-/// What a chat user is told when a flow fails terminally.
+/// i18n key for what a chat user is told when a flow fails terminally.
+/// Resolved by [`user_facing_flow_failure_text`].
 ///
 /// Deliberately generic. The engine's own error text stays in
 /// `metadata.error_message` for logs, the conformance harness and richer
@@ -343,14 +344,67 @@ impl FlowExecution {
 /// `mode: always`, which must reach a human and instead failed invisibly.
 ///
 /// webchat still renders its styled card rather than this string: it checks the
-/// envelope first and only falls back to `text`. This value is what the other
+/// envelope first and only falls back to `text`. This message is what the other
 /// twelve providers send.
 ///
-/// Not localized. The engine has no per-conversation locale here, so a tenant
-/// serving non-English users sees English. Worth fixing by threading locale or
-/// making this host-configurable; silence was worse.
-const USER_FACING_FLOW_FAILURE_TEXT: &str =
-    "Sorry — something went wrong while handling that. Please try again.";
+/// Localized at the **deployment** level, not per conversation. See
+/// [`user_facing_flow_failure_text`] for what that does and does not buy.
+const USER_FACING_FLOW_FAILURE_KEY: &str = "runner.flow.execution_failed";
+
+/// Resolve the failure text for an explicitly supplied locale.
+///
+/// Split out from [`user_facing_flow_failure_text`] so tests can exercise every
+/// entry in the table without mutating the process environment (which is
+/// `unsafe` in Rust 2024) — the same shape as
+/// `HostConfig::oauth_broker_config_with_env`.
+///
+/// Unknown, empty and untranslated locales resolve to the English wording, and
+/// the result is **never empty**: a blank `text` is the silent-on-every-channel
+/// bug this whole path exists to prevent, so a blank table entry is corrected
+/// here rather than shipped to a user.
+fn user_facing_flow_failure_text_for(locale: &str) -> String {
+    let text = crate::runner::i18n::resolve_message(
+        USER_FACING_FLOW_FAILURE_KEY,
+        crate::runner::i18n::FLOW_EXECUTION_FAILED_EN,
+        locale,
+    );
+    if text.trim().is_empty() {
+        return crate::runner::i18n::FLOW_EXECUTION_FAILED_EN.to_string();
+    }
+    text
+}
+
+/// What a chat user is told when a flow fails terminally, in their language
+/// where we know it.
+///
+/// Two sources, in order:
+///
+/// 1. **The conversation**, via [`activity_locale`] on the inbound activity
+///    payload — the same `metadata.locale` the card path already honours. This
+///    is what makes one process able to answer two users in two languages.
+/// 2. **The deployment**, via `i18n::select_locale(None)`: `--locale`, then
+///    `GREENTIC_LOCALE`, then the system `LANG`/`LC_ALL`/`LC_MESSAGES`. The
+///    existing operator knob, and the same resolver `runner::operator` uses, so
+///    an operator serving one language sets it once for every channel.
+///
+/// Then English, for an unknown or untranslated locale.
+///
+/// **What is honestly still missing.** Source 1 depends on the *producer*
+/// stamping `metadata.locale` into the payload: `FlowContext` has no locale
+/// field, `IngressEnvelope` has no typed one (and `host.rs` sends its
+/// free-form `metadata` as `None`), and although `greentic_types::TenantCtx`
+/// carries an `i18n_id` slot meant for exactly this, every construction site on
+/// the flow path sets it `None` — only `greentic_x_provider` populates it, from
+/// a greentic-x `input_locale`. So a channel that stamps nothing falls to the
+/// deployment locale, and a deployment serving mixed languages answers them all
+/// in one. Closing that needs a typed locale on the envelope threaded onto
+/// `FlowContext`; it is not something this function can do from here.
+fn user_facing_flow_failure_text(entry: &Value) -> String {
+    let locale = activity_locale(entry)
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::runner::i18n::select_locale(None));
+    user_facing_flow_failure_text_for(&locale)
+}
 
 impl FlowEngine {
     pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
@@ -688,10 +742,10 @@ impl FlowEngine {
                             if ctx.session_id.is_some() {
                                 return Ok(FlowExecution::completed(
                                     json!({
-                                        "text": USER_FACING_FLOW_FAILURE_TEXT,
+                                        "text": user_facing_flow_failure_text(&original_input),
                                         // Generic, user-safe, and REQUIRED for the
                                         // failure to reach anyone. See
-                                        // `USER_FACING_FLOW_FAILURE_TEXT`.
+                                        // `USER_FACING_FLOW_FAILURE_KEY`.
                                         "metadata": {
                                             "error_kind": "flow_execution_failed",
                                             "error_message": err.to_string(),
@@ -3757,6 +3811,24 @@ fn card_defaults_source<'a>(
     None
 }
 
+/// The conversation's locale as carried by the inbound activity payload.
+///
+/// `/input/metadata/locale`, then `/metadata/locale` — the shape
+/// `inject_card_locale` has always read for card invocations. Factored out so
+/// the card path and the flow-failure path resolve a conversation's language
+/// from the *same* pointers; two copies would silently drift into disagreeing
+/// about what language a user is speaking.
+///
+/// A blank value is treated as absent, so a producer that stamps an empty
+/// string does not out-rank the deployment locale.
+fn activity_locale(entry: &Value) -> Option<&str> {
+    entry
+        .pointer("/input/metadata/locale")
+        .or_else(|| entry.pointer("/metadata/locale"))
+        .and_then(Value::as_str)
+        .filter(|locale| !locale.trim().is_empty())
+}
+
 fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if !is_card_invocation(payload) {
         return;
@@ -3765,11 +3837,7 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
     if map.contains_key("locale") {
         return;
     }
-    let locale = entry
-        .pointer("/input/metadata/locale")
-        .or_else(|| entry.pointer("/metadata/locale"))
-        .and_then(Value::as_str);
-    if let Some(locale) = locale {
+    if let Some(locale) = activity_locale(entry) {
         map.insert("locale".into(), Value::String(locale.to_string()));
     }
 }
@@ -6180,16 +6248,11 @@ mod tests {
         assert_eq!(lifted, output);
     }
 
-    #[tokio::test]
-    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
-        // Flow whose start node is missing — drive_flow will return Err on
-        // node lookup. With session_id present, execute() must convert that
-        // to a Completed FlowExecution carrying error_kind/error_message in
-        // output.metadata so the chat user sees the error card.
-        let flow_id_str = "broken.flow";
-        let pack_id_str = "test-pack";
+    /// An engine holding one flow whose start node is missing, so `drive_flow`
+    /// returns `Err` on node lookup. Shared by the terminal-failure tests below.
+    fn broken_flow_engine(pack_id_str: &str, flow_id_str: &str) -> FlowEngine {
         let host_flow = host_flow_for_test(flow_id_str, &["only-node"], Some("does-not-exist"));
-        let engine = FlowEngine {
+        FlowEngine {
             operala_node_handler: None,
             packs: Vec::new(),
             flows: Vec::new(),
@@ -6216,8 +6279,12 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
-        };
-        let ctx = FlowContext {
+        }
+    }
+
+    /// A single-attempt, session-bound context for `broken_flow_engine`.
+    fn terminal_failure_ctx<'a>(pack_id_str: &'a str, flow_id_str: &'a str) -> FlowContext<'a> {
+        FlowContext {
             tenant: "demo",
             pack_id: pack_id_str,
             flow_id: flow_id_str,
@@ -6234,7 +6301,18 @@ mod tests {
             attempt: 1,
             observer: None,
             mocks: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_returns_completed_with_error_envelope() {
+        // With session_id present, execute() must convert the terminal Err to a
+        // Completed FlowExecution carrying error_kind/error_message in
+        // output.metadata plus user-safe text.
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let engine = broken_flow_engine(pack_id_str, flow_id_str);
+        let ctx = terminal_failure_ctx(pack_id_str, flow_id_str);
         let result = engine
             .execute(ctx, Value::Null)
             .await
@@ -6256,17 +6334,132 @@ mod tests {
         // the `lift_first_node_error_from_nodes` envelope, which enriches an
         // output that already carries text.
         assert_eq!(
-            result.output["text"], USER_FACING_FLOW_FAILURE_TEXT,
-            "a terminal session-flow failure must carry user-safe text or it is silent on every channel"
+            result.output["text"],
+            user_facing_flow_failure_text(&Value::Null),
+            "a terminal session-flow failure must carry the resolved user-facing message"
+        );
+        // Localisation must not be able to reintroduce the silence: whatever
+        // locale this process resolved to, `text` has to be a non-empty string.
+        let shown = result.output["text"].as_str().unwrap_or_default();
+        assert!(
+            !shown.trim().is_empty(),
+            "an empty `text` is silent on every channel"
         );
         // And the engine's own wording must NOT be what the user is shown.
         assert!(
-            !result.output["text"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("does-not-exist"),
+            !shown.contains("does-not-exist"),
             "raw engine text must stay in metadata.error_message"
         );
+    }
+
+    /// The conversation's own locale — not the deployment's — decides the
+    /// language a failing flow apologises in.
+    ///
+    /// Drives the real `execute` failure path, so it also pins that
+    /// `original_input` (and not something else) is what gets consulted.
+    #[tokio::test]
+    async fn execute_user_facing_flow_failure_answers_in_the_conversation_locale() {
+        let flow_id_str = "broken.flow";
+        let pack_id_str = "test-pack";
+        let engine = broken_flow_engine(pack_id_str, flow_id_str);
+
+        // Same `metadata.locale` shape the card path already honours.
+        let result = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "metadata": { "locale": "id-ID" } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        let shown = result.output["text"].as_str().unwrap_or_default();
+        assert_eq!(
+            shown,
+            user_facing_flow_failure_text_for("id"),
+            "an Indonesian conversation must be answered in Indonesian"
+        );
+        assert_ne!(
+            shown,
+            crate::runner::i18n::FLOW_EXECUTION_FAILED_EN,
+            "the conversation locale was ignored"
+        );
+
+        // The nested shape is honoured too, and the raw engine error still must
+        // not leak into a localized `text`.
+        let nested = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "input": { "metadata": { "locale": "ja" } } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        let nested_text = nested.output["text"].as_str().unwrap_or_default();
+        assert_eq!(nested_text, user_facing_flow_failure_text_for("ja"));
+        assert!(!nested_text.trim().is_empty());
+        assert!(
+            !nested_text.contains("does-not-exist"),
+            "raw engine text must stay in metadata.error_message in every locale"
+        );
+
+        // A locale nobody translated still gets a reply, in English.
+        let unknown = engine
+            .execute(
+                terminal_failure_ctx(pack_id_str, flow_id_str),
+                json!({ "metadata": { "locale": "kl-GL" } }),
+            )
+            .await
+            .expect("must not propagate Err");
+        assert_eq!(
+            unknown.output["text"],
+            crate::runner::i18n::FLOW_EXECUTION_FAILED_EN
+        );
+    }
+
+    /// The locale table must localize, and must never be able to reintroduce
+    /// the silent-on-every-channel bug.
+    ///
+    /// Drives `user_facing_flow_failure_text_for` directly rather than the env,
+    /// so every entry is covered without an `unsafe` `set_var`.
+    #[test]
+    fn user_facing_flow_failure_text_is_localized_and_never_empty() {
+        let english = user_facing_flow_failure_text_for("en");
+        assert_eq!(english, crate::runner::i18n::FLOW_EXECUTION_FAILED_EN);
+
+        // Every shipped translation must differ from English — otherwise the
+        // table is present but not wired up, which is the bug this replaces.
+        for locale in ["id", "es", "ja", "zh"] {
+            let translated = user_facing_flow_failure_text_for(locale);
+            assert_ne!(
+                translated, english,
+                "`{locale}` must resolve to its own wording, not English"
+            );
+        }
+
+        // Region subtags and separators normalize to the primary subtag.
+        assert_eq!(user_facing_flow_failure_text_for("id-ID"), {
+            user_facing_flow_failure_text_for("id")
+        });
+        assert_eq!(user_facing_flow_failure_text_for("zh_TW"), {
+            user_facing_flow_failure_text_for("zh")
+        });
+
+        // Unknown, absent and container-default locales fall back to English
+        // rather than to nothing.
+        for locale in ["", "xx", "klingon", "C", "C.UTF-8", "POSIX"] {
+            assert_eq!(
+                user_facing_flow_failure_text_for(locale),
+                english,
+                "`{locale}` must fall back to English"
+            );
+        }
+
+        // The invariant that matters on every channel, across the whole table.
+        for locale in ["en", "id", "es", "ja", "zh", "", "xx", "C.UTF-8"] {
+            let text = user_facing_flow_failure_text_for(locale);
+            assert!(
+                !text.trim().is_empty(),
+                "`{locale}` resolved to empty text, which is silent on every channel"
+            );
+        }
     }
 
     #[test]

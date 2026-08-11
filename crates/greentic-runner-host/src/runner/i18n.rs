@@ -70,11 +70,23 @@ pub fn select_locale(explicit: Option<&str>) -> String {
     )
 }
 
+/// English wording for `runner.flow.execution_failed` — what a chat user is
+/// shown when a session flow fails terminally.
+///
+/// Exported so the engine can pass it as the last-resort `fallback` without
+/// keeping a second copy of the literal; the rationale for the string itself
+/// lives at its use site in `runner::engine`.
+pub const FLOW_EXECUTION_FAILED_EN: &str =
+    "Sorry — something went wrong while handling that. Please try again.";
+
 pub fn resolve_message(key: &str, fallback: &str, locale: &str) -> String {
     let normalized = normalize_locale(locale);
     match normalized.as_str() {
         "en" => english_message(key).unwrap_or(fallback).to_string(),
-        _ => fallback.to_string(),
+        // Additive by construction: a key with no translated wording resolves
+        // to `fallback` exactly as it did before this arm gained a lookup, so
+        // adding a translation for one key cannot change any other key.
+        other => translated_message(key, other).unwrap_or(fallback).to_string(),
     }
 }
 
@@ -112,6 +124,35 @@ fn english_message(key: &str) -> Option<&'static str> {
         "runner.schema.invalid_schema" => Some("invalid schema document"),
         "runner.schema.validation_failed" => Some("schema validation failed"),
         "runner.flow.required_var_missing" => Some("required flow variable not provided"),
+        "runner.flow.execution_failed" => Some(FLOW_EXECUTION_FAILED_EN),
+        _ => None,
+    }
+}
+
+/// Non-English wordings, keyed by `(message key, primary-subtag locale)`.
+///
+/// Deliberately tiny, and deliberately not exhaustive: only strings a real end
+/// user reads belong here, and only for the languages the platform already
+/// ships UI catalogs for (`id`, `es`, `ja`, `zh`). Every other locale — and
+/// every key absent from this table — falls through to the caller's English
+/// `fallback` rather than being guessed at.
+///
+/// Locales arrive here already reduced by [`normalize_locale`], so match on the
+/// primary subtag only. One consequence worth knowing: `zh-TW` normalizes to
+/// `zh` and is therefore served the Simplified wording. That is a property of
+/// the whole mechanism, not of this table.
+fn translated_message(key: &str, locale: &str) -> Option<&'static str> {
+    match (key, locale) {
+        ("runner.flow.execution_failed", "id") => {
+            Some("Maaf — terjadi kesalahan saat memproses permintaan itu. Silakan coba lagi.")
+        }
+        ("runner.flow.execution_failed", "es") => {
+            Some("Lo sentimos: se produjo un error al procesar esa solicitud. Vuelve a intentarlo.")
+        }
+        ("runner.flow.execution_failed", "ja") => {
+            Some("申し訳ありません。処理中に問題が発生しました。もう一度お試しください。")
+        }
+        ("runner.flow.execution_failed", "zh") => Some("抱歉，处理该请求时出现问题。请重试。"),
         _ => None,
     }
 }
