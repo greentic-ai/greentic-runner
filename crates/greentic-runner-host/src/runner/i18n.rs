@@ -86,7 +86,9 @@ pub fn resolve_message(key: &str, fallback: &str, locale: &str) -> String {
         // Additive by construction: a key with no translated wording resolves
         // to `fallback` exactly as it did before this arm gained a lookup, so
         // adding a translation for one key cannot change any other key.
-        other => translated_message(key, other).unwrap_or(fallback).to_string(),
+        other => translated_message(key, other)
+            .unwrap_or(fallback)
+            .to_string(),
     }
 }
 
@@ -188,6 +190,46 @@ mod tests {
         let text = I18nText::new("runner.operator.op_not_found", "fallback");
         let message = resolve_text(&text, "en");
         assert_eq!(message, "operation not found");
+    }
+
+    #[test]
+    fn resolve_message_prefers_a_translated_wording_over_the_fallback() {
+        // `runner.flow.execution_failed` is the one key with translations.
+        let english = resolve_message("runner.flow.execution_failed", "unused fallback", "en-GB");
+        assert_eq!(english, FLOW_EXECUTION_FAILED_EN);
+
+        for locale in ["id", "id-ID", "es-419", "ja_JP", "zh-CN"] {
+            let translated = resolve_message(
+                "runner.flow.execution_failed",
+                FLOW_EXECUTION_FAILED_EN,
+                locale,
+            );
+            assert_ne!(
+                translated, FLOW_EXECUTION_FAILED_EN,
+                "`{locale}` must resolve to its own wording"
+            );
+            assert!(
+                !translated.trim().is_empty(),
+                "`{locale}` resolved to empty"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_message_leaves_untranslated_keys_on_the_fallback() {
+        // The non-`en` arm gained a lookup; that must not change any key which
+        // has no translated wording — including the other real runner keys.
+        for key in [
+            "runner.operator.op_not_found",
+            "runner.flow.required_var_missing",
+            "runner.unknown",
+        ] {
+            assert_eq!(
+                resolve_message(key, "fallback message", "nl-NL"),
+                "fallback message",
+                "`{key}` must still resolve to the caller's fallback"
+            );
+        }
     }
 
     #[test]

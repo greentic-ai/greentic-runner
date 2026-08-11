@@ -6414,6 +6414,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn activity_locale_reads_both_shapes_and_treats_blank_as_absent() {
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "nl-NL" } })),
+            Some("nl-NL")
+        );
+        assert_eq!(
+            activity_locale(&json!({ "input": { "metadata": { "locale": "en-GB" } } })),
+            Some("en-GB")
+        );
+        // The nested shape wins, matching inject_card_locale's ordering.
+        assert_eq!(
+            activity_locale(&json!({
+                "input": { "metadata": { "locale": "ja" } },
+                "metadata": { "locale": "id" },
+            })),
+            Some("ja")
+        );
+        // A blank stamp must not out-rank the deployment locale.
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "  " } })),
+            None
+        );
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": "" } })),
+            None
+        );
+        assert_eq!(
+            activity_locale(&json!({ "metadata": { "locale": 7 } })),
+            None
+        );
+        assert_eq!(activity_locale(&Value::Null), None);
+        assert_eq!(activity_locale(&json!({})), None);
+    }
+
     /// The locale table must localize, and must never be able to reintroduce
     /// the silent-on-every-channel bug.
     ///
