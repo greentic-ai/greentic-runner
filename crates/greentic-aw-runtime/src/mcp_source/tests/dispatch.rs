@@ -400,3 +400,90 @@ async fn dispatch_route_local_wasm_wrong_digest_returns_error_not_panic() {
         "a digest mismatch during dispatch must leave the cache empty"
     );
 }
+
+/// A tool that takes longer than the catalog PROBE budget must still be allowed
+/// to finish.
+///
+/// One 5s constant used to govern both "is this server alive?" and "has this
+/// tool finished its work?". Those are different questions with different
+/// budgets: a liveness probe should fail fast so a dead server is skipped
+/// quickly, while real work — a desktop agent driving an application to produce
+/// a quote, say — routinely takes tens of seconds. Sharing the constant made
+/// every such tool permanently impossible to call, reported as
+/// `tool call timed out after 5s`.
+///
+/// The delay here is deliberately longer than the probe budget and far shorter
+/// than the call budget, so this fails if the two are ever collapsed back into
+/// one constant.
+#[tokio::test]
+async fn a_slow_tool_call_is_not_cut_off_by_the_probe_budget() {
+    use std::time::Duration;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "initialize" })))
+        .respond_with(super::catalog::initialize_ok())
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(
+            json!({ "method": "notifications/initialized" }),
+        ))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_partial_json(json!({ "method": "tools/call" })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(6))
+                .set_body_json(json!({
+                    "jsonrpc": "2.0", "id": 3,
+                    "result": { "structuredContent": { "quote": "ok" } }
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let route = crate::mcp_source::route_for_tests("srv", "create_quote", &server.uri());
+    let scope =
+        crate::mcp_scope::McpCallScope::new(crate::tenant::TenantContext::new("acme", "prod"));
+    let out = dispatch_route(&route, "{}", &scope).await;
+
+    assert!(
+        !out.to_string().contains("timed out"),
+        "a 6s tool call must not be cut off by the 5s probe budget; got: {out}"
+    );
+}
+
+/// The call-budget override is parsed defensively: anything unusable falls back
+/// to the default rather than being honoured.
+///
+/// A zero is the case worth stating. Honouring it literally would time out
+/// every tool call instantly — reintroducing, via a typo in a knob, exactly the
+/// "no MCP tool can ever run" failure this split exists to remove.
+#[test]
+fn an_unusable_call_timeout_override_falls_back_to_the_default() {
+    use crate::mcp_source::types::{DEFAULT_CALL_TIMEOUT, call_timeout_from};
+    use std::time::Duration;
+
+    assert_eq!(call_timeout_from(Some("300")), Duration::from_secs(300));
+    assert_eq!(call_timeout_from(Some("  300  ")), Duration::from_secs(300));
+
+    for unusable in [
+        None,
+        Some(""),
+        Some("abc"),
+        Some("-5"),
+        Some("0"),
+        Some("1.5"),
+    ] {
+        assert_eq!(
+            call_timeout_from(unusable),
+            DEFAULT_CALL_TIMEOUT,
+            "unusable override {unusable:?} must fall back to the default"
+        );
+    }
+}

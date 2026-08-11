@@ -14,8 +14,46 @@ use serde::Deserialize;
 /// How long a built catalog is reused before a refetch is considered.
 pub(super) const CATALOG_TTL: Duration = Duration::from_secs(5 * 60);
 
-/// Per-server budget for the full connect → initialize → list/call sequence.
-pub(super) const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-server budget for a catalog PROBE (connect → initialize → tools/list).
+///
+/// Deliberately short. A probe only asks "is this server reachable and what
+/// does it offer?", and it runs for every server on the catalog path, so a dead
+/// or hanging one must be skipped quickly rather than holding up the servers
+/// that do work.
+pub(super) const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default budget for a tool CALL (connect → initialize → tools/call).
+///
+/// This is a different question from the probe budget and needs a different
+/// answer: the tool is doing real work. A desktop agent driving an application
+/// to produce a quote routinely takes tens of seconds, and sharing the probe's
+/// 5s made every such tool permanently uncallable — reported only as
+/// `tool call timed out after 5s`, which reads like a network fault rather than
+/// a budget that was never meant to cover work.
+pub(super) const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Operator override for [`DEFAULT_CALL_TIMEOUT`], in whole seconds.
+pub(super) const CALL_TIMEOUT_ENV: &str = "GREENTIC_AW_MCP_CALL_TIMEOUT_SECS";
+
+/// Resolve the tool-call budget from an already-read env value.
+///
+/// Pure so it can be tested without mutating the process environment. Anything
+/// unusable — absent, unparseable, or zero — falls back to the default rather
+/// than failing: a malformed knob must not make every MCP tool uncallable,
+/// which is the failure this whole budget split exists to remove. A zero would
+/// time out every call instantly, so it is treated as unusable rather than
+/// honoured as "no time at all".
+pub(super) fn call_timeout_from(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CALL_TIMEOUT)
+}
+
+/// The tool-call budget for this process.
+pub(super) fn call_timeout() -> Duration {
+    call_timeout_from(std::env::var(CALL_TIMEOUT_ENV).ok().as_deref())
+}
 
 /// Role a server must carry to be exposed to agentic workers (the agent-loop
 /// MCP path).
