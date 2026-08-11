@@ -491,6 +491,30 @@ impl FlowEngine {
         &self.rollout_ids
     }
 
+    /// Use an MCP tool source the embedding host built, in place of the one
+    /// [`FlowEngine::new`] derives from the process-global `GREENTIC_AW_*`
+    /// environment.
+    ///
+    /// Env can only ever name ONE tenant, so a host that serves many tenants
+    /// from one process cannot express its per-tenant catalog that way. Such a
+    /// host builds a source per tenant (see
+    /// `greentic_aw_runtime::McpCallerIdentity`) and injects it here.
+    ///
+    /// `None` LEAVES THE ENV-DERIVED SOURCE IN PLACE rather than clearing it —
+    /// callers thread this straight through from a host that may not have one,
+    /// and the standalone runner must keep working off its environment. Use
+    /// `GREENTIC_AW_MCP=0` to disable MCP outright.
+    #[cfg(feature = "agentic-worker")]
+    pub fn with_mcp_source(
+        mut self,
+        source: Option<Arc<greentic_aw_runtime::McpToolSource>>,
+    ) -> Self {
+        if let Some(source) = source {
+            self.mcp_tool_source = Some(source);
+        }
+        self
+    }
+
     /// Set an optional cross-pack resolver for `provider.invoke` nodes that
     /// reference providers in other packs (resolved via capability registry).
     pub fn set_cross_pack_resolver(&mut self, resolver: Arc<dyn CrossPackResolver>) {

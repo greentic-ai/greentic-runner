@@ -65,6 +65,8 @@ pub async fn start_pack_watcher(
     #[cfg(feature = "agentic-worker")]
     let ext_llm_port = host.ext_llm_port();
     #[cfg(feature = "agentic-worker")]
+    let mcp_source = host.mcp_source();
+    #[cfg(feature = "agentic-worker")]
     let stream_observers = host.stream_observers();
 
     reload_once(
@@ -82,6 +84,8 @@ pub async fn start_pack_watcher(
         #[cfg(feature = "agentic-worker")]
         ext_llm_port.clone(),
         #[cfg(feature = "agentic-worker")]
+        mcp_source.clone(),
+        #[cfg(feature = "agentic-worker")]
         stream_observers.clone(),
     )
     .await?;
@@ -97,6 +101,8 @@ pub async fn start_pack_watcher(
     let secrets_manager_clone = secrets_manager.clone();
     #[cfg(feature = "agentic-worker")]
     let ext_llm_port_clone = ext_llm_port.clone();
+    #[cfg(feature = "agentic-worker")]
+    let mcp_source_clone = mcp_source.clone();
     #[cfg(feature = "agentic-worker")]
     let stream_observers_clone = stream_observers.clone();
     let handle = tokio::spawn(async move {
@@ -124,6 +130,8 @@ pub async fn start_pack_watcher(
                 secrets_manager_clone.clone(),
                 #[cfg(feature = "agentic-worker")]
                 ext_llm_port_clone.clone(),
+                #[cfg(feature = "agentic-worker")]
+                mcp_source_clone.clone(),
                 #[cfg(feature = "agentic-worker")]
                 stream_observers_clone.clone(),
             )
@@ -154,6 +162,7 @@ async fn reload_once(
     wasi_policy: Arc<RunnerWasiPolicy>,
     secrets_manager: DynSecretsManager,
     #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+    #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
     #[cfg(feature = "agentic-worker")]
     stream_observers: crate::http::agent_stream::StreamObserverRegistry,
 ) -> Result<()> {
@@ -223,6 +232,8 @@ async fn reload_once(
             Arc::clone(&secrets_manager),
             #[cfg(feature = "agentic-worker")]
             ext_llm_port.clone(),
+            #[cfg(feature = "agentic-worker")]
+            mcp_source.clone(),
             #[cfg(feature = "agentic-worker")]
             Some(stream_observers.clone()),
         )

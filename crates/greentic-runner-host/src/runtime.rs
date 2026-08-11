@@ -351,6 +351,7 @@ impl TenantRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -380,6 +381,8 @@ impl TenantRuntime {
             secrets_manager,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
         )
@@ -498,6 +501,13 @@ impl TenantRuntime {
             state_store,
             state_host,
             secrets_manager,
+            // No host-injected ports on the revision-keyed path: it is
+            // constructed from a pinned pack list rather than from a
+            // `RunnerHost`, so there is none to read them from. Matches what
+            // `ext_llm_port` already does here — an engine built this way
+            // falls back to env for both.
+            #[cfg(feature = "agentic-worker")]
+            None,
             #[cfg(feature = "agentic-worker")]
             None,
             #[cfg(feature = "agentic-worker")]
@@ -587,6 +597,7 @@ impl TenantRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -602,6 +613,8 @@ impl TenantRuntime {
             secrets_manager,
             #[cfg(feature = "agentic-worker")]
             ext_llm_port,
+            #[cfg(feature = "agentic-worker")]
+            mcp_source,
             #[cfg(feature = "agentic-worker")]
             stream_observers,
             RolloutIds::default(),
@@ -624,6 +637,7 @@ impl TenantRuntime {
         state_host: Arc<dyn StateHost>,
         secrets_manager: DynSecretsManager,
         #[cfg(feature = "agentic-worker")] ext_llm_port: Option<crate::host::ExtLlmPort>,
+        #[cfg(feature = "agentic-worker")] mcp_source: Option<crate::host::McpSource>,
         #[cfg(feature = "agentic-worker")] stream_observers: Option<
             crate::http::agent_stream::StreamObserverRegistry,
         >,
@@ -665,11 +679,17 @@ impl TenantRuntime {
         // to a non-unique in-pack agent id.
         #[cfg(feature = "agentic-worker")]
         let agent_project_id = rollout.bundle_id.clone();
-        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
-        let mut engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
+        let engine = FlowEngine::new(pack_runtimes.clone(), Arc::clone(&config))
             .await
             .context("failed to prime flow engine")?
             .with_rollout_ids(rollout);
+        // A host-injected MCP source replaces the one `FlowEngine::new` derives
+        // from env; `None` leaves that env-derived source alone, so a
+        // standalone runner is unaffected.
+        #[cfg(feature = "agentic-worker")]
+        let engine = engine.with_mcp_source(mcp_source);
+        #[cfg_attr(not(feature = "agentic-worker"), allow(unused_mut))]
+        let mut engine = engine;
 
         // Wire Sorla remote-dispatch (NATS) into the flow engine BEFORE it is
         // moved behind an `Arc`. `set_remote_dispatch_handler` takes `&mut self`,

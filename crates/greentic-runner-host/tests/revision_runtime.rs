@@ -190,6 +190,8 @@ async fn build_legacy() -> Result<Arc<TenantRuntime>> {
         None,
         #[cfg(feature = "agentic-worker")]
         None,
+        #[cfg(feature = "agentic-worker")]
+        None,
     )
     .await
 }
