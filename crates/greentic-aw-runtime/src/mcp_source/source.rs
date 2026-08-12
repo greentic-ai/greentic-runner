@@ -357,6 +357,11 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
                     name: tool_def.name,
                     description: tool_def.description,
                     input_schema: tool_def.input_schema,
+                    // `greentic_mcp_exec::ToolDef` carries no output schema, so a
+                    // local-wasm component cannot advertise one yet. `None` is the
+                    // honest answer ("the server said nothing"), which is exactly
+                    // what `McpToolDef::output_schema` distinguishes from `{}`.
+                    output_schema: None,
                 })
                 .collect())
         }
