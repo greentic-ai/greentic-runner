@@ -1751,10 +1751,26 @@ impl FlowEngine {
             .cloned()
             .unwrap_or_else(|| Value::Object(JsonMap::new()));
 
+        // Route material the running pack carries. Preferred over the admin
+        // catalog, so a deployed runner with no admin credentials can dispatch
+        // at all; `None` (a pack predating the sidecar) falls back to the
+        // catalog exactly as before.
+        let pack_routes = self
+            .packs
+            .iter()
+            .find(|pack| pack.metadata().pack_id == ctx.pack_id)
+            .and_then(|pack| pack.mcp_routes());
+
         let result = crate::runner::mcp_node::invoke(
             self.mcp_tool_source.as_ref(),
+            pack_routes,
             ctx.tenant,
             &self.default_env,
+            // No team on the flow path yet: `FlowContext` carries none, and
+            // `_` is the segment admin writes for a tenant-wide secret. A
+            // team-scoped MCP secret would resolve under a different URI —
+            // tracked as an open question in the design (§8.5).
+            None,
             server_id,
             tool,
             &arguments,
