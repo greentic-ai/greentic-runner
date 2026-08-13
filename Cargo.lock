@@ -3954,9 +3954,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-mcp-client"
-version = "1.3.0-research.2"
+version = "1.3.0-research.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6961da48975633d8ba23770c19a87eff7b118f965d874fdb4e79e0d1f14cfe7"
+checksum = "0969a7157ae8470487d3784255b07e5411dc7fe692c2e1755f4dc438ed1e0342"
 dependencies = [
  "reqwest 0.13.4",
  "serde",
@@ -3968,8 +3968,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-mcp-exec"
-version = "1.3.0-research.2"
-source = "git+https://github.com/greenticai/greentic-mcp.git?rev=a4ad9e4ef8f6a6ff0496e2d3dfa2de9e35f84adc#a4ad9e4ef8f6a6ff0496e2d3dfa2de9e35f84adc"
+version = "1.3.0-research.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb69c9264eaa0d1a7cb400e0fc40edba3e4ffaad57b6fe1fa9022bf1ff4f63ce"
 dependencies = [
  "anyhow",
  "async-trait",
