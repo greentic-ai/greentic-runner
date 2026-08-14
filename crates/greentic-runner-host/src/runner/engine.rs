@@ -746,6 +746,9 @@ impl FlowEngine {
             .clone()
             .unwrap_or_else(|| snapshot.flow_id.clone());
         let flow_ir = self.get_or_load_flow(ctx.pack_id, &resume_flow).await?;
+        // Computed before `snapshot.state` is moved out below, since it borrows
+        // `snapshot` (specifically `next_node` and `awaiting_submit`).
+        let pending_card_answers = pending_from_snapshot(&snapshot, &input);
         let mut state = snapshot.state;
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
@@ -757,6 +760,10 @@ impl FlowEngine {
         // to refresh `entry` ourselves; `ensure_entry` is a no-op once
         // entry is non-null.
         state.replace_input(input.clone());
+        // Park the submitted fields for the node that was awaiting them. Only a
+        // snapshot flagged `awaiting_submit` names the waiting node in
+        // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
+        state.pending_card_answers = pending_card_answers;
         state.entry = input;
         let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
@@ -877,7 +884,10 @@ impl FlowEngine {
                     &event,
                 )
                 .await;
-            let DispatchOutcome { output, control } = match dispatch {
+            let DispatchOutcome {
+                mut output,
+                control,
+            } = match dispatch {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     if let Some(observer) = step_ctx.observer {
@@ -890,6 +900,7 @@ impl FlowEngine {
                 }
             };
 
+            attach_pending_card_answers(&mut state, node_id.as_str(), &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -2416,6 +2427,38 @@ pub struct NodeEvent<'a> {
     pub payload: &'a Value,
 }
 
+/// Safety backstop for a CONVERSATIONAL `dw.agent` node's park-and-loop cycle.
+///
+/// This is NOT a UX limit — it exists purely so that a stuck or misbehaving
+/// conversational agent (one that never emits `conversation_ended`) cannot
+/// trap a flow at the same node forever. After this many parked turns at a
+/// single conversational `dw.agent` node without a `conversation_ended`
+/// termination, the flow force-advances to the node's successor using the
+/// agent's last output. Deliberately a plain constant: no env var, no
+/// per-agent config knob.
+///
+/// Only referenced from the conversational `DwAgent` branch of
+/// `dispatch_node` and from the (already `#[cfg(feature = "agentic-worker")]`
+/// -gated) park-loop-cap unit tests below; cfg-gate it the same way so it
+/// isn't flagged dead when that feature is off (e.g. a lean
+/// `--no-default-features --features verify` build). Unlike
+/// `bump_park_turns`/etc. below, no plain (ungated) test references this
+/// constant directly, so no `test` alternative is needed here.
+#[cfg(feature = "agentic-worker")]
+const MAX_PARK_TURNS: u32 = 100;
+
+/// Submitted fields waiting to be attached to the output of the node that
+/// parked for them.
+///
+/// It cannot be attached at resume time: `drive_flow` re-dispatches
+/// `snapshot.next_node` and `state.nodes.insert` REPLACES that node's stored
+/// output, so anything written before the dispatch is destroyed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingCardAnswers {
+    node_id: String,
+    answers: JsonMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionState {
     #[serde(default)]
@@ -2432,6 +2475,28 @@ pub struct ExecutionState {
     redirect_count: u32,
     #[serde(default)]
     vars: JsonMap<String, Value>,
+    /// Per-node park-loop turn counter for conversational `dw.agent` nodes,
+    /// keyed by node id. Mirrors `redirect_count`'s per-execution safety-cap
+    /// pattern, but tracked per node since a flow may hold more than one
+    /// conversational agent.
+    #[serde(default)]
+    park_turns: HashMap<String, u32>,
+    /// Marks a node as awaiting an async `dw.agent` NATS dispatch response.
+    /// Set on dispatch, checked-and-cleared on resume; mirrors `park_turns`'
+    /// per-node, serde-defaulted, persisted-in-snapshot pattern.
+    #[serde(default)]
+    pending_agent_await: HashMap<String, ()>,
+    /// Nodes that dispatched an approval request and are parked awaiting the
+    /// decision. Set on dispatch, cleared when the response re-enters the node.
+    /// Without it a stray inbound arriving mid-await would look like a first
+    /// entry and re-dispatch — a duplicate approval request to the operator.
+    #[serde(default)]
+    pending_approval_await: HashMap<String, ()>,
+    /// Submitted fields awaiting attachment to their node's output. In practice
+    /// never survives a snapshot — it is consumed by the first dispatch after a
+    /// resume — but is serde-defaulted like its neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_card_answers: Option<PendingCardAnswers>,
 }
 
 impl ExecutionState {
@@ -2444,6 +2509,10 @@ impl ExecutionState {
             last_output: None,
             redirect_count: 0,
             vars: JsonMap::new(),
+            park_turns: HashMap::new(),
+            pending_agent_await: HashMap::new(),
+            pending_approval_await: HashMap::new(),
+            pending_card_answers: None,
         }
     }
 
@@ -2716,6 +2785,61 @@ fn node_output_view(payload: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+/// Merge the pending submitted fields into `output` when it belongs to the node
+/// that parked for them, then CONSUME the pending entry.
+///
+/// Consuming rather than reading is what stops a loop back through the same node
+/// (without a resume) re-attaching stale answers.
+///
+/// Called immediately before `state.nodes.insert`, and that position is
+/// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
+fn attach_pending_card_answers(state: &mut ExecutionState, node_id: &str, output: &mut NodeOutput) {
+    let is_target = state
+        .pending_card_answers
+        .as_ref()
+        .is_some_and(|pending| pending.node_id == node_id);
+    if !is_target {
+        return;
+    }
+    let Some(pending) = state.pending_card_answers.take() else {
+        return;
+    };
+    // No `ok` check on purpose: the answers are real whether or not the
+    // re-render succeeded, and dropping them would let a transient render error
+    // silently destroy what someone typed.
+    let Some(map) = output.payload.as_object_mut() else {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output payload is not an object; submitted answers not attached"
+        );
+        return;
+    };
+    if map.contains_key("answers") {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output already carries `answers`; overwriting with the submitted fields"
+        );
+    }
+    map.insert("answers".to_string(), Value::Object(pending.answers));
+}
+
+/// Decide what to park for the node awaiting a submit, from the snapshot being
+/// resumed and the fresh input that carries the submission.
+///
+/// Only a snapshot flagged `awaiting_submit` names the waiting node in
+/// `next_node`; a `session.wait` snapshot names its SUCCESSOR, which has not
+/// run yet, so attaching answers there would name the wrong node. Returns
+/// `None` in that case, so nothing gets parked.
+fn pending_from_snapshot(snapshot: &FlowSnapshot, input: &Value) -> Option<PendingCardAnswers> {
+    if !snapshot.awaiting_submit {
+        return None;
+    }
+    Some(PendingCardAnswers {
+        node_id: snapshot.next_node.clone(),
+        answers: submitted_fields(input),
+    })
 }
 
 fn outcome_meta(output: &Value) -> Value {
@@ -3969,6 +4093,94 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Where the submit envelope carries its metadata, across both delivery paths.
+///
+/// `greentic-start` wraps the activity (`entry.input.metadata`); the direct
+/// runner path does not (`entry.metadata`). Both the `response.*` synthesis in
+/// [`build_routing_context`] and [`submitted_fields`] resolve through here, so
+/// the two can never disagree about which object is the metadata.
+fn resolve_entry_metadata(entry: &Value) -> Option<&Value> {
+    entry
+        .pointer("/input/metadata")
+        .or_else(|| entry.pointer("/metadata"))
+}
+
+/// The fields a person actually submitted, as one flat map.
+///
+/// The envelope root is `entry.input` when that is an object (the wrapped
+/// `greentic-start` path) and `entry` itself otherwise (the Run Demo path,
+/// whose inputs sit at the root — see that repo's
+/// `flow_demo/host.rs::build_submit_payload`). Resolving it is not bookkeeping:
+/// taking `entry`'s root keys directly on the wrapped path would make one field
+/// named `input` holding the entire nested activity.
+///
+/// The rule:
+///
+/// > the envelope root's keys except `metadata` and `text`, unioned with the
+/// > resolved metadata object's keys except `action`; on collision the envelope
+/// > root wins.
+///
+/// `text` is the message body in both shapes and is already exposed as
+/// `response.text`. `action` is the route discriminator, already exposed as
+/// `response.action` — but a key named `action` at the envelope ROOT is counted,
+/// because on the demo path that is a real keystroke at a different level from
+/// the routing metadata.
+///
+/// NOTE: `response.*` must NOT be rebuilt on top of this. It shares only
+/// [`resolve_entry_metadata`]. Feeding `response` this map would drop
+/// `response.action`, which every parking card's conditional routing tests —
+/// and a failed condition silently takes the false branch.
+fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
+    let mut fields = JsonMap::new();
+    if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
+        for (key, value) in meta {
+            if key == "action" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    let envelope = entry
+        .get("input")
+        .filter(|v| v.is_object())
+        .unwrap_or(entry);
+    if let Some(map) = envelope.as_object() {
+        for (key, value) in map {
+            if key == "metadata" || key == "text" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    fields
+}
+
+/// Build the context a routing condition is evaluated against.
+///
+/// Layout:
+/// ```text
+/// {
+///   ...output.payload...,     // this node's fields, spread at the top level
+///   "entry":    <flow entry>,
+///   "in":       <flow entry>, // alias for entry
+///   "node":     { "<id>": <node_output_view>, ... },  // every prior node
+///   "response": { <key>: <value>, ... },              // from envelope metadata
+///   "event":    "<outcome>"   // the port this node routes on
+/// }
+/// ```
+///
+/// The spread comes FIRST and the named keys are inserted after, so
+/// **`entry`, `in`, `node`, `response` and `event` are reserved**: a component
+/// whose payload has a top-level field with one of those names has it shadowed
+/// here. That is deliberate — the spread is what lets a guard say `q_age >= 18`
+/// about its own node (and is what the designer's source-node prefix strip
+/// relies on) — but it means those five names are not usable as payload fields
+/// in a routed node.
+///
+/// `node` is the same `outputs_map()` projection [`template_context`] exposes,
+/// so a condition resolves `node.<id>.<field>` exactly as a param template
+/// resolves `{{node.<id>.<field>}}`. Note `vars` is NOT here: `vars.x` in a
+/// condition does not resolve, whereas `{{vars.x}}` in a param does.
 fn build_routing_context(
     output: &NodeOutput,
     state: &ExecutionState,
@@ -8791,6 +9003,171 @@ mod tests {
         });
         let snap: FlowSnapshot = serde_json::from_value(raw).expect("legacy snapshot decodes");
         assert!(!snap.awaiting_submit);
+    }
+
+    /// A resumed node's submitted fields must be readable from its output by a
+    /// LATER node, through the ordinary `{{node.<id>.<field>}}` grammar.
+    ///
+    /// This is the whole feature, and it is also the ordering proof: the resume
+    /// RE-DISPATCHES the parked node and `state.nodes.insert` replaces its stored
+    /// output, so an implementation that attaches the answers before the dispatch
+    /// makes this test fail. Do not "simplify" the merge earlier.
+    #[test]
+    fn submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node() {
+        let mut state = ExecutionState::new(json!({}));
+        // The parked node has already run once; its stored output is what the
+        // resume dispatch will REPLACE.
+        state.nodes.insert(
+            "card".to_string(),
+            NodeOutput::new(json!({ "event": "rendered" })),
+        );
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "submit" }
+            })),
+        });
+
+        // Simulate the re-dispatch: a FRESH output object, exactly as the loop
+        // builds one, then the merge at its real call position.
+        let mut fresh = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut fresh);
+        state.nodes.insert("card".to_string(), fresh);
+
+        // Read it the way a downstream node's config would.
+        let ctx = template_context(&state, Value::Null);
+        let rendered = render_template_value(
+            &json!("{{node.card.answers.email}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+        assert_eq!(rendered, json!("a@b.c"));
+    }
+
+    #[test]
+    fn the_card_render_context_carries_the_answers_too() {
+        // One write, two read surfaces: `outputs_map()` feeds {{node.…}} and
+        // `context()` feeds the `state` handed to the adaptive-card component.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut output);
+        state.nodes.insert("card".to_string(), output);
+
+        let ctx = state.context();
+        assert_eq!(
+            ctx["nodes"]["card"]["payload"]["answers"]["email"],
+            json!("a@b.c")
+        );
+    }
+
+    #[test]
+    fn answers_are_absent_before_any_submit() {
+        // Absent is not empty: absent means never submitted, {} means submitted
+        // with no fields. Do not collapse the two.
+        let mut state = ExecutionState::new(json!({}));
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut output);
+        assert!(output.payload.get("answers").is_none());
+    }
+
+    #[test]
+    fn a_button_with_no_inputs_yields_an_empty_answers_object() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "metadata": { "action": "approve" } })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut output);
+        assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    #[test]
+    fn the_pending_answers_are_consumed_exactly_once() {
+        // A loop back through the same node without a resume must not re-attach
+        // stale answers.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut first = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut first);
+        assert!(first.payload.get("answers").is_some());
+
+        let mut second = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &mut second);
+        assert!(
+            second.payload.get("answers").is_none(),
+            "consumed, not read"
+        );
+    }
+
+    #[test]
+    fn answers_attach_even_when_the_redispatch_failed() {
+        // The answers are real regardless of whether the re-render succeeded.
+        // Dropping them would let a transient render error destroy what someone
+        // typed.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "ok": false, "error": { "code": "boom" } }));
+        attach_pending_card_answers(&mut state, "card", &mut output);
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answers_are_not_attached_to_a_different_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut other = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "next_step", &mut other);
+        assert!(other.payload.get("answers").is_none());
+        assert!(
+            state.pending_card_answers.is_some(),
+            "still pending for its own node"
+        );
+    }
+
+    #[test]
+    fn pending_from_snapshot_names_next_node_when_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "card".to_string(),
+            awaiting_submit: true,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let pending = pending_from_snapshot(&snapshot, &input).expect("should park answers");
+        assert_eq!(pending.node_id, "card");
+        assert_eq!(pending.answers.get("email"), Some(&json!("a@b.c")));
+    }
+
+    #[test]
+    fn pending_from_snapshot_is_none_when_not_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "successor".to_string(),
+            awaiting_submit: false,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c" });
+        assert!(pending_from_snapshot(&snapshot, &input).is_none());
     }
 }
 
