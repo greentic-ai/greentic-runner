@@ -3219,27 +3219,71 @@ fn node_output_view(payload: &Value) -> Value {
     }
 }
 
+/// The result of reading `answer_fields` from a card node's raw input mapping.
+///
+/// `Absent` and `Malformed` both fall back to the permissive (unfiltered)
+/// path in [`attach_pending_card_answers`] — the contract is "absent means
+/// this pack predates the allow-list", so failing permissively rather than
+/// closed is deliberate for both. They are kept as separate variants (rather
+/// than collapsed into one `None`) purely so the caller can log the
+/// `Malformed` case: an ordinary pre-upgrade pack has no `answer_fields` key
+/// at all and must stay quiet, but a *present-and-broken* value is a
+/// designer-side bug reproducing this feature's original leak, and must not
+/// be silently indistinguishable from the ordinary case in the logs.
+enum DeclaredAnswerFields {
+    /// The `answer_fields` key is not present at all. The ordinary case for
+    /// every pack built before this feature — must not be logged.
+    Absent,
+    /// The key is present but is not a valid array of strings (wrong type,
+    /// or an array containing a non-string entry — e.g. an unresolved
+    /// template). Distinct from `Absent` so it can be surfaced.
+    Malformed,
+    /// The key is present and a valid (possibly empty) array of strings.
+    Declared(Vec<String>),
+}
+
 /// The card's own declared allow-list for `answers`, read from its raw input
 /// mapping (`HostNode::payload_expr`) BEFORE template rendering — greentic-designer
 /// writes the card's declared `Input.*` ids under this key
 /// (`answer_fields: ["field_a", "field_b", ...]`) at composer-save time.
 ///
-/// `None` means the key is absent — a pack built before this change, or any
+/// Reading `payload_expr` here is safe from upstream interference: it is
+/// built once, from the pack's `Node.input.mapping`, in `HostNode`'s
+/// `From<Node>` impl, and `flow_ir.nodes` is never mutated for the lifetime of
+/// a `drive_flow` call (only `.get()` — see `engine.rs` near `drive_flow`'s
+/// dispatch loop). The dispatch loop's own template render
+/// (`let payload_template = node.payload_expr.clone();`, a few lines above the
+/// call site) clones it into a separate value before rendering, so the render
+/// never touches `node.payload_expr` itself. By the time this function runs —
+/// after that node has already been dispatched — `node.payload_expr` is
+/// byte-identical to what was loaded from the pack.
+///
+/// `Absent` means the key is absent — a pack built before this change, or any
 /// path that never runs the designer injector. That is deliberately treated as
 /// "no allow-list", not "empty allow-list": those packs, and the fixtures for
 /// paths that skip the injector, would otherwise silently lose every submitted
 /// answer. A present-but-malformed value (not an array, or containing a
-/// non-string entry) is likewise treated as absent, so a malformed pack fails
-/// permissively (today's behaviour) instead of collapsing to zero answers.
+/// non-string entry) is likewise treated as permissive (see
+/// [`DeclaredAnswerFields`]), so a malformed pack fails open instead of
+/// collapsing to zero answers — but unlike `Absent`, it is observable.
 ///
-/// `Some(vec![])` — a present but EMPTY array — means the card genuinely
+/// `Declared(vec![])` — a present but EMPTY array — means the card genuinely
 /// declares no inputs; the caller must produce `{}`, not the unfiltered set.
-fn declared_answer_fields(payload_expr: &Value) -> Option<Vec<String>> {
-    let raw = payload_expr.get("answer_fields")?;
-    let arr = raw.as_array()?;
-    arr.iter()
+fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
+    let Some(raw) = payload_expr.get("answer_fields") else {
+        return DeclaredAnswerFields::Absent;
+    };
+    let Some(arr) = raw.as_array() else {
+        return DeclaredAnswerFields::Malformed;
+    };
+    match arr
+        .iter()
         .map(|entry| entry.as_str().map(str::to_string))
         .collect::<Option<Vec<String>>>()
+    {
+        Some(list) => DeclaredAnswerFields::Declared(list),
+        None => DeclaredAnswerFields::Malformed,
+    }
 }
 
 /// Merge the pending submitted fields into `output` when it belongs to the node
@@ -3291,7 +3335,7 @@ fn attach_pending_card_answers(
         );
     }
     let answers = match declared_answer_fields(&node.payload_expr) {
-        Some(allow_list) => {
+        DeclaredAnswerFields::Declared(allow_list) => {
             let allowed: std::collections::HashSet<&str> =
                 allow_list.iter().map(String::as_str).collect();
             pending
@@ -3300,7 +3344,19 @@ fn attach_pending_card_answers(
                 .filter(|(key, _)| allowed.contains(key.as_str()))
                 .collect()
         }
-        None => pending.answers,
+        DeclaredAnswerFields::Malformed => {
+            // Distinct from `Absent` on purpose: an ordinary pre-upgrade pack
+            // has no `answer_fields` key and must stay quiet, but a
+            // present-and-broken value reproduces this feature's original
+            // leak (the full unfiltered envelope, including any secret
+            // references, ships as `answers`) and must be observable.
+            tracing::warn!(
+                node_id = %node_id,
+                "answer_fields present but malformed; falling back to unfiltered answers"
+            );
+            pending.answers
+        }
+        DeclaredAnswerFields::Absent => pending.answers,
     };
     map.insert("answers".to_string(), Value::Object(answers));
 }
@@ -10390,6 +10446,90 @@ mod tests {
         attach_pending_card_answers(&mut state, "card", &node, &mut output);
 
         assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    /// The three-way distinction `declared_answer_fields` exists to preserve:
+    /// absent (ordinary pre-upgrade pack) and malformed (a designer-side bug)
+    /// both fall back to the SAME permissive, unfiltered `answers` — that part
+    /// is asserted here — but only the malformed case is meant to be logged
+    /// (`tracing::warn!` in `attach_pending_card_answers`). This test can only
+    /// assert the behavioural half: nothing in this crate's dev-dependencies
+    /// captures `tracing` output (no `tracing-test`/subscriber-capture
+    /// harness is wired up here), and adding one purely to assert a log line
+    /// felt like more machinery than the assertion warrants. The `Malformed`
+    /// arm's `tracing::warn!` call is exercised (not just present in source)
+    /// by the "malformed" case below, since the same match arm both logs and
+    /// returns the unfiltered map — a change that broke or removed the log
+    /// call, if it also broke the fallback, would fail this test.
+    #[test]
+    fn absent_and_malformed_answer_fields_both_stay_permissive_but_declared_filters() {
+        let entry = json!({ "email": "a@b.c", "phone": "555-1234" });
+
+        // Absent: no `answer_fields` key at all.
+        let mut absent_state = ExecutionState::new(json!({}));
+        absent_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut absent_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut absent_state,
+            "card",
+            &plain_card_node(),
+            &mut absent_output,
+        );
+        assert_eq!(
+            absent_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "absent must stay fully permissive"
+        );
+
+        // Malformed: the key is present but is not an array of strings (e.g.
+        // an unresolved template, or a wrong-typed value from a designer bug).
+        let mut malformed_state = ExecutionState::new(json!({}));
+        malformed_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let malformed_node = HostNode {
+            payload_expr: json!({ "answer_fields": "{{unresolved.template}}" }),
+            ..plain_card_node()
+        };
+        let mut malformed_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut malformed_state,
+            "card",
+            &malformed_node,
+            &mut malformed_output,
+        );
+        assert_eq!(
+            malformed_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "malformed must ALSO stay fully permissive, same as absent"
+        );
+
+        // Declared: a valid, non-empty allow-list actually filters.
+        let mut declared_state = ExecutionState::new(json!({}));
+        declared_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let declared_node = HostNode {
+            payload_expr: json!({ "answer_fields": ["email"] }),
+            ..plain_card_node()
+        };
+        let mut declared_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut declared_state,
+            "card",
+            &declared_node,
+            &mut declared_output,
+        );
+        assert_eq!(
+            declared_output.payload["answers"],
+            json!({ "email": "a@b.c" }),
+            "declared must filter down to exactly the allow-listed keys"
+        );
     }
 
     #[test]
