@@ -57,6 +57,7 @@ const NATIVE_OP_KEYS: &[&str] = &[
     "session.wait",
     "state.get",
     "state.set",
+    "var.set",
     "dw.agent",
     "dw.agent_graph",
     "sorla.call",

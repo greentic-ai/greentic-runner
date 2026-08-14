@@ -4001,9 +4001,7 @@ mod tests {
     /// point; a test listing strings alone would have gone stale the same way
     /// the doc comment did.
     ///
-    /// Ported from #686 on `research`, minus its `var.set` arm: this lane's
-    /// engine has no `VarSet` variant, and listing a key the engine cannot
-    /// dispatch is the same defect mirrored.
+    /// Ported from #686 on `research`, `var.set` arm included.
     fn native_op_key_for(kind: &NodeKind) -> Option<&'static str> {
         match kind {
             // Not op-keys: these ARE the generic component paths.
@@ -4016,6 +4014,7 @@ mod tests {
             NodeKind::FlowGoto => Some("flow.goto"),
             NodeKind::BuiltinStateGet => Some("state.get"),
             NodeKind::BuiltinStateSet => Some("state.set"),
+            NodeKind::VarSet { .. } => Some("var.set"),
             NodeKind::Wait => Some("session.wait"),
             NodeKind::DwAgent { .. } => Some("dw.agent"),
             NodeKind::DwAgentGraph { .. } => Some("dw.agent_graph"),
@@ -4038,6 +4037,7 @@ mod tests {
             "flow.goto",
             "state.get",
             "state.set",
+            "var.set",
             "session.wait",
             "dw.agent",
             "dw.agent_graph",
