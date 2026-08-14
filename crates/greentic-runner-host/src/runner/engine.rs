@@ -4711,6 +4711,87 @@ mod approval_gate_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The loader and the engine must agree on which op-keys are runner-native.
+    ///
+    /// `flow_adapter::NATIVE_OP_KEYS` decides which keys the LOADER preserves
+    /// verbatim instead of wrapping in a `component.exec` node; the match in
+    /// `component_label` above is what the ENGINE dispatches. Its doc says to
+    /// keep the two in lockstep, and nothing enforced it — so `flow.goto`
+    /// shipped with an engine arm the loader never routed a node to, which is
+    /// silent: the node builds, loads as a generic component, and simply is not
+    /// a goto any more.
+    ///
+    /// `native_op_key_for` exists to make that mechanical. It is an EXHAUSTIVE
+    /// match, so adding a `NodeKind` variant fails to compile here until
+    /// somebody says whether the loader must preserve it — which is the whole
+    /// point; a test listing strings alone would have gone stale the same way
+    /// the doc comment did.
+    fn native_op_key_for(kind: &NodeKind) -> Option<&'static str> {
+        match kind {
+            // Not op-keys: these ARE the generic component paths.
+            NodeKind::Exec { .. } | NodeKind::PackComponent { .. } => None,
+            // Prefix-matched by `is_native_op_key`, not listed in the array.
+            NodeKind::BuiltinEmit { .. } | NodeKind::Mcp { .. } => None,
+
+            NodeKind::ProviderInvoke => Some("provider.invoke"),
+            NodeKind::FlowCall => Some("flow.call"),
+            NodeKind::FlowGoto => Some("flow.goto"),
+            NodeKind::BuiltinStateGet => Some("state.get"),
+            NodeKind::BuiltinStateSet => Some("state.set"),
+            NodeKind::VarSet { .. } => Some("var.set"),
+            NodeKind::Wait => Some("session.wait"),
+            NodeKind::DwAgent { .. } => Some("dw.agent"),
+            NodeKind::DwAgentGraph { .. } => Some("dw.agent_graph"),
+            NodeKind::SorlaCall { .. } => Some("sorla.call"),
+            NodeKind::OperalaCall { .. } => Some("operala.call"),
+            NodeKind::AgenticCall { .. } => Some("agentic.call"),
+            NodeKind::TelcoXCall { .. } => Some("telco-x.call"),
+            NodeKind::ApprovalCall { .. } => Some("approval.call"),
+        }
+    }
+
+    #[test]
+    fn every_engine_dispatched_op_key_is_native_to_the_loader() {
+        // Mirrors `component_label`'s builtin arms. Each string here is one the
+        // engine will dispatch itself, so the loader must hand it through
+        // unwrapped.
+        for key in [
+            "provider.invoke",
+            "flow.call",
+            "flow.goto",
+            "state.get",
+            "state.set",
+            "var.set",
+            "session.wait",
+            "dw.agent",
+            "dw.agent_graph",
+            "sorla.call",
+            "operala.call",
+            "agentic.call",
+            "telco-x.call",
+            "approval.call",
+        ] {
+            assert!(
+                crate::runner::flow_adapter::is_native_op_key(key),
+                "the engine dispatches `{key}`, but the loader does not treat it \
+                 as native — it will be wrapped as a generic component and the \
+                 engine arm becomes unreachable"
+            );
+        }
+        // The two prefix families, which are deliberately not in the array.
+        assert!(crate::runner::flow_adapter::is_native_op_key(
+            "emit.response"
+        ));
+        assert!(crate::runner::flow_adapter::is_native_op_key(
+            "mcp:srv/tool"
+        ));
+        // And a genuine pack component must NOT be native.
+        assert!(!crate::runner::flow_adapter::is_native_op_key("mcp.exec"));
+
+        // Keeps `native_op_key_for` live: its exhaustiveness is the guard.
+        assert_eq!(native_op_key_for(&NodeKind::FlowGoto), Some("flow.goto"));
+    }
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
         Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,
