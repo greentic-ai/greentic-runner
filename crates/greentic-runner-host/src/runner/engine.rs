@@ -9169,6 +9169,194 @@ mod tests {
         let input = json!({ "email": "a@b.c" });
         assert!(pending_from_snapshot(&snapshot, &input).is_none());
     }
+
+    /// Build a two-node flow: `card` (`Routing::Custom`, parks until
+    /// `response.action == "submit"`) -> `next` (reads
+    /// `{{node.card.answers.email}}`). `card`'s first pass has no
+    /// `response.action`, so its conditional routing falls through and it
+    /// parks with `awaiting_submit: true`.
+    fn card_answers_flow() -> Flow {
+        let card_id = NodeId::from_str("card").unwrap();
+        let next_id = NodeId::from_str("next").unwrap();
+
+        let card_node = Node {
+            id: card_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "event": "rendered" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Custom(json!([
+                { "condition": "response.action == \"submit\"", "to": next_id.to_string() }
+            ])),
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let next_node = Node {
+            id: next_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "got_email": "{{node.card.answers.email}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(card_id.clone(), card_node);
+        nodes.insert(next_id.clone(), next_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("card.answers.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(card_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({}),
+            },
+        }
+    }
+
+    /// The covering test for both findings from Task 3 code review: this
+    /// drives the REAL `FlowEngine::resume` -> `drive_flow` -> dispatch-loop
+    /// path, not a hand-simulated `ExecutionState`. It pins BOTH the `resume`
+    /// wiring (`state.pending_card_answers = pending_card_answers;`, engine.rs
+    /// near `resume`) AND the merge position immediately before
+    /// `state.nodes.insert` in the dispatch loop: deleting or moving either
+    /// makes this test fail, unlike the hand-simulated
+    /// `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`,
+    /// whose ordering sensitivity is a property of its own three
+    /// hand-written statements rather than of the engine.
+    #[test]
+    fn card_answers_survive_a_real_park_and_resume_and_reach_a_later_node() {
+        let flow = card_answers_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "card.answers.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        // First turn: no `response.action` yet, so `card`'s conditional
+        // routing falls through and it parks awaiting the submit.
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting at the card node, got {other:?}"),
+        };
+        assert!(
+            snapshot.awaiting_submit,
+            "the card's conditional fall-through must set awaiting_submit"
+        );
+        assert_eq!(snapshot.next_node, "card");
+
+        // Resume with the submitted fields. `resume` must park them, the
+        // dispatch loop must re-run `card`, and `attach_pending_card_answers`
+        // must merge them into its FRESH re-dispatched output before `next`
+        // runs.
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let result2 = rt.block_on(engine.resume(ctx2, snapshot, input)).unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "the submit must route past the card to `next`"
+        );
+        assert_eq!(
+            result2.node_outputs["card"]["answers"]["email"],
+            json!("a@b.c"),
+            "the card's own re-dispatched output must carry the merged answers"
+        );
+        assert_eq!(
+            result2.node_outputs["next"]["got_email"],
+            json!("a@b.c"),
+            "`next`, a LATER node, must read the answers through {{node.card.answers.email}}"
+        );
+    }
 }
 
 use tracing::Instrument;
