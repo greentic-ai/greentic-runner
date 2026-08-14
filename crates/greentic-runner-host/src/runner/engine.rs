@@ -106,6 +106,14 @@ pub struct FlowSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_flow: Option<String>,
     pub next_node: String,
+    /// True only when this snapshot was taken because conditional routing fell
+    /// through and the node parked at ITSELF awaiting the next submit — the
+    /// card case. False for `session.wait`, whose `next_node` is the SUCCESSOR,
+    /// not the node that was waiting; attaching a person's answers there would
+    /// name a node that had not run yet. Defaulted so snapshots written before
+    /// this field behave exactly as they did.
+    #[serde(default)]
+    pub awaiting_submit: bool,
     pub state: ExecutionState,
 }
 
@@ -1031,6 +1039,7 @@ impl FlowEngine {
                                 next_flow: (current_flow_id != step_ctx.flow_id)
                                     .then_some(current_flow_id.clone()),
                                 next_node: node_id.as_str().to_string(),
+                                awaiting_submit: true,
                                 state: snapshot_state,
                             };
                             let node_outputs = state.outputs_map();
@@ -1080,6 +1089,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: resume_target.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -1103,6 +1113,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: node_id.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -1140,6 +1151,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: node_id.as_str().to_string(), // SELF, not successor
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -9966,6 +9978,20 @@ mod tests {
     fn submitted_fields_is_empty_for_a_button_with_no_inputs() {
         let entry = json!({ "metadata": { "action": "approve" } });
         assert!(submitted_fields(&entry).is_empty());
+    }
+
+    #[test]
+    fn an_old_snapshot_without_the_flag_deserializes_as_not_awaiting_submit() {
+        // Snapshots persisted before this field existed must keep their exact
+        // current behaviour: no answers attached.
+        let raw = json!({
+            "pack_id": "p",
+            "flow_id": "f",
+            "next_node": "card",
+            "state": {}
+        });
+        let snap: FlowSnapshot = serde_json::from_value(raw).expect("legacy snapshot decodes");
+        assert!(!snap.awaiting_submit);
     }
 }
 
