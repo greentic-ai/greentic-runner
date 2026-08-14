@@ -264,6 +264,7 @@ mod tests {
                 flow_id: "flow.main".into(),
                 next_flow: None,
                 next_node: "node-2".into(),
+                awaiting_submit: false,
                 state,
             },
         }

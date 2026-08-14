@@ -105,6 +105,14 @@ pub struct FlowSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_flow: Option<String>,
     pub next_node: String,
+    /// True only when this snapshot was taken because conditional routing fell
+    /// through and the node parked at ITSELF awaiting the next submit — the
+    /// card case. False for `session.wait`, whose `next_node` is the SUCCESSOR,
+    /// not the node that was waiting; attaching a person's answers there would
+    /// name a node that had not run yet. Defaulted so snapshots written before
+    /// this field behave exactly as they did.
+    #[serde(default)]
+    pub awaiting_submit: bool,
     pub state: ExecutionState,
 }
 
@@ -952,6 +960,7 @@ impl FlowEngine {
                                 next_flow: (current_flow_id != step_ctx.flow_id)
                                     .then_some(current_flow_id.clone()),
                                 next_node: node_id.as_str().to_string(),
+                                awaiting_submit: true,
                                 state: snapshot_state,
                             };
                             let output_value = state.finalize_with(Some(output.payload.clone()));
@@ -999,12 +1008,79 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: resume_target.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let output_value = state.clone().finalize_with(None);
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
+                        node_outputs,
+                    ));
+                }
+                NodeControl::LoopHere { reason } => {
+                    // Conversational dw.agent: park and re-enter THIS node so the
+                    // next user message drives the next turn. Render the reply
+                    // (finalize_with Some) — unlike NodeControl::Wait, which
+                    // resumes at the successor and finalizes with None.
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(),
+                        awaiting_submit: false,
+                        state: snapshot_state,
+                    };
+                    let node_outputs = state.outputs_map();
+                    let output_value = state.finalize_with(Some(output.payload.clone()));
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                        node_outputs,
+                    ));
+                }
+                NodeControl::AwaitHere {
+                    reason,
+                    correlation_id: _,
+                } => {
+                    // Await the async agent response, but resume at THIS node so
+                    // the conversational branch evaluates `terminated_by`. Mirror the
+                    // remote-await Wait snapshot construction EXCEPT next_node = self.
+                    //
+                    // Keying note: the resume snapshot is stored under the SAME
+                    // `(session_hint, scope_hash)` store key as every other wait kind
+                    // (`build_store_ctx` strips the correlation from the key). The
+                    // correlation id is NOT part of the key — it only drives how the
+                    // NATS response reconstructs the hint/scope (RuntimeSessionResumer)
+                    // so it recomputes that same key. So an AwaitHere park and a later
+                    // LoopHere park for the same conversation occupy the same single
+                    // slot; they never coexist because each park overwrites it. Safety
+                    // rests on sequential single-slot resume, not key separation — an
+                    // inbound arriving mid-await resolves to this slot (a known
+                    // interleaving limitation, tracked as a follow-up).
+                    let mut snapshot_state = state.clone();
+                    snapshot_state.clear_egress();
+                    let snapshot = FlowSnapshot {
+                        pack_id: step_ctx.pack_id.to_string(),
+                        flow_id: step_ctx.flow_id.to_string(),
+                        next_flow: (current_flow_id != step_ctx.flow_id)
+                            .then_some(current_flow_id.clone()),
+                        next_node: node_id.as_str().to_string(), // SELF, not successor
+                        awaiting_submit: false,
+                        state: snapshot_state,
+                    };
+                    let node_outputs = state.outputs_map();
+                    // Finalize with None (render nothing here — the reply, if any,
+                    // was already surfaced before the dispatch): match the
+                    // remote-await Wait finalize semantics confirmed in Task 1.
+                    let output_value = state.clone().finalize_with(None);
+                    return Ok(FlowExecution::waiting(
+                        output_value,
+                        FlowWait { reason, snapshot },
+                        node_outputs,
                     ));
                 }
                 NodeControl::Jump(jump) => {
@@ -7620,6 +7696,1101 @@ mod tests {
             Some(&json!(1)),
             "vars.counter (vars_init) must survive the park/resume"
         );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    struct StubAgentHandler {
+        payload: serde_json::Value,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for StubAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a 2-node flow: a `dw.agent` node (id "agent", conversational as
+    /// given) routing to an emit "thanks" node that ends the flow.
+    #[cfg(feature = "agentic-worker")]
+    fn conversational_dw_flow(conversational: bool) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let agent_id = NodeId::from_str("agent").unwrap();
+        let thanks_id = NodeId::from_str("thanks").unwrap();
+        nodes.insert(
+            agent_id.clone(),
+            HostNode {
+                kind: NodeKind::DwAgent {
+                    agent_id: "a".to_string(),
+                    conversational,
+                },
+                component: "dw.agent".to_string(),
+                component_id: "dw.agent".to_string(),
+                operation_name: Some("a".to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "user_text": "hi" }),
+                routing: Routing::Next {
+                    node_id: thanks_id.clone(),
+                },
+                vars_out: None,
+            },
+        );
+        nodes.insert(
+            thanks_id.clone(),
+            HostNode {
+                kind: NodeKind::BuiltinEmit {
+                    kind: EmitKind::Response,
+                },
+                component: "emit.response".to_string(),
+                component_id: "emit.response".to_string(),
+                operation_name: None,
+                operation_in_mapping: None,
+                payload_expr: json!({ "text": "thanks" }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            slot_schema: None,
+            id: "conv.flow".to_string(),
+            start: Some(agent_id),
+            nodes,
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with a stub agent handler returning `payload`.
+    /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn conv_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "conv.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-conv"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_parks_and_loops_on_normal_reply() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (park-loop), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "must re-enter the dw.agent node itself"
+        );
+        // The reply is rendered in the parked output.
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent reply must be rendered before parking: {:?}",
+            result.output
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_advances_on_conversation_ended() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended must advance to the successor and complete, got {:?}",
+            result.status
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn non_conversational_dw_agent_never_loops() {
+        // Even with terminated_by == conversation_ended, a non-conversational
+        // node just routes onward (today's one-shot behaviour) — never parks.
+        for tb in ["final_reply", "conversation_ended"] {
+            let engine = conv_engine(
+                conversational_dw_flow(false),
+                json!({ "reply": "x", "trail": [], "terminated_by": tb }),
+            );
+            let rt = Runtime::new().unwrap();
+            let result = rt
+                .block_on(engine.execute(conv_ctx(), Value::Null))
+                .unwrap();
+            assert!(
+                matches!(result.status, FlowStatus::Completed),
+                "non-conversational must complete (route onward) for terminated_by={tb}, got {:?}",
+                result.status
+            );
+        }
+    }
+
+    /// Safety-backstop behavioral test: a conversational `dw.agent` that
+    /// never emits `conversation_ended` must keep parking up to
+    /// `MAX_PARK_TURNS` turns, then force-advance to the successor instead
+    /// of trapping the flow forever.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_force_advances_after_park_loop_cap() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "still thinking", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1, got {other:?}"),
+        };
+
+        // Turns 2..MAX_PARK_TURNS (exclusive) must keep parking.
+        for turn in 2..MAX_PARK_TURNS {
+            let result = rt
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting at turn {turn}, got {other:?}"),
+            };
+        }
+
+        // The MAX_PARK_TURNS-th turn must force-advance instead of parking again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at turn {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+    }
+
+    // ── NATS conversational `dw.agent` park-loop (Task 6) ──────────────────
+    //
+    // These tests drive the SAME `conversational_dw_flow`/`conv_ctx` harness as
+    // the in-process tests above, but with `DwAgentDispatch::Nats` and a stub
+    // `RemoteDispatchHandler` that never touches a live NATS server — it just
+    // records the dispatch and immediately returns `AwaitingResponse`, exactly
+    // like `dw_agent_nats_mode_dispatches_remote` above. The "NATS response
+    // arriving" half of the round trip is simulated by calling `engine.resume`
+    // directly with a hand-built envelope `{ok, output, events, error}` — the
+    // exact shape `dispatch_listener::decode_response` builds and that lands in
+    // `state.entry` on a real resume (spike finding §Q2). No live NATS server is
+    // needed or used.
+
+    /// Records every dispatch and immediately returns `AwaitingResponse`, so the
+    /// engine parks without a live NATS server. Mirrors `RecordingDispatcher` in
+    /// `dw_agent_nats_mode_dispatches_remote`, kept separate (and named for
+    /// re-use across the tests below) since three tests share it.
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedNatsDispatcher {
+        calls: Mutex<Vec<crate::runner::remote_dispatch::RemoteDispatch>>,
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedNatsDispatcher {
+        async fn dispatch(
+            &self,
+            request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> anyhow::Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            let correlation_id = request.correlation_id.clone();
+            self.calls.lock().unwrap().push(request);
+            Ok(
+                crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
+                    correlation_id,
+                },
+            )
+        }
+    }
+
+    /// Build an engine holding `flow` in `DwAgentDispatch::Nats` mode, wired to
+    /// `dispatcher`. Mirrors `conv_engine` (the in-process counterpart) so the
+    /// two harnesses are structurally comparable.
+    #[cfg(feature = "agentic-worker")]
+    fn nats_conv_engine(
+        flow: HostFlow,
+        dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(dispatcher),
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::Nats,
+            agent_node_handler: None,
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        }
+    }
+
+    /// Build the envelope a real NATS response resume lands in `state.entry`,
+    /// per spike finding §Q2: `{ok, output: {reply, trail, terminated_by},
+    /// events, error}` (mirrors `dispatch_listener::decode_response`).
+    #[cfg(feature = "agentic-worker")]
+    fn agent_response_envelope(reply: &str, terminated_by: &str) -> Value {
+        json!({
+            "ok": true,
+            "output": { "reply": reply, "trail": [], "terminated_by": terminated_by },
+            "events": [],
+            "error": Value::Null,
+        })
+    }
+
+    /// Turn 1 (fresh, no prior await marker): the conversational Nats arm must
+    /// mark the pending await, dispatch to NATS exactly once, and park via
+    /// `NodeControl::AwaitHere` — resuming at the node itself (not the routing
+    /// successor) with no reply surfaced yet (the response hasn't arrived).
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_turn1_parks_via_await_here() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after fresh dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "AwaitHere must resume at self, not the routing successor"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "a fresh user turn must dispatch to NATS exactly once"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is known yet on the initial dispatch — the async response hasn't arrived"
+        );
+    }
+
+    /// Full turn cycle, behavioral: fresh dispatch → AwaitHere park; simulated
+    /// "not ended" NATS response resume → LoopHere park (reply surfaced,
+    /// session-keyed park awaiting the next user message); a user-reply resume
+    /// dispatches to NATS again; a `conversation_ended` response resume →
+    /// Completed (advanced to the successor). This is the exact turn-by-turn
+    /// script called for in Task 6's brief.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_park_loop_full_turn_cycle() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh user turn → dispatch to NATS → AwaitHere (self, park).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 1 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // Simulated NATS response resume, "not ended": LoopHere (session-keyed
+        // park awaiting the next user message), reply surfaced.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (LoopHere) after not-ended response, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere also re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent's reply must be surfaced once the response resume lands: {:?}",
+            result.output
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "the response landing must not itself trigger another NATS dispatch"
+        );
+
+        // User-reply resume: a fresh user turn dispatches to NATS again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "user says more" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 2 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "a second fresh user turn must dispatch to NATS again"
+        );
+
+        // Simulated NATS response resume, `conversation_ended`: advance to the
+        // successor and complete.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended response must advance to the successor and complete, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "conversation end must not trigger another NATS dispatch"
+        );
+    }
+
+    /// Safety-backstop parity with the in-process cap test: a NATS
+    /// conversational `dw.agent` whose response never carries
+    /// `conversation_ended` must keep parking (dispatch → AwaitHere →
+    /// response-resume → LoopHere) up to `MAX_PARK_TURNS` "not ended" responses,
+    /// then force-advance to the successor instead of trapping the flow.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_force_advances_after_park_loop_cap() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch (does not itself count toward the park cap —
+        // the cap is bumped only on a "not ended" response, matching the
+        // in-process semantics).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // Responses 1..MAX_PARK_TURNS (exclusive) must keep looping: a "not
+        // ended" response resume (LoopHere), then a user-message resume that
+        // re-dispatches to NATS (AwaitHere) for the next response.
+        for turn in 1..MAX_PARK_TURNS {
+            let result = rt
+                .block_on(engine.resume(
+                    conv_ctx(),
+                    snapshot,
+                    agent_response_envelope("still thinking", "final_reply"),
+                ))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting (LoopHere) at response #{turn}, got {other:?}"),
+            };
+            let result = rt
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => {
+                    panic!("expected Waiting (AwaitHere) after user turn #{turn}, got {other:?}")
+                }
+            };
+        }
+
+        // The MAX_PARK_TURNS-th "not ended" response must force-advance instead
+        // of parking again.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("still thinking", "final_reply"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at response {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1 + (MAX_PARK_TURNS as usize - 1),
+            "exactly one NATS dispatch per user turn across the whole park-loop"
+        );
+    }
+
+    /// Parity: for the same scripted two-turn conversation (turn 1 replies
+    /// "hello there", not ended; turn 2 replies "bye", `conversation_ended`),
+    /// the NATS and in-process dispatch paths must be *observationally*
+    /// identical — same sequence of user-visible statuses, and the same
+    /// surfaced reply text on the parked turn.
+    ///
+    /// Caveat (documented, not hidden): the NATS path has one extra *internal*
+    /// resume between user turns — the async response landing (AwaitHere →
+    /// LoopHere) — that the in-process path does synchronously inside a single
+    /// `execute`/`resume` call. That extra step is invisible to the flow's
+    /// outward status/reply, which is exactly what this test asserts; it does
+    /// NOT assert the two paths take the same number of `resume` calls.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_and_inprocess_transcripts_match_for_same_script() {
+        let rt = Runtime::new().unwrap();
+
+        // ── In-process transcript ──
+        let inproc_handler = Arc::new(ScriptedAgentHandler {
+            script: Mutex::new(std::collections::VecDeque::from(vec![
+                json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+                json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+            ])),
+        });
+        let inproc_engine = conv_engine_scripted(conversational_dw_flow(true), inproc_handler);
+        let r1 = rt
+            .block_on(inproc_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let inproc_snapshot = match r1.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("in-process turn 1: expected Waiting, got {other:?}"),
+        };
+        let r2 = rt
+            .block_on(inproc_engine.resume(conv_ctx(), inproc_snapshot, json!({ "text": "more" })))
+            .unwrap();
+
+        // ── NATS transcript, same script ──
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let nats_engine = nats_conv_engine(conversational_dw_flow(true), dispatcher);
+        let n1 = rt
+            .block_on(nats_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let n1_snapshot = match n1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 1 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n1r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n1_snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let n1r_snapshot = match n1r.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("nats turn 1 response resume: expected Waiting, got {other:?}"),
+        };
+        let n2 = rt
+            .block_on(nats_engine.resume(conv_ctx(), n1r_snapshot, json!({ "text": "more" })))
+            .unwrap();
+        let n2_snapshot = match n2.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 2 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n2r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n2_snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+
+        // Same user-visible status per turn.
+        assert!(matches!(r1.status, FlowStatus::Waiting(_)));
+        assert!(
+            matches!(n1r.status, FlowStatus::Waiting(_)),
+            "nats turn 1's user-visible status must also be Waiting"
+        );
+        assert!(matches!(r2.status, FlowStatus::Completed));
+        assert!(
+            matches!(n2r.status, FlowStatus::Completed),
+            "nats turn 2 must also complete, matching the in-process transcript"
+        );
+
+        // Same surfaced reply text on the parked turn.
+        assert!(
+            serde_json::to_string(&r1.output)
+                .unwrap()
+                .contains("hello there"),
+            "in-process turn 1 must surface the reply: {:?}",
+            r1.output
+        );
+        assert!(
+            serde_json::to_string(&n1r.output)
+                .unwrap()
+                .contains("hello there"),
+            "nats turn 1 must surface the identical reply once the response resume lands: {:?}",
+            n1r.output
+        );
+    }
+
+    /// Build the error envelope shape a NATS response resume can also land in
+    /// `state.entry`: `{ok:false, output:null, events:[], error:{code,
+    /// message}}` (mirrors `agent_response_envelope`, but for the failure
+    /// path — a genuine agent/transport error. This code sets no deadline of
+    /// its own, but the same `{ok:false}` shape is also what a flow-authored
+    /// timeout, or any other error source, would arrive as — Fix B handles it
+    /// identically either way.
+    #[cfg(feature = "agentic-worker")]
+    fn agent_error_envelope(message: &str, code: Option<&str>) -> Value {
+        json!({
+            "ok": false,
+            "output": Value::Null,
+            "events": [],
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// Fix A (interleave guard): a user message arriving before the agent's
+    /// NATS response must NOT be misread as that response. With the
+    /// pending-await marker set (turn 1's fresh dispatch), a resume whose
+    /// `state.entry` is a plain user-message shape (no `"ok"` key) must fall
+    /// through to the fresh-dispatch branch — re-dispatching to NATS as a new
+    /// turn and parking via `AwaitHere` again — instead of being consumed as
+    /// a (null) agent reply. The marker must also survive: it was NOT
+    /// consumed by the misrouted resume, only by the eventual real response.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_interleaved_user_message_is_not_misread_as_response() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch marks the pending-await and parks (AwaitHere).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "turn 1 dispatch must mark the pending await"
+        );
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // A stray user message arrives BEFORE the agent's NATS response —
+        // same shape a real inbound activity would resume with, no `"ok"` key.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                json!({ "text": "are you still there?" }),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!(
+                "a stray user message must re-dispatch as a fresh turn (Waiting/AwaitHere), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "the fresh re-dispatch still awaits at self"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "the stray user message must trigger its OWN fresh NATS dispatch, not be swallowed"
+        );
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "the marker must still be set for the real response to land against"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is surfaced — this was not a misread null agent turn"
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "a stray user message must not touch the park-loop cap"
+        );
+    }
+
+    /// Fix B (error envelope handling): a `{ok:false, ...}` response — any
+    /// agent/transport error, or a timeout-shaped envelope from any source
+    /// (this code no longer sets its own deadline) — must surface the error
+    /// message as the reply, re-park via `LoopHere` (fail-safe: await the
+    /// next user message, do not force-advance), and must NOT bump the
+    /// park-loop turn counter. Exercises two full error cycles (error →
+    /// user turn → error) to confirm the cap counter never advances even
+    /// after repeated failures.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_error_envelope_surfaces_and_reparks_without_cap_bump() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch → AwaitHere.
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // A plain agent/transport error resumes the flow.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, agent_error_envelope("boom", None)))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("an error envelope must re-park (Waiting/LoopHere), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("boom"),
+            "the error message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "an error response must NOT bump the park-loop cap counter"
+        );
+
+        // A user turn in between re-dispatches (as usual).
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "hello?" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after user turn, got {other:?}"),
+        };
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
+
+        // A timeout-coded envelope (this code sets no deadline of its own —
+        // this shape would only arrive from a flow-authored deadline or some
+        // other upstream source) behaves identically to a plain error.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_error_envelope("timeout waiting for agent response", Some("timeout")),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => {
+                panic!("a timeout envelope must also re-park (Waiting/LoopHere), got {other:?}")
+            }
+        };
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("timeout waiting for agent response"),
+            "the timeout message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "two error/timeout responses in a row (with an intervening user turn) must still \
+             not have bumped the park-loop cap counter"
+        );
+    }
+
+    /// Scriptable `AgentNodeHandler` stub: returns the next queued payload on
+    /// each call, so a single in-process engine can simulate a multi-turn
+    /// conversation with a different agent output per turn (unlike
+    /// `StubAgentHandler`, which always returns the same fixed payload).
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedAgentHandler {
+        script: Mutex<std::collections::VecDeque<serde_json::Value>>,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for ScriptedAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedAgentHandler: script exhausted"))
+        }
+    }
+
+    /// Build an in-process engine holding `flow`, wired to a `ScriptedAgentHandler`
+    /// so each agent turn can return a different payload. Mirrors `conv_engine`
+    /// (which uses a fixed payload for every call).
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine_scripted(
+        flow: HostFlow,
+        handler: std::sync::Arc<ScriptedAgentHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(handler),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // operala.call in-process handler wiring
+    // -----------------------------------------------------------------------
+
+    struct StubOperalaHandler {
+        payload: serde_json::Value,
+    }
+    #[async_trait::async_trait]
+    impl crate::runner::operala_node::OperalaNodeHandler for StubOperalaHandler {
+        async fn execute(
+            &self,
+            _tenant: &str,
+            _env: &str,
+            _target: &str,
+            _operation: &str,
+            _session_id: &str,
+            _input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a single-node flow: an `operala.call` node (given `target`) that
+    /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
+    /// the (non-conversational) operala path.
+    fn operala_flow(target: &str) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let node_id = NodeId::from_str("op").unwrap();
+        nodes.insert(
+            node_id.clone(),
+            HostNode {
+                kind: NodeKind::OperalaCall {
+                    target: target.to_string(),
+                },
+                component: "operala.call".to_string(),
+                component_id: "operala.call".to_string(),
+                operation_name: Some(target.to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "operation": "", "input": { "goal": "hi" } }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            slot_schema: None,
+            id: "operala.flow".to_string(),
+            start: Some(node_id),
+            nodes,
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with the given optional in-process
+    /// operala handler and no NATS `RemoteDispatchHandler` — a `None` handler
+    /// exercises the existing NATS-fallback error path.
+    fn operala_engine(
+        flow: HostFlow,
+        handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
+    ) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "operala.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            operala_node_handler: handler,
+        }
+    }
+
+    fn operala_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "operala.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-op"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[test]
+    fn operala_call_with_in_process_handler_completes_inline() {
+        let handler = std::sync::Arc::new(StubOperalaHandler {
+            payload: json!({ "reply": "stub" }),
+        });
+        let engine = operala_engine(operala_flow("deep_worker"), Some(handler));
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("operala.call with an in-process handler must complete");
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        assert_eq!(execution.output, json!({ "reply": "stub" }));
+    }
+
+    #[test]
+    fn operala_call_without_handler_or_nats_fails() {
+        let engine = operala_engine(operala_flow("deep_worker"), None);
+        let execution = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(engine.execute(operala_ctx(), Value::Null))
+            .expect("session flow returns a completed error envelope, not an Err");
+        // `operala_ctx` carries a `session_id`, so main's retry-exhaustion policy
+        // wraps the execution error into a `Completed` flow carrying the
+        // `flow_execution_failed` envelope (graceful degradation for session
+        // flows) rather than propagating an `Err`. The operala misconfiguration
+        // is still surfaced loudly — in the error payload.
+        assert!(matches!(execution.status, FlowStatus::Completed));
+        let msg = execution.output["metadata"]["error_message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            msg.contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
+            "unexpected output: {:?}",
+            execution.output
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_root_inputs_on_the_demo_path() {
+        // Run Demo puts input ids at the entry ROOT beside `metadata`
+        // (greentic-designer flow_demo/host.rs::build_submit_payload).
+        let entry = json!({
+            "amount": "500",
+            "reason": "looks good",
+            "metadata": { "action": "approve" }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("amount"), Some(&json!("500")));
+        assert_eq!(fields.get("reason"), Some(&json!("looks good")));
+        assert!(
+            !fields.contains_key("metadata"),
+            "the envelope key is not a field"
+        );
+        assert!(
+            !fields.contains_key("action"),
+            "the route discriminator is not a field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_metadata_on_the_wrapped_path() {
+        // greentic-start wraps the activity: entry.input.metadata.*
+        let entry = json!({
+            "input": {
+                "metadata": { "action": "approve", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("email"), Some(&json!("a@b.c")));
+        assert!(!fields.contains_key("action"));
+        assert!(!fields.contains_key("text"), "envelope text is not a field");
+        assert!(
+            !fields.contains_key("input"),
+            "the envelope root must be resolved, or `input` becomes one giant field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_lets_the_envelope_root_win_a_collision() {
+        let entry = json!({
+            "email": "root@x",
+            "metadata": { "action": "go", "email": "meta@x" }
+        });
+        assert_eq!(
+            submitted_fields(&entry).get("email"),
+            Some(&json!("root@x"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_counts_a_root_input_named_action() {
+        // `action` is the route discriminator ONLY in metadata. At the root it is
+        // a real keystroke on the demo path.
+        let entry = json!({ "action": "typed", "metadata": { "action": "approve" } });
+        assert_eq!(
+            submitted_fields(&entry).get("action"),
+            Some(&json!("typed"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_is_empty_for_a_button_with_no_inputs() {
+        let entry = json!({ "metadata": { "action": "approve" } });
+        assert!(submitted_fields(&entry).is_empty());
+    }
+
+    #[test]
+    fn an_old_snapshot_without_the_flag_deserializes_as_not_awaiting_submit() {
+        // Snapshots persisted before this field existed must keep their exact
+        // current behaviour: no answers attached.
+        let raw = json!({
+            "pack_id": "p",
+            "flow_id": "f",
+            "next_node": "card",
+            "state": {}
+        });
+        let snap: FlowSnapshot = serde_json::from_value(raw).expect("legacy snapshot decodes");
+        assert!(!snap.awaiting_submit);
     }
 }
 
