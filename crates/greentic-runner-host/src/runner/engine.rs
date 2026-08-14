@@ -4412,6 +4412,72 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Where the submit envelope carries its metadata, across both delivery paths.
+///
+/// `greentic-start` wraps the activity (`entry.input.metadata`); the direct
+/// runner path does not (`entry.metadata`). Both the `response.*` synthesis in
+/// [`build_routing_context`] and [`submitted_fields`] resolve through here, so
+/// the two can never disagree about which object is the metadata.
+fn resolve_entry_metadata(entry: &Value) -> Option<&Value> {
+    entry
+        .pointer("/input/metadata")
+        .or_else(|| entry.pointer("/metadata"))
+}
+
+/// The fields a person actually submitted, as one flat map.
+///
+/// The envelope root is `entry.input` when that is an object (the wrapped
+/// `greentic-start` path) and `entry` itself otherwise (the Run Demo path,
+/// whose inputs sit at the root — see that repo's
+/// `flow_demo/host.rs::build_submit_payload`). Resolving it is not bookkeeping:
+/// taking `entry`'s root keys directly on the wrapped path would make one field
+/// named `input` holding the entire nested activity.
+///
+/// The rule:
+///
+/// > the envelope root's keys except `metadata` and `text`, unioned with the
+/// > resolved metadata object's keys except `action`; on collision the envelope
+/// > root wins.
+///
+/// `text` is the message body in both shapes and is already exposed as
+/// `response.text`. `action` is the route discriminator, already exposed as
+/// `response.action` — but a key named `action` at the envelope ROOT is counted,
+/// because on the demo path that is a real keystroke at a different level from
+/// the routing metadata.
+///
+/// NOTE: `response.*` must NOT be rebuilt on top of this. It shares only
+/// [`resolve_entry_metadata`]. Feeding `response` this map would drop
+/// `response.action`, which every parking card's conditional routing tests —
+/// and a failed condition silently takes the false branch.
+///
+/// Currently unused in production: the caller arrives with the resume wiring
+/// (a later task).
+#[allow(dead_code)]
+fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
+    let mut fields = JsonMap::new();
+    if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
+        for (key, value) in meta {
+            if key == "action" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    let envelope = entry
+        .get("input")
+        .filter(|v| v.is_object())
+        .unwrap_or(entry);
+    if let Some(map) = envelope.as_object() {
+        for (key, value) in map {
+            if key == "metadata" || key == "text" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    fields
+}
+
 /// Build the context a routing condition is evaluated against.
 ///
 /// Layout:
@@ -4464,9 +4530,7 @@ fn build_routing_context(
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
     // greentic-runner direct path: entry.metadata.*
-    let metadata = entry
-        .pointer("/input/metadata")
-        .or_else(|| entry.pointer("/metadata"));
+    let metadata = resolve_entry_metadata(entry);
 
     let mut response = JsonMap::new();
     if let Some(Value::Object(meta)) = metadata {
@@ -9832,6 +9896,76 @@ mod tests {
             "unexpected output: {:?}",
             execution.output
         );
+    }
+
+    #[test]
+    fn submitted_fields_reads_root_inputs_on_the_demo_path() {
+        // Run Demo puts input ids at the entry ROOT beside `metadata`
+        // (greentic-designer flow_demo/host.rs::build_submit_payload).
+        let entry = json!({
+            "amount": "500",
+            "reason": "looks good",
+            "metadata": { "action": "approve" }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("amount"), Some(&json!("500")));
+        assert_eq!(fields.get("reason"), Some(&json!("looks good")));
+        assert!(
+            !fields.contains_key("metadata"),
+            "the envelope key is not a field"
+        );
+        assert!(
+            !fields.contains_key("action"),
+            "the route discriminator is not a field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_metadata_on_the_wrapped_path() {
+        // greentic-start wraps the activity: entry.input.metadata.*
+        let entry = json!({
+            "input": {
+                "metadata": { "action": "approve", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("email"), Some(&json!("a@b.c")));
+        assert!(!fields.contains_key("action"));
+        assert!(!fields.contains_key("text"), "envelope text is not a field");
+        assert!(
+            !fields.contains_key("input"),
+            "the envelope root must be resolved, or `input` becomes one giant field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_lets_the_envelope_root_win_a_collision() {
+        let entry = json!({
+            "email": "root@x",
+            "metadata": { "action": "go", "email": "meta@x" }
+        });
+        assert_eq!(
+            submitted_fields(&entry).get("email"),
+            Some(&json!("root@x"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_counts_a_root_input_named_action() {
+        // `action` is the route discriminator ONLY in metadata. At the root it is
+        // a real keystroke on the demo path.
+        let entry = json!({ "action": "typed", "metadata": { "action": "approve" } });
+        assert_eq!(
+            submitted_fields(&entry).get("action"),
+            Some(&json!("typed"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_is_empty_for_a_button_with_no_inputs() {
+        let entry = json!({ "metadata": { "action": "approve" } });
+        assert!(submitted_fields(&entry).is_empty());
     }
 }
 
