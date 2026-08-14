@@ -29,6 +29,49 @@ async fn route_debug_redacts_token() {
     assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
 }
 
+/// `from_parts` is a SECOND way to get a token into an `McpRoute` — a
+/// pack-carried route resolves one from the secrets backend instead of an
+/// admin row. A route built this way is logged on exactly the same paths, so
+/// the redaction has to cover it too; the struct-literal test above cannot
+/// catch a constructor that bypasses it.
+#[test]
+fn route_from_parts_redacts_its_token_in_debug() {
+    let route = McpRoute::from_parts(
+        "s1",
+        "https://mcp.example.com/",
+        Some("Authorization"),
+        Some("tok-secret"),
+        "http",
+        None,
+        None,
+        None,
+    )
+    .with_tool("get_issue");
+
+    let dbg = format!("{route:?}");
+    assert!(!dbg.contains("tok-secret"), "got: {dbg}");
+    assert!(dbg.contains("[REDACTED]"), "got: {dbg}");
+    assert!(matches!(route.transport, Transport::Http));
+}
+
+/// The transport discriminator is a string on the wire; `local-wasm` is the
+/// only value that is not HTTP, and getting it wrong would dial an empty URL.
+#[test]
+fn route_from_parts_maps_the_local_wasm_transport() {
+    let route = McpRoute::from_parts(
+        "s1",
+        "",
+        None,
+        None,
+        "local-wasm",
+        Some("router_echo"),
+        Some("1.0.0"),
+        Some("sha256:abc"),
+    );
+    assert!(matches!(route.transport, Transport::LocalWasm));
+    assert_eq!(route.component_digest.as_deref(), Some("sha256:abc"));
+}
+
 #[test]
 fn parse_rows_defaults_transport_to_http_and_reads_local_wasm() {
     let body = json!({"servers": [

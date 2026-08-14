@@ -17,12 +17,14 @@
 //! successful call, so downstream nodes can branch on the `error` key.
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) mod aw {
+pub mod aw {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
 
     use greentic_aw_runtime::{MCP_ROLE_FLOW_EDITOR, McpToolSource, TenantContext, dispatch_route};
+
+    use crate::runner::mcp_pack_routes::{PackMcpRoute, PackMcpRoutes};
 
     /// Build an [`McpToolSource`] for the flow-execution path from the same
     /// admin credentials the agentic-worker registry uses
@@ -81,27 +83,169 @@ pub(crate) mod aw {
         CACHED.get_or_init(build_secrets_manager).clone()
     }
 
-    /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
-    /// reusing the flow-editor MCP catalog.
+    /// Secret URI a pack-carried `http` route's bearer token is read from.
     ///
-    /// Infallible by contract: every failure path (source not configured,
-    /// server/tool not in the flow-editor catalog, transport error) returns a
-    /// structured `{"error": "..."}` value. The caller binds the value as-is.
+    /// Byte-for-byte the shape greentic-designer-admin writes for the `mcp`
+    /// category (parity source: `greentic_aw_runtime::mcp_secrets`): the env
+    /// segment is pinned to `default` regardless of the flow env, the team and
+    /// the name pass through verbatim, and an absent team becomes `_`.
+    /// Canonicalizing anything here would read a URI admin never wrote — the
+    /// server id is a hyphenated UUID that lowercasing would corrupt.
+    fn pack_route_secret_uri(tenant: &str, team: Option<&str>, server_id: &str) -> String {
+        format!(
+            "secrets://default/{tenant}/{}/mcp/{server_id}",
+            team.unwrap_or("_")
+        )
+    }
+
+    /// Build a dispatchable route from a pack-carried record, resolving the
+    /// credential from the secrets backend.
+    ///
+    /// The token is NEVER carried by the pack — it is read from
+    /// `secrets://default/<tenant>/<team>/mcp/<server_id>`, the URI
+    /// greentic-designer-admin writes under the `mcp` category and
+    /// `greentic_aw_runtime::mcp_secrets` already reads for `local-wasm`
+    /// components. This extends the same read to the HTTP dispatch path.
+    ///
+    /// Only an `http` route reads a token here. A `local-wasm` route has no
+    /// HTTP credential at all — admin writes no `mcp/<server_id>` entry for one
+    /// — and the component reads its own secrets through the
+    /// [`McpCallScope`](greentic_aw_runtime::mcp_scope::McpCallScope) the
+    /// caller attaches. Reading unconditionally would fail every local-wasm
+    /// pack route on a credential that is not supposed to exist.
+    ///
+    /// NOTE: this resolves only under `SECRETS_BACKEND=broker`. The `env`
+    /// backend looks a variable up by the literal path, and a variable named
+    /// `secrets://…` is not settable in Kubernetes — so the error below names
+    /// the URI rather than reporting an opaque NotFound.
+    async fn route_from_pack(
+        route: &PackMcpRoute,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+        tenant: &str,
+        team: Option<&str>,
+    ) -> Result<greentic_aw_runtime::McpRoute, String> {
+        let is_http = route.transport != "local-wasm";
+        let uri = pack_route_secret_uri(tenant, team, &route.server_id);
+
+        let token = match secrets.filter(|_| is_http) {
+            Some(manager) => match manager.read(&uri).await {
+                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(e) => {
+                    return Err(format!(
+                        "mcp server '{}' has no credential at {uri} ({e}). Note that MCP \
+                         requires SECRETS_BACKEND=broker; the env backend cannot resolve a \
+                         secrets:// URI.",
+                        route.server_id
+                    ));
+                }
+            },
+            None => None,
+        };
+
+        Ok(greentic_aw_runtime::McpRoute::from_parts(
+            &route.server_id,
+            route.transport_url.as_deref().unwrap_or_default(),
+            route.auth_header_name.as_deref(),
+            token.as_deref(),
+            &route.transport,
+            route.component_ref.as_deref(),
+            route.component_version.as_deref(),
+            route.component_digest.as_deref(),
+        ))
+    }
+
+    /// The `(tenant, secrets)` pair a dispatch runs under. `local-wasm` tools
+    /// need both halves for their own `secret_get` to resolve.
+    fn call_scope(
+        tenant_ctx: TenantContext,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+    ) -> greentic_aw_runtime::mcp_scope::McpCallScope {
+        match secrets {
+            Some(manager) => greentic_aw_runtime::mcp_scope::McpCallScope::with_secrets(
+                tenant_ctx,
+                manager.clone(),
+            ),
+            None => greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx),
+        }
+    }
+
+    /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
+    /// preferring a pack-carried route and falling back to the flow-editor
+    /// MCP catalog.
+    ///
+    /// Infallible by contract: every failure path (no route anywhere, missing
+    /// credential, server/tool not in the flow-editor catalog, transport
+    /// error) returns a structured `{"error": "..."}` value. The caller binds
+    /// the value as-is.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn invoke(
         source: Option<&Arc<McpToolSource>>,
+        pack_routes: Option<&PackMcpRoutes>,
         tenant: &str,
         env: &str,
+        team: Option<&str>,
         server_id: &str,
         tool: &str,
         arguments: &Value,
     ) -> Value {
+        let secrets = secrets_from_env();
+        invoke_with_secrets(
+            source,
+            pack_routes,
+            secrets.as_ref(),
+            tenant,
+            env,
+            team,
+            server_id,
+            tool,
+            arguments,
+        )
+        .await
+    }
+
+    /// [`invoke`] with the secrets manager supplied explicitly.
+    ///
+    /// Public because [`invoke`] reads the process-global memoized manager
+    /// ([`secrets_from_env`]), which a test cannot substitute — and the
+    /// pack-route path is defined by which credential it resolves, so a test
+    /// that cannot control the backend cannot cover it at all.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_with_secrets(
+        source: Option<&Arc<McpToolSource>>,
+        pack_routes: Option<&PackMcpRoutes>,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+        tenant: &str,
+        env: &str,
+        team: Option<&str>,
+        server_id: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Value {
+        // `dispatch_route` takes the arguments as a JSON string and is itself
+        // infallible (bad args / connect / timeout all become `{"error": ...}`).
+        let args_str = arguments.to_string();
+        let tenant_ctx = TenantContext::new(tenant, env);
+
+        // A pack-carried route wins. This is what lets a deployed runner with
+        // no admin credentials dispatch at all; falling through to the admin
+        // catalog keeps every existing deployment and Run Demo unchanged.
+        if let Some(route) = pack_routes.and_then(|routes| routes.get(server_id)) {
+            return match route_from_pack(route, secrets, tenant, team).await {
+                Ok(resolved) => {
+                    let scope = call_scope(tenant_ctx, secrets);
+                    dispatch_route(&resolved.with_tool(tool), &args_str, &scope).await
+                }
+                Err(e) => json!({ "error": e }),
+            };
+        }
+
         let Some(source) = source else {
             return json!({
-                "error": "MCP is not configured on this runner (set GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
+                "error": "MCP is not configured on this runner (no route in the pack, and no \
+                          GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
             });
         };
 
-        let tenant_ctx = TenantContext::new(tenant, env);
         let catalog = source
             .catalog_for_role(&tenant_ctx, MCP_ROLE_FLOW_EDITOR)
             .await;
@@ -114,16 +258,7 @@ pub(crate) mod aw {
             });
         };
 
-        // `dispatch_route` takes the arguments as a JSON string and is itself
-        // infallible (bad args / connect / timeout all become `{"error": ...}`).
-        let args_str = arguments.to_string();
-        let scope = match secrets_from_env() {
-            Some(manager) => greentic_aw_runtime::mcp_scope::McpCallScope::with_secrets(
-                tenant_ctx.clone(),
-                manager,
-            ),
-            None => greentic_aw_runtime::mcp_scope::McpCallScope::new(tenant_ctx.clone()),
-        };
+        let scope = call_scope(tenant_ctx, secrets);
         dispatch_route(route, &args_str, &scope).await
     }
 

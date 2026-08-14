@@ -154,6 +154,10 @@ pub struct PackRuntime {
     ///
     /// [`RuntimeRefResolver`]: crate::runtime_refs::RuntimeRefResolver
     runtime_refs: Option<RuntimeRefsInjection>,
+    /// Lazily-parsed `assets/mcp-routes.json` sidecar — see
+    /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
+    /// pack with no MCP nodes never touches the archive for it.
+    mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
 }
 
 struct PackComponent {
@@ -2142,6 +2146,7 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
         })
     }
 
@@ -3040,6 +3045,25 @@ impl PackRuntime {
         self.read_pack_file("agent-graph.json")
     }
 
+    /// MCP route material from the optional `assets/mcp-routes.json` sidecar.
+    ///
+    /// `None` when the pack carries none — which is how a pack built before
+    /// the feature reads, and means "fall back to the tenant's admin catalog"
+    /// rather than "this pack has no MCP servers".
+    ///
+    /// Parsed at most once per `PackRuntime` and memoized: a hot reload
+    /// allocates a fresh `PackRuntime`, so there is nothing to invalidate.
+    pub fn mcp_routes(&self) -> Option<&crate::runner::mcp_pack_routes::PackMcpRoutes> {
+        self.mcp_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::mcp_pack_routes::MCP_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::mcp_pack_routes::PackMcpRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
     /// Raw agent-config blobs from the optional `dw-agents.json` sidecar.
     ///
     /// Designer-built packs (old greentic-pack, which cannot populate
@@ -3382,6 +3406,7 @@ impl PackRuntime {
             cache,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
         })
     }
 }
@@ -5406,6 +5431,7 @@ mod tests {
             oauth_config: None,
             runtime_config_non_secret: None,
             runtime_refs: None,
+            mcp_routes: std::sync::OnceLock::new(),
             cache,
         }
     }
