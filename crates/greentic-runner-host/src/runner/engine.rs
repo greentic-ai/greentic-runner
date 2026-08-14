@@ -900,7 +900,7 @@ impl FlowEngine {
                 }
             };
 
-            attach_pending_card_answers(&mut state, node_id.as_str(), &mut output);
+            attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -2787,15 +2787,51 @@ fn node_output_view(payload: &Value) -> Value {
     }
 }
 
+/// The card's own declared allow-list for `answers`, read from its raw input
+/// mapping (`HostNode::payload_expr`) BEFORE template rendering — greentic-designer
+/// writes the card's declared `Input.*` ids under this key
+/// (`answer_fields: ["field_a", "field_b", ...]`) at composer-save time.
+///
+/// `None` means the key is absent — a pack built before this change, or any
+/// path that never runs the designer injector. That is deliberately treated as
+/// "no allow-list", not "empty allow-list": those packs, and the fixtures for
+/// paths that skip the injector, would otherwise silently lose every submitted
+/// answer. A present-but-malformed value (not an array, or containing a
+/// non-string entry) is likewise treated as absent, so a malformed pack fails
+/// permissively (today's behaviour) instead of collapsing to zero answers.
+///
+/// `Some(vec![])` — a present but EMPTY array — means the card genuinely
+/// declares no inputs; the caller must produce `{}`, not the unfiltered set.
+fn declared_answer_fields(payload_expr: &Value) -> Option<Vec<String>> {
+    let raw = payload_expr.get("answer_fields")?;
+    let arr = raw.as_array()?;
+    arr.iter()
+        .map(|entry| entry.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+}
+
 /// Merge the pending submitted fields into `output` when it belongs to the node
 /// that parked for them, then CONSUME the pending entry.
 ///
 /// Consuming rather than reading is what stops a loop back through the same node
 /// (without a resume) re-attaching stale answers.
 ///
+/// When `node`'s input mapping carries `answer_fields` (see
+/// [`declared_answer_fields`]), `answers` is intersected down to exactly those
+/// keys — `submitted_fields` unions the whole submit envelope, which on the
+/// `greentic-start` path includes transport identity (`tenant`, `session_id`,
+/// `from`, ...) and pack config (routing keys, secret references, ...) that a
+/// person never typed. Without a declared allow-list, `answers` stays exactly
+/// what `submitted_fields` produced (today's behaviour, unchanged).
+///
 /// Called immediately before `state.nodes.insert`, and that position is
 /// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
-fn attach_pending_card_answers(state: &mut ExecutionState, node_id: &str, output: &mut NodeOutput) {
+fn attach_pending_card_answers(
+    state: &mut ExecutionState,
+    node_id: &str,
+    node: &HostNode,
+    output: &mut NodeOutput,
+) {
     let is_target = state
         .pending_card_answers
         .as_ref()
@@ -2822,7 +2858,19 @@ fn attach_pending_card_answers(state: &mut ExecutionState, node_id: &str, output
             "node output already carries `answers`; overwriting with the submitted fields"
         );
     }
-    map.insert("answers".to_string(), Value::Object(pending.answers));
+    let answers = match declared_answer_fields(&node.payload_expr) {
+        Some(allow_list) => {
+            let allowed: std::collections::HashSet<&str> =
+                allow_list.iter().map(String::as_str).collect();
+            pending
+                .answers
+                .into_iter()
+                .filter(|(key, _)| allowed.contains(key.as_str()))
+                .collect()
+        }
+        None => pending.answers,
+    };
+    map.insert("answers".to_string(), Value::Object(answers));
 }
 
 /// Decide what to park for the node awaiting a submit, from the snapshot being
@@ -8991,6 +9039,24 @@ mod tests {
         assert!(submitted_fields(&entry).is_empty());
     }
 
+    /// A card node with no declared `answer_fields` — i.e. a pack built before
+    /// this feature existed. `attach_pending_card_answers` must treat this as
+    /// "no allow-list" (today's permissive behaviour), not "zero fields".
+    fn plain_card_node() -> HostNode {
+        HostNode {
+            kind: NodeKind::Exec {
+                target_component: "card".to_string(),
+            },
+            component: "component.exec".to_string(),
+            component_id: "component.exec".to_string(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        }
+    }
+
     #[test]
     fn an_old_snapshot_without_the_flag_deserializes_as_not_awaiting_submit() {
         // Snapshots persisted before this field existed must keep their exact
@@ -9032,7 +9098,7 @@ mod tests {
         // Simulate the re-dispatch: a FRESH output object, exactly as the loop
         // builds one, then the merge at its real call position.
         let mut fresh = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut fresh);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut fresh);
         state.nodes.insert("card".to_string(), fresh);
 
         // Read it the way a downstream node's config would.
@@ -9056,7 +9122,7 @@ mod tests {
             answers: submitted_fields(&json!({ "email": "a@b.c" })),
         });
         let mut output = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut output);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
         state.nodes.insert("card".to_string(), output);
 
         let ctx = state.context();
@@ -9072,7 +9138,7 @@ mod tests {
         // with no fields. Do not collapse the two.
         let mut state = ExecutionState::new(json!({}));
         let mut output = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut output);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
         assert!(output.payload.get("answers").is_none());
     }
 
@@ -9084,7 +9150,7 @@ mod tests {
             answers: submitted_fields(&json!({ "metadata": { "action": "approve" } })),
         });
         let mut output = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut output);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
         assert_eq!(output.payload["answers"], json!({}));
     }
 
@@ -9098,11 +9164,11 @@ mod tests {
             answers: submitted_fields(&json!({ "email": "a@b.c" })),
         });
         let mut first = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut first);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut first);
         assert!(first.payload.get("answers").is_some());
 
         let mut second = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "card", &mut second);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut second);
         assert!(
             second.payload.get("answers").is_none(),
             "consumed, not read"
@@ -9120,7 +9186,7 @@ mod tests {
             answers: submitted_fields(&json!({ "email": "a@b.c" })),
         });
         let mut output = NodeOutput::new(json!({ "ok": false, "error": { "code": "boom" } }));
-        attach_pending_card_answers(&mut state, "card", &mut output);
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
         assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
     }
 
@@ -9132,12 +9198,129 @@ mod tests {
             answers: submitted_fields(&json!({ "email": "a@b.c" })),
         });
         let mut other = NodeOutput::new(json!({ "event": "rendered" }));
-        attach_pending_card_answers(&mut state, "next_step", &mut other);
+        attach_pending_card_answers(&mut state, "next_step", &plain_card_node(), &mut other);
         assert!(other.payload.get("answers").is_none());
         assert!(
             state.pending_card_answers.is_some(),
             "still pending for its own node"
         );
+    }
+
+    /// THE defect this feature closes. On the `greentic-start` path
+    /// `entry.input` is a whole `ChannelMessageEnvelope` (see
+    /// `greentic-types::messaging`), not a flat map of input ids — so without
+    /// an allow-list, `submitted_fields` unions transport identity
+    /// (`tenant`, `session_id`, `from`, `attachments`, ...), routing keys
+    /// (`nextCardId`, `route`), channel keys (`env`, `team`, `locale`,
+    /// `autoStart`), and greentic-start's own injected pack setup answers
+    /// (`url`, `model`, `provider`, `api_key_secret` — a `secrets://...`
+    /// reference) into `answers`, under a key documented as "the fields
+    /// someone typed into this card". With a declared `answer_fields`
+    /// allow-list, none of that must survive — only the two genuine card
+    /// inputs.
+    #[test]
+    fn answers_intersect_the_declared_allow_list_on_a_wrapped_start_envelope() {
+        let entry = json!({
+            "input": {
+                "id": "msg-1",
+                "tenant": "acme",
+                "channel": "webchat",
+                "session_id": "sess-1",
+                "from": "user-1",
+                "to": "bot-1",
+                "correlation_id": "corr-1",
+                "attachments": [],
+                "metadata": {
+                    "action": "submit",
+                    "nextCardId": "confirm",
+                    "route": "default",
+                    "env": "prod",
+                    "team": "support",
+                    "locale": "en-US",
+                    "autoStart": true,
+                    "url": "https://api.example.com",
+                    "model": "gpt-4",
+                    "provider": "openai",
+                    "api_key_secret": "secrets://tenant/acme/openai_key",
+                    "full_name": "Ada Lovelace",
+                    "email": "ada@example.com"
+                },
+                "text": "submitted"
+            }
+        });
+
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": ["full_name", "email"] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        let answers = output.payload["answers"]
+            .as_object()
+            .expect("answers must be an object");
+        assert_eq!(
+            answers,
+            &serde_json::Map::from_iter([
+                ("full_name".to_string(), json!("Ada Lovelace")),
+                ("email".to_string(), json!("ada@example.com")),
+            ]),
+            "answers must contain exactly the two declared card inputs, and \
+             nothing from transport identity, routing, or pack config: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn answer_fields_absent_keeps_todays_permissive_behaviour() {
+        // Pre-upgrade packs, and any path that never runs the designer
+        // injector, must keep exactly today's behaviour: no allow-list means
+        // no filtering, even on a wrapped envelope carrying non-input keys.
+        let entry = json!({
+            "input": {
+                "tenant": "acme",
+                "metadata": { "action": "submit", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+
+        assert_eq!(output.payload["answers"]["tenant"], json!("acme"));
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answer_fields_declared_empty_yields_no_answers() {
+        // A card that genuinely declares zero inputs must produce `{}` — an
+        // empty allow-list is not the same as an absent one, and must not be
+        // collapsed into the unfiltered set.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "approve" }
+            })),
+        });
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": [] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        assert_eq!(output.payload["answers"], json!({}));
     }
 
     #[test]
