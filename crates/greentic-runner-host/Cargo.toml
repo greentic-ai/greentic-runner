@@ -138,8 +138,8 @@ greentic-dw-knowledge = { git = "https://github.com/greenticai/greentic-dw-provi
 # ephemeral only — see that feature's comment). Same git source (greentic-dw,
 # branch research) the runner already pulls greentic-dw-manifest from via
 # greentic-aw-runtime, so this reuses the already-locked commit.
-greentic-dw-operala-invoker = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research", optional = true }
-greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.git", branch = "research", optional = true }
+greentic-dw-operala-invoker = { git = "https://github.com/greenticai/greentic-dw.git", rev = "4d3609224a4d3ffbcf61ab37369f5f5842433cb9", optional = true }
+greentic-dw-operala-bridge = { git = "https://github.com/greenticai/greentic-dw.git", rev = "4d3609224a4d3ffbcf61ab37369f5f5842433cb9", optional = true }
 # Needed directly (not just transitively via greentic-aw-runtime) to build the
 # `Arc<dyn greentic_llm::LlmProvider>` that `DeepWorkerInvoker::new` takes.
 # Pinned to the exact registry version already resolved elsewhere in the
