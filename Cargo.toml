@@ -269,14 +269,14 @@ strip = true
 # requirement from greentic-ext-runtime v1.2.13-research onto the git
 # tag so the workspace can adopt it without waiting on a registry release.
 [patch.crates-io]
-greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
+greentic-extension-sdk-contract = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.3" }
 # greentic-ext-runtime now anchors describe signatures to a TOFU publisher-key
 # store, reusing sdk-registry's `TrustStore` rather than porting it. That pulls
 # -registry (and its -state dep) into this graph; neither is on crates.io, so
 # both need the same tag redirect as -contract above. Keep all three on ONE tag:
 # they are `=`-pinned to each other, so a split resolves two crate instances.
-greentic-extension-sdk-registry = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
-greentic-extension-sdk-state = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.1" }
+greentic-extension-sdk-registry = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.3" }
+greentic-extension-sdk-state = { git = "https://github.com/greenticai/greentic-designer-sdk.git", tag = "v1.3.0-research.3" }
 
 # `greentic-dw-operala-invoker` (and its sibling `*-llm` provider crates in
 # greentic-dw) pin `greentic-llm` via a git tag (v1.2.6-research), while this
