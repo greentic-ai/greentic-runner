@@ -194,6 +194,20 @@ enum NodeKind {
     },
     ProviderInvoke,
     FlowCall,
+    /// Hand the turn over to another flow and do NOT come back.
+    ///
+    /// [`FlowCall`] is a subroutine: it awaits the callee and turns a
+    /// `FlowStatus::Waiting` into a hard error, so a target that asks the user
+    /// anything can never be called. `FlowGoto` is the transfer instead — it
+    /// resolves to [`NodeControl::Jump`], which switches the walk to the target
+    /// flow rather than nesting an execution, so the target's status BECOMES
+    /// the turn's status. A target that parks parks the turn, and the snapshot
+    /// records `next_flow`, so the next inbound activity resumes inside the
+    /// target rather than back here.
+    ///
+    /// That is what a menu whose options open a conversation needs, and what
+    /// `flow.call` structurally cannot do.
+    FlowGoto,
     BuiltinEmit {
         kind: EmitKind,
     },
@@ -962,6 +976,7 @@ impl FlowEngine {
                 .execute_flow_call(ctx, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::FlowGoto => execute_flow_goto(payload),
             NodeKind::ProviderInvoke => self
                 .execute_provider_invoke(ctx, node_id, state, payload, event)
                 .await
@@ -1577,7 +1592,71 @@ impl FlowEngine {
             ),
         }
     }
+}
 
+/// Build the jump that hands this turn over to another flow.
+///
+/// Payload shape mirrors `flow.call`'s, so a flow document reads the same
+/// either way:
+///
+/// ```yaml
+/// <node_id>:
+///   flow.goto:
+///     flow_id: support        # required; `flow` accepted as an alias
+///     node: ask_order         # optional entry node, else the flow's start
+///     input: { order: "..." } # optional; becomes the target's input
+/// ```
+///
+/// Returns a `NodeControl::Jump`, which `apply_jump` then applies to the SAME
+/// walk — that is what makes the target's `Waiting` become the turn's, instead
+/// of the hard error `flow.call` raises. Loop protection is inherited: every
+/// jump increments the execution's redirect count and `redirect_limit` trips at
+/// `max_redirects` (default 3).
+fn execute_flow_goto(payload: Value) -> Result<DispatchOutcome> {
+    #[derive(Deserialize)]
+    struct FlowGotoPayload {
+        #[serde(alias = "flow")]
+        flow_id: String,
+        #[serde(default)]
+        node: Option<String>,
+        #[serde(default)]
+        input: Value,
+        #[serde(default)]
+        max_redirects: Option<u32>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    let goto: FlowGotoPayload =
+        serde_json::from_value(payload).context("invalid payload for flow.goto node")?;
+    let flow = goto.flow_id.trim().to_string();
+    if flow.is_empty() {
+        bail!("flow.goto requires a non-empty flow_id");
+    }
+    let node = goto
+        .node
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty());
+
+    let jump = JumpControl {
+        flow,
+        node,
+        payload: goto.input,
+        // `hints` carries component-supplied routing metadata; a declarative
+        // goto has none to add, and passing anything here would put a value in
+        // the target's meta that the flow author never wrote.
+        hints: Value::Null,
+        max_redirects: goto.max_redirects,
+        reason: goto.reason.or_else(|| Some("flow.goto node".to_string())),
+    };
+    let output = NodeOutput::with_meta(jump.payload.clone(), jump.hints.clone());
+    Ok(DispatchOutcome::with_control(
+        output,
+        NodeControl::Jump(jump),
+    ))
+}
+
+impl FlowEngine {
     async fn execute_component_exec(
         &self,
         ctx: &FlowContext<'_>,
@@ -2749,6 +2828,7 @@ impl From<Node> for HostNode {
         } else {
             match component_ref.as_str() {
                 "flow.call" => NodeKind::FlowCall,
+                "flow.goto" => NodeKind::FlowGoto,
                 "provider.invoke" => NodeKind::ProviderInvoke,
                 "session.wait" => NodeKind::Wait,
                 "state.get" => NodeKind::BuiltinStateGet,
@@ -2802,6 +2882,7 @@ impl From<Node> for HostNode {
             NodeKind::PackComponent { component_ref } => component_ref.clone(),
             NodeKind::ProviderInvoke => "provider.invoke".to_string(),
             NodeKind::FlowCall => "flow.call".to_string(),
+            NodeKind::FlowGoto => "flow.goto".to_string(),
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
             NodeKind::BuiltinStateGet => "state.get".to_string(),
             NodeKind::BuiltinStateSet => "state.set".to_string(),
@@ -4208,6 +4289,102 @@ mod tests {
     }
 
     #[test]
+    fn flow_goto_builds_a_jump_to_the_named_flow() {
+        let outcome = execute_flow_goto(json!({
+            "flow_id": "support",
+            "node": "ask_order",
+            "input": { "order": "A-1" },
+        }))
+        .expect("goto builds");
+
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("flow.goto must produce a Jump, got {:?}", outcome.control);
+        };
+        assert_eq!(jump.flow, "support");
+        assert_eq!(jump.node.as_deref(), Some("ask_order"));
+        assert_eq!(jump.payload, json!({ "order": "A-1" }));
+        // The node's own output is the payload the target receives, so a
+        // template downstream of the goto reads what was actually handed over.
+        assert_eq!(outcome.output.payload, json!({ "order": "A-1" }));
+    }
+
+    /// `flow` is accepted alongside `flow_id`, matching `flow.call`'s payload so
+    /// a document reads the same whichever primitive it uses.
+    #[test]
+    fn flow_goto_accepts_the_flow_alias_and_defaults_the_entry_node() {
+        let outcome = execute_flow_goto(json!({ "flow": "support" })).expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+        assert_eq!(jump.flow, "support");
+        assert!(
+            jump.node.is_none(),
+            "no node means `apply_jump` uses the target flow's start"
+        );
+        assert_eq!(jump.payload, Value::Null);
+    }
+
+    /// An empty target is refused here rather than reaching `apply_jump`, which
+    /// would fail later with a message about a flow named "".
+    #[test]
+    fn flow_goto_refuses_an_empty_flow_id() {
+        for payload in [json!({ "flow_id": "" }), json!({ "flow_id": "   " })] {
+            let err = execute_flow_goto(payload)
+                .err()
+                .expect("empty target must not build");
+            assert!(
+                err.to_string().contains("flow_id"),
+                "error must name the field: {err}"
+            );
+        }
+        let err = execute_flow_goto(json!({ "input": {} }))
+            .err()
+            .expect("missing target");
+        assert!(err.to_string().contains("flow.goto"), "got: {err}");
+    }
+
+    /// A blank `node` is the same as omitting it — otherwise `apply_jump` would
+    /// look for a node whose id is the empty string and fail with a confusing
+    /// "node not found".
+    #[test]
+    fn flow_goto_treats_a_blank_entry_node_as_absent() {
+        let outcome =
+            execute_flow_goto(json!({ "flow_id": "support", "node": "  " })).expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+        assert!(jump.node.is_none());
+    }
+
+    /// The redirect ceiling is forwarded so a flow can tighten (or loosen) the
+    /// default of 3 that `apply_jump` applies.
+    #[test]
+    fn flow_goto_forwards_the_redirect_ceiling_and_reason() {
+        let outcome = execute_flow_goto(json!({
+            "flow_id": "support",
+            "max_redirects": 1,
+            "reason": "menu choice",
+        }))
+        .expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+        assert_eq!(jump.max_redirects, Some(1));
+        assert_eq!(jump.reason.as_deref(), Some("menu choice"));
+    }
+
+    /// Absent a reason, one is supplied — `flow.jump.applied` logs it, and an
+    /// empty reason there is indistinguishable from a component-emitted jump.
+    #[test]
+    fn flow_goto_names_itself_as_the_reason_by_default() {
+        let outcome = execute_flow_goto(json!({ "flow_id": "support" })).expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+        assert_eq!(jump.reason.as_deref(), Some("flow.goto node"));
+    }
+
+    #[test]
     fn parse_component_control_ignores_plain_payload() {
         let payload = json!({
             "flow": "not-a-control-field",
@@ -5171,6 +5348,64 @@ mod tests {
         assert_eq!(engine.rollout_ids.deployment_id.as_deref(), Some("01JTKS"));
         // A freshly-built engine carries no rollout identity (legacy runtime).
         assert!(minimal_engine().rollout_ids.is_empty());
+    }
+
+    /// The composition that matters: what a `flow.goto` NODE produces is a jump
+    /// the engine actually applies. Proven end to end through `apply_jump`
+    /// rather than by inspecting the control alone — a `JumpControl` the engine
+    /// would reject is not a working transfer.
+    ///
+    /// The target flow's start node is selected, the handed-over payload
+    /// becomes the target's input, and the redirect counter advances, which is
+    /// what makes a goto loop terminate instead of spinning.
+    #[test]
+    fn a_flow_goto_node_produces_a_jump_the_engine_applies() {
+        let outcome = execute_flow_goto(json!({
+            "flow_id": "flow.target",
+            "input": { "order": "A-1" },
+        }))
+        .expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+
+        let engine = jump_test_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let rt = Runtime::new().unwrap();
+        let target = rt
+            .block_on(engine.apply_jump(&jump_ctx("flow.source"), &mut state, jump))
+            .expect("the engine must accept the jump a flow.goto node builds");
+
+        assert_eq!(target.flow_id, "flow.target");
+        assert_eq!(
+            target.node_id.as_str(),
+            "node-a",
+            "no explicit node means the target flow's first node"
+        );
+        assert_eq!(
+            state.redirect_count(),
+            1,
+            "the loop guard must have counted"
+        );
+    }
+
+    /// An explicit entry node is honoured, so a menu can hand over to the exact
+    /// step that answers the option the user picked.
+    #[test]
+    fn a_flow_goto_node_can_name_the_entry_node() {
+        let outcome = execute_flow_goto(json!({ "flow_id": "flow.target", "node": "node-b" }))
+            .expect("goto builds");
+        let NodeControl::Jump(jump) = outcome.control else {
+            panic!("expected a Jump");
+        };
+
+        let engine = jump_test_engine();
+        let mut state = ExecutionState::new(Value::Null);
+        let rt = Runtime::new().unwrap();
+        let target = rt
+            .block_on(engine.apply_jump(&jump_ctx("flow.source"), &mut state, jump))
+            .expect("jump applies");
+        assert_eq!(target.node_id.as_str(), "node-b");
     }
 
     #[test]
