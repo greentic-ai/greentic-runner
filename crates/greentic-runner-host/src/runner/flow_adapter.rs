@@ -52,6 +52,7 @@ const FLOW_SCHEMA_VERSION: &str = "1.0";
 /// rather than exact.
 const NATIVE_OP_KEYS: &[&str] = &[
     "flow.call",
+    "flow.goto",
     "provider.invoke",
     "session.wait",
     "state.get",
