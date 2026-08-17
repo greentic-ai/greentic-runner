@@ -1368,6 +1368,7 @@ mod welcome_flow_tests {
                 flow_id: envelope.flow_id.clone(),
                 next_flow: None,
                 next_node: "node-2".into(),
+                awaiting_submit: false,
                 state,
             },
         };

@@ -106,6 +106,14 @@ pub struct FlowSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_flow: Option<String>,
     pub next_node: String,
+    /// True only when this snapshot was taken because conditional routing fell
+    /// through and the node parked at ITSELF awaiting the next submit — the
+    /// card case. False for `session.wait`, whose `next_node` is the SUCCESSOR,
+    /// not the node that was waiting; attaching a person's answers there would
+    /// name a node that had not run yet. Defaulted so snapshots written before
+    /// this field behave exactly as they did.
+    #[serde(default)]
+    pub awaiting_submit: bool,
     pub state: ExecutionState,
 }
 
@@ -812,6 +820,9 @@ impl FlowEngine {
             .clone()
             .unwrap_or_else(|| snapshot.flow_id.clone());
         let flow_ir = self.get_or_load_flow(ctx.pack_id, &resume_flow).await?;
+        // Computed before `snapshot.state` is moved out below, since it borrows
+        // `snapshot` (specifically `next_node` and `awaiting_submit`).
+        let pending_card_answers = pending_from_snapshot(&snapshot, &input);
         let mut state = snapshot.state;
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
@@ -823,6 +834,10 @@ impl FlowEngine {
         // to refresh `entry` ourselves; `ensure_entry` is a no-op once
         // entry is non-null.
         state.replace_input(input.clone());
+        // Park the submitted fields for the node that was awaiting them. Only a
+        // snapshot flagged `awaiting_submit` names the waiting node in
+        // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
+        state.pending_card_answers = pending_card_answers;
         state.entry = input;
         let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
@@ -947,7 +962,10 @@ impl FlowEngine {
                     &event,
                 )
                 .await;
-            let DispatchOutcome { output, control } = match dispatch {
+            let DispatchOutcome {
+                mut output,
+                control,
+            } = match dispatch {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     if let Some(observer) = step_ctx.observer {
@@ -960,6 +978,7 @@ impl FlowEngine {
                 }
             };
 
+            attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -1031,6 +1050,7 @@ impl FlowEngine {
                                 next_flow: (current_flow_id != step_ctx.flow_id)
                                     .then_some(current_flow_id.clone()),
                                 next_node: node_id.as_str().to_string(),
+                                awaiting_submit: true,
                                 state: snapshot_state,
                             };
                             let node_outputs = state.outputs_map();
@@ -1080,6 +1100,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: resume_target.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -1103,6 +1124,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: node_id.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -1140,6 +1162,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: node_id.as_str().to_string(), // SELF, not successor
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let node_outputs = state.outputs_map();
@@ -2774,6 +2797,18 @@ pub struct NodeEvent<'a> {
 #[cfg(feature = "agentic-worker")]
 const MAX_PARK_TURNS: u32 = 100;
 
+/// Submitted fields waiting to be attached to the output of the node that
+/// parked for them.
+///
+/// It cannot be attached at resume time: `drive_flow` re-dispatches
+/// `snapshot.next_node` and `state.nodes.insert` REPLACES that node's stored
+/// output, so anything written before the dispatch is destroyed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingCardAnswers {
+    node_id: String,
+    answers: JsonMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionState {
     #[serde(default)]
@@ -2807,6 +2842,11 @@ pub struct ExecutionState {
     /// entry and re-dispatch — a duplicate approval request to the operator.
     #[serde(default)]
     pending_approval_await: HashMap<String, ()>,
+    /// Submitted fields awaiting attachment to their node's output. In practice
+    /// never survives a snapshot — it is consumed by the first dispatch after a
+    /// resume — but is serde-defaulted like its neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_card_answers: Option<PendingCardAnswers>,
 }
 
 impl ExecutionState {
@@ -2822,6 +2862,7 @@ impl ExecutionState {
             park_turns: HashMap::new(),
             pending_agent_await: HashMap::new(),
             pending_approval_await: HashMap::new(),
+            pending_card_answers: None,
         }
     }
 
@@ -3176,6 +3217,165 @@ fn node_output_view(payload: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+/// The result of reading `answer_fields` from a card node's raw input mapping.
+///
+/// `Absent` and `Malformed` both fall back to the permissive (unfiltered)
+/// path in [`attach_pending_card_answers`] — the contract is "absent means
+/// this pack predates the allow-list", so failing permissively rather than
+/// closed is deliberate for both. They are kept as separate variants (rather
+/// than collapsed into one `None`) purely so the caller can log the
+/// `Malformed` case: an ordinary pre-upgrade pack has no `answer_fields` key
+/// at all and must stay quiet, but a *present-and-broken* value is a
+/// designer-side bug reproducing this feature's original leak, and must not
+/// be silently indistinguishable from the ordinary case in the logs.
+enum DeclaredAnswerFields {
+    /// The `answer_fields` key is not present at all. The ordinary case for
+    /// every pack built before this feature — must not be logged.
+    Absent,
+    /// The key is present but is not a valid array of strings (wrong type,
+    /// or an array containing a non-string entry — e.g. an unresolved
+    /// template). Distinct from `Absent` so it can be surfaced.
+    Malformed,
+    /// The key is present and a valid (possibly empty) array of strings.
+    Declared(Vec<String>),
+}
+
+/// The card's own declared allow-list for `answers`, read from its raw input
+/// mapping (`HostNode::payload_expr`) BEFORE template rendering — greentic-designer
+/// writes the card's declared `Input.*` ids under this key
+/// (`answer_fields: ["field_a", "field_b", ...]`) at composer-save time.
+///
+/// Reading `payload_expr` here is safe from upstream interference: it is
+/// built once, from the pack's `Node.input.mapping`, in `HostNode`'s
+/// `From<Node>` impl, and `flow_ir.nodes` is never mutated for the lifetime of
+/// a `drive_flow` call (only `.get()` — see `engine.rs` near `drive_flow`'s
+/// dispatch loop). The dispatch loop's own template render
+/// (`let payload_template = node.payload_expr.clone();`, a few lines above the
+/// call site) clones it into a separate value before rendering, so the render
+/// never touches `node.payload_expr` itself. By the time this function runs —
+/// after that node has already been dispatched — `node.payload_expr` is
+/// byte-identical to what was loaded from the pack.
+///
+/// `Absent` means the key is absent — a pack built before this change, or any
+/// path that never runs the designer injector. That is deliberately treated as
+/// "no allow-list", not "empty allow-list": those packs, and the fixtures for
+/// paths that skip the injector, would otherwise silently lose every submitted
+/// answer. A present-but-malformed value (not an array, or containing a
+/// non-string entry) is likewise treated as permissive (see
+/// [`DeclaredAnswerFields`]), so a malformed pack fails open instead of
+/// collapsing to zero answers — but unlike `Absent`, it is observable.
+///
+/// `Declared(vec![])` — a present but EMPTY array — means the card genuinely
+/// declares no inputs; the caller must produce `{}`, not the unfiltered set.
+fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
+    let Some(raw) = payload_expr.get("answer_fields") else {
+        return DeclaredAnswerFields::Absent;
+    };
+    let Some(arr) = raw.as_array() else {
+        return DeclaredAnswerFields::Malformed;
+    };
+    match arr
+        .iter()
+        .map(|entry| entry.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+    {
+        Some(list) => DeclaredAnswerFields::Declared(list),
+        None => DeclaredAnswerFields::Malformed,
+    }
+}
+
+/// Merge the pending submitted fields into `output` when it belongs to the node
+/// that parked for them, then CONSUME the pending entry.
+///
+/// Consuming rather than reading is what stops a loop back through the same node
+/// (without a resume) re-attaching stale answers.
+///
+/// When `node`'s input mapping carries `answer_fields` (see
+/// [`declared_answer_fields`]), `answers` is intersected down to exactly those
+/// keys — `submitted_fields` unions the whole submit envelope, which on the
+/// `greentic-start` path includes transport identity (`tenant`, `session_id`,
+/// `from`, ...) and pack config (routing keys, secret references, ...) that a
+/// person never typed. Without a declared allow-list, `answers` stays exactly
+/// what `submitted_fields` produced (today's behaviour, unchanged).
+///
+/// Called immediately before `state.nodes.insert`, and that position is
+/// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
+fn attach_pending_card_answers(
+    state: &mut ExecutionState,
+    node_id: &str,
+    node: &HostNode,
+    output: &mut NodeOutput,
+) {
+    let is_target = state
+        .pending_card_answers
+        .as_ref()
+        .is_some_and(|pending| pending.node_id == node_id);
+    if !is_target {
+        return;
+    }
+    let Some(pending) = state.pending_card_answers.take() else {
+        return;
+    };
+    // No `ok` check on purpose: the answers are real whether or not the
+    // re-render succeeded, and dropping them would let a transient render error
+    // silently destroy what someone typed.
+    let Some(map) = output.payload.as_object_mut() else {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output payload is not an object; submitted answers not attached"
+        );
+        return;
+    };
+    if map.contains_key("answers") {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output already carries `answers`; overwriting with the submitted fields"
+        );
+    }
+    let answers = match declared_answer_fields(&node.payload_expr) {
+        DeclaredAnswerFields::Declared(allow_list) => {
+            let allowed: std::collections::HashSet<&str> =
+                allow_list.iter().map(String::as_str).collect();
+            pending
+                .answers
+                .into_iter()
+                .filter(|(key, _)| allowed.contains(key.as_str()))
+                .collect()
+        }
+        DeclaredAnswerFields::Malformed => {
+            // Distinct from `Absent` on purpose: an ordinary pre-upgrade pack
+            // has no `answer_fields` key and must stay quiet, but a
+            // present-and-broken value reproduces this feature's original
+            // leak (the full unfiltered envelope, including any secret
+            // references, ships as `answers`) and must be observable.
+            tracing::warn!(
+                node_id = %node_id,
+                "answer_fields present but malformed; falling back to unfiltered answers"
+            );
+            pending.answers
+        }
+        DeclaredAnswerFields::Absent => pending.answers,
+    };
+    map.insert("answers".to_string(), Value::Object(answers));
+}
+
+/// Decide what to park for the node awaiting a submit, from the snapshot being
+/// resumed and the fresh input that carries the submission.
+///
+/// Only a snapshot flagged `awaiting_submit` names the waiting node in
+/// `next_node`; a `session.wait` snapshot names its SUCCESSOR, which has not
+/// run yet, so attaching answers there would name the wrong node. Returns
+/// `None` in that case, so nothing gets parked.
+fn pending_from_snapshot(snapshot: &FlowSnapshot, input: &Value) -> Option<PendingCardAnswers> {
+    if !snapshot.awaiting_submit {
+        return None;
+    }
+    Some(PendingCardAnswers {
+        node_id: snapshot.next_node.clone(),
+        answers: submitted_fields(input),
+    })
 }
 
 fn outcome_meta(output: &Value) -> Value {
@@ -4412,6 +4612,68 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Where the submit envelope carries its metadata, across both delivery paths.
+///
+/// `greentic-start` wraps the activity (`entry.input.metadata`); the direct
+/// runner path does not (`entry.metadata`). Both the `response.*` synthesis in
+/// [`build_routing_context`] and [`submitted_fields`] resolve through here, so
+/// the two can never disagree about which object is the metadata.
+fn resolve_entry_metadata(entry: &Value) -> Option<&Value> {
+    entry
+        .pointer("/input/metadata")
+        .or_else(|| entry.pointer("/metadata"))
+}
+
+/// The fields a person actually submitted, as one flat map.
+///
+/// The envelope root is `entry.input` when that is an object (the wrapped
+/// `greentic-start` path) and `entry` itself otherwise (the Run Demo path,
+/// whose inputs sit at the root — see that repo's
+/// `flow_demo/host.rs::build_submit_payload`). Resolving it is not bookkeeping:
+/// taking `entry`'s root keys directly on the wrapped path would make one field
+/// named `input` holding the entire nested activity.
+///
+/// The rule:
+///
+/// > the envelope root's keys except `metadata` and `text`, unioned with the
+/// > resolved metadata object's keys except `action`; on collision the envelope
+/// > root wins.
+///
+/// `text` is the message body in both shapes and is already exposed as
+/// `response.text`. `action` is the route discriminator, already exposed as
+/// `response.action` — but a key named `action` at the envelope ROOT is counted,
+/// because on the demo path that is a real keystroke at a different level from
+/// the routing metadata.
+///
+/// NOTE: `response.*` must NOT be rebuilt on top of this. It shares only
+/// [`resolve_entry_metadata`]. Feeding `response` this map would drop
+/// `response.action`, which every parking card's conditional routing tests —
+/// and a failed condition silently takes the false branch.
+fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
+    let mut fields = JsonMap::new();
+    if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
+        for (key, value) in meta {
+            if key == "action" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    let envelope = entry
+        .get("input")
+        .filter(|v| v.is_object())
+        .unwrap_or(entry);
+    if let Some(map) = envelope.as_object() {
+        for (key, value) in map {
+            if key == "metadata" || key == "text" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    fields
+}
+
 /// Build the context a routing condition is evaluated against.
 ///
 /// Layout:
@@ -4464,9 +4726,7 @@ fn build_routing_context(
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
     // greentic-runner direct path: entry.metadata.*
-    let metadata = entry
-        .pointer("/input/metadata")
-        .or_else(|| entry.pointer("/metadata"));
+    let metadata = resolve_entry_metadata(entry);
 
     let mut response = JsonMap::new();
     if let Some(Value::Object(meta)) = metadata {
@@ -9912,6 +10172,662 @@ mod tests {
             msg.contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
             "unexpected output: {:?}",
             execution.output
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_root_inputs_on_the_demo_path() {
+        // Run Demo puts input ids at the entry ROOT beside `metadata`
+        // (greentic-designer flow_demo/host.rs::build_submit_payload).
+        let entry = json!({
+            "amount": "500",
+            "reason": "looks good",
+            "metadata": { "action": "approve" }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("amount"), Some(&json!("500")));
+        assert_eq!(fields.get("reason"), Some(&json!("looks good")));
+        assert!(
+            !fields.contains_key("metadata"),
+            "the envelope key is not a field"
+        );
+        assert!(
+            !fields.contains_key("action"),
+            "the route discriminator is not a field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_metadata_on_the_wrapped_path() {
+        // greentic-start wraps the activity: entry.input.metadata.*
+        let entry = json!({
+            "input": {
+                "metadata": { "action": "approve", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("email"), Some(&json!("a@b.c")));
+        assert!(!fields.contains_key("action"));
+        assert!(!fields.contains_key("text"), "envelope text is not a field");
+        assert!(
+            !fields.contains_key("input"),
+            "the envelope root must be resolved, or `input` becomes one giant field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_lets_the_envelope_root_win_a_collision() {
+        let entry = json!({
+            "email": "root@x",
+            "metadata": { "action": "go", "email": "meta@x" }
+        });
+        assert_eq!(
+            submitted_fields(&entry).get("email"),
+            Some(&json!("root@x"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_counts_a_root_input_named_action() {
+        // `action` is the route discriminator ONLY in metadata. At the root it is
+        // a real keystroke on the demo path.
+        let entry = json!({ "action": "typed", "metadata": { "action": "approve" } });
+        assert_eq!(
+            submitted_fields(&entry).get("action"),
+            Some(&json!("typed"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_is_empty_for_a_button_with_no_inputs() {
+        let entry = json!({ "metadata": { "action": "approve" } });
+        assert!(submitted_fields(&entry).is_empty());
+    }
+
+    /// A card node with no declared `answer_fields` — i.e. a pack built before
+    /// this feature existed. `attach_pending_card_answers` must treat this as
+    /// "no allow-list" (today's permissive behaviour), not "zero fields".
+    fn plain_card_node() -> HostNode {
+        HostNode {
+            kind: NodeKind::Exec {
+                target_component: "card".to_string(),
+            },
+            component: "component.exec".to_string(),
+            component_id: "component.exec".to_string(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        }
+    }
+
+    #[test]
+    fn an_old_snapshot_without_the_flag_deserializes_as_not_awaiting_submit() {
+        // Snapshots persisted before this field existed must keep their exact
+        // current behaviour: no answers attached.
+        let raw = json!({
+            "pack_id": "p",
+            "flow_id": "f",
+            "next_node": "card",
+            "state": {}
+        });
+        let snap: FlowSnapshot = serde_json::from_value(raw).expect("legacy snapshot decodes");
+        assert!(!snap.awaiting_submit);
+    }
+
+    /// A resumed node's submitted fields must be readable from its output by a
+    /// LATER node, through the ordinary `{{node.<id>.<field>}}` grammar.
+    ///
+    /// This is the whole feature, and it is also the ordering proof: the resume
+    /// RE-DISPATCHES the parked node and `state.nodes.insert` replaces its stored
+    /// output, so an implementation that attaches the answers before the dispatch
+    /// makes this test fail. Do not "simplify" the merge earlier.
+    #[test]
+    fn submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node() {
+        let mut state = ExecutionState::new(json!({}));
+        // The parked node has already run once; its stored output is what the
+        // resume dispatch will REPLACE.
+        state.nodes.insert(
+            "card".to_string(),
+            NodeOutput::new(json!({ "event": "rendered" })),
+        );
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "submit" }
+            })),
+        });
+
+        // Simulate the re-dispatch: a FRESH output object, exactly as the loop
+        // builds one, then the merge at its real call position.
+        let mut fresh = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut fresh);
+        state.nodes.insert("card".to_string(), fresh);
+
+        // Read it the way a downstream node's config would.
+        let ctx = template_context(&state, Value::Null);
+        let rendered = render_template_value(
+            &json!("{{node.card.answers.email}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+        assert_eq!(rendered, json!("a@b.c"));
+    }
+
+    #[test]
+    fn the_card_render_context_carries_the_answers_too() {
+        // One write, two read surfaces: `outputs_map()` feeds {{node.…}} and
+        // `context()` feeds the `state` handed to the adaptive-card component.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        state.nodes.insert("card".to_string(), output);
+
+        let ctx = state.context();
+        assert_eq!(
+            ctx["nodes"]["card"]["payload"]["answers"]["email"],
+            json!("a@b.c")
+        );
+    }
+
+    #[test]
+    fn answers_are_absent_before_any_submit() {
+        // Absent is not empty: absent means never submitted, {} means submitted
+        // with no fields. Do not collapse the two.
+        let mut state = ExecutionState::new(json!({}));
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert!(output.payload.get("answers").is_none());
+    }
+
+    #[test]
+    fn a_button_with_no_inputs_yields_an_empty_answers_object() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "metadata": { "action": "approve" } })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    #[test]
+    fn the_pending_answers_are_consumed_exactly_once() {
+        // A loop back through the same node without a resume must not re-attach
+        // stale answers.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut first = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut first);
+        assert!(first.payload.get("answers").is_some());
+
+        let mut second = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut second);
+        assert!(
+            second.payload.get("answers").is_none(),
+            "consumed, not read"
+        );
+    }
+
+    #[test]
+    fn answers_attach_even_when_the_redispatch_failed() {
+        // The answers are real regardless of whether the re-render succeeded.
+        // Dropping them would let a transient render error destroy what someone
+        // typed.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "ok": false, "error": { "code": "boom" } }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answers_are_not_attached_to_a_different_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut other = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "next_step", &plain_card_node(), &mut other);
+        assert!(other.payload.get("answers").is_none());
+        assert!(
+            state.pending_card_answers.is_some(),
+            "still pending for its own node"
+        );
+    }
+
+    /// THE defect this feature closes. On the `greentic-start` path
+    /// `entry.input` is a whole `ChannelMessageEnvelope` (see
+    /// `greentic-types::messaging`), not a flat map of input ids — so without
+    /// an allow-list, `submitted_fields` unions transport identity
+    /// (`tenant`, `session_id`, `from`, `attachments`, ...), routing keys
+    /// (`nextCardId`, `route`), channel keys (`env`, `team`, `locale`,
+    /// `autoStart`), and greentic-start's own injected pack setup answers
+    /// (`url`, `model`, `provider`, `api_key_secret` — a `secrets://...`
+    /// reference) into `answers`, under a key documented as "the fields
+    /// someone typed into this card". With a declared `answer_fields`
+    /// allow-list, none of that must survive — only the two genuine card
+    /// inputs.
+    #[test]
+    fn answers_intersect_the_declared_allow_list_on_a_wrapped_start_envelope() {
+        let entry = json!({
+            "input": {
+                "id": "msg-1",
+                "tenant": "acme",
+                "channel": "webchat",
+                "session_id": "sess-1",
+                "from": "user-1",
+                "to": "bot-1",
+                "correlation_id": "corr-1",
+                "attachments": [],
+                "metadata": {
+                    "action": "submit",
+                    "nextCardId": "confirm",
+                    "route": "default",
+                    "env": "prod",
+                    "team": "support",
+                    "locale": "en-US",
+                    "autoStart": true,
+                    "url": "https://api.example.com",
+                    "model": "gpt-4",
+                    "provider": "openai",
+                    "api_key_secret": "secrets://tenant/acme/openai_key",
+                    "full_name": "Ada Lovelace",
+                    "email": "ada@example.com"
+                },
+                "text": "submitted"
+            }
+        });
+
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": ["full_name", "email"] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        let answers = output.payload["answers"]
+            .as_object()
+            .expect("answers must be an object");
+        assert_eq!(
+            answers,
+            &serde_json::Map::from_iter([
+                ("full_name".to_string(), json!("Ada Lovelace")),
+                ("email".to_string(), json!("ada@example.com")),
+            ]),
+            "answers must contain exactly the two declared card inputs, and \
+             nothing from transport identity, routing, or pack config: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn answer_fields_absent_keeps_todays_permissive_behaviour() {
+        // Pre-upgrade packs, and any path that never runs the designer
+        // injector, must keep exactly today's behaviour: no allow-list means
+        // no filtering, even on a wrapped envelope carrying non-input keys.
+        let entry = json!({
+            "input": {
+                "tenant": "acme",
+                "metadata": { "action": "submit", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+
+        assert_eq!(output.payload["answers"]["tenant"], json!("acme"));
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answer_fields_declared_empty_yields_no_answers() {
+        // A card that genuinely declares zero inputs must produce `{}` — an
+        // empty allow-list is not the same as an absent one, and must not be
+        // collapsed into the unfiltered set.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "approve" }
+            })),
+        });
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": [] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    /// The three-way distinction `declared_answer_fields` exists to preserve:
+    /// absent (ordinary pre-upgrade pack) and malformed (a designer-side bug)
+    /// both fall back to the SAME permissive, unfiltered `answers` — that part
+    /// is asserted here — but only the malformed case is meant to be logged
+    /// (`tracing::warn!` in `attach_pending_card_answers`). This test can only
+    /// assert the behavioural half: nothing in this crate's dev-dependencies
+    /// captures `tracing` output (no `tracing-test`/subscriber-capture
+    /// harness is wired up here), and adding one purely to assert a log line
+    /// felt like more machinery than the assertion warrants. The `Malformed`
+    /// arm's `tracing::warn!` call is exercised (not just present in source)
+    /// by the "malformed" case below, since the same match arm both logs and
+    /// returns the unfiltered map — a change that broke or removed the log
+    /// call, if it also broke the fallback, would fail this test.
+    #[test]
+    fn absent_and_malformed_answer_fields_both_stay_permissive_but_declared_filters() {
+        let entry = json!({ "email": "a@b.c", "phone": "555-1234" });
+
+        // Absent: no `answer_fields` key at all.
+        let mut absent_state = ExecutionState::new(json!({}));
+        absent_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut absent_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut absent_state,
+            "card",
+            &plain_card_node(),
+            &mut absent_output,
+        );
+        assert_eq!(
+            absent_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "absent must stay fully permissive"
+        );
+
+        // Malformed: the key is present but is not an array of strings (e.g.
+        // an unresolved template, or a wrong-typed value from a designer bug).
+        let mut malformed_state = ExecutionState::new(json!({}));
+        malformed_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let malformed_node = HostNode {
+            payload_expr: json!({ "answer_fields": "{{unresolved.template}}" }),
+            ..plain_card_node()
+        };
+        let mut malformed_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut malformed_state,
+            "card",
+            &malformed_node,
+            &mut malformed_output,
+        );
+        assert_eq!(
+            malformed_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "malformed must ALSO stay fully permissive, same as absent"
+        );
+
+        // Declared: a valid, non-empty allow-list actually filters.
+        let mut declared_state = ExecutionState::new(json!({}));
+        declared_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let declared_node = HostNode {
+            payload_expr: json!({ "answer_fields": ["email"] }),
+            ..plain_card_node()
+        };
+        let mut declared_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut declared_state,
+            "card",
+            &declared_node,
+            &mut declared_output,
+        );
+        assert_eq!(
+            declared_output.payload["answers"],
+            json!({ "email": "a@b.c" }),
+            "declared must filter down to exactly the allow-listed keys"
+        );
+    }
+
+    #[test]
+    fn pending_from_snapshot_names_next_node_when_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "card".to_string(),
+            awaiting_submit: true,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let pending = pending_from_snapshot(&snapshot, &input).expect("should park answers");
+        assert_eq!(pending.node_id, "card");
+        assert_eq!(pending.answers.get("email"), Some(&json!("a@b.c")));
+    }
+
+    #[test]
+    fn pending_from_snapshot_is_none_when_not_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "successor".to_string(),
+            awaiting_submit: false,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c" });
+        assert!(pending_from_snapshot(&snapshot, &input).is_none());
+    }
+
+    /// Build a two-node flow: `card` (`Routing::Custom`, parks until
+    /// `response.action == "submit"`) -> `next` (reads
+    /// `{{node.card.answers.email}}`). `card`'s first pass has no
+    /// `response.action`, so its conditional routing falls through and it
+    /// parks with `awaiting_submit: true`.
+    fn card_answers_flow() -> Flow {
+        let card_id = NodeId::from_str("card").unwrap();
+        let next_id = NodeId::from_str("next").unwrap();
+
+        let card_node = Node {
+            id: card_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "event": "rendered" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Custom(json!([
+                { "condition": "response.action == \"submit\"", "to": next_id.to_string() }
+            ])),
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let next_node = Node {
+            id: next_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "got_email": "{{node.card.answers.email}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(card_id.clone(), card_node);
+        nodes.insert(next_id.clone(), next_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("card.answers.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(card_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({}),
+            },
+        }
+    }
+
+    /// The covering test for both findings from Task 3 code review: this
+    /// drives the REAL `FlowEngine::resume` -> `drive_flow` -> dispatch-loop
+    /// path, not a hand-simulated `ExecutionState`. It pins BOTH the `resume`
+    /// wiring (`state.pending_card_answers = pending_card_answers;`, engine.rs
+    /// near `resume`) AND the merge position immediately before
+    /// `state.nodes.insert` in the dispatch loop: deleting or moving either
+    /// makes this test fail, unlike the hand-simulated
+    /// `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`,
+    /// whose ordering sensitivity is a property of its own three
+    /// hand-written statements rather than of the engine.
+    #[test]
+    fn card_answers_survive_a_real_park_and_resume_and_reach_a_later_node() {
+        let flow = card_answers_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "card.answers.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+            operala_node_handler: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        // First turn: no `response.action` yet, so `card`'s conditional
+        // routing falls through and it parks awaiting the submit.
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting at the card node, got {other:?}"),
+        };
+        assert!(
+            snapshot.awaiting_submit,
+            "the card's conditional fall-through must set awaiting_submit"
+        );
+        assert_eq!(snapshot.next_node, "card");
+
+        // Resume with the submitted fields. `resume` must park them, the
+        // dispatch loop must re-run `card`, and `attach_pending_card_answers`
+        // must merge them into its FRESH re-dispatched output before `next`
+        // runs.
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let result2 = rt.block_on(engine.resume(ctx2, snapshot, input)).unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "the submit must route past the card to `next`"
+        );
+        assert_eq!(
+            result2.node_outputs["card"]["answers"]["email"],
+            json!("a@b.c"),
+            "the card's own re-dispatched output must carry the merged answers"
+        );
+        assert_eq!(
+            result2.node_outputs["next"]["got_email"],
+            json!("a@b.c"),
+            "`next`, a LATER node, must read the answers through {{node.card.answers.email}}"
         );
     }
 }
