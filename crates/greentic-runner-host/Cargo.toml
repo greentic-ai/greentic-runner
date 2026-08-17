@@ -35,6 +35,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(feature, values("agentic-worker", "desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
 ] }
 
+
 [dependencies]
 async-nats = "0.49"
 async-trait.workspace = true

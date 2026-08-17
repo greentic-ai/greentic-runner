@@ -45,7 +45,7 @@ GitHub CI (`ci.yml`) is thinner than `ci/local_check.sh`: it runs `cargo fmt --c
 
 The compile gate exists on `develop` and `main` but **not on `research`**: research carries 38 git dependencies, 6 of them on the cross-org private `greentic-biz` org, so cargo dies at dependency-fetch there without a cross-org deploy key. `develop` and `main` have zero git dependencies (`grep -c 'source = "git' Cargo.lock` → 0), which is why the gate runs.
 
-Note that `-p <crate>` is not a faithful reduction of a workspace build here: feature unification means `cargo clippy -p <crate> --all-features` can pass while the workspace build of the same crate fails. Reproduce workspace failures with the workspace command.
+Note that `-p <crate>` is not a faithful reduction of a workspace build here: feature unification means `cargo clippy -p greentic-aw-runtime --all-features` can pass while the workspace build of the same crate fails, because `greentic-runner-host` turns on features that pull in extra code paths. Reproduce workspace failures with the workspace command.
 
 ## Workspace Layout
 

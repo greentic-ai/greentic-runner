@@ -32,5 +32,13 @@ jobs:
       contents: read
     uses: greenticai/.github/.github/workflows/crates-publish.yml@main
     with:
-      crates: "runner-core greentic-runner-host greentic-runner-desktop greentic-runner"
+      # Must match crates-publish.yml and stay in dependency order: a crate is
+      # verified against its dependencies as resolved from crates.io (cargo
+      # strips `path` when packaging), so every workspace sibling a later crate
+      # depends on has to be published earlier in this same list. Omitting
+      # greentic-aw-runtime made greentic-runner-host verify against whatever
+      # older aw-runtime was already on crates.io, which breaks the moment a
+      # release has runner-host calling a newly added aw-runtime API (v1.1.10:
+      # `TenantContext::with_project_id` -> E0599, partial release).
+      crates: "runner-core aw-event-bridge greentic-aw-runtime greentic-runner-host greentic-runner-desktop greentic-runner"
     secrets: inherit
