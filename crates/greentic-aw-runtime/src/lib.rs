@@ -53,6 +53,7 @@ pub mod state_kv;
 pub mod state_redis;
 pub mod telemetry;
 pub mod tenant;
+pub mod tool_wire_name;
 pub mod tools;
 
 #[cfg(feature = "test-mock")]
@@ -106,6 +107,7 @@ pub use state_kv::KvAgentStateStore;
 pub use state_redis::RedisAgentStateStore;
 pub use telemetry::{OtelTelemetry, StepTelemetryCtx, Telemetry};
 pub use tenant::TenantContext;
+pub use tool_wire_name::{ToolNameCodec, is_wire_safe, wire_tool_name};
 pub use tools::{KvToolLedger, RedisToolLedger, ToolLedger};
 
 use std::sync::Arc;
