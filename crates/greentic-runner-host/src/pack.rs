@@ -297,6 +297,26 @@ fn normalize_pack_path(path: &Path) -> Result<(PathBuf, PathBuf)> {
 
 static HTTP_CLIENT: Lazy<Arc<BlockingClient>> = Lazy::new(|| Arc::new(build_blocking_client()));
 
+/// Default for [`FlowDescriptor::entry`]. A flow is treated as an entrypoint
+/// unless it is explicitly tagged `internal`, so packs (and serialized
+/// descriptors) that predate the `entry` field keep their prior behaviour of
+/// every flow being externally routable.
+fn default_flow_entry() -> bool {
+    true
+}
+
+/// A flow is an *entry* flow — a valid target for an inbound provider event
+/// resolved by flow type — unless it is tagged `internal`. Internal flows are
+/// only reachable via `flow.call` (e.g. a dispatcher's sub-flows) and must
+/// never be selected for type-only routing. Untagged flows default to entry,
+/// preserving behaviour for packs that don't declare the distinction.
+fn tags_indicate_entry<'a, I>(tags: I) -> bool
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    !tags.into_iter().any(|tag| tag == "internal")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDescriptor {
     pub id: String,
@@ -307,6 +327,9 @@ pub struct FlowDescriptor {
     pub version: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// Whether this flow is an entrypoint (see [`tags_indicate_entry`]).
+    #[serde(default = "default_flow_entry")]
+    pub entry: bool,
 }
 
 pub struct HostState {
@@ -1383,6 +1406,9 @@ fn build_legacy_flows(
             profile: manifest.meta.pack_id.clone(),
             version: manifest.meta.version.to_string(),
             description: None,
+            // Legacy manifests carry no flow tags; treat every flow as an
+            // entrypoint, matching prior behaviour.
+            entry: true,
         });
         flows.insert(entry.id.clone(), flow);
     }
@@ -2192,6 +2218,7 @@ impl PackRuntime {
                     profile: manifest.pack_id.as_str().to_string(),
                     version: manifest.version.to_string(),
                     description: None,
+                    entry: tags_indicate_entry(flow.tags.iter().map(String::as_str)),
                 })
                 .collect();
             return Ok(descriptors);
@@ -2223,6 +2250,7 @@ impl PackRuntime {
                     profile: manifest.pack_id.as_str().to_string(),
                     version: manifest.version.to_string(),
                     description: None,
+                    entry: tags_indicate_entry(flow.tags.iter().map(String::as_str)),
                 })
                 .collect();
         }
@@ -3366,6 +3394,7 @@ impl PackRuntime {
                 profile: "test".into(),
                 version: "0.0.0".into(),
                 description: None,
+                entry: true,
             });
         }
         let entry_flows = descriptors.iter().map(|flow| flow.id.clone()).collect();
@@ -3787,6 +3816,7 @@ impl PackFlows {
                 profile: manifest.pack_id.as_str().to_string(),
                 version: manifest.version.to_string(),
                 description: None,
+                entry: tags_indicate_entry(entry.tags.iter().map(String::as_str)),
             })
             .collect();
         let mut flows = HashMap::new();
@@ -3827,6 +3857,7 @@ fn flows_from_runtime_extension(manifest: &greentic_types::PackManifest) -> Opti
             profile: manifest.pack_id.as_str().to_string(),
             version: manifest.version.to_string(),
             description: None,
+            entry: tags_indicate_entry(flow.metadata.tags.iter().map(String::as_str)),
         })
         .collect::<Vec<_>>();
     let flows = runtime_flows
@@ -5368,6 +5399,32 @@ mod tests {
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
     use serde_json::json;
+
+    #[test]
+    fn tags_indicate_entry_treats_internal_as_non_entry() {
+        // `internal`-tagged flows are helpers reachable only via flow.call.
+        assert!(!tags_indicate_entry(["internal"]));
+        assert!(!tags_indicate_entry(["default", "internal"]));
+        // The public entrypoint and untagged/other-tagged flows are entries.
+        assert!(tags_indicate_entry(["default"]));
+        assert!(tags_indicate_entry(["ui", "featured"]));
+        assert!(tags_indicate_entry(std::iter::empty::<&str>()));
+    }
+
+    #[test]
+    fn flow_descriptor_deserializes_missing_entry_as_true() {
+        // Descriptors serialized before the `entry` field default to entry,
+        // preserving prior routing behaviour.
+        let desc: FlowDescriptor = serde_json::from_value(json!({
+            "id": "default",
+            "type": "messaging",
+            "pack_id": "weatherapi-pack",
+            "profile": "weatherapi-pack",
+            "version": "0.1.0"
+        }))
+        .expect("descriptor without `entry` must deserialize");
+        assert!(desc.entry);
+    }
 
     /// Build a minimal `PackRuntime` rooted at `dir` so that `read_pack_file`
     /// resolves files from that directory via `self.path.is_dir()`.

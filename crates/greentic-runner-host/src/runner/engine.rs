@@ -57,6 +57,13 @@ pub struct FlowEngine {
     packs: Vec<Arc<PackRuntime>>,
     flows: Vec<FlowDescriptor>,
     flow_sources: HashMap<FlowKey, usize>,
+    /// Pack ids whose manifest declares a `messaging.*` provider. Such a pack's
+    /// flows are that provider's own ingress plumbing, not the application
+    /// entrypoint, so they are excluded from type-only entry-flow resolution.
+    /// Without this, a multi-provider bundle (app pack + `messaging-*` provider
+    /// packs) registers several entry `messaging` flows and
+    /// `entry_flow_by_type("messaging")` bails "ambiguous; pack_id is required".
+    messaging_provider_pack_ids: std::collections::HashSet<String>,
     flow_cache: RwLock<HashMap<FlowKey, HostFlow>>,
     default_env: String,
     validation: ValidationConfig,
@@ -431,6 +438,8 @@ fn user_facing_flow_failure_text(entry: &Value) -> String {
 impl FlowEngine {
     pub async fn new(packs: Vec<Arc<PackRuntime>>, config: Arc<HostConfig>) -> Result<Self> {
         let mut flow_sources: HashMap<FlowKey, usize> = HashMap::new();
+        let mut messaging_provider_pack_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let mut descriptors = Vec::new();
         let mut bindings = HashMap::new();
         for pack in &config.pack_bindings {
@@ -441,6 +450,23 @@ impl FlowEngine {
             let pack_id = pack.metadata().pack_id.clone();
             if enforce_bindings && !bindings.contains_key(&pack_id) {
                 bail!("no gtbind entries found for pack {}", pack_id);
+            }
+            // Mark packs that declare a `messaging.*` provider so their ingress
+            // flows are excluded from type-only entry-flow routing (see
+            // `messaging_provider_pack_ids`). Derived once here, off the hot path.
+            let declares_messaging_provider = pack
+                .provider_registry_optional()
+                .ok()
+                .flatten()
+                .map(|registry| {
+                    registry
+                        .operator_metadata()
+                        .iter()
+                        .any(|meta| meta.provider_type.starts_with("messaging."))
+                })
+                .unwrap_or(false);
+            if declares_messaging_provider {
+                messaging_provider_pack_ids.insert(pack_id.clone());
             }
             let flows = pack.list_flows().await?;
             let allowed = bindings.get(&pack_id).map(|flows| {
@@ -532,6 +558,7 @@ impl FlowEngine {
             packs,
             flows: descriptors,
             flow_sources,
+            messaging_provider_pack_ids,
             flow_cache: RwLock::new(flow_map),
             default_env: env::var("GREENTIC_ENV").unwrap_or_else(|_| "local".to_string()),
             validation: config.validation.clone(),
@@ -1215,6 +1242,7 @@ impl FlowEngine {
         event: &NodeEvent<'_>,
     ) -> Result<DispatchOutcome> {
         inject_card_locale(&mut payload, &state.entry);
+        inject_card_route(&mut payload, &state.entry, node);
         match &node.kind {
             NodeKind::Exec { target_component } => self
                 .execute_component_exec(
@@ -2750,6 +2778,38 @@ impl FlowEngine {
         Some(first)
     }
 
+    /// Resolve a flow by type, considering only application entrypoint flows.
+    ///
+    /// Used to disambiguate an inbound provider event (routed by flow type,
+    /// with no explicit `pack_id`/`flow_id`) when a pack registers one public
+    /// entrypoint plus internal helper flows of the same type — the common
+    /// "dispatcher + sub-flows" shape. Internal flows are only reachable via
+    /// `flow.call`, so they must never win a type-only route.
+    ///
+    /// Flows owned by a messaging **provider** pack (its manifest declares a
+    /// `messaging.*` provider) are also excluded: a provider ships its own
+    /// ingress `main`/`default` flow that is plumbing for *that provider*, not
+    /// the application. In a multi-provider bundle that flow would otherwise
+    /// compete with the app's real entrypoint and make the route ambiguous.
+    ///
+    /// Returns `None` when zero or more than one *application* entry flow of the
+    /// type exists (genuinely ambiguous — the caller must then require a
+    /// `pack_id`).
+    pub fn entry_flow_by_type(&self, flow_type: &str) -> Option<&FlowDescriptor> {
+        let mut matches = self.flows.iter().filter(|descriptor| {
+            descriptor.flow_type == flow_type
+                && descriptor.entry
+                && !self
+                    .messaging_provider_pack_ids
+                    .contains(&descriptor.pack_id)
+        });
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
     pub fn flow_by_id(&self, flow_id: &str) -> Option<&FlowDescriptor> {
         let mut matches = self
             .flows
@@ -2981,6 +3041,14 @@ impl ExecutionState {
             match value {
                 Value::Null => {}
                 Value::Array(items) => emitted.extend(items),
+                // A terminal `emit.response` node BOTH pushes its payload to
+                // egress (see `push_egress` in `dispatch_node`) AND returns that
+                // same payload as its node output, which the `End` path passes
+                // here as `final_payload`. Appending it unconditionally would
+                // emit the response twice (the webchat "double card"). Skip the
+                // re-append when it merely repeats the last emitted response;
+                // a genuinely distinct terminal output is still appended.
+                other if emitted.last() == Some(&other) => {}
                 other => emitted.push(other),
             }
         }
@@ -3548,11 +3616,31 @@ fn parse_component_control(payload: &Value) -> Result<Option<NodeControl>> {
     }
 }
 
+/// Make `in.input.*` resolve even when the flow entry IS the message (the
+/// env/revision path passes `envelope.payload` — the message — directly), not
+/// the legacy `{ "input": <message> }` wrapper. Packs are compiled against the
+/// legacy shape and read `in.input.metadata.*` (e.g. a card button's dispatch
+/// `flow_{{in.input.metadata.operation}}`); on the direct path `in.input` was
+/// null, so metadata-based routing fell through to the entry/welcome flow.
+///
+/// When the entry is an object without an `input` key, alias `input` to the
+/// entry itself so both `in.input.X` and `in.X` resolve. Entries that already
+/// carry an explicit `input` (the legacy wrapper) are left untouched.
+fn alias_input_to_entry(mut entry: Value) -> Value {
+    if let Value::Object(map) = &mut entry
+        && !map.contains_key("input")
+    {
+        let base = Value::Object(map.clone());
+        map.insert("input".into(), base);
+    }
+    entry
+}
+
 fn template_context(state: &ExecutionState, prev: Value) -> Value {
     let entry = if state.entry.is_null() {
         Value::Object(JsonMap::new())
     } else {
-        state.entry.clone()
+        alias_input_to_entry(state.entry.clone())
     };
     let mut ctx = JsonMap::new();
     ctx.insert("entry".into(), entry.clone());
@@ -4139,6 +4227,55 @@ fn inject_card_locale(payload: &mut Value, entry: &Value) {
     }
 }
 
+/// Select an adaptive-card node's card from a `routeToCardId`/`toCardId`/
+/// `nextCardId` carried on the flow entry (a card button's submit), so the flow
+/// renders the routed card instead of the node's `default_card_asset`.
+///
+/// This keeps card navigation *inside* the flow — the runner sets the node's
+/// `card_spec.asset_path` from the routing key, which makes
+/// [`promote_card_config_to_invocation`] treat the input as an explicit card
+/// invocation (so it does not overwrite it with the default), and
+/// [`resolve_card_assets`] then inlines the routed card. It replaces the legacy
+/// host-side "read the card from the pack and bypass the flow" shortcut.
+///
+/// No-ops (leaving the node's default card) when: the node is not the
+/// adaptive-card component, the payload already carries an explicit
+/// `card_source`/`card_spec` (author-set), or no routing key is present.
+fn inject_card_route(payload: &mut Value, entry: &Value, node: &HostNode) {
+    let is_adaptive_card =
+        node.component_id().contains("adaptive-card") || node.component.contains("adaptive-card");
+    if !is_adaptive_card || is_card_invocation(payload) {
+        return;
+    }
+    let route = entry
+        .pointer("/input/metadata/routeToCardId")
+        .or_else(|| entry.pointer("/metadata/routeToCardId"))
+        .or_else(|| entry.pointer("/input/metadata/toCardId"))
+        .or_else(|| entry.pointer("/metadata/toCardId"))
+        .or_else(|| entry.pointer("/input/metadata/nextCardId"))
+        .or_else(|| entry.pointer("/metadata/nextCardId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(route) = route else {
+        return;
+    };
+
+    if !matches!(payload, Value::Object(_)) {
+        *payload = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = payload {
+        let mut card_spec = serde_json::Map::new();
+        card_spec.insert(
+            "asset_path".into(),
+            Value::String(format!("assets/cards/{route}.json")),
+        );
+        map.insert("card_source".into(), Value::String("asset".into()));
+        map.insert("card_spec".into(), Value::Object(card_spec));
+        tracing::debug!(route_to_card = %route, "inject_card_route: routed card asset selected");
+    }
+}
+
 /// Inject flow-level `slot_schema` as `slot_definitions` into the
 /// slot-extractor component's input value. Skips injection when the input
 /// already contains an explicit `slot_definitions` key (back-compat with
@@ -4711,7 +4848,11 @@ fn build_routing_context(
         _ => JsonMap::new(),
     };
 
-    let entry = &state.entry;
+    // Alias `in.input` to the entry itself when the entry is the bare message
+    // (env/revision path) so routing templates that read `in.input.*` resolve,
+    // mirroring `template_context`. Legacy `{input: <message>}` entries are
+    // left untouched.
+    let entry = alias_input_to_entry(state.entry.clone());
     ctx.insert("entry".into(), entry.clone());
     ctx.insert("in".into(), entry.clone());
 
@@ -4726,7 +4867,7 @@ fn build_routing_context(
     // Synthesise "response" from the envelope metadata.
     // greentic-start demo path: entry.input.metadata.*
     // greentic-runner direct path: entry.metadata.*
-    let metadata = resolve_entry_metadata(entry);
+    let metadata = resolve_entry_metadata(&entry);
 
     let mut response = JsonMap::new();
     if let Some(Value::Object(meta)) = metadata {
@@ -5068,6 +5209,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::new()),
             default_env: "local".to_string(),
             validation: ValidationConfig {
@@ -5086,6 +5228,104 @@ mod tests {
             mcp_tool_source: None,
             operala_node_handler: None,
         }
+    }
+
+    fn flow_desc(id: &str, pack_id: &str, flow_type: &str, entry: bool) -> FlowDescriptor {
+        FlowDescriptor {
+            id: id.into(),
+            flow_type: flow_type.into(),
+            pack_id: pack_id.into(),
+            profile: pack_id.into(),
+            version: "0.0.0".into(),
+            description: None,
+            entry,
+        }
+    }
+
+    #[test]
+    fn entry_flow_by_type_disambiguates_entrypoint_from_internal_helpers() {
+        // Regression: a pack with one public messaging entrypoint (`default`)
+        // plus internal helper flows of the same type (dispatcher sub-flows)
+        // must route an inbound, type-only provider event to the entrypoint —
+        // NOT fail as "flow type messaging is ambiguous; pack_id is required".
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("default", "weatherapi-pack", "messaging", true),
+            flow_desc("flow_", "weatherapi-pack", "messaging", false),
+            flow_desc("flow_error", "weatherapi-pack", "messaging", false),
+            flow_desc("flow_get_weather", "weatherapi-pack", "messaging", false),
+        ];
+
+        // Multiple flows of the type => the plain lookup is ambiguous...
+        assert!(
+            engine.flow_by_type("messaging").is_none(),
+            "multiple messaging flows must be ambiguous for the plain lookup"
+        );
+        // ...but exactly one is an entrypoint, so entry-aware routing resolves.
+        let resolved = engine
+            .entry_flow_by_type("messaging")
+            .expect("single entry flow must resolve");
+        assert_eq!(resolved.id, "default");
+        assert_eq!(resolved.pack_id, "weatherapi-pack");
+    }
+
+    #[test]
+    fn entry_flow_by_type_still_ambiguous_across_two_entrypoints() {
+        // Two entrypoints of the same type across packs is genuinely ambiguous
+        // and must still require a pack_id (no silent, arbitrary pick).
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("default", "pack.a", "messaging", true),
+            flow_desc("default", "pack.b", "messaging", true),
+            flow_desc("helper", "pack.a", "messaging", false),
+        ];
+        assert!(engine.entry_flow_by_type("messaging").is_none());
+    }
+
+    #[test]
+    fn entry_flow_by_type_excludes_messaging_provider_pack_flows() {
+        // Multi-provider bundle: the app pack's entry flow AND a messaging
+        // *provider* pack's ingress `main` are both entry `messaging` flows.
+        // The provider flow is that provider's plumbing, not the application
+        // entrypoint, so a type-only webchat event must resolve to the app flow
+        // — not bail "flow type messaging is ambiguous; pack_id is required".
+        let mut engine = minimal_engine();
+        engine.flows = vec![
+            flow_desc("main", "hr-onboarding-pack", "messaging", true),
+            flow_desc("main", "messaging-teams", "messaging", true),
+        ];
+        // `messaging-teams` declares a `messaging.*` provider in its manifest;
+        // the engine records that at build time.
+        engine
+            .messaging_provider_pack_ids
+            .insert("messaging-teams".to_string());
+
+        // Plain lookup is still ambiguous (two flows of the type)...
+        assert!(engine.flow_by_type("messaging").is_none());
+        // ...but only the app pack's flow is an *application* entrypoint.
+        let resolved = engine
+            .entry_flow_by_type("messaging")
+            .expect("app entry flow must resolve past the provider flow");
+        assert_eq!(resolved.id, "main");
+        assert_eq!(resolved.pack_id, "hr-onboarding-pack");
+    }
+
+    #[test]
+    fn entry_flow_by_type_matches_plain_lookup_for_single_flow() {
+        // Backward-compat: a lone flow of a type resolves the same way through
+        // both paths, tagged entry or not.
+        let mut engine = minimal_engine();
+        engine.flows = vec![flow_desc("only", "pack.a", "messaging", true)];
+        assert_eq!(
+            engine.flow_by_type("messaging").map(|f| f.id.as_str()),
+            Some("only")
+        );
+        assert_eq!(
+            engine
+                .entry_flow_by_type("messaging")
+                .map(|f| f.id.as_str()),
+            Some("only")
+        );
     }
 
     #[test]
@@ -5192,6 +5432,59 @@ mod tests {
                 { "text": "final" }
             ])
         );
+    }
+
+    #[test]
+    fn finalize_does_not_double_terminal_emit_response() {
+        // Regression: a terminal `emit.response` node pushes its card to egress
+        // AND returns it as the node output, which the `End` path passes as
+        // `final_payload`. The card must appear ONCE, not twice (the webchat
+        // "double card").
+        let card = json!({ "renderedCard": { "type": "AdaptiveCard" } });
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(card.clone());
+        let result = state.finalize_with(Some(card.clone()));
+        assert_eq!(result, json!([card]));
+    }
+
+    #[test]
+    fn finalize_still_appends_distinct_terminal_output() {
+        // A terminal output that differs from the last emitted response is a
+        // genuine additional reply and must still be appended.
+        let mut state = ExecutionState::new(json!({}));
+        state.push_egress(json!({ "text": "emitted" }));
+        let result = state.finalize_with(Some(json!({ "text": "final" })));
+        assert_eq!(result, json!([{ "text": "emitted" }, { "text": "final" }]));
+    }
+
+    #[test]
+    fn alias_input_to_entry_exposes_input_for_bare_message() {
+        // Env/revision path: the flow entry IS the message — metadata at the
+        // top level, no `input` wrapper. After aliasing, the pack's
+        // `in.input.metadata.*` template resolves the same as `in.metadata.*`.
+        let msg = json!({ "text": "hi", "metadata": { "operation": "get_weather" } });
+        let aliased = alias_input_to_entry(msg);
+        assert_eq!(
+            aliased.pointer("/metadata/operation"),
+            Some(&json!("get_weather"))
+        );
+        assert_eq!(
+            aliased.pointer("/input/metadata/operation"),
+            Some(&json!("get_weather"))
+        );
+    }
+
+    #[test]
+    fn alias_input_to_entry_preserves_explicit_input_wrapper() {
+        // Legacy `{input: <message>}` entries must not be double-wrapped.
+        let wrapped = json!({ "input": { "metadata": { "operation": "x" } } });
+        assert_eq!(alias_input_to_entry(wrapped.clone()), wrapped);
+    }
+
+    #[test]
+    fn alias_input_to_entry_ignores_non_objects() {
+        assert_eq!(alias_input_to_entry(json!("hi")), json!("hi"));
+        assert_eq!(alias_input_to_entry(json!(null)), json!(null));
     }
 
     #[test]
@@ -5714,6 +6007,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -5957,6 +6251,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -6100,6 +6395,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -6273,6 +6569,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -6394,6 +6691,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -6849,6 +7147,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: pack_id_str.to_string(),
@@ -7133,6 +7432,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: pack_id_str.to_string(),
@@ -7953,6 +8253,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "e2e-pack".to_string(),
@@ -8245,6 +8546,7 @@ mod tests {
         let host_flow = HostFlow::from(flow);
 
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -8359,6 +8661,7 @@ mod tests {
         let host_flow = HostFlow::from(flow);
 
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -8503,6 +8806,7 @@ mod tests {
     fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
         let host_flow = HostFlow::from(flow);
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -9057,6 +9361,7 @@ mod tests {
         let flow_id = "vars.survive.flow";
         let pack_id = "test-pack";
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -9239,6 +9544,7 @@ mod tests {
     #[cfg(feature = "agentic-worker")]
     fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
         FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -9446,6 +9752,7 @@ mod tests {
         dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
     ) -> FlowEngine {
         FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -10002,6 +10309,7 @@ mod tests {
         handler: std::sync::Arc<ScriptedAgentHandler>,
     ) -> FlowEngine {
         FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -10088,6 +10396,7 @@ mod tests {
         handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
     ) -> FlowEngine {
         FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
@@ -10731,6 +11040,7 @@ mod tests {
         let flow_id = "card.answers.flow";
         let pack_id = "test-pack";
         let engine = FlowEngine {
+            messaging_provider_pack_ids: Default::default(),
             rollout_ids: RolloutIds::default(),
             packs: Vec::new(),
             flows: Vec::new(),
