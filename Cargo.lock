@@ -4327,7 +4327,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -5339,9 +5339,9 @@ dependencies = [
 
 [[package]]
 name = "serde_yaml_gtc"
-version = "2.6.28789766602"
+version = "2.6.29816201036"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bcc076cd30d36f57ebd831ec6ed8703fb4099e6ce583be5552318ea506a7f9b6"
+checksum = "67a4077b293ac175452fd85f0d61668002ca3466dd678ae857ec125c92db216e"
 dependencies = [
  "base64 0.22.1",
  "indexmap 2.14.0",
@@ -7323,7 +7323,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
