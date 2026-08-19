@@ -1026,72 +1026,6 @@ impl FlowEngine {
                     return Ok(FlowExecution::waiting(
                         output_value,
                         FlowWait { reason, snapshot },
-                        node_outputs,
-                    ));
-                }
-                NodeControl::LoopHere { reason } => {
-                    // Conversational dw.agent: park and re-enter THIS node so the
-                    // next user message drives the next turn. Render the reply
-                    // (finalize_with Some) — unlike NodeControl::Wait, which
-                    // resumes at the successor and finalizes with None.
-                    let mut snapshot_state = state.clone();
-                    snapshot_state.clear_egress();
-                    let snapshot = FlowSnapshot {
-                        pack_id: step_ctx.pack_id.to_string(),
-                        flow_id: step_ctx.flow_id.to_string(),
-                        next_flow: (current_flow_id != step_ctx.flow_id)
-                            .then_some(current_flow_id.clone()),
-                        next_node: node_id.as_str().to_string(),
-                        awaiting_submit: false,
-                        state: snapshot_state,
-                    };
-                    let node_outputs = state.outputs_map();
-                    let output_value = state.finalize_with(Some(output.payload.clone()));
-                    return Ok(FlowExecution::waiting(
-                        output_value,
-                        FlowWait { reason, snapshot },
-                        node_outputs,
-                    ));
-                }
-                NodeControl::AwaitHere {
-                    reason,
-                    correlation_id: _,
-                } => {
-                    // Await the async agent response, but resume at THIS node so
-                    // the conversational branch evaluates `terminated_by`. Mirror the
-                    // remote-await Wait snapshot construction EXCEPT next_node = self.
-                    //
-                    // Keying note: the resume snapshot is stored under the SAME
-                    // `(session_hint, scope_hash)` store key as every other wait kind
-                    // (`build_store_ctx` strips the correlation from the key). The
-                    // correlation id is NOT part of the key — it only drives how the
-                    // NATS response reconstructs the hint/scope (RuntimeSessionResumer)
-                    // so it recomputes that same key. So an AwaitHere park and a later
-                    // LoopHere park for the same conversation occupy the same single
-                    // slot; they never coexist because each park overwrites it. Safety
-                    // rests on sequential single-slot resume, not key separation — an
-                    // inbound arriving mid-await resolves to this slot (a known
-                    // interleaving limitation, tracked as a follow-up).
-                    let mut snapshot_state = state.clone();
-                    snapshot_state.clear_egress();
-                    let snapshot = FlowSnapshot {
-                        pack_id: step_ctx.pack_id.to_string(),
-                        flow_id: step_ctx.flow_id.to_string(),
-                        next_flow: (current_flow_id != step_ctx.flow_id)
-                            .then_some(current_flow_id.clone()),
-                        next_node: node_id.as_str().to_string(), // SELF, not successor
-                        awaiting_submit: false,
-                        state: snapshot_state,
-                    };
-                    let node_outputs = state.outputs_map();
-                    // Finalize with None (render nothing here — the reply, if any,
-                    // was already surfaced before the dispatch): match the
-                    // remote-await Wait finalize semantics confirmed in Task 1.
-                    let output_value = state.clone().finalize_with(None);
-                    return Ok(FlowExecution::waiting(
-                        output_value,
-                        FlowWait { reason, snapshot },
-                        node_outputs,
                     ));
                 }
                 NodeControl::Jump(jump) => {
@@ -8110,7 +8044,6 @@ mod tests {
             agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
             graph_node_handler: None,
             mcp_tool_source: None,
-            operala_node_handler: None,
         }
     }
 
@@ -8317,7 +8250,6 @@ mod tests {
             agent_node_handler: None,
             graph_node_handler: None,
             mcp_tool_source: None,
-            operala_node_handler: None,
         }
     }
 
@@ -8873,156 +8805,7 @@ mod tests {
             agent_node_handler: Some(handler),
             graph_node_handler: None,
             mcp_tool_source: None,
-            operala_node_handler: None,
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // operala.call in-process handler wiring
-    // -----------------------------------------------------------------------
-
-    struct StubOperalaHandler {
-        payload: serde_json::Value,
-    }
-    #[async_trait::async_trait]
-    impl crate::runner::operala_node::OperalaNodeHandler for StubOperalaHandler {
-        async fn execute(
-            &self,
-            _tenant: &str,
-            _env: &str,
-            _target: &str,
-            _operation: &str,
-            _session_id: &str,
-            _input: &serde_json::Value,
-        ) -> anyhow::Result<serde_json::Value> {
-            Ok(self.payload.clone())
-        }
-    }
-
-    /// Build a single-node flow: an `operala.call` node (given `target`) that
-    /// ends the flow directly. Mirrors `conversational_dw_flow`'s shape for
-    /// the (non-conversational) operala path.
-    fn operala_flow(target: &str) -> HostFlow {
-        let mut nodes = IndexMap::new();
-        let node_id = NodeId::from_str("op").unwrap();
-        nodes.insert(
-            node_id.clone(),
-            HostNode {
-                kind: NodeKind::OperalaCall {
-                    target: target.to_string(),
-                },
-                component: "operala.call".to_string(),
-                component_id: "operala.call".to_string(),
-                operation_name: Some(target.to_string()),
-                operation_in_mapping: None,
-                payload_expr: json!({ "operation": "", "input": { "goal": "hi" } }),
-                routing: Routing::End,
-                vars_out: None,
-            },
-        );
-        HostFlow {
-            slot_schema: None,
-            id: "operala.flow".to_string(),
-            start: Some(node_id),
-            nodes,
-            vars_init: JsonMap::new(),
-            required_vars: Vec::new(),
-        }
-    }
-
-    /// Build an engine holding `flow` with the given optional in-process
-    /// operala handler and no NATS `RemoteDispatchHandler` — a `None` handler
-    /// exercises the existing NATS-fallback error path.
-    fn operala_engine(
-        flow: HostFlow,
-        handler: Option<std::sync::Arc<dyn crate::runner::operala_node::OperalaNodeHandler>>,
-    ) -> FlowEngine {
-        FlowEngine {
-            rollout_ids: RolloutIds::default(),
-            packs: Vec::new(),
-            flows: Vec::new(),
-            flow_sources: StdHashMap::new(),
-            flow_cache: RwLock::new(StdHashMap::from([(
-                FlowKey {
-                    pack_id: "test-pack".to_string(),
-                    flow_id: "operala.flow".to_string(),
-                },
-                flow,
-            )])),
-            default_env: "local".to_string(),
-            validation: ValidationConfig {
-                mode: ValidationMode::Off,
-            },
-            cross_pack_resolver: None,
-            remote_dispatch_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
-            #[cfg(feature = "agentic-worker")]
-            agent_node_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            graph_node_handler: None,
-            #[cfg(feature = "agentic-worker")]
-            mcp_tool_source: None,
-            operala_node_handler: handler,
-        }
-    }
-
-    fn operala_ctx<'a>() -> FlowContext<'a> {
-        FlowContext {
-            tenant: "demo",
-            pack_id: "test-pack",
-            flow_id: "operala.flow",
-            node_id: None,
-            tool: None,
-            action: None,
-            session_id: Some("sess-op"),
-            provider_id: None,
-            reply_scope: None,
-            retry_config: RetryConfig {
-                max_attempts: 1,
-                base_delay_ms: 1,
-            },
-            attempt: 1,
-            observer: None,
-            mocks: None,
-        }
-    }
-
-    #[test]
-    fn operala_call_with_in_process_handler_completes_inline() {
-        let handler = std::sync::Arc::new(StubOperalaHandler {
-            payload: json!({ "reply": "stub" }),
-        });
-        let engine = operala_engine(operala_flow("deep_worker"), Some(handler));
-        let execution = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(engine.execute(operala_ctx(), Value::Null))
-            .expect("operala.call with an in-process handler must complete");
-        assert!(matches!(execution.status, FlowStatus::Completed));
-        assert_eq!(execution.output, json!({ "reply": "stub" }));
-    }
-
-    #[test]
-    fn operala_call_without_handler_or_nats_fails() {
-        let engine = operala_engine(operala_flow("deep_worker"), None);
-        let execution = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(engine.execute(operala_ctx(), Value::Null))
-            .expect("session flow returns a completed error envelope, not an Err");
-        // `operala_ctx` carries a `session_id`, so main's retry-exhaustion policy
-        // wraps the execution error into a `Completed` flow carrying the
-        // `flow_execution_failed` envelope (graceful degradation for session
-        // flows) rather than propagating an `Err`. The operala misconfiguration
-        // is still surfaced loudly — in the error payload.
-        assert!(matches!(execution.status, FlowStatus::Completed));
-        let msg = execution.output["metadata"]["error_message"]
-            .as_str()
-            .unwrap_or_default();
-        assert!(
-            msg.contains("operala.call node dispatched but no RemoteDispatchHandler configured"),
-            "unexpected output: {:?}",
-            execution.output
-        );
     }
 
     #[test]
@@ -9526,12 +9309,12 @@ mod tests {
         let next_node = Node {
             id: next_id.clone(),
             component: FlowComponentRef {
-                id: "emit.log".parse().unwrap(),
+                id: "emit.response".parse().unwrap(),
                 pack_alias: None,
                 operation: None,
             },
             input: InputMapping {
-                mapping: json!({ "got_email": "{{node.card.answers.email}}" }),
+                mapping: json!({ "text": "{{node.card.answers.email}}" }),
             },
             output: OutputMapping {
                 mapping: Value::Null,
@@ -9585,6 +9368,7 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: pack_id.to_string(),
@@ -9606,7 +9390,6 @@ mod tests {
             graph_node_handler: None,
             #[cfg(feature = "agentic-worker")]
             mcp_tool_source: None,
-            operala_node_handler: None,
         };
         let rt = Runtime::new().unwrap();
 
@@ -9669,15 +9452,15 @@ mod tests {
             matches!(result2.status, FlowStatus::Completed),
             "the submit must route past the card to `next`"
         );
-        assert_eq!(
-            result2.node_outputs["card"]["answers"]["email"],
-            json!("a@b.c"),
-            "the card's own re-dispatched output must carry the merged answers"
-        );
-        assert_eq!(
-            result2.node_outputs["next"]["got_email"],
-            json!("a@b.c"),
-            "`next`, a LATER node, must read the answers through {{node.card.answers.email}}"
+        // This lane has no `FlowExecution::node_outputs` to inspect, so the
+        // later node emits the value as a response and we assert on the flow
+        // output. Same claim: `{{node.card.answers.email}}` resolved, which it
+        // can only do if the resumed card attached the submitted answers.
+        let rendered = serde_json::to_string(&result2.output).expect("encode output");
+        assert!(
+            rendered.contains("a@b.c"),
+            "`next`, a LATER node, must read the answers through \
+             {{node.card.answers.email}}; got {rendered}"
         );
     }
 }
