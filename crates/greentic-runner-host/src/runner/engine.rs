@@ -5041,6 +5041,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -5183,6 +5184,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -5336,6 +5338,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -5353,6 +5356,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), agent_node);
@@ -6492,6 +6496,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -6509,6 +6514,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(agent_node_id.clone(), agent_node);
@@ -6633,6 +6639,8 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
             messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
@@ -6844,6 +6852,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -6873,6 +6882,8 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(HashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -6963,6 +6974,7 @@ mod tests {
                 node_id: emit_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit_node = Node {
@@ -6981,6 +6993,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();
@@ -7013,6 +7026,8 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "test-pack".to_string(),
@@ -7210,6 +7225,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let host_node = HostNode::from(node);
@@ -7260,6 +7276,7 @@ mod tests {
                 node_id: emit2_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit2_node = Node {
@@ -7278,6 +7295,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();
@@ -7359,6 +7377,7 @@ mod tests {
                 node_id: wait_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let wait_node = Node {
@@ -7379,6 +7398,7 @@ mod tests {
                 node_id: emit_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let emit_node = Node {
@@ -7400,6 +7420,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
 
         let mut nodes = indexmap::IndexMap::default();
@@ -7441,6 +7462,8 @@ mod tests {
             packs: Vec::new(),
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: pack_id.to_string(),
