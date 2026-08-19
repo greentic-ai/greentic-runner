@@ -604,6 +604,54 @@ impl FlowEngine {
     }
 
     pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, None).await
+    }
+
+    /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
+    /// declared entrypoint.
+    ///
+    /// Card-driven messaging packs carry the id of the next node to run on the
+    /// inbound activity (the designer emits it as `nextCardId`). A host that can
+    /// only call [`FlowEngine::execute`] restarts such a flow at its entrypoint
+    /// on every turn, so the capture nodes chained between two cards never run.
+    ///
+    /// Unlike [`FlowEngine::resume`] this needs no persisted `FlowSnapshot`:
+    /// state starts fresh from `input`. That is what makes it usable for packs
+    /// whose pause points are rendered cards rather than `session.wait` nodes —
+    /// those never park, so they never leave a snapshot behind.
+    ///
+    /// An `entry_node` that is not a node of the flow is a hard error. Falling
+    /// back to the entrypoint would re-introduce the silent restart this exists
+    /// to remove.
+    pub async fn execute_from(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: &str,
+    ) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, Some(entry_node.to_string()))
+            .await
+    }
+
+    async fn execute_with_entry(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
+        // Validate the caller's entry node BEFORE the retry loop below, whose
+        // session-flow arm converts a terminal error into an Ok envelope. A
+        // node id the flow does not have is a caller/pack defect, not a
+        // transient failure, and must surface as an error rather than as a
+        // rendered "something went wrong" card.
+        if let Some(node) = entry_node.as_deref() {
+            let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
+            let node_id = NodeId::from_str(node)
+                .with_context(|| format!("invalid entry node id `{node}`"))?;
+            if !flow_ir.nodes.contains_key(&node_id) {
+                bail!("flow {} has no node `{}`", ctx.flow_id, node);
+            }
+        }
         let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
@@ -627,7 +675,10 @@ impl FlowEngine {
                     maybe_fail(FaultPoint::Timeout, fault_ctx)
                         .map_err(|err| anyhow!(err.to_string()))?;
                 }
-                match self.execute_once(&ctx, original_input.clone()).await {
+                match self
+                    .execute_once(&ctx, original_input.clone(), entry_node.clone())
+                    .await
+                {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
@@ -705,7 +756,12 @@ impl FlowEngine {
             .await
     }
 
-    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    async fn execute_once(
+        &self,
+        ctx: &FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
         let mut state = ExecutionState::new(input);
         for (name, default) in flow_ir.vars_init.iter() {
@@ -714,7 +770,7 @@ impl FlowEngine {
                 .entry(name.clone())
                 .or_insert_with(|| default.clone());
         }
-        self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
+        self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
     }
 

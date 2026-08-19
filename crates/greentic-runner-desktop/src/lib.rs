@@ -107,6 +107,20 @@ impl TenantContext {
 pub struct RunOptions {
     pub profile: Profile,
     pub entry_flow: Option<String>,
+    /// Start the run at this node instead of the flow's declared entrypoint.
+    ///
+    /// Card-driven messaging packs carry the id of the next node to run on the
+    /// inbound activity. Without this the host can only restart at the
+    /// entrypoint on every turn, so the nodes chained between two rendered
+    /// cards never execute.
+    ///
+    /// This OUTRANKS a persisted resume snapshot, and clears it: it is a fresh
+    /// navigation decision taken from the inbound activity, so resuming a
+    /// parked node instead would send the run somewhere the user did not ask
+    /// for. Card journeys park on every rendered card, so a snapshot is almost
+    /// always present. A node id the flow does not have is an error, never a
+    /// silent fall back to the entrypoint.
+    pub entry_node: Option<String>,
     pub input: Value,
     pub ctx: TenantContext,
     pub transcript: Option<TranscriptHook>,
@@ -150,6 +164,7 @@ impl fmt::Debug for RunOptions {
         f.debug_struct("RunOptions")
             .field("profile", &self.profile)
             .field("entry_flow", &self.entry_flow)
+            .field("entry_node", &self.entry_node)
             .field("input", &self.input)
             .field("ctx", &self.ctx)
             .field("transcript", &self.transcript.is_some())
@@ -277,6 +292,7 @@ pub fn desktop_defaults() -> RunOptions {
         secrets_manager: None,
         cross_pack_resolver: None,
         session_state_dir: None,
+        entry_node: None,
     }
 }
 
@@ -525,7 +541,26 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         .as_deref()
         .and_then(load_session_snapshot);
 
-    let execution = if let Some(snapshot) = resume_snapshot {
+    let execution = if let Some(entry_node) = opts.entry_node.as_deref() {
+        // An explicit entry node OUTRANKS a parked snapshot. It is a fresh
+        // navigation decision the caller just took from the inbound activity
+        // ("the user pressed the button that goes to <node>"), so honouring a
+        // snapshot instead would send the run somewhere the user did not ask
+        // for. Card journeys park on every rendered card, so a snapshot is
+        // almost always present and would win every time.
+        //
+        // The snapshot's accumulated state is not lost in practice: the card
+        // protocol carries the collected form data forward on every button, so
+        // the capture nodes re-seed the vars from the inbound envelope. Clear
+        // the stale snapshot so the next turn cannot resume into a node this
+        // run has moved past.
+        if let Some(path) = session_snapshot_path.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+        engine
+            .execute_from(ctx, opts.input.clone(), entry_node)
+            .await
+    } else if let Some(snapshot) = resume_snapshot {
         engine.resume(ctx, snapshot, opts.input.clone()).await
     } else {
         engine.execute(ctx, opts.input.clone()).await
