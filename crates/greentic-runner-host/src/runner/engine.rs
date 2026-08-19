@@ -105,6 +105,14 @@ pub struct FlowSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_flow: Option<String>,
     pub next_node: String,
+    /// True only when this snapshot was taken because conditional routing fell
+    /// through and the node parked at ITSELF awaiting the next submit — the
+    /// card case. False for `session.wait`, whose `next_node` is the SUCCESSOR,
+    /// not the node that was waiting; attaching a person's answers there would
+    /// name a node that had not run yet. Defaulted so snapshots written before
+    /// this field behave exactly as they did.
+    #[serde(default)]
+    pub awaiting_submit: bool,
     pub state: ExecutionState,
 }
 
@@ -134,6 +142,7 @@ struct HostFlow {
     /// Flow-level slot definitions extracted from `metadata.extra["greentic.slot_schema"]`.
     /// Injected into slot-extractor component invocations at dispatch time (Phase D).
     slot_schema: Option<Value>,
+    vars_init: JsonMap<String, Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +155,11 @@ pub struct HostNode {
     operation_in_mapping: Option<String>,
     payload_expr: Value,
     routing: Routing,
+    /// Per-node implicit output bindings: after this node runs, each entry
+    /// `{ varName: template }` is rendered against a context where `prev` is
+    /// the node's own output payload, and the result is written to
+    /// `ExecutionState.vars[varName]`.
+    vars_out: Option<JsonMap<String, Value>>,
 }
 
 impl HostNode {
@@ -180,6 +194,7 @@ impl HostNode {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         }
     }
 }
@@ -213,6 +228,13 @@ enum NodeKind {
     },
     BuiltinStateGet,
     BuiltinStateSet,
+    /// Session-scoped variable write: renders `value` against the current
+    /// template context and inserts into `ExecutionState.vars[name]`.
+    /// Config shape: `{ name: String, value: any }`.
+    VarSet {
+        name: String,
+        value: Value,
+    },
     Wait,
     DwAgent {
         agent_id: String,
@@ -590,6 +612,54 @@ impl FlowEngine {
     }
 
     pub async fn execute(&self, ctx: FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, None).await
+    }
+
+    /// Execute a flow whose cursor starts at `entry_node` instead of the flow's
+    /// declared entrypoint.
+    ///
+    /// Card-driven messaging packs carry the id of the next node to run on the
+    /// inbound activity (the designer emits it as `nextCardId`). A host that can
+    /// only call [`FlowEngine::execute`] restarts such a flow at its entrypoint
+    /// on every turn, so the capture nodes chained between two cards never run.
+    ///
+    /// Unlike [`FlowEngine::resume`] this needs no persisted `FlowSnapshot`:
+    /// state starts fresh from `input`. That is what makes it usable for packs
+    /// whose pause points are rendered cards rather than `session.wait` nodes —
+    /// those never park, so they never leave a snapshot behind.
+    ///
+    /// An `entry_node` that is not a node of the flow is a hard error. Falling
+    /// back to the entrypoint would re-introduce the silent restart this exists
+    /// to remove.
+    pub async fn execute_from(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: &str,
+    ) -> Result<FlowExecution> {
+        self.execute_with_entry(ctx, input, Some(entry_node.to_string()))
+            .await
+    }
+
+    async fn execute_with_entry(
+        &self,
+        ctx: FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
+        // Validate the caller's entry node BEFORE the retry loop below, whose
+        // session-flow arm converts a terminal error into an Ok envelope. A
+        // node id the flow does not have is a caller/pack defect, not a
+        // transient failure, and must surface as an error rather than as a
+        // rendered "something went wrong" card.
+        if let Some(node) = entry_node.as_deref() {
+            let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
+            let node_id = NodeId::from_str(node)
+                .with_context(|| format!("invalid entry node id `{node}`"))?;
+            if !flow_ir.nodes.contains_key(&node_id) {
+                bail!("flow {} has no node `{}`", ctx.flow_id, node);
+            }
+        }
         let span = self.flow_execute_span(&ctx);
         let retry_config = ctx.retry_config;
         let original_input = input;
@@ -613,7 +683,10 @@ impl FlowEngine {
                     maybe_fail(FaultPoint::Timeout, fault_ctx)
                         .map_err(|err| anyhow!(err.to_string()))?;
                 }
-                match self.execute_once(&ctx, original_input.clone()).await {
+                match self
+                    .execute_once(&ctx, original_input.clone(), entry_node.clone())
+                    .await
+                {
                     Ok(value) => return Ok(value),
                     Err(err) => {
                         if attempt >= retry_config.max_attempts || !should_retry(&err) {
@@ -673,6 +746,9 @@ impl FlowEngine {
             .clone()
             .unwrap_or_else(|| snapshot.flow_id.clone());
         let flow_ir = self.get_or_load_flow(ctx.pack_id, &resume_flow).await?;
+        // Computed before `snapshot.state` is moved out below, since it borrows
+        // `snapshot` (specifically `next_node` and `awaiting_submit`).
+        let pending_card_answers = pending_from_snapshot(&snapshot, &input);
         let mut state = snapshot.state;
         // Replace BOTH `input` AND `entry` with the new activity. The
         // routing context (built by `build_routing_context`) reads
@@ -684,6 +760,10 @@ impl FlowEngine {
         // to refresh `entry` ourselves; `ensure_entry` is a no-op once
         // entry is non-null.
         state.replace_input(input.clone());
+        // Park the submitted fields for the node that was awaiting them. Only a
+        // snapshot flagged `awaiting_submit` names the waiting node in
+        // `next_node`; `session.wait` names its SUCCESSOR, which has not run.
+        state.pending_card_answers = pending_card_answers;
         state.entry = input;
         let span = self.flow_execute_span(&ctx);
         self.drive_flow(&ctx, flow_ir, state, Some(snapshot.next_node), resume_flow)
@@ -691,10 +771,21 @@ impl FlowEngine {
             .await
     }
 
-    async fn execute_once(&self, ctx: &FlowContext<'_>, input: Value) -> Result<FlowExecution> {
+    async fn execute_once(
+        &self,
+        ctx: &FlowContext<'_>,
+        input: Value,
+        entry_node: Option<String>,
+    ) -> Result<FlowExecution> {
         let flow_ir = self.get_or_load_flow(ctx.pack_id, ctx.flow_id).await?;
-        let state = ExecutionState::new(input);
-        self.drive_flow(ctx, flow_ir, state, None, ctx.flow_id.to_string())
+        let mut state = ExecutionState::new(input);
+        for (name, default) in flow_ir.vars_init.iter() {
+            state
+                .vars
+                .entry(name.clone())
+                .or_insert_with(|| default.clone());
+        }
+        self.drive_flow(ctx, flow_ir, state, entry_node, ctx.flow_id.to_string())
             .await
     }
 
@@ -793,7 +884,10 @@ impl FlowEngine {
                     &event,
                 )
                 .await;
-            let DispatchOutcome { output, control } = match dispatch {
+            let DispatchOutcome {
+                mut output,
+                control,
+            } = match dispatch {
                 Ok(outcome) => outcome,
                 Err(err) => {
                     if let Some(observer) = step_ctx.observer {
@@ -806,8 +900,27 @@ impl FlowEngine {
                 }
             };
 
+            let owned_the_submit =
+                attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
+            // Apply per-node vars_out bindings: render each template against a
+            // context where `prev` is this node's own output payload (already
+            // stored in state.last_output above), then write into state.vars.
+            if let Some(bindings) = node.vars_out.as_ref() {
+                let ctx = template_context(&state, output.payload.clone());
+                for (var_name, template) in bindings.iter() {
+                    let rendered = render_template_value(
+                        template,
+                        &ctx,
+                        TemplateOptions {
+                            allow_pointer: true,
+                        },
+                    )
+                    .with_context(|| format!("failed to render vars_out binding `{var_name}`"))?;
+                    state.vars.insert(var_name.clone(), rendered);
+                }
+            }
             if let Some(observer) = step_ctx.observer {
                 observer.on_node_end(&event, &output.payload);
             }
@@ -836,6 +949,18 @@ impl FlowEngine {
                         }
                     };
 
+                    // This node has now routed on the submit that was delivered
+                    // to it, so the action is spent. `response.*` is synthesised
+                    // from the run's entry envelope and is therefore run-scoped:
+                    // left in place it matches again at the NEXT card and the
+                    // run walks straight past it, advancing the journey by two
+                    // pages per submit. Clearing it here means every later node
+                    // sees a freshly rendered card with no pending action, falls
+                    // through its conditional routing, and parks for the user.
+                    if owned_the_submit {
+                        consume_routing_action(&mut state.entry);
+                    }
+
                     match decision {
                         NextDecision::Next(n) => current = n,
                         NextDecision::End => {
@@ -859,6 +984,7 @@ impl FlowEngine {
                                 next_flow: (current_flow_id != step_ctx.flow_id)
                                     .then_some(current_flow_id.clone()),
                                 next_node: node_id.as_str().to_string(),
+                                awaiting_submit: true,
                                 state: snapshot_state,
                             };
                             let output_value = state.finalize_with(Some(output.payload.clone()));
@@ -906,6 +1032,7 @@ impl FlowEngine {
                         next_flow: (current_flow_id != step_ctx.flow_id)
                             .then_some(current_flow_id.clone()),
                         next_node: resume_target.as_str().to_string(),
+                        awaiting_submit: false,
                         state: snapshot_state,
                     };
                     let output_value = state.clone().finalize_with(None);
@@ -999,6 +1126,31 @@ impl FlowEngine {
                 .execute_state_set(ctx, payload)
                 .await
                 .map(DispatchOutcome::complete),
+            NodeKind::VarSet { name, value } => {
+                if name.trim().is_empty() {
+                    tracing::warn!(
+                        node_id = %node_id,
+                        "var_set node has an empty variable name; skipping write"
+                    );
+                    return Ok(DispatchOutcome::complete(NodeOutput::new(
+                        serde_json::json!({ "ok": true }),
+                    )));
+                }
+                let prev = state.last_output.clone().unwrap_or(Value::Null);
+                let ctx_val = template_context(state, prev);
+                let rendered = render_template_value(
+                    value,
+                    &ctx_val,
+                    TemplateOptions {
+                        allow_pointer: true,
+                    },
+                )
+                .context("failed to render var_set value")?;
+                state.vars.insert(name.clone(), rendered);
+                Ok(DispatchOutcome::complete(NodeOutput::new(
+                    serde_json::json!({ "ok": true }),
+                )))
+            }
             NodeKind::Wait => {
                 let reason = extract_wait_reason(&payload);
                 Ok(DispatchOutcome::wait(NodeOutput::new(payload), reason))
@@ -2222,6 +2374,38 @@ pub struct NodeEvent<'a> {
     pub payload: &'a Value,
 }
 
+/// Safety backstop for a CONVERSATIONAL `dw.agent` node's park-and-loop cycle.
+///
+/// This is NOT a UX limit — it exists purely so that a stuck or misbehaving
+/// conversational agent (one that never emits `conversation_ended`) cannot
+/// trap a flow at the same node forever. After this many parked turns at a
+/// single conversational `dw.agent` node without a `conversation_ended`
+/// termination, the flow force-advances to the node's successor using the
+/// agent's last output. Deliberately a plain constant: no env var, no
+/// per-agent config knob.
+///
+/// Only referenced from the conversational `DwAgent` branch of
+/// `dispatch_node` and from the (already `#[cfg(feature = "agentic-worker")]`
+/// -gated) park-loop-cap unit tests below; cfg-gate it the same way so it
+/// isn't flagged dead when that feature is off (e.g. a lean
+/// `--no-default-features --features verify` build). Unlike
+/// `bump_park_turns`/etc. below, no plain (ungated) test references this
+/// constant directly, so no `test` alternative is needed here.
+#[cfg(feature = "agentic-worker")]
+const MAX_PARK_TURNS: u32 = 100;
+
+/// Submitted fields waiting to be attached to the output of the node that
+/// parked for them.
+///
+/// It cannot be attached at resume time: `drive_flow` re-dispatches
+/// `snapshot.next_node` and `state.nodes.insert` REPLACES that node's stored
+/// output, so anything written before the dispatch is destroyed.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingCardAnswers {
+    node_id: String,
+    answers: JsonMap<String, Value>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionState {
     #[serde(default)]
@@ -2236,6 +2420,30 @@ pub struct ExecutionState {
     last_output: Option<Value>,
     #[serde(default)]
     redirect_count: u32,
+    #[serde(default)]
+    vars: JsonMap<String, Value>,
+    /// Per-node park-loop turn counter for conversational `dw.agent` nodes,
+    /// keyed by node id. Mirrors `redirect_count`'s per-execution safety-cap
+    /// pattern, but tracked per node since a flow may hold more than one
+    /// conversational agent.
+    #[serde(default)]
+    park_turns: HashMap<String, u32>,
+    /// Marks a node as awaiting an async `dw.agent` NATS dispatch response.
+    /// Set on dispatch, checked-and-cleared on resume; mirrors `park_turns`'
+    /// per-node, serde-defaulted, persisted-in-snapshot pattern.
+    #[serde(default)]
+    pending_agent_await: HashMap<String, ()>,
+    /// Nodes that dispatched an approval request and are parked awaiting the
+    /// decision. Set on dispatch, cleared when the response re-enters the node.
+    /// Without it a stray inbound arriving mid-await would look like a first
+    /// entry and re-dispatch — a duplicate approval request to the operator.
+    #[serde(default)]
+    pending_approval_await: HashMap<String, ()>,
+    /// Submitted fields awaiting attachment to their node's output. In practice
+    /// never survives a snapshot — it is consumed by the first dispatch after a
+    /// resume — but is serde-defaulted like its neighbours.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_card_answers: Option<PendingCardAnswers>,
 }
 
 impl ExecutionState {
@@ -2247,6 +2455,11 @@ impl ExecutionState {
             egress: Vec::new(),
             last_output: None,
             redirect_count: 0,
+            vars: JsonMap::new(),
+            park_turns: HashMap::new(),
+            pending_agent_await: HashMap::new(),
+            pending_approval_await: HashMap::new(),
+            pending_card_answers: None,
         }
     }
 
@@ -2521,6 +2734,181 @@ fn node_output_view(payload: &Value) -> Value {
     }
 }
 
+/// The result of reading `answer_fields` from a card node's raw input mapping.
+///
+/// `Absent` and `Malformed` both fall back to the permissive (unfiltered)
+/// path in [`attach_pending_card_answers`] — the contract is "absent means
+/// this pack predates the allow-list", so failing permissively rather than
+/// closed is deliberate for both. They are kept as separate variants (rather
+/// than collapsed into one `None`) purely so the caller can log the
+/// `Malformed` case: an ordinary pre-upgrade pack has no `answer_fields` key
+/// at all and must stay quiet, but a *present-and-broken* value is a
+/// designer-side bug reproducing this feature's original leak, and must not
+/// be silently indistinguishable from the ordinary case in the logs.
+enum DeclaredAnswerFields {
+    /// The `answer_fields` key is not present at all. The ordinary case for
+    /// every pack built before this feature — must not be logged.
+    Absent,
+    /// The key is present but is not a valid array of strings (wrong type,
+    /// or an array containing a non-string entry — e.g. an unresolved
+    /// template). Distinct from `Absent` so it can be surfaced.
+    Malformed,
+    /// The key is present and a valid (possibly empty) array of strings.
+    Declared(Vec<String>),
+}
+
+/// The card's own declared allow-list for `answers`, read from its raw input
+/// mapping (`HostNode::payload_expr`) BEFORE template rendering — greentic-designer
+/// writes the card's declared `Input.*` ids under this key
+/// (`answer_fields: ["field_a", "field_b", ...]`) at composer-save time.
+///
+/// Reading `payload_expr` here is safe from upstream interference: it is
+/// built once, from the pack's `Node.input.mapping`, in `HostNode`'s
+/// `From<Node>` impl, and `flow_ir.nodes` is never mutated for the lifetime of
+/// a `drive_flow` call (only `.get()` — see `engine.rs` near `drive_flow`'s
+/// dispatch loop). The dispatch loop's own template render
+/// (`let payload_template = node.payload_expr.clone();`, a few lines above the
+/// call site) clones it into a separate value before rendering, so the render
+/// never touches `node.payload_expr` itself. By the time this function runs —
+/// after that node has already been dispatched — `node.payload_expr` is
+/// byte-identical to what was loaded from the pack.
+///
+/// `Absent` means the key is absent — a pack built before this change, or any
+/// path that never runs the designer injector. That is deliberately treated as
+/// "no allow-list", not "empty allow-list": those packs, and the fixtures for
+/// paths that skip the injector, would otherwise silently lose every submitted
+/// answer. A present-but-malformed value (not an array, or containing a
+/// non-string entry) is likewise treated as permissive (see
+/// [`DeclaredAnswerFields`]), so a malformed pack fails open instead of
+/// collapsing to zero answers — but unlike `Absent`, it is observable.
+///
+/// `Declared(vec![])` — a present but EMPTY array — means the card genuinely
+/// declares no inputs; the caller must produce `{}`, not the unfiltered set.
+fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
+    let Some(raw) = payload_expr.get("answer_fields") else {
+        return DeclaredAnswerFields::Absent;
+    };
+    let Some(arr) = raw.as_array() else {
+        return DeclaredAnswerFields::Malformed;
+    };
+    match arr
+        .iter()
+        .map(|entry| entry.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()
+    {
+        Some(list) => DeclaredAnswerFields::Declared(list),
+        None => DeclaredAnswerFields::Malformed,
+    }
+}
+
+/// Merge the pending submitted fields into `output` when it belongs to the node
+/// that parked for them, then CONSUME the pending entry.
+///
+/// Consuming rather than reading is what stops a loop back through the same node
+/// (without a resume) re-attaching stale answers.
+///
+/// When `node`'s input mapping carries `answer_fields` (see
+/// [`declared_answer_fields`]), `answers` is intersected down to exactly those
+/// keys — `submitted_fields` unions the whole submit envelope, which on the
+/// `greentic-start` path includes transport identity (`tenant`, `session_id`,
+/// `from`, ...) and pack config (routing keys, secret references, ...) that a
+/// person never typed. Without a declared allow-list, `answers` stays exactly
+/// what `submitted_fields` produced (today's behaviour, unchanged).
+///
+/// Called immediately before `state.nodes.insert`, and that position is
+/// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
+/// Remove the routing `action` from a run's entry envelope.
+///
+/// Mirrors the two shapes [`build_routing_context`] reads it from: the
+/// greentic-start demo path wraps the activity (`entry.input.metadata`), the
+/// direct runner path does not (`entry.metadata`).
+fn consume_routing_action(entry: &mut Value) {
+    for pointer in ["/input/metadata", "/metadata"] {
+        if let Some(Value::Object(meta)) = entry.pointer_mut(pointer) {
+            meta.remove("action");
+        }
+    }
+}
+
+/// Returns true when the pending submit belonged to `node_id` and was consumed
+/// here — the caller clears the routing action once this node has routed on it.
+fn attach_pending_card_answers(
+    state: &mut ExecutionState,
+    node_id: &str,
+    node: &HostNode,
+    output: &mut NodeOutput,
+) -> bool {
+    let is_target = state
+        .pending_card_answers
+        .as_ref()
+        .is_some_and(|pending| pending.node_id == node_id);
+    if !is_target {
+        return false;
+    }
+    let Some(pending) = state.pending_card_answers.take() else {
+        return false;
+    };
+    // No `ok` check on purpose: the answers are real whether or not the
+    // re-render succeeded, and dropping them would let a transient render error
+    // silently destroy what someone typed.
+    let Some(map) = output.payload.as_object_mut() else {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output payload is not an object; submitted answers not attached"
+        );
+        return true;
+    };
+    if map.contains_key("answers") {
+        tracing::warn!(
+            node_id = %node_id,
+            "node output already carries `answers`; overwriting with the submitted fields"
+        );
+    }
+    let answers = match declared_answer_fields(&node.payload_expr) {
+        DeclaredAnswerFields::Declared(allow_list) => {
+            let allowed: std::collections::HashSet<&str> =
+                allow_list.iter().map(String::as_str).collect();
+            pending
+                .answers
+                .into_iter()
+                .filter(|(key, _)| allowed.contains(key.as_str()))
+                .collect()
+        }
+        DeclaredAnswerFields::Malformed => {
+            // Distinct from `Absent` on purpose: an ordinary pre-upgrade pack
+            // has no `answer_fields` key and must stay quiet, but a
+            // present-and-broken value reproduces this feature's original
+            // leak (the full unfiltered envelope, including any secret
+            // references, ships as `answers`) and must be observable.
+            tracing::warn!(
+                node_id = %node_id,
+                "answer_fields present but malformed; falling back to unfiltered answers"
+            );
+            pending.answers
+        }
+        DeclaredAnswerFields::Absent => pending.answers,
+    };
+    map.insert("answers".to_string(), Value::Object(answers));
+    true
+}
+
+/// Decide what to park for the node awaiting a submit, from the snapshot being
+/// resumed and the fresh input that carries the submission.
+///
+/// Only a snapshot flagged `awaiting_submit` names the waiting node in
+/// `next_node`; a `session.wait` snapshot names its SUCCESSOR, which has not
+/// run yet, so attaching answers there would name the wrong node. Returns
+/// `None` in that case, so nothing gets parked.
+fn pending_from_snapshot(snapshot: &FlowSnapshot, input: &Value) -> Option<PendingCardAnswers> {
+    if !snapshot.awaiting_submit {
+        return None;
+    }
+    Some(PendingCardAnswers {
+        node_id: snapshot.next_node.clone(),
+        answers: submitted_fields(input),
+    })
+}
+
 fn outcome_meta(output: &Value) -> Value {
     match output.get("outcome").and_then(Value::as_str) {
         Some(outcome) => json!({ "outcome": outcome }),
@@ -2723,6 +3111,7 @@ fn template_context(state: &ExecutionState, prev: Value) -> Value {
     ctx.insert("prev".into(), prev);
     ctx.insert("node".into(), Value::Object(state.outputs_map()));
     ctx.insert("state".into(), state.context());
+    ctx.insert("vars".into(), Value::Object(state.vars.clone()));
     Value::Object(ctx)
 }
 
@@ -2747,11 +3136,26 @@ impl From<Flow> for HostFlow {
             .get(SLOT_SCHEMA_METADATA_KEY)
             .filter(|v| !v.is_null())
             .cloned();
+        let vars_init = value
+            .metadata
+            .extra
+            .get("vars_init")
+            .and_then(|v| v.as_object())
+            .map(|decls| {
+                decls
+                    .iter()
+                    .filter_map(|(name, decl)| {
+                        decl.get("default").map(|d| (name.clone(), d.clone()))
+                    })
+                    .collect::<JsonMap<String, Value>>()
+            })
+            .unwrap_or_default();
         Self {
             id: value.id.as_str().to_string(),
             start,
             nodes,
             slot_schema,
+            vars_init,
         }
     }
 }
@@ -2777,6 +3181,7 @@ impl From<Node> for HostNode {
             || full_ref.starts_with("sorla.")
             || full_ref.starts_with("operala.")
             || full_ref.starts_with("agentic.")
+            || full_ref.starts_with("var.")
             // `mcp:<server>/<tool>` is a self-contained ref; never dot-split it
             // into a `component.operation` pair.
             || full_ref.starts_with("mcp:");
@@ -2833,6 +3238,22 @@ impl From<Node> for HostNode {
                 "session.wait" => NodeKind::Wait,
                 "state.get" => NodeKind::BuiltinStateGet,
                 "state.set" => NodeKind::BuiltinStateSet,
+                "var.set" => {
+                    let name = node
+                        .input
+                        .mapping
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let value = node
+                        .input
+                        .mapping
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    NodeKind::VarSet { name, value }
+                }
                 "dw.agent" => NodeKind::DwAgent {
                     agent_id: raw_operation.clone().unwrap_or_default(),
                 },
@@ -2886,6 +3307,7 @@ impl From<Node> for HostNode {
             NodeKind::BuiltinEmit { kind } => emit_ref_from_kind(kind),
             NodeKind::BuiltinStateGet => "state.get".to_string(),
             NodeKind::BuiltinStateSet => "state.set".to_string(),
+            NodeKind::VarSet { .. } => "var.set".to_string(),
             NodeKind::Wait => "session.wait".to_string(),
             NodeKind::DwAgent { .. } => "dw.agent".to_string(),
             NodeKind::DwAgentGraph { .. } => "dw.agent_graph".to_string(),
@@ -2901,9 +3323,30 @@ impl From<Node> for HostNode {
         } else {
             raw_operation.clone()
         };
+        // Extract per-node output bindings before the mapping is consumed by
+        // `payload_expr`. Stored as raw (unrendered) templates so they can be
+        // applied after the node runs, using the node's own output as `prev`.
+        let vars_out = node
+            .input
+            .mapping
+            .get("vars_out")
+            .and_then(Value::as_object)
+            .cloned();
         let payload_expr = match kind {
             NodeKind::BuiltinEmit { .. } => extract_emit_payload(&node.input.mapping),
-            _ => node.input.mapping.clone(),
+            // VarSet dispatch re-reads name/value from NodeKind::VarSet directly;
+            // the payload render is redundant and must not be forwarded as node input.
+            NodeKind::VarSet { .. } => Value::Null,
+            _ => {
+                // Strip the internal `vars_out` meta-key so it is never
+                // forwarded as an input field to wasm components or other
+                // non-emit node kinds (which may have strict schemas).
+                let mut mapping = node.input.mapping.clone();
+                if let Some(obj) = mapping.as_object_mut() {
+                    obj.remove("vars_out");
+                }
+                mapping
+            }
         };
         Self {
             kind,
@@ -2917,6 +3360,7 @@ impl From<Node> for HostNode {
             operation_in_mapping,
             payload_expr,
             routing: node.routing,
+            vars_out,
         }
     }
 }
@@ -3716,6 +4160,94 @@ fn condition_event_eq(condition: &str) -> Option<&str> {
     Some(condition[idx + 2..].trim().trim_matches('"'))
 }
 
+/// Where the submit envelope carries its metadata, across both delivery paths.
+///
+/// `greentic-start` wraps the activity (`entry.input.metadata`); the direct
+/// runner path does not (`entry.metadata`). Both the `response.*` synthesis in
+/// [`build_routing_context`] and [`submitted_fields`] resolve through here, so
+/// the two can never disagree about which object is the metadata.
+fn resolve_entry_metadata(entry: &Value) -> Option<&Value> {
+    entry
+        .pointer("/input/metadata")
+        .or_else(|| entry.pointer("/metadata"))
+}
+
+/// The fields a person actually submitted, as one flat map.
+///
+/// The envelope root is `entry.input` when that is an object (the wrapped
+/// `greentic-start` path) and `entry` itself otherwise (the Run Demo path,
+/// whose inputs sit at the root — see that repo's
+/// `flow_demo/host.rs::build_submit_payload`). Resolving it is not bookkeeping:
+/// taking `entry`'s root keys directly on the wrapped path would make one field
+/// named `input` holding the entire nested activity.
+///
+/// The rule:
+///
+/// > the envelope root's keys except `metadata` and `text`, unioned with the
+/// > resolved metadata object's keys except `action`; on collision the envelope
+/// > root wins.
+///
+/// `text` is the message body in both shapes and is already exposed as
+/// `response.text`. `action` is the route discriminator, already exposed as
+/// `response.action` — but a key named `action` at the envelope ROOT is counted,
+/// because on the demo path that is a real keystroke at a different level from
+/// the routing metadata.
+///
+/// NOTE: `response.*` must NOT be rebuilt on top of this. It shares only
+/// [`resolve_entry_metadata`]. Feeding `response` this map would drop
+/// `response.action`, which every parking card's conditional routing tests —
+/// and a failed condition silently takes the false branch.
+fn submitted_fields(entry: &Value) -> JsonMap<String, Value> {
+    let mut fields = JsonMap::new();
+    if let Some(Value::Object(meta)) = resolve_entry_metadata(entry) {
+        for (key, value) in meta {
+            if key == "action" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    let envelope = entry
+        .get("input")
+        .filter(|v| v.is_object())
+        .unwrap_or(entry);
+    if let Some(map) = envelope.as_object() {
+        for (key, value) in map {
+            if key == "metadata" || key == "text" {
+                continue;
+            }
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    fields
+}
+
+/// Build the context a routing condition is evaluated against.
+///
+/// Layout:
+/// ```text
+/// {
+///   ...output.payload...,     // this node's fields, spread at the top level
+///   "entry":    <flow entry>,
+///   "in":       <flow entry>, // alias for entry
+///   "node":     { "<id>": <node_output_view>, ... },  // every prior node
+///   "response": { <key>: <value>, ... },              // from envelope metadata
+///   "event":    "<outcome>"   // the port this node routes on
+/// }
+/// ```
+///
+/// The spread comes FIRST and the named keys are inserted after, so
+/// **`entry`, `in`, `node`, `response` and `event` are reserved**: a component
+/// whose payload has a top-level field with one of those names has it shadowed
+/// here. That is deliberate — the spread is what lets a guard say `q_age >= 18`
+/// about its own node (and is what the designer's source-node prefix strip
+/// relies on) — but it means those five names are not usable as payload fields
+/// in a routed node.
+///
+/// `node` is the same `outputs_map()` projection [`template_context`] exposes,
+/// so a condition resolves `node.<id>.<field>` exactly as a param template
+/// resolves `{{node.<id>.<field>}}`. Note `vars` is NOT here: `vars.x` in a
+/// condition does not resolve, whereas `{{vars.x}}` in a param does.
 fn build_routing_context(
     output: &NodeOutput,
     state: &ExecutionState,
@@ -3880,9 +4412,7 @@ mod tests {
     /// point; a test listing strings alone would have gone stale the same way
     /// the doc comment did.
     ///
-    /// Ported from #686 on `research`, minus its `var.set` arm: this lane's
-    /// engine has no `VarSet` variant, and listing a key the engine cannot
-    /// dispatch is the same defect mirrored.
+    /// Ported from #686 on `research`, `var.set` arm included.
     fn native_op_key_for(kind: &NodeKind) -> Option<&'static str> {
         match kind {
             // Not op-keys: these ARE the generic component paths.
@@ -3895,6 +4425,7 @@ mod tests {
             NodeKind::FlowGoto => Some("flow.goto"),
             NodeKind::BuiltinStateGet => Some("state.get"),
             NodeKind::BuiltinStateSet => Some("state.set"),
+            NodeKind::VarSet { .. } => Some("var.set"),
             NodeKind::Wait => Some("session.wait"),
             NodeKind::DwAgent { .. } => Some("dw.agent"),
             NodeKind::DwAgentGraph { .. } => Some("dw.agent_graph"),
@@ -3917,6 +4448,7 @@ mod tests {
             "flow.goto",
             "state.get",
             "state.set",
+            "var.set",
             "session.wait",
             "dw.agent",
             "dw.agent_graph",
@@ -3948,8 +4480,8 @@ mod tests {
     }
     use crate::validate::{ValidationConfig, ValidationMode};
     use greentic_types::{
-        Flow, FlowComponentRef, FlowId, FlowKind, InputMapping, Node, NodeId, OutputMapping,
-        Routing, TelemetryHints,
+        Flow, FlowComponentRef, FlowId, FlowKind, FlowMetadata, InputMapping, Node, NodeId,
+        OutputMapping, Routing, TelemetryHints,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, HashMap as StdHashMap};
@@ -4549,6 +5081,7 @@ mod tests {
             operation_in_mapping: None,
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -4615,6 +5148,7 @@ mod tests {
             operation_in_mapping: Some("render".into()),
             payload_expr: Value::Null,
             routing: Routing::End,
+            vars_out: None,
         };
         let _state = ExecutionState::new(Value::Null);
         let payload = json!({ "component": "qa.process" });
@@ -4918,6 +5452,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -5060,6 +5595,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), node);
@@ -5213,6 +5749,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -5230,6 +5767,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(node_id.clone(), agent_node);
@@ -5604,6 +6142,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current_node = NodeId::from_str("current").unwrap();
         let output = NodeOutput::new(Value::Null);
@@ -6059,6 +6598,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6092,6 +6632,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6147,6 +6688,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6233,6 +6775,7 @@ mod tests {
             start: None,
             nodes: IndexMap::new(),
             slot_schema: None,
+            vars_init: JsonMap::new(),
         };
         let current = NodeId::from_str("current").unwrap();
         let state = ExecutionState::new(json!({}));
@@ -6364,6 +6907,7 @@ mod tests {
                 node_id: resume_id.clone(),
             },
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let resume_node = Node {
             id: resume_id.clone(),
@@ -6381,6 +6925,7 @@ mod tests {
             err_map: None,
             routing: Routing::End,
             telemetry: TelemetryHints::default(),
+            conversational: false,
         };
         let mut nodes = indexmap::IndexMap::default();
         nodes.insert(agent_node_id.clone(), agent_node);
@@ -6506,6 +7051,8 @@ mod tests {
             flows: Vec::new(),
             flow_sources: StdHashMap::new(),
             messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
             flow_cache: RwLock::new(StdHashMap::from([(
                 FlowKey {
                     pack_id: "e2e-pack".to_string(),
@@ -6589,6 +7136,2502 @@ mod tests {
         eprintln!(
             "PASSED: dw.agent scale-to-zero NATS e2e — reply={:?}",
             output["output"]["reply"]
+        );
+    }
+
+    #[test]
+    fn execution_state_vars_survive_serde_round_trip() {
+        // vars must persist across a park/resume, which is a serde round-trip of ExecutionState.
+        let mut st = ExecutionState::new(json!({}));
+        st.vars.insert("counter".into(), json!(3));
+        st.vars.insert("region".into(), json!("us-east-1"));
+
+        let encoded = serde_json::to_string(&st).expect("serialize");
+        let decoded: ExecutionState = serde_json::from_str(&encoded).expect("deserialize");
+
+        assert_eq!(decoded.vars.get("counter"), Some(&json!(3)));
+        assert_eq!(decoded.vars.get("region"), Some(&json!("us-east-1")));
+    }
+
+    #[test]
+    fn execution_state_vars_default_empty_for_old_snapshots() {
+        // A snapshot serialized before `vars` existed (no `vars` key) must still load.
+        let legacy = r#"{"entry":{},"input":{},"nodes":{},"egress":[],"redirect_count":0}"#;
+        let decoded: ExecutionState = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(decoded.vars.is_empty());
+    }
+
+    #[test]
+    fn template_context_exposes_vars_namespace_typed() {
+        let mut st = ExecutionState::new(serde_json::json!({}));
+        st.vars.insert("count".into(), serde_json::json!(5));
+        st.vars.insert("name".into(), serde_json::json!("aws"));
+
+        let ctx = template_context(&st, serde_json::Value::Null);
+        // {{vars.count}} must resolve to the JSON number 5, not the string "5".
+        let rendered_num = render_template_value(
+            &serde_json::json!("{{vars.count}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render num");
+        assert_eq!(rendered_num, serde_json::json!(5));
+
+        let rendered_str = render_template_value(
+            &serde_json::json!("prefix-{{vars.name}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render str");
+        assert_eq!(rendered_str, serde_json::json!("prefix-aws"));
+    }
+
+    #[test]
+    fn vars_namespace_does_not_shadow_existing_namespaces() {
+        let st = ExecutionState::new(serde_json::json!({"user": {"id": 7}}));
+        let ctx = template_context(&st, serde_json::Value::Null);
+        let obj = ctx.as_object().expect("ctx object");
+        for key in ["entry", "in", "prev", "node", "state", "vars"] {
+            assert!(obj.contains_key(key), "context must expose `{key}`");
+        }
+    }
+
+    // ── vars_init tests ────────────────────────────────────────────────────
+
+    /// Build a minimal flow with the given free-form `metadata.extra` value.
+    /// Mirrors the construction used by neighbouring engine tests: a schema-1.0
+    /// Messaging flow with no nodes and no entrypoints, only the metadata set.
+    fn flow_with_extra(extra: serde_json::Value) -> Flow {
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("test.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::new(),
+            nodes: indexmap::IndexMap::default(),
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    #[test]
+    fn from_flow_extracts_vars_init() {
+        let flow = flow_with_extra(serde_json::json!({
+            "vars_init": {
+                "region":  { "type": "string", "default": "us-east-1" },
+                "counter": { "type": "number", "default": 0 }
+            }
+        }));
+        let host: HostFlow = HostFlow::from(flow);
+        assert_eq!(
+            host.vars_init.get("region"),
+            Some(&serde_json::json!("us-east-1"))
+        );
+        assert_eq!(host.vars_init.get("counter"), Some(&serde_json::json!(0)));
+    }
+
+    #[test]
+    fn from_flow_vars_init_absent() {
+        let flow = flow_with_extra(serde_json::json!({}));
+        let host: HostFlow = HostFlow::from(flow);
+        assert!(host.vars_init.is_empty());
+    }
+
+    #[test]
+    fn execute_once_seeds_declared_vars() {
+        // A flow with vars_init seeds state.vars before the first node runs.
+        // We verify this by using an emit.log node whose message template
+        // references {{vars.region}}: if the var is seeded, the rendered
+        // output will contain "us-east-1".
+        let node_id = NodeId::from_str("n1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "message": "{{vars.region}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(node_id.clone(), node);
+        let flow = Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(node_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "region": { "type": "string", "default": "us-east-1" }
+                    }
+                }),
+            },
+        };
+        let host_flow = HostFlow::from(flow);
+
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: HashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
+            flow_cache: RwLock::new(HashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "vars.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "vars.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        assert!(matches!(result.status, FlowStatus::Completed));
+
+        let ends = observer.ends.lock().unwrap();
+        assert_eq!(ends.len(), 1);
+        assert_eq!(
+            ends[0].get("message").and_then(Value::as_str),
+            Some("us-east-1"),
+            "vars.region must be seeded to its default and rendered in the node payload"
+        );
+    }
+
+    // ── var_set tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: var_set → emit.log, with optional vars_init.
+    ///
+    /// `var_set_input` is the raw input mapping for the var.set node,
+    /// e.g. `json!({ "name": "greeting", "value": "hi" })`.
+    /// `emit_input` is the input mapping for the emit.log node.
+    /// `vars_init_extra` is optional flow-level vars_init metadata.
+    fn var_set_flow(
+        var_set_input: Value,
+        emit_input: Value,
+        vars_init_extra: Option<Value>,
+    ) -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: var_set_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        let extra = vars_init_extra.unwrap_or(serde_json::json!({}));
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra,
+            },
+        }
+    }
+
+    fn run_var_set_flow(flow: Flow) -> (FlowStatus, Vec<Value>) {
+        let host_flow = HostFlow::from(flow);
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "var.set.flow".to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let observer = CountingObserver::new();
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer),
+            mocks: None,
+        };
+        let rt = Runtime::new().unwrap();
+        let result = rt.block_on(engine.execute(ctx, Value::Null)).unwrap();
+        let ends = observer.ends.lock().unwrap().clone();
+        (result.status, ends)
+    }
+
+    #[test]
+    fn var_set_node_writes_literal_value_into_vars() {
+        // A var_set node with a literal value: greeting="hi".
+        // The following emit.log node uses {{vars.greeting}} and its output
+        // proves the var was written.
+        let flow = var_set_flow(
+            json!({ "name": "greeting", "value": "hi" }),
+            json!({ "message": "{{vars.greeting}}" }),
+            None,
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // var_set node output
+        assert_eq!(ends[0].get("ok"), Some(&json!(true)), "var_set output ok");
+        // emit.log node output: vars.greeting was written
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hi"),
+            "vars.greeting must be written and renderable in the next node"
+        );
+    }
+
+    #[test]
+    fn var_set_node_writes_templated_value_with_type_preserved() {
+        // vars_init seeds counter=1 (a number).
+        // var_set copies it into "copy" via {{vars.counter}}.
+        // The emit.log node uses {{vars.copy}} as the sole message template;
+        // render_template_value returns the typed JSON number, not a string.
+        let flow = var_set_flow(
+            json!({ "name": "copy", "value": "{{vars.counter}}" }),
+            json!({ "message": "{{vars.copy}}" }),
+            Some(json!({
+                "vars_init": {
+                    "counter": { "type": "number", "default": 1 }
+                }
+            })),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // emit.log message must be the typed number 1, not the string "1"
+        assert_eq!(
+            ends[1].get("message"),
+            Some(&json!(1)),
+            "vars.copy must preserve the JSON number type from vars.counter"
+        );
+    }
+
+    #[test]
+    fn var_set_empty_name_is_skipped_not_written() {
+        // A var_set node with an empty (or whitespace-only) name must complete
+        // without panic and must NOT insert a "" key into state.vars.
+        let engine = minimal_engine();
+        let rt = Runtime::new().unwrap();
+        let retry_config = RetryConfig {
+            max_attempts: 1,
+            base_delay_ms: 1,
+        };
+        let ctx = FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "var.set.flow",
+            node_id: Some("set1"),
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config,
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let node = HostNode {
+            kind: NodeKind::VarSet {
+                name: "".to_string(),
+                value: json!("garbage"),
+            },
+            component: "var.set".into(),
+            component_id: "var.set".into(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        };
+        let mut state = ExecutionState::new(Value::Null);
+        let payload = Value::Null;
+        let event = NodeEvent {
+            context: &ctx,
+            node_id: "set1",
+            node: &node,
+            payload: &payload,
+        };
+
+        let outcome = rt
+            .block_on(engine.dispatch_node(
+                &ctx,
+                "set1",
+                &node,
+                &mut state,
+                payload.clone(),
+                &event,
+            ))
+            .expect("dispatch_node must not error on empty var name");
+
+        // Must return {ok: true} (not an error).
+        assert_eq!(
+            outcome.output.payload,
+            json!({ "ok": true }),
+            "dispatch must return ok:true even when name is empty"
+        );
+        // Must NOT have inserted a \"\" key into state.vars.
+        assert!(
+            state.vars.get("").is_none(),
+            "empty var name must not create a \"\" key in state.vars"
+        );
+    }
+
+    #[test]
+    fn var_set_node_has_empty_payload_expr() {
+        // Lowering a var.set Node must yield a HostNode whose payload_expr is
+        // Value::Null. The VarSet dispatch arm reads name/value directly from
+        // NodeKind::VarSet, so forwarding the mapping as payload_expr is redundant.
+        let node_id = NodeId::from_str("set1").unwrap();
+        let node = Node {
+            id: node_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hi" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let host_node = HostNode::from(node);
+
+        // payload_expr must be Null.
+        assert_eq!(
+            host_node.payload_expr,
+            Value::Null,
+            "var.set node must have Null payload_expr after lowering"
+        );
+        // NodeKind::VarSet must still carry the original name and value.
+        match &host_node.kind {
+            NodeKind::VarSet { name, value } => {
+                assert_eq!(name.as_str(), "greeting", "name must be preserved in kind");
+                assert_eq!(value, &json!("hi"), "value must be preserved in kind");
+            }
+            other => panic!("expected NodeKind::VarSet, got {other:?}"),
+        }
+    }
+
+    // ── vars_out tests ──────────────────────────────────────────────────────
+
+    /// Build a two-node flow: emit.log (with vars_out) → emit.log.
+    ///
+    /// `emit1_input` is the raw input mapping for the first emit.log node
+    /// (should include the `vars_out` binding).
+    /// `emit2_input` is the input mapping for the second emit.log node
+    /// (reads from `vars.*` to prove bindings were applied).
+    fn vars_out_flow(emit1_input: Value, emit2_input: Value) -> Flow {
+        let emit1_id = NodeId::from_str("emit1").unwrap();
+        let emit2_id = NodeId::from_str("emit2").unwrap();
+
+        let emit1_node = Node {
+            id: emit1_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit1_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit2_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let emit2_node = Node {
+            id: emit2_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: emit2_input,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(emit1_id.clone(), emit1_node);
+        nodes.insert(emit2_id.clone(), emit2_node);
+
+        // Reuse the same flow_id as var_set_flow so we can pass it directly to
+        // `run_var_set_flow`, which registers the flow under that key.
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("var.set.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(emit1_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_out_binds_node_output_into_vars() {
+        // `emit.log` outputs its rendered payload directly. Node 1 emits
+        // `{ message: "hello" }` and declares `vars_out = { lastReply:
+        // "{{prev.message}}" }`. After it runs, `state.vars["lastReply"]`
+        // must equal "hello". Node 2 reads that var so the assertion is driven
+        // from the second node's output rather than internal state.
+        let flow = vars_out_flow(
+            json!({
+                "message": "hello",
+                "vars_out": { "lastReply": "{{prev.message}}" }
+            }),
+            json!({ "message": "{{vars.lastReply}}" }),
+        );
+        let (status, ends) = run_var_set_flow(flow);
+
+        assert!(
+            matches!(status, FlowStatus::Completed),
+            "flow must complete"
+        );
+        assert_eq!(ends.len(), 2, "both nodes must fire");
+        // Node 2's message must equal the value captured by vars_out in node 1.
+        assert_eq!(
+            ends[1].get("message").and_then(Value::as_str),
+            Some("hello"),
+            "vars_out binding from node 1 must be readable in node 2"
+        );
+    }
+
+    /// Build a three-node flow: var_set → session.wait → emit.log.
+    /// `vars_init` seeds `counter = 1`; `var_set` writes `greeting = "hello"`.
+    /// The wait parks the flow; resume runs emit.log which reads both vars.
+    fn vars_survive_flow() -> Flow {
+        let set_id = NodeId::from_str("set1").unwrap();
+        let wait_id = NodeId::from_str("wait1").unwrap();
+        let emit_id = NodeId::from_str("emit1").unwrap();
+
+        let set_node = Node {
+            id: set_id.clone(),
+            component: FlowComponentRef {
+                id: "var.set".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "name": "greeting", "value": "hello" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: wait_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let wait_node = Node {
+            id: wait_id.clone(),
+            component: FlowComponentRef {
+                id: "session.wait".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: Value::Null,
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Next {
+                node_id: emit_id.clone(),
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let emit_node = Node {
+            id: emit_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({
+                    "greeting": "{{vars.greeting}}",
+                    "counter": "{{vars.counter}}"
+                }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(set_id.clone(), set_node);
+        nodes.insert(wait_id.clone(), wait_node);
+        nodes.insert(emit_id.clone(), emit_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("vars.survive.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(set_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({
+                    "vars_init": {
+                        "counter": { "type": "number", "default": 1 }
+                    }
+                }),
+            },
+        }
+    }
+
+    #[test]
+    fn vars_survive_park_and_resume_end_to_end() {
+        // vars_init seeds counter=1; var_set writes greeting="hello"; the flow
+        // parks at session.wait; resume drives emit.log which reads both vars.
+        let flow = vars_survive_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "vars.survive.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            rollout_ids: RolloutIds::default(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        // First execution: must park at session.wait after var_set fires.
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after session.wait, got {other:?}"),
+        };
+
+        // Both vars must be present in the snapshot before resume.
+        assert_eq!(
+            snapshot.state.vars.get("greeting"),
+            Some(&json!("hello")),
+            "greeting var must be in snapshot"
+        );
+        assert_eq!(
+            snapshot.state.vars.get("counter"),
+            Some(&json!(1)),
+            "counter var (from vars_init) must be in snapshot"
+        );
+
+        // Resume: emit.log must read both vars from the restored state.
+        let observer2 = CountingObserver::new();
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: Some(&observer2),
+            mocks: None,
+        };
+        let result2 = rt
+            .block_on(engine.resume(ctx2, snapshot, Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "flow must complete after resume"
+        );
+        let ends2 = observer2.ends.lock().unwrap().clone();
+        assert_eq!(ends2.len(), 1, "only emit.log fires after resume");
+        assert_eq!(
+            ends2[0].get("greeting").and_then(Value::as_str),
+            Some("hello"),
+            "vars.greeting must survive the park/resume"
+        );
+        assert_eq!(
+            ends2[0].get("counter"),
+            Some(&json!(1)),
+            "vars.counter (vars_init) must survive the park/resume"
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    struct StubAgentHandler {
+        payload: serde_json::Value,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for StubAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self.payload.clone())
+        }
+    }
+
+    /// Build a 2-node flow: a `dw.agent` node (id "agent", conversational as
+    /// given) routing to an emit "thanks" node that ends the flow.
+    #[cfg(feature = "agentic-worker")]
+    fn conversational_dw_flow(conversational: bool) -> HostFlow {
+        let mut nodes = IndexMap::new();
+        let agent_id = NodeId::from_str("agent").unwrap();
+        let thanks_id = NodeId::from_str("thanks").unwrap();
+        nodes.insert(
+            agent_id.clone(),
+            HostNode {
+                kind: NodeKind::DwAgent {
+                    agent_id: "a".to_string(),
+                    conversational,
+                },
+                component: "dw.agent".to_string(),
+                component_id: "dw.agent".to_string(),
+                operation_name: Some("a".to_string()),
+                operation_in_mapping: None,
+                payload_expr: json!({ "user_text": "hi" }),
+                routing: Routing::Next {
+                    node_id: thanks_id.clone(),
+                },
+                vars_out: None,
+            },
+        );
+        nodes.insert(
+            thanks_id.clone(),
+            HostNode {
+                kind: NodeKind::BuiltinEmit {
+                    kind: EmitKind::Response,
+                },
+                component: "emit.response".to_string(),
+                component_id: "emit.response".to_string(),
+                operation_name: None,
+                operation_in_mapping: None,
+                payload_expr: json!({ "text": "thanks" }),
+                routing: Routing::End,
+                vars_out: None,
+            },
+        );
+        HostFlow {
+            slot_schema: None,
+            id: "conv.flow".to_string(),
+            start: Some(agent_id),
+            nodes,
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+        }
+    }
+
+    /// Build an engine holding `flow` with a stub agent handler returning `payload`.
+    /// Mirrors the FlowEngine literal in `vars_survive_park_and_resume_end_to_end`.
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine(flow: HostFlow, payload: serde_json::Value) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(std::sync::Arc::new(StubAgentHandler { payload })),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    fn conv_ctx<'a>() -> FlowContext<'a> {
+        FlowContext {
+            tenant: "demo",
+            pack_id: "test-pack",
+            flow_id: "conv.flow",
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: Some("sess-conv"),
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        }
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_parks_and_loops_on_normal_reply() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (park-loop), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "must re-enter the dw.agent node itself"
+        );
+        // The reply is rendered in the parked output.
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent reply must be rendered before parking: {:?}",
+            result.output
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_advances_on_conversation_ended() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+        );
+        let rt = Runtime::new().unwrap();
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended must advance to the successor and complete, got {:?}",
+            result.status
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn non_conversational_dw_agent_never_loops() {
+        // Even with terminated_by == conversation_ended, a non-conversational
+        // node just routes onward (today's one-shot behaviour) — never parks.
+        for tb in ["final_reply", "conversation_ended"] {
+            let engine = conv_engine(
+                conversational_dw_flow(false),
+                json!({ "reply": "x", "trail": [], "terminated_by": tb }),
+            );
+            let rt = Runtime::new().unwrap();
+            let result = rt
+                .block_on(engine.execute(conv_ctx(), Value::Null))
+                .unwrap();
+            assert!(
+                matches!(result.status, FlowStatus::Completed),
+                "non-conversational must complete (route onward) for terminated_by={tb}, got {:?}",
+                result.status
+            );
+        }
+    }
+
+    /// Safety-backstop behavioral test: a conversational `dw.agent` that
+    /// never emits `conversation_ended` must keep parking up to
+    /// `MAX_PARK_TURNS` turns, then force-advance to the successor instead
+    /// of trapping the flow forever.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_force_advances_after_park_loop_cap() {
+        let engine = conv_engine(
+            conversational_dw_flow(true),
+            json!({ "reply": "still thinking", "trail": [], "terminated_by": "final_reply" }),
+        );
+        let rt = Runtime::new().unwrap();
+
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1, got {other:?}"),
+        };
+
+        // Turns 2..MAX_PARK_TURNS (exclusive) must keep parking.
+        for turn in 2..MAX_PARK_TURNS {
+            let result = rt
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting at turn {turn}, got {other:?}"),
+            };
+        }
+
+        // The MAX_PARK_TURNS-th turn must force-advance instead of parking again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at turn {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+    }
+
+    // ── NATS conversational `dw.agent` park-loop (Task 6) ──────────────────
+    //
+    // These tests drive the SAME `conversational_dw_flow`/`conv_ctx` harness as
+    // the in-process tests above, but with `DwAgentDispatch::Nats` and a stub
+    // `RemoteDispatchHandler` that never touches a live NATS server — it just
+    // records the dispatch and immediately returns `AwaitingResponse`, exactly
+    // like `dw_agent_nats_mode_dispatches_remote` above. The "NATS response
+    // arriving" half of the round trip is simulated by calling `engine.resume`
+    // directly with a hand-built envelope `{ok, output, events, error}` — the
+    // exact shape `dispatch_listener::decode_response` builds and that lands in
+    // `state.entry` on a real resume (spike finding §Q2). No live NATS server is
+    // needed or used.
+
+    /// Records every dispatch and immediately returns `AwaitingResponse`, so the
+    /// engine parks without a live NATS server. Mirrors `RecordingDispatcher` in
+    /// `dw_agent_nats_mode_dispatches_remote`, kept separate (and named for
+    /// re-use across the tests below) since three tests share it.
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedNatsDispatcher {
+        calls: Mutex<Vec<crate::runner::remote_dispatch::RemoteDispatch>>,
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::remote_dispatch::RemoteDispatchHandler for ScriptedNatsDispatcher {
+        async fn dispatch(
+            &self,
+            request: crate::runner::remote_dispatch::RemoteDispatch,
+        ) -> anyhow::Result<crate::runner::remote_dispatch::RemoteDispatchAction> {
+            let correlation_id = request.correlation_id.clone();
+            self.calls.lock().unwrap().push(request);
+            Ok(
+                crate::runner::remote_dispatch::RemoteDispatchAction::AwaitingResponse {
+                    correlation_id,
+                },
+            )
+        }
+    }
+
+    /// Build an engine holding `flow` in `DwAgentDispatch::Nats` mode, wired to
+    /// `dispatcher`. Mirrors `conv_engine` (the in-process counterpart) so the
+    /// two harnesses are structurally comparable.
+    #[cfg(feature = "agentic-worker")]
+    fn nats_conv_engine(
+        flow: HostFlow,
+        dispatcher: std::sync::Arc<dyn crate::runner::remote_dispatch::RemoteDispatchHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: Some(dispatcher),
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::Nats,
+            agent_node_handler: None,
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        }
+    }
+
+    /// Build the envelope a real NATS response resume lands in `state.entry`,
+    /// per spike finding §Q2: `{ok, output: {reply, trail, terminated_by},
+    /// events, error}` (mirrors `dispatch_listener::decode_response`).
+    #[cfg(feature = "agentic-worker")]
+    fn agent_response_envelope(reply: &str, terminated_by: &str) -> Value {
+        json!({
+            "ok": true,
+            "output": { "reply": reply, "trail": [], "terminated_by": terminated_by },
+            "events": [],
+            "error": Value::Null,
+        })
+    }
+
+    /// Turn 1 (fresh, no prior await marker): the conversational Nats arm must
+    /// mark the pending await, dispatch to NATS exactly once, and park via
+    /// `NodeControl::AwaitHere` — resuming at the node itself (not the routing
+    /// successor) with no reply surfaced yet (the response hasn't arrived).
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_turn1_parks_via_await_here() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after fresh dispatch, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "AwaitHere must resume at self, not the routing successor"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "a fresh user turn must dispatch to NATS exactly once"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is known yet on the initial dispatch — the async response hasn't arrived"
+        );
+    }
+
+    /// Full turn cycle, behavioral: fresh dispatch → AwaitHere park; simulated
+    /// "not ended" NATS response resume → LoopHere park (reply surfaced,
+    /// session-keyed park awaiting the next user message); a user-reply resume
+    /// dispatches to NATS again; a `conversation_ended` response resume →
+    /// Completed (advanced to the successor). This is the exact turn-by-turn
+    /// script called for in Task 6's brief.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_park_loop_full_turn_cycle() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh user turn → dispatch to NATS → AwaitHere (self, park).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 1 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // Simulated NATS response resume, "not ended": LoopHere (session-keyed
+        // park awaiting the next user message), reply surfaced.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (LoopHere) after not-ended response, got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere also re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("hello there"),
+            "the agent's reply must be surfaced once the response resume lands: {:?}",
+            result.output
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1,
+            "the response landing must not itself trigger another NATS dispatch"
+        );
+
+        // User-reply resume: a fresh user turn dispatches to NATS again.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "user says more" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after turn 2 dispatch, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "agent");
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "a second fresh user turn must dispatch to NATS again"
+        );
+
+        // Simulated NATS response resume, `conversation_ended`: advance to the
+        // successor and complete.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "conversation_ended response must advance to the successor and complete, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "conversation end must not trigger another NATS dispatch"
+        );
+    }
+
+    /// Safety-backstop parity with the in-process cap test: a NATS
+    /// conversational `dw.agent` whose response never carries
+    /// `conversation_ended` must keep parking (dispatch → AwaitHere →
+    /// response-resume → LoopHere) up to `MAX_PARK_TURNS` "not ended" responses,
+    /// then force-advance to the successor instead of trapping the flow.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_force_advances_after_park_loop_cap() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch (does not itself count toward the park cap —
+        // the cap is bumped only on a "not ended" response, matching the
+        // in-process semantics).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let mut snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // Responses 1..MAX_PARK_TURNS (exclusive) must keep looping: a "not
+        // ended" response resume (LoopHere), then a user-message resume that
+        // re-dispatches to NATS (AwaitHere) for the next response.
+        for turn in 1..MAX_PARK_TURNS {
+            let result = rt
+                .block_on(engine.resume(
+                    conv_ctx(),
+                    snapshot,
+                    agent_response_envelope("still thinking", "final_reply"),
+                ))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => panic!("expected Waiting (LoopHere) at response #{turn}, got {other:?}"),
+            };
+            let result = rt
+                .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "still here" })))
+                .unwrap();
+            snapshot = match result.status {
+                FlowStatus::Waiting(w) => w.snapshot,
+                other => {
+                    panic!("expected Waiting (AwaitHere) after user turn #{turn}, got {other:?}")
+                }
+            };
+        }
+
+        // The MAX_PARK_TURNS-th "not ended" response must force-advance instead
+        // of parking again.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_response_envelope("still thinking", "final_reply"),
+            ))
+            .unwrap();
+        assert!(
+            matches!(result.status, FlowStatus::Completed),
+            "park-loop cap must force-advance to the successor at response {MAX_PARK_TURNS}, got {:?}",
+            result.status
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            1 + (MAX_PARK_TURNS as usize - 1),
+            "exactly one NATS dispatch per user turn across the whole park-loop"
+        );
+    }
+
+    /// Parity: for the same scripted two-turn conversation (turn 1 replies
+    /// "hello there", not ended; turn 2 replies "bye", `conversation_ended`),
+    /// the NATS and in-process dispatch paths must be *observationally*
+    /// identical — same sequence of user-visible statuses, and the same
+    /// surfaced reply text on the parked turn.
+    ///
+    /// Caveat (documented, not hidden): the NATS path has one extra *internal*
+    /// resume between user turns — the async response landing (AwaitHere →
+    /// LoopHere) — that the in-process path does synchronously inside a single
+    /// `execute`/`resume` call. That extra step is invisible to the flow's
+    /// outward status/reply, which is exactly what this test asserts; it does
+    /// NOT assert the two paths take the same number of `resume` calls.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_and_inprocess_transcripts_match_for_same_script() {
+        let rt = Runtime::new().unwrap();
+
+        // ── In-process transcript ──
+        let inproc_handler = Arc::new(ScriptedAgentHandler {
+            script: Mutex::new(std::collections::VecDeque::from(vec![
+                json!({ "reply": "hello there", "trail": [], "terminated_by": "final_reply" }),
+                json!({ "reply": "bye", "trail": [], "terminated_by": "conversation_ended" }),
+            ])),
+        });
+        let inproc_engine = conv_engine_scripted(conversational_dw_flow(true), inproc_handler);
+        let r1 = rt
+            .block_on(inproc_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let inproc_snapshot = match r1.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("in-process turn 1: expected Waiting, got {other:?}"),
+        };
+        let r2 = rt
+            .block_on(inproc_engine.resume(conv_ctx(), inproc_snapshot, json!({ "text": "more" })))
+            .unwrap();
+
+        // ── NATS transcript, same script ──
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let nats_engine = nats_conv_engine(conversational_dw_flow(true), dispatcher);
+        let n1 = rt
+            .block_on(nats_engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let n1_snapshot = match n1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 1 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n1r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n1_snapshot,
+                agent_response_envelope("hello there", "final_reply"),
+            ))
+            .unwrap();
+        let n1r_snapshot = match n1r.status {
+            FlowStatus::Waiting(ref w) => w.snapshot.clone(),
+            ref other => panic!("nats turn 1 response resume: expected Waiting, got {other:?}"),
+        };
+        let n2 = rt
+            .block_on(nats_engine.resume(conv_ctx(), n1r_snapshot, json!({ "text": "more" })))
+            .unwrap();
+        let n2_snapshot = match n2.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("nats turn 2 dispatch: expected Waiting, got {other:?}"),
+        };
+        let n2r = rt
+            .block_on(nats_engine.resume(
+                conv_ctx(),
+                n2_snapshot,
+                agent_response_envelope("bye", "conversation_ended"),
+            ))
+            .unwrap();
+
+        // Same user-visible status per turn.
+        assert!(matches!(r1.status, FlowStatus::Waiting(_)));
+        assert!(
+            matches!(n1r.status, FlowStatus::Waiting(_)),
+            "nats turn 1's user-visible status must also be Waiting"
+        );
+        assert!(matches!(r2.status, FlowStatus::Completed));
+        assert!(
+            matches!(n2r.status, FlowStatus::Completed),
+            "nats turn 2 must also complete, matching the in-process transcript"
+        );
+
+        // Same surfaced reply text on the parked turn.
+        assert!(
+            serde_json::to_string(&r1.output)
+                .unwrap()
+                .contains("hello there"),
+            "in-process turn 1 must surface the reply: {:?}",
+            r1.output
+        );
+        assert!(
+            serde_json::to_string(&n1r.output)
+                .unwrap()
+                .contains("hello there"),
+            "nats turn 1 must surface the identical reply once the response resume lands: {:?}",
+            n1r.output
+        );
+    }
+
+    /// Build the error envelope shape a NATS response resume can also land in
+    /// `state.entry`: `{ok:false, output:null, events:[], error:{code,
+    /// message}}` (mirrors `agent_response_envelope`, but for the failure
+    /// path — a genuine agent/transport error. This code sets no deadline of
+    /// its own, but the same `{ok:false}` shape is also what a flow-authored
+    /// timeout, or any other error source, would arrive as — Fix B handles it
+    /// identically either way.
+    #[cfg(feature = "agentic-worker")]
+    fn agent_error_envelope(message: &str, code: Option<&str>) -> Value {
+        json!({
+            "ok": false,
+            "output": Value::Null,
+            "events": [],
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// Fix A (interleave guard): a user message arriving before the agent's
+    /// NATS response must NOT be misread as that response. With the
+    /// pending-await marker set (turn 1's fresh dispatch), a resume whose
+    /// `state.entry` is a plain user-message shape (no `"ok"` key) must fall
+    /// through to the fresh-dispatch branch — re-dispatching to NATS as a new
+    /// turn and parking via `AwaitHere` again — instead of being consumed as
+    /// a (null) agent reply. The marker must also survive: it was NOT
+    /// consumed by the misrouted resume, only by the eventual real response.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_interleaved_user_message_is_not_misread_as_response() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch marks the pending-await and parks (AwaitHere).
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "turn 1 dispatch must mark the pending await"
+        );
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 1);
+
+        // A stray user message arrives BEFORE the agent's NATS response —
+        // same shape a real inbound activity would resume with, no `"ok"` key.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                json!({ "text": "are you still there?" }),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!(
+                "a stray user message must re-dispatch as a fresh turn (Waiting/AwaitHere), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "the fresh re-dispatch still awaits at self"
+        );
+        assert_eq!(
+            dispatcher.calls.lock().unwrap().len(),
+            2,
+            "the stray user message must trigger its OWN fresh NATS dispatch, not be swallowed"
+        );
+        assert!(
+            snapshot.state.pending_agent_await.contains_key("agent"),
+            "the marker must still be set for the real response to land against"
+        );
+        assert_eq!(
+            result.output,
+            Value::Null,
+            "no reply is surfaced — this was not a misread null agent turn"
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "a stray user message must not touch the park-loop cap"
+        );
+    }
+
+    /// Fix B (error envelope handling): a `{ok:false, ...}` response — any
+    /// agent/transport error, or a timeout-shaped envelope from any source
+    /// (this code no longer sets its own deadline) — must surface the error
+    /// message as the reply, re-park via `LoopHere` (fail-safe: await the
+    /// next user message, do not force-advance), and must NOT bump the
+    /// park-loop turn counter. Exercises two full error cycles (error →
+    /// user turn → error) to confirm the cap counter never advances even
+    /// after repeated failures.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn conversational_dw_agent_nats_error_envelope_surfaces_and_reparks_without_cap_bump() {
+        let dispatcher = Arc::new(ScriptedNatsDispatcher {
+            calls: Mutex::new(vec![]),
+        });
+        let engine = nats_conv_engine(conversational_dw_flow(true), dispatcher.clone());
+        let rt = Runtime::new().unwrap();
+
+        // Turn 1: fresh dispatch → AwaitHere.
+        let result = rt
+            .block_on(engine.execute(conv_ctx(), Value::Null))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting after turn 1 dispatch, got {other:?}"),
+        };
+
+        // A plain agent/transport error resumes the flow.
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, agent_error_envelope("boom", None)))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("an error envelope must re-park (Waiting/LoopHere), got {other:?}"),
+        };
+        assert_eq!(
+            snapshot.next_node, "agent",
+            "LoopHere re-enters the node itself"
+        );
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("boom"),
+            "the error message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "an error response must NOT bump the park-loop cap counter"
+        );
+
+        // A user turn in between re-dispatches (as usual).
+        let result = rt
+            .block_on(engine.resume(conv_ctx(), snapshot, json!({ "text": "hello?" })))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting (AwaitHere) after user turn, got {other:?}"),
+        };
+        assert_eq!(dispatcher.calls.lock().unwrap().len(), 2);
+
+        // A timeout-coded envelope (this code sets no deadline of its own —
+        // this shape would only arrive from a flow-authored deadline or some
+        // other upstream source) behaves identically to a plain error.
+        let result = rt
+            .block_on(engine.resume(
+                conv_ctx(),
+                snapshot,
+                agent_error_envelope("timeout waiting for agent response", Some("timeout")),
+            ))
+            .unwrap();
+        let snapshot = match result.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => {
+                panic!("a timeout envelope must also re-park (Waiting/LoopHere), got {other:?}")
+            }
+        };
+        assert!(
+            serde_json::to_string(&result.output)
+                .unwrap()
+                .contains("timeout waiting for agent response"),
+            "the timeout message must be surfaced as the reply: {:?}",
+            result.output
+        );
+        assert!(
+            !snapshot.state.park_turns.contains_key("agent"),
+            "two error/timeout responses in a row (with an intervening user turn) must still \
+             not have bumped the park-loop cap counter"
+        );
+    }
+
+    /// Scriptable `AgentNodeHandler` stub: returns the next queued payload on
+    /// each call, so a single in-process engine can simulate a multi-turn
+    /// conversation with a different agent output per turn (unlike
+    /// `StubAgentHandler`, which always returns the same fixed payload).
+    #[cfg(feature = "agentic-worker")]
+    struct ScriptedAgentHandler {
+        script: Mutex<std::collections::VecDeque<serde_json::Value>>,
+    }
+    #[cfg(feature = "agentic-worker")]
+    #[async_trait::async_trait]
+    impl crate::runner::agent_node::AgentNodeHandler for ScriptedAgentHandler {
+        async fn execute(
+            &self,
+            _tenant_id: &str,
+            _env_id: &str,
+            _agent_id: &str,
+            _session_id: &str,
+            _flow_input: &serde_json::Value,
+            _conversational: bool,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(self
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedAgentHandler: script exhausted"))
+        }
+    }
+
+    /// Build an in-process engine holding `flow`, wired to a `ScriptedAgentHandler`
+    /// so each agent turn can return a different payload. Mirrors `conv_engine`
+    /// (which uses a fixed payload for every call).
+    #[cfg(feature = "agentic-worker")]
+    fn conv_engine_scripted(
+        flow: HostFlow,
+        handler: std::sync::Arc<ScriptedAgentHandler>,
+    ) -> FlowEngine {
+        FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: "test-pack".to_string(),
+                    flow_id: "conv.flow".to_string(),
+                },
+                flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            agent_node_handler: Some(handler),
+            graph_node_handler: None,
+            mcp_tool_source: None,
+        }
+    }
+
+    #[test]
+    fn submitted_fields_reads_root_inputs_on_the_demo_path() {
+        // Run Demo puts input ids at the entry ROOT beside `metadata`
+        // (greentic-designer flow_demo/host.rs::build_submit_payload).
+        let entry = json!({
+            "amount": "500",
+            "reason": "looks good",
+            "metadata": { "action": "approve" }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("amount"), Some(&json!("500")));
+        assert_eq!(fields.get("reason"), Some(&json!("looks good")));
+        assert!(
+            !fields.contains_key("metadata"),
+            "the envelope key is not a field"
+        );
+        assert!(
+            !fields.contains_key("action"),
+            "the route discriminator is not a field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_reads_metadata_on_the_wrapped_path() {
+        // greentic-start wraps the activity: entry.input.metadata.*
+        let entry = json!({
+            "input": {
+                "metadata": { "action": "approve", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let fields = submitted_fields(&entry);
+        assert_eq!(fields.get("email"), Some(&json!("a@b.c")));
+        assert!(!fields.contains_key("action"));
+        assert!(!fields.contains_key("text"), "envelope text is not a field");
+        assert!(
+            !fields.contains_key("input"),
+            "the envelope root must be resolved, or `input` becomes one giant field"
+        );
+    }
+
+    #[test]
+    fn submitted_fields_lets_the_envelope_root_win_a_collision() {
+        let entry = json!({
+            "email": "root@x",
+            "metadata": { "action": "go", "email": "meta@x" }
+        });
+        assert_eq!(
+            submitted_fields(&entry).get("email"),
+            Some(&json!("root@x"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_counts_a_root_input_named_action() {
+        // `action` is the route discriminator ONLY in metadata. At the root it is
+        // a real keystroke on the demo path.
+        let entry = json!({ "action": "typed", "metadata": { "action": "approve" } });
+        assert_eq!(
+            submitted_fields(&entry).get("action"),
+            Some(&json!("typed"))
+        );
+    }
+
+    #[test]
+    fn submitted_fields_is_empty_for_a_button_with_no_inputs() {
+        let entry = json!({ "metadata": { "action": "approve" } });
+        assert!(submitted_fields(&entry).is_empty());
+    }
+
+    /// A card node with no declared `answer_fields` — i.e. a pack built before
+    /// this feature existed. `attach_pending_card_answers` must treat this as
+    /// "no allow-list" (today's permissive behaviour), not "zero fields".
+    fn plain_card_node() -> HostNode {
+        HostNode {
+            kind: NodeKind::Exec {
+                target_component: "card".to_string(),
+            },
+            component: "component.exec".to_string(),
+            component_id: "component.exec".to_string(),
+            operation_name: None,
+            operation_in_mapping: None,
+            payload_expr: Value::Null,
+            routing: Routing::End,
+            vars_out: None,
+        }
+    }
+
+    #[test]
+    fn an_old_snapshot_without_the_flag_deserializes_as_not_awaiting_submit() {
+        // Snapshots persisted before this field existed must keep their exact
+        // current behaviour: no answers attached.
+        let raw = json!({
+            "pack_id": "p",
+            "flow_id": "f",
+            "next_node": "card",
+            "state": {}
+        });
+        let snap: FlowSnapshot = serde_json::from_value(raw).expect("legacy snapshot decodes");
+        assert!(!snap.awaiting_submit);
+    }
+
+    /// A resumed node's submitted fields must be readable from its output by a
+    /// LATER node, through the ordinary `{{node.<id>.<field>}}` grammar.
+    ///
+    /// This is the whole feature, and it is also the ordering proof: the resume
+    /// RE-DISPATCHES the parked node and `state.nodes.insert` replaces its stored
+    /// output, so an implementation that attaches the answers before the dispatch
+    /// makes this test fail. Do not "simplify" the merge earlier.
+    #[test]
+    fn submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node() {
+        let mut state = ExecutionState::new(json!({}));
+        // The parked node has already run once; its stored output is what the
+        // resume dispatch will REPLACE.
+        state.nodes.insert(
+            "card".to_string(),
+            NodeOutput::new(json!({ "event": "rendered" })),
+        );
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "submit" }
+            })),
+        });
+
+        // Simulate the re-dispatch: a FRESH output object, exactly as the loop
+        // builds one, then the merge at its real call position.
+        let mut fresh = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut fresh);
+        state.nodes.insert("card".to_string(), fresh);
+
+        // Read it the way a downstream node's config would.
+        let ctx = template_context(&state, Value::Null);
+        let rendered = render_template_value(
+            &json!("{{node.card.answers.email}}"),
+            &ctx,
+            TemplateOptions::default(),
+        )
+        .expect("render");
+        assert_eq!(rendered, json!("a@b.c"));
+    }
+
+    #[test]
+    fn the_card_render_context_carries_the_answers_too() {
+        // One write, two read surfaces: `outputs_map()` feeds {{node.…}} and
+        // `context()` feeds the `state` handed to the adaptive-card component.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        state.nodes.insert("card".to_string(), output);
+
+        let ctx = state.context();
+        assert_eq!(
+            ctx["nodes"]["card"]["payload"]["answers"]["email"],
+            json!("a@b.c")
+        );
+    }
+
+    #[test]
+    fn answers_are_absent_before_any_submit() {
+        // Absent is not empty: absent means never submitted, {} means submitted
+        // with no fields. Do not collapse the two.
+        let mut state = ExecutionState::new(json!({}));
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert!(output.payload.get("answers").is_none());
+    }
+
+    #[test]
+    fn a_button_with_no_inputs_yields_an_empty_answers_object() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "metadata": { "action": "approve" } })),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    #[test]
+    fn the_pending_answers_are_consumed_exactly_once() {
+        // A loop back through the same node without a resume must not re-attach
+        // stale answers.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut first = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut first);
+        assert!(first.payload.get("answers").is_some());
+
+        let mut second = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut second);
+        assert!(
+            second.payload.get("answers").is_none(),
+            "consumed, not read"
+        );
+    }
+
+    #[test]
+    fn answers_attach_even_when_the_redispatch_failed() {
+        // The answers are real regardless of whether the re-render succeeded.
+        // Dropping them would let a transient render error destroy what someone
+        // typed.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut output = NodeOutput::new(json!({ "ok": false, "error": { "code": "boom" } }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answers_are_not_attached_to_a_different_node() {
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({ "email": "a@b.c" })),
+        });
+        let mut other = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "next_step", &plain_card_node(), &mut other);
+        assert!(other.payload.get("answers").is_none());
+        assert!(
+            state.pending_card_answers.is_some(),
+            "still pending for its own node"
+        );
+    }
+
+    /// THE defect this feature closes. On the `greentic-start` path
+    /// `entry.input` is a whole `ChannelMessageEnvelope` (see
+    /// `greentic-types::messaging`), not a flat map of input ids — so without
+    /// an allow-list, `submitted_fields` unions transport identity
+    /// (`tenant`, `session_id`, `from`, `attachments`, ...), routing keys
+    /// (`nextCardId`, `route`), channel keys (`env`, `team`, `locale`,
+    /// `autoStart`), and greentic-start's own injected pack setup answers
+    /// (`url`, `model`, `provider`, `api_key_secret` — a `secrets://...`
+    /// reference) into `answers`, under a key documented as "the fields
+    /// someone typed into this card". With a declared `answer_fields`
+    /// allow-list, none of that must survive — only the two genuine card
+    /// inputs.
+    #[test]
+    fn answers_intersect_the_declared_allow_list_on_a_wrapped_start_envelope() {
+        let entry = json!({
+            "input": {
+                "id": "msg-1",
+                "tenant": "acme",
+                "channel": "webchat",
+                "session_id": "sess-1",
+                "from": "user-1",
+                "to": "bot-1",
+                "correlation_id": "corr-1",
+                "attachments": [],
+                "metadata": {
+                    "action": "submit",
+                    "nextCardId": "confirm",
+                    "route": "default",
+                    "env": "prod",
+                    "team": "support",
+                    "locale": "en-US",
+                    "autoStart": true,
+                    "url": "https://api.example.com",
+                    "model": "gpt-4",
+                    "provider": "openai",
+                    "api_key_secret": "secrets://tenant/acme/openai_key",
+                    "full_name": "Ada Lovelace",
+                    "email": "ada@example.com"
+                },
+                "text": "submitted"
+            }
+        });
+
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": ["full_name", "email"] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        let answers = output.payload["answers"]
+            .as_object()
+            .expect("answers must be an object");
+        assert_eq!(
+            answers,
+            &serde_json::Map::from_iter([
+                ("full_name".to_string(), json!("Ada Lovelace")),
+                ("email".to_string(), json!("ada@example.com")),
+            ]),
+            "answers must contain exactly the two declared card inputs, and \
+             nothing from transport identity, routing, or pack config: {answers:?}"
+        );
+    }
+
+    #[test]
+    fn answer_fields_absent_keeps_todays_permissive_behaviour() {
+        // Pre-upgrade packs, and any path that never runs the designer
+        // injector, must keep exactly today's behaviour: no allow-list means
+        // no filtering, even on a wrapped envelope carrying non-input keys.
+        let entry = json!({
+            "input": {
+                "tenant": "acme",
+                "metadata": { "action": "submit", "email": "a@b.c" },
+                "text": "hi"
+            }
+        });
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &plain_card_node(), &mut output);
+
+        assert_eq!(output.payload["answers"]["tenant"], json!("acme"));
+        assert_eq!(output.payload["answers"]["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn answer_fields_declared_empty_yields_no_answers() {
+        // A card that genuinely declares zero inputs must produce `{}` — an
+        // empty allow-list is not the same as an absent one, and must not be
+        // collapsed into the unfiltered set.
+        let mut state = ExecutionState::new(json!({}));
+        state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&json!({
+                "email": "a@b.c",
+                "metadata": { "action": "approve" }
+            })),
+        });
+        let node = HostNode {
+            payload_expr: json!({ "answer_fields": [] }),
+            ..plain_card_node()
+        };
+        let mut output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(&mut state, "card", &node, &mut output);
+
+        assert_eq!(output.payload["answers"], json!({}));
+    }
+
+    /// The three-way distinction `declared_answer_fields` exists to preserve:
+    /// absent (ordinary pre-upgrade pack) and malformed (a designer-side bug)
+    /// both fall back to the SAME permissive, unfiltered `answers` — that part
+    /// is asserted here — but only the malformed case is meant to be logged
+    /// (`tracing::warn!` in `attach_pending_card_answers`). This test can only
+    /// assert the behavioural half: nothing in this crate's dev-dependencies
+    /// captures `tracing` output (no `tracing-test`/subscriber-capture
+    /// harness is wired up here), and adding one purely to assert a log line
+    /// felt like more machinery than the assertion warrants. The `Malformed`
+    /// arm's `tracing::warn!` call is exercised (not just present in source)
+    /// by the "malformed" case below, since the same match arm both logs and
+    /// returns the unfiltered map — a change that broke or removed the log
+    /// call, if it also broke the fallback, would fail this test.
+    #[test]
+    fn absent_and_malformed_answer_fields_both_stay_permissive_but_declared_filters() {
+        let entry = json!({ "email": "a@b.c", "phone": "555-1234" });
+
+        // Absent: no `answer_fields` key at all.
+        let mut absent_state = ExecutionState::new(json!({}));
+        absent_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let mut absent_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut absent_state,
+            "card",
+            &plain_card_node(),
+            &mut absent_output,
+        );
+        assert_eq!(
+            absent_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "absent must stay fully permissive"
+        );
+
+        // Malformed: the key is present but is not an array of strings (e.g.
+        // an unresolved template, or a wrong-typed value from a designer bug).
+        let mut malformed_state = ExecutionState::new(json!({}));
+        malformed_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let malformed_node = HostNode {
+            payload_expr: json!({ "answer_fields": "{{unresolved.template}}" }),
+            ..plain_card_node()
+        };
+        let mut malformed_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut malformed_state,
+            "card",
+            &malformed_node,
+            &mut malformed_output,
+        );
+        assert_eq!(
+            malformed_output.payload["answers"],
+            json!({ "email": "a@b.c", "phone": "555-1234" }),
+            "malformed must ALSO stay fully permissive, same as absent"
+        );
+
+        // Declared: a valid, non-empty allow-list actually filters.
+        let mut declared_state = ExecutionState::new(json!({}));
+        declared_state.pending_card_answers = Some(PendingCardAnswers {
+            node_id: "card".to_string(),
+            answers: submitted_fields(&entry),
+        });
+        let declared_node = HostNode {
+            payload_expr: json!({ "answer_fields": ["email"] }),
+            ..plain_card_node()
+        };
+        let mut declared_output = NodeOutput::new(json!({ "event": "rendered" }));
+        attach_pending_card_answers(
+            &mut declared_state,
+            "card",
+            &declared_node,
+            &mut declared_output,
+        );
+        assert_eq!(
+            declared_output.payload["answers"],
+            json!({ "email": "a@b.c" }),
+            "declared must filter down to exactly the allow-listed keys"
+        );
+    }
+
+    #[test]
+    fn pending_from_snapshot_names_next_node_when_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "card".to_string(),
+            awaiting_submit: true,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let pending = pending_from_snapshot(&snapshot, &input).expect("should park answers");
+        assert_eq!(pending.node_id, "card");
+        assert_eq!(pending.answers.get("email"), Some(&json!("a@b.c")));
+    }
+
+    #[test]
+    fn pending_from_snapshot_is_none_when_not_awaiting_submit() {
+        let snapshot = FlowSnapshot {
+            pack_id: "p".to_string(),
+            flow_id: "f".to_string(),
+            next_flow: None,
+            next_node: "successor".to_string(),
+            awaiting_submit: false,
+            state: ExecutionState::new(json!({})),
+        };
+        let input = json!({ "email": "a@b.c" });
+        assert!(pending_from_snapshot(&snapshot, &input).is_none());
+    }
+
+    /// Build a two-node flow: `card` (`Routing::Custom`, parks until
+    /// `response.action == "submit"`) -> `next` (reads
+    /// `{{node.card.answers.email}}`). `card`'s first pass has no
+    /// `response.action`, so its conditional routing falls through and it
+    /// parks with `awaiting_submit: true`.
+    /// Two chained cards that route on the SAME action, then a terminal node.
+    ///
+    /// This is the shape every designer card journey has: each page's Continue
+    /// button submits `action = "continue"`, and each page's routing tests for
+    /// it.
+    fn two_card_chain_flow() -> Flow {
+        let card_node = |id: &str, to: Option<&str>| Node {
+            id: NodeId::from_str(id).unwrap(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "card": id }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: match to {
+                Some(target) => Routing::Custom(json!([
+                    { "condition": "response.action == \"submit\"", "to": target }
+                ])),
+                None => Routing::End,
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        for (id, to) in [
+            ("card1", Some("card2")),
+            ("card2", Some("card3")),
+            ("card3", None),
+        ] {
+            nodes.insert(NodeId::from_str(id).unwrap(), card_node(id, to));
+        }
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("two.card.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String("card1".to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({}),
+            },
+        }
+    }
+
+    /// One submit must advance the journey by exactly ONE card.
+    ///
+    /// `response.*` is synthesised from the run's entry envelope, so it is
+    /// run-scoped: without consuming it, the action that moved `card1` matches
+    /// again at `card2` and the run walks straight past it. Measured on the
+    /// meridian quote journey: page 1's Continue landed the user on page 3.
+    ///
+    /// The submit belongs to the node it was delivered to. Once that node has
+    /// routed on it, later nodes in the same run must see a fresh card with no
+    /// pending action, park, and wait for the user.
+    #[test]
+    fn one_submit_advances_exactly_one_card() {
+        let host_flow = HostFlow::from(two_card_chain_flow());
+        let (flow_id, pack_id) = ("two.card.flow", "test-pack");
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+        let ctx = || FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        // Turn 1: no action yet, so `card1` falls through and parks.
+        let first = rt.block_on(engine.execute(ctx(), Value::Null)).unwrap();
+        let snapshot = match first.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting at card1, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "card1");
+
+        // Turn 2: ONE submit. `card1` routes on it; `card2` must not.
+        let submit = json!({ "input": { "metadata": { "action": "submit" } } });
+        let second = rt.block_on(engine.resume(ctx(), snapshot, submit)).unwrap();
+        match second.status {
+            FlowStatus::Waiting(w) => assert_eq!(
+                w.snapshot.next_node, "card2",
+                "one submit must advance exactly one card and park at the next"
+            ),
+            FlowStatus::Completed => panic!(
+                "the run reached the terminal node: the consumed action re-fired \
+                 at card2 and skipped it"
+            ),
+        }
+    }
+
+    fn card_answers_flow() -> Flow {
+        let card_id = NodeId::from_str("card").unwrap();
+        let next_id = NodeId::from_str("next").unwrap();
+
+        let card_node = Node {
+            id: card_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "event": "rendered" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::Custom(json!([
+                { "condition": "response.action == \"submit\"", "to": next_id.to_string() }
+            ])),
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let next_node = Node {
+            id: next_id.clone(),
+            component: FlowComponentRef {
+                id: "emit.response".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "text": "{{node.card.answers.email}}" }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: Routing::End,
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        nodes.insert(card_id.clone(), card_node);
+        nodes.insert(next_id.clone(), next_node);
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("card.answers.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String(card_id.to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({}),
+            },
+        }
+    }
+
+    /// The covering test for both findings from Task 3 code review: this
+    /// drives the REAL `FlowEngine::resume` -> `drive_flow` -> dispatch-loop
+    /// path, not a hand-simulated `ExecutionState`. It pins BOTH the `resume`
+    /// wiring (`state.pending_card_answers = pending_card_answers;`, engine.rs
+    /// near `resume`) AND the merge position immediately before
+    /// `state.nodes.insert` in the dispatch loop: deleting or moving either
+    /// makes this test fail, unlike the hand-simulated
+    /// `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`,
+    /// whose ordering sensitivity is a property of its own three
+    /// hand-written statements rather than of the engine.
+    #[test]
+    fn card_answers_survive_a_real_park_and_resume_and_reach_a_later_node() {
+        let flow = card_answers_flow();
+        let host_flow = HostFlow::from(flow);
+        let flow_id = "card.answers.flow";
+        let pack_id = "test-pack";
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+
+        let ctx1 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        // First turn: no `response.action` yet, so `card`'s conditional
+        // routing falls through and it parks awaiting the submit.
+        let result1 = rt.block_on(engine.execute(ctx1, Value::Null)).unwrap();
+        let snapshot = match result1.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting at the card node, got {other:?}"),
+        };
+        assert!(
+            snapshot.awaiting_submit,
+            "the card's conditional fall-through must set awaiting_submit"
+        );
+        assert_eq!(snapshot.next_node, "card");
+
+        // Resume with the submitted fields. `resume` must park them, the
+        // dispatch loop must re-run `card`, and `attach_pending_card_answers`
+        // must merge them into its FRESH re-dispatched output before `next`
+        // runs.
+        let ctx2 = FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+        let input = json!({ "email": "a@b.c", "metadata": { "action": "submit" } });
+        let result2 = rt.block_on(engine.resume(ctx2, snapshot, input)).unwrap();
+        assert!(
+            matches!(result2.status, FlowStatus::Completed),
+            "the submit must route past the card to `next`"
+        );
+        // This lane has no `FlowExecution::node_outputs` to inspect, so the
+        // later node emits the value as a response and we assert on the flow
+        // output. Same claim: `{{node.card.answers.email}}` resolved, which it
+        // can only do if the resumed card attached the submitted answers.
+        let rendered = serde_json::to_string(&result2.output).expect("encode output");
+        assert!(
+            rendered.contains("a@b.c"),
+            "`next`, a LATER node, must read the answers through \
+             {{node.card.answers.email}}; got {rendered}"
         );
     }
 }

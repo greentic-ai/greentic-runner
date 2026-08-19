@@ -55,6 +55,7 @@ mod redis_lb {
                 flow_id: "flow.main".into(),
                 next_flow: None,
                 next_node: next_node.into(),
+                awaiting_submit: false,
                 state,
             },
         }
