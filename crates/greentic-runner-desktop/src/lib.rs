@@ -114,12 +114,13 @@ pub struct RunOptions {
     /// entrypoint on every turn, so the nodes chained between two rendered
     /// cards never execute.
     ///
-    /// This OUTRANKS a persisted resume snapshot, and clears it: it is a fresh
-    /// navigation decision taken from the inbound activity, so resuming a
-    /// parked node instead would send the run somewhere the user did not ask
-    /// for. Card journeys park on every rendered card, so a snapshot is almost
-    /// always present. A node id the flow does not have is an error, never a
-    /// silent fall back to the entrypoint.
+    /// A persisted resume snapshot WINS over this: it means a card is parked
+    /// awaiting the user's submit, and only re-dispatching that card attaches
+    /// the submitted `answers` to its output for the nodes downstream to read.
+    /// So this drives the FIRST hop into a flow, and resume drives the rest.
+    ///
+    /// A node id the flow does not have is an error, never a silent fall back
+    /// to the entrypoint.
     pub entry_node: Option<String>,
     pub input: Value,
     pub ctx: TenantContext,
@@ -541,27 +542,20 @@ async fn run_pack_async(pack_path: &Path, opts: RunOptions) -> Result<RunResult>
         .as_deref()
         .and_then(load_session_snapshot);
 
-    let execution = if let Some(entry_node) = opts.entry_node.as_deref() {
-        // An explicit entry node OUTRANKS a parked snapshot. It is a fresh
-        // navigation decision the caller just took from the inbound activity
-        // ("the user pressed the button that goes to <node>"), so honouring a
-        // snapshot instead would send the run somewhere the user did not ask
-        // for. Card journeys park on every rendered card, so a snapshot is
-        // almost always present and would win every time.
-        //
-        // The snapshot's accumulated state is not lost in practice: the card
-        // protocol carries the collected form data forward on every button, so
-        // the capture nodes re-seed the vars from the inbound envelope. Clear
-        // the stale snapshot so the next turn cannot resume into a node this
-        // run has moved past.
-        if let Some(path) = session_snapshot_path.as_deref() {
-            let _ = std::fs::remove_file(path);
-        }
+    let execution = if let Some(snapshot) = resume_snapshot {
+        // A parked snapshot OUTRANKS `entry_node`. A card parks awaiting the
+        // user's submit, and only re-dispatching THAT node on resume attaches
+        // the submitted `answers` to its output — which is what the nodes
+        // downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
+        // entry node instead skips the card, so the answers never exist and
+        // every downstream binding resolves empty.
+        engine.resume(ctx, snapshot, opts.input.clone()).await
+    } else if let Some(entry_node) = opts.entry_node.as_deref() {
+        // No parked run to continue, so this is the caller's first hop into
+        // the flow: start at the node it named.
         engine
             .execute_from(ctx, opts.input.clone(), entry_node)
             .await
-    } else if let Some(snapshot) = resume_snapshot {
-        engine.resume(ctx, snapshot, opts.input.clone()).await
     } else {
         engine.execute(ctx, opts.input.clone()).await
     };

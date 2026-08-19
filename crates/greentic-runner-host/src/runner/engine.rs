@@ -900,7 +900,8 @@ impl FlowEngine {
                 }
             };
 
-            attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
+            let owned_the_submit =
+                attach_pending_card_answers(&mut state, node_id.as_str(), node, &mut output);
             state.nodes.insert(node_id.clone().into(), output.clone());
             state.last_output = Some(output.payload.clone());
             // Apply per-node vars_out bindings: render each template against a
@@ -947,6 +948,18 @@ impl FlowEngine {
                             }
                         }
                     };
+
+                    // This node has now routed on the submit that was delivered
+                    // to it, so the action is spent. `response.*` is synthesised
+                    // from the run's entry envelope and is therefore run-scoped:
+                    // left in place it matches again at the NEXT card and the
+                    // run walks straight past it, advancing the journey by two
+                    // pages per submit. Clearing it here means every later node
+                    // sees a freshly rendered card with no pending action, falls
+                    // through its conditional routing, and parks for the user.
+                    if owned_the_submit {
+                        consume_routing_action(&mut state.entry);
+                    }
 
                     match decision {
                         NextDecision::Next(n) => current = n,
@@ -2804,21 +2817,36 @@ fn declared_answer_fields(payload_expr: &Value) -> DeclaredAnswerFields {
 ///
 /// Called immediately before `state.nodes.insert`, and that position is
 /// load-bearing — see `submitted_answers_survive_the_resume_redispatch_and_reach_a_later_node`.
+/// Remove the routing `action` from a run's entry envelope.
+///
+/// Mirrors the two shapes [`build_routing_context`] reads it from: the
+/// greentic-start demo path wraps the activity (`entry.input.metadata`), the
+/// direct runner path does not (`entry.metadata`).
+fn consume_routing_action(entry: &mut Value) {
+    for pointer in ["/input/metadata", "/metadata"] {
+        if let Some(Value::Object(meta)) = entry.pointer_mut(pointer) {
+            meta.remove("action");
+        }
+    }
+}
+
+/// Returns true when the pending submit belonged to `node_id` and was consumed
+/// here — the caller clears the routing action once this node has routed on it.
 fn attach_pending_card_answers(
     state: &mut ExecutionState,
     node_id: &str,
     node: &HostNode,
     output: &mut NodeOutput,
-) {
+) -> bool {
     let is_target = state
         .pending_card_answers
         .as_ref()
         .is_some_and(|pending| pending.node_id == node_id);
     if !is_target {
-        return;
+        return false;
     }
     let Some(pending) = state.pending_card_answers.take() else {
-        return;
+        return false;
     };
     // No `ok` check on purpose: the answers are real whether or not the
     // re-render succeeded, and dropping them would let a transient render error
@@ -2828,7 +2856,7 @@ fn attach_pending_card_answers(
             node_id = %node_id,
             "node output payload is not an object; submitted answers not attached"
         );
-        return;
+        return true;
     };
     if map.contains_key("answers") {
         tracing::warn!(
@@ -2861,6 +2889,7 @@ fn attach_pending_card_answers(
         DeclaredAnswerFields::Absent => pending.answers,
     };
     map.insert("answers".to_string(), Value::Object(answers));
+    true
 }
 
 /// Decide what to park for the node awaiting a submit, from the snapshot being
@@ -9281,6 +9310,148 @@ mod tests {
     /// `{{node.card.answers.email}}`). `card`'s first pass has no
     /// `response.action`, so its conditional routing falls through and it
     /// parks with `awaiting_submit: true`.
+    /// Two chained cards that route on the SAME action, then a terminal node.
+    ///
+    /// This is the shape every designer card journey has: each page's Continue
+    /// button submits `action = "continue"`, and each page's routing tests for
+    /// it.
+    fn two_card_chain_flow() -> Flow {
+        let card_node = |id: &str, to: Option<&str>| Node {
+            id: NodeId::from_str(id).unwrap(),
+            component: FlowComponentRef {
+                id: "emit.log".parse().unwrap(),
+                pack_alias: None,
+                operation: None,
+            },
+            input: InputMapping {
+                mapping: json!({ "card": id }),
+            },
+            output: OutputMapping {
+                mapping: Value::Null,
+            },
+            err_map: None,
+            routing: match to {
+                Some(target) => Routing::Custom(json!([
+                    { "condition": "response.action == \"submit\"", "to": target }
+                ])),
+                None => Routing::End,
+            },
+            telemetry: TelemetryHints::default(),
+            conversational: false,
+        };
+
+        let mut nodes = indexmap::IndexMap::default();
+        for (id, to) in [
+            ("card1", Some("card2")),
+            ("card2", Some("card3")),
+            ("card3", None),
+        ] {
+            nodes.insert(NodeId::from_str(id).unwrap(), card_node(id, to));
+        }
+
+        Flow {
+            schema_version: "1.0".into(),
+            id: FlowId::from_str("two.card.flow").unwrap(),
+            kind: FlowKind::Messaging,
+            entrypoints: BTreeMap::from([(
+                "default".to_string(),
+                Value::String("card1".to_string()),
+            )]),
+            nodes,
+            metadata: FlowMetadata {
+                title: None,
+                description: None,
+                tags: Default::default(),
+                extra: json!({}),
+            },
+        }
+    }
+
+    /// One submit must advance the journey by exactly ONE card.
+    ///
+    /// `response.*` is synthesised from the run's entry envelope, so it is
+    /// run-scoped: without consuming it, the action that moved `card1` matches
+    /// again at `card2` and the run walks straight past it. Measured on the
+    /// meridian quote journey: page 1's Continue landed the user on page 3.
+    ///
+    /// The submit belongs to the node it was delivered to. Once that node has
+    /// routed on it, later nodes in the same run must see a fresh card with no
+    /// pending action, park, and wait for the user.
+    #[test]
+    fn one_submit_advances_exactly_one_card() {
+        let host_flow = HostFlow::from(two_card_chain_flow());
+        let (flow_id, pack_id) = ("two.card.flow", "test-pack");
+        let engine = FlowEngine {
+            rollout_ids: RolloutIds::default(),
+            packs: Vec::new(),
+            flows: Vec::new(),
+            flow_sources: StdHashMap::new(),
+            messaging_provider_pack_ids: std::collections::HashSet::new(),
+            flow_cache: RwLock::new(StdHashMap::from([(
+                FlowKey {
+                    pack_id: pack_id.to_string(),
+                    flow_id: flow_id.to_string(),
+                },
+                host_flow,
+            )])),
+            default_env: "local".to_string(),
+            validation: ValidationConfig {
+                mode: ValidationMode::Off,
+            },
+            cross_pack_resolver: None,
+            remote_dispatch_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            dw_agent_dispatch: crate::runner::agent_node::DwAgentDispatch::InProcess,
+            #[cfg(feature = "agentic-worker")]
+            agent_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            graph_node_handler: None,
+            #[cfg(feature = "agentic-worker")]
+            mcp_tool_source: None,
+        };
+        let rt = Runtime::new().unwrap();
+        let ctx = || FlowContext {
+            tenant: "demo",
+            pack_id,
+            flow_id,
+            node_id: None,
+            tool: None,
+            action: None,
+            session_id: None,
+            provider_id: None,
+            reply_scope: None,
+            retry_config: RetryConfig {
+                max_attempts: 1,
+                base_delay_ms: 1,
+            },
+            attempt: 1,
+            observer: None,
+            mocks: None,
+        };
+
+        // Turn 1: no action yet, so `card1` falls through and parks.
+        let first = rt.block_on(engine.execute(ctx(), Value::Null)).unwrap();
+        let snapshot = match first.status {
+            FlowStatus::Waiting(w) => w.snapshot,
+            other => panic!("expected Waiting at card1, got {other:?}"),
+        };
+        assert_eq!(snapshot.next_node, "card1");
+
+        // Turn 2: ONE submit. `card1` routes on it; `card2` must not.
+        let submit = json!({ "input": { "metadata": { "action": "submit" } } });
+        let second = rt.block_on(engine.resume(ctx(), snapshot, submit)).unwrap();
+        match second.status {
+            FlowStatus::Waiting(w) => assert_eq!(
+                w.snapshot.next_node, "card2",
+                "one submit must advance exactly one card and park at the next"
+            ),
+            FlowStatus::Completed => panic!(
+                "the run reached the terminal node: the consumed action re-fired \
+                 at card2 and skipped it"
+            ),
+        }
+    }
+
     fn card_answers_flow() -> Flow {
         let card_id = NodeId::from_str("card").unwrap();
         let next_id = NodeId::from_str("next").unwrap();

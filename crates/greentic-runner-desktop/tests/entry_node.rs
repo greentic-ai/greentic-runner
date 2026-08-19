@@ -59,18 +59,6 @@ fn run_with_session(entry_node: Option<&str>, session_dir: &std::path::Path) -> 
     .expect("run should not fail to start")
 }
 
-fn snapshot_files(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(session_dir)
-        .map(|entries| {
-            entries
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| p.to_string_lossy().ends_with(".snapshot.json"))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Plant a resume snapshot that would send the run to `emit`, skipping `qa`.
 fn plant_snapshot(session_dir: &std::path::Path, pack_id: &str) {
     let snapshot = json!({
@@ -88,45 +76,45 @@ fn plant_snapshot(session_dir: &std::path::Path, pack_id: &str) {
     .expect("write snapshot");
 }
 
-/// A parked snapshot must NOT hijack an explicit entry node.
+/// A parked snapshot must WIN over an explicit entry node.
 ///
-/// Card journeys park on every rendered card, so a snapshot is present on all
-/// but the first turn. Letting it win means the run resumes where the previous
-/// turn stopped and ignores the button the user just pressed — which silently
-/// pins the journey to one card. Getting this precedence backwards is exactly
-/// how the meridian quote journey stalled on page 2 forever.
+/// A card parks awaiting the user's submit, and only re-dispatching THAT card
+/// on resume attaches the submitted `answers` to its output — which is what the
+/// nodes downstream read (`{{node.<card>.answers.<field>}}`). Jumping to an
+/// entry node instead skips the card, so the answers never exist and every
+/// downstream binding resolves empty. Measured on the meridian quote journey:
+/// with the precedence this way round the page-3 fields reached the MCP call
+/// (`contact_name: "Jane"`); with it backwards every argument was `""`.
+///
+/// `entry_node` therefore drives only the FIRST hop into a flow.
 #[test]
-fn entry_node_outranks_a_parked_resume_snapshot() {
+fn a_parked_snapshot_outranks_an_entry_node() {
     let tmp = TempDir::new().expect("tempdir");
     let session_dir = tmp.path().join("sessions");
     std::fs::create_dir_all(&session_dir).expect("session dir");
     let pack_id = run(None).pack_id;
 
-    // Premise: prove the planted snapshot is actually loaded and honoured.
-    // Without this the precedence assertion below could pass simply because the
-    // snapshot was malformed and silently ignored.
-    plant_snapshot(&session_dir, &pack_id);
-    let resumed = executed_nodes(&run_with_session(None, &session_dir));
+    // Premise: prove `entry_node` reaches `qa` at all when nothing is parked.
+    // Without this the assertion below could pass simply because the entry node
+    // never worked in this harness.
+    let fresh = executed_nodes(&run_with_session(Some("qa"), &session_dir));
     assert!(
-        resumed.iter().any(|n| n == "emit") && !resumed.iter().any(|n| n == "qa"),
-        "planted snapshot was not honoured, so this test cannot prove anything \
-         about precedence — got {resumed:?}"
+        fresh.iter().any(|n| n == "qa"),
+        "entry_node did not reach `qa` even with no snapshot, so this test \
+         cannot prove anything about precedence — got {fresh:?}"
     );
 
-    // Now the real assertion: the same snapshot must lose to an entry node that
-    // names a node UPSTREAM of it. Resuming would never reach `qa`.
+    // The real assertion: with a snapshot parked at `emit`, the same entry node
+    // must lose. Only resume reaches `emit` without running `qa`.
     plant_snapshot(&session_dir, &pack_id);
-    let jumped = executed_nodes(&run_with_session(Some("qa"), &session_dir));
+    let resumed = executed_nodes(&run_with_session(Some("qa"), &session_dir));
     assert!(
-        jumped.iter().any(|n| n == "qa"),
-        "the explicit entry node must win over the parked snapshot, got {jumped:?}"
+        resumed.iter().any(|n| n == "emit"),
+        "the parked snapshot must win and resume at `emit`, got {resumed:?}"
     );
-
-    // And the stale snapshot must be gone, or the next turn resumes into a node
-    // this run has already moved past.
     assert!(
-        snapshot_files(&session_dir).is_empty(),
-        "an entry-node run must clear the snapshot it overrode"
+        !resumed.iter().any(|n| n == "qa"),
+        "resuming must not run the entry node `qa`, got {resumed:?}"
     );
 }
 
