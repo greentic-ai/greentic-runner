@@ -5,6 +5,9 @@ members = [
     "crates/greentic-runner-desktop",
     "crates/tests",
     "crates/runner-core",
+    "crates/greentic-aw-runtime",
+    "crates/aw-event-bridge",
+    "crates/telco-x-event-bridge",
     "tests/fixtures/packs/secrets_store_smoke/components",
     "tests/assets/component-v0-6-dummy",
 ]
@@ -15,11 +18,6 @@ exclude = [
     "tests/fixtures/runner-components",
     "tests/fixtures/wasi-p2-smoke",
     "tests/assets/provider-core-dummy",
-    # Main-only crates: not yet integrated into develop (their transitive deps
-    # pin 1.1.x interfaces which conflict with develop's 1.2.x ranges).
-    "crates/greentic-aw-runtime",
-    "crates/aw-event-bridge",
-    "crates/telco-x-event-bridge",
 ]
 
 [workspace.package]
