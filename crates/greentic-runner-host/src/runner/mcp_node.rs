@@ -83,29 +83,23 @@ pub mod aw {
         CACHED.get_or_init(build_secrets_manager).clone()
     }
 
-    /// Secret URI a pack-carried `http` route's bearer token is read from.
-    ///
-    /// Byte-for-byte the shape greentic-designer-admin writes for the `mcp`
-    /// category (parity source: `greentic_aw_runtime::mcp_secrets`): the env
-    /// segment is pinned to `default` regardless of the flow env, the team and
-    /// the name pass through verbatim, and an absent team becomes `_`.
-    /// Canonicalizing anything here would read a URI admin never wrote — the
-    /// server id is a hyphenated UUID that lowercasing would corrupt.
-    fn pack_route_secret_uri(tenant: &str, team: Option<&str>, server_id: &str) -> String {
-        format!(
-            "secrets://default/{tenant}/{}/mcp/{server_id}",
-            team.unwrap_or("_")
-        )
-    }
-
     /// Build a dispatchable route from a pack-carried record, resolving the
     /// credential from the secrets backend.
     ///
     /// The token is NEVER carried by the pack — it is read from
     /// `secrets://default/<tenant>/<team>/mcp/<server_id>`, the URI
-    /// greentic-designer-admin writes under the `mcp` category and
-    /// `greentic_aw_runtime::mcp_secrets` already reads for `local-wasm`
-    /// components. This extends the same read to the HTTP dispatch path.
+    /// greentic-designer-admin writes under the `mcp` category. That URI is
+    /// built by [`greentic_aw_runtime::mcp_secrets::mcp_secret_uri`], now the
+    /// SINGLE builder for the shape — this module used to carry a byte-for-byte
+    /// second copy, which is how the flow path and the agent path would have
+    /// started resolving different URIs for the same server with nothing
+    /// failing.
+    ///
+    /// `read_mcp_secret` tries the record's `auth_team` scope before the
+    /// tenant-default `_` scope, mirroring admin's own resolver precedence. A
+    /// deployment whose token sits at `_` is unaffected; one whose token sits at
+    /// a team scope starts working, because the deployed runtime carries no team
+    /// of its own and so resolved `_` only.
     ///
     /// Only an `http` route reads a token here. A `local-wasm` route has no
     /// HTTP credential at all — admin writes no `mcp/<server_id>` entry for one
@@ -117,7 +111,7 @@ pub mod aw {
     /// NOTE: this resolves only under `SECRETS_BACKEND=broker`. The `env`
     /// backend looks a variable up by the literal path, and a variable named
     /// `secrets://…` is not settable in Kubernetes — so the error below names
-    /// the URI rather than reporting an opaque NotFound.
+    /// every URI tried rather than reporting an opaque NotFound.
     async fn route_from_pack(
         route: &PackMcpRoute,
         secrets: Option<&crate::secrets::DynSecretsManager>,
@@ -125,18 +119,19 @@ pub mod aw {
         team: Option<&str>,
     ) -> Result<greentic_aw_runtime::McpRoute, String> {
         let is_http = route.transport != "local-wasm";
-        let uri = pack_route_secret_uri(tenant, team, &route.server_id);
 
         let token = match secrets.filter(|_| is_http) {
-            Some(manager) => match manager.read(&uri).await {
+            Some(manager) => match greentic_aw_runtime::mcp_secrets::read_mcp_secret(
+                manager.as_ref(),
+                tenant,
+                team,
+                &route.server_id,
+            )
+            .await
+            {
                 Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-                Err(e) => {
-                    return Err(format!(
-                        "mcp server '{}' has no credential at {uri} ({e}). Note that MCP \
-                         requires SECRETS_BACKEND=broker; the env backend cannot resolve a \
-                         secrets:// URI.",
-                        route.server_id
-                    ));
+                Err(miss) => {
+                    return Err(format!("mcp server '{}' has {miss}", route.server_id));
                 }
             },
             None => None,

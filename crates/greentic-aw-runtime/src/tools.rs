@@ -364,9 +364,13 @@ pub async fn dispatch_tool_call(
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
+        // `resolve_route` takes the catalog's exact `(server, tool)` entry when
+        // it has one and otherwise stamps the tool onto a pack-carried
+        // server-level route. An admin-built catalog registers no server-level
+        // routes, so its behaviour here is unchanged.
         let value = match mcp
             .as_deref()
-            .and_then(|c| c.route(server_id, &call.tool_name))
+            .and_then(|c| c.resolve_route(server_id, &call.tool_name))
         {
             Some(route) => {
                 let args = call.args.to_string();
@@ -376,7 +380,7 @@ pub async fn dispatch_tool_call(
                     }
                     None => crate::mcp_scope::McpCallScope::new(tenant.clone()),
                 };
-                crate::mcp_source::dispatch_route(route, &args, &scope).await
+                crate::mcp_source::dispatch_route(&route, &args, &scope).await
             }
             None => {
                 tracing::warn!(
@@ -384,8 +388,17 @@ pub async fn dispatch_tool_call(
                     tool = %call.tool_name,
                     "mcp call has no route in the tenant catalog; returning error value"
                 );
+                // A per-server diagnostic (only the pack path records one) names
+                // the real cause; without it a missing credential and an
+                // unregistered server are indistinguishable to the operator.
                 serde_json::json!({
-                    "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
+                    "error": match mcp.as_deref().and_then(|c| c.server_error(server_id)) {
+                        Some(detail) => format!(
+                            "mcp tool '{}/{}' is unavailable: mcp server '{}' has {detail}",
+                            server_id, call.tool_name, server_id
+                        ),
+                        None => format!("unknown mcp tool '{}/{}'", server_id, call.tool_name),
+                    }
                 })
             }
         };
