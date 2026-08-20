@@ -23,11 +23,10 @@ use greentic_aw_runtime::config::ToolRef;
 use greentic_aw_runtime::state::ToolCallRecord;
 use greentic_aw_runtime::tenant::TenantContext;
 use greentic_aw_runtime::tools::{dispatch_tool_call, list_tools_for_llm};
-use greentic_ext_runtime::ExtensionRuntime;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unloaded_tool_is_invisible_to_llm_and_dispatch_fails_safe() {
-    let runtime = ExtensionRuntime::for_test();
+    let runtime = greentic_aw_runtime::test_support::extension_runtime();
 
     let allowed = vec![ToolRef {
         extension_id: "greentic.absent".into(),

@@ -54,21 +54,19 @@ required-features = ["legacy-gen-bindings"]
 # Passthrough feature flags so the `info` report can accurately partition host
 # capabilities into enabled/disabled. These stay disabled by default — enable
 # them on the host crate and mirror them here if you need them surfaced.
-default = ["verify"]
+default = ["verify", "agentic-worker"]
 verify = ["greentic-runner-host/verify"]
 telemetry = ["greentic-runner-host/telemetry"]
 session-redis = ["greentic-runner-host/session-redis"]
 component-v0-6-introspection = ["greentic-runner-host/component-v0-6-introspection"]
 fault-injection = ["greentic-runner-host/fault-injection"]
 legacy-gen-bindings = []
-
-# `agentic-worker` cfg gates remain in the source but the feature declaration was
-# removed from the develop lane in d43ae4dd (main-only wiring). Whitelist the value
-# for check-cfg so `-D warnings` (unexpected_cfgs) does not fire on the dead gates.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("agentic-worker"))',
-] }
+# Re-declared now that the host carries the agentic worker again (it was
+# dropped from this lane in d43ae4dd as main-only wiring, leaving the source's
+# cfg gates permanently false). On by default to match the host, so `info`
+# reports the capability truthfully and `HostConfig`'s agent/graph fields are
+# initialised in the tests below.
+agentic-worker = ["greentic-runner-host/agentic-worker"]
 
 [dependencies]
 anyhow.workspace = true

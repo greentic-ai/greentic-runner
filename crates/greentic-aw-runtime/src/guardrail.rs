@@ -161,12 +161,12 @@ impl GuardrailEvaluator for UnavailableGuardrailEvaluator {
 /// and `GuardrailVerdictWire`, which exist only where the runtime carries the
 /// `greentic:extension-design@0.3.0` WIT surface. Lanes without it get
 /// [`UnavailableGuardrailEvaluator`] instead, which fails closed.
-#[cfg(feature = "guardrail-ext")]
+#[cfg(greentic_guardrail_ext)]
 pub struct ExtRuntimeGuardrailEvaluator {
     pub ext_runtime: std::sync::Arc<greentic_ext_runtime::ExtensionRuntime>,
 }
 
-#[cfg(feature = "guardrail-ext")]
+#[cfg(greentic_guardrail_ext)]
 impl GuardrailEvaluator for ExtRuntimeGuardrailEvaluator {
     fn evaluate(
         &self,

@@ -17,10 +17,6 @@
 use crate::config::ToolRef;
 use greentic_dw_manifest::DigitalWorkerManifest;
 
-/// Capability literal a tool must declare to be usable by an agentic worker.
-/// The manifest's own validation requires every `ExtensionTool` to carry this.
-const AGENTIC_WORKER_CAPABILITY: &str = "agentic_worker";
-
 /// Convert a manifest's `extension_tools` into AW runtime [`ToolRef`]s.
 ///
 /// Only tools whose `capabilities` declare [`AGENTIC_WORKER_CAPABILITY`] are
@@ -51,14 +47,19 @@ pub fn manifest_to_tool_refs(manifest: &DigitalWorkerManifest) -> Vec<ToolRef> {
     // tools and the overlay is empty. That is the honest answer rather than a
     // failure: `ManifestToolOverlayProvider` is fail-soft by contract, and an
     // empty overlay leaves the base config's tools untouched.
-    #[cfg(not(feature = "dw-manifest-tools"))]
+    #[cfg(not(greentic_dw_manifest_tools))]
     {
         let _ = manifest;
-        return Vec::new();
+        Vec::new()
     }
 
-    #[cfg(feature = "dw-manifest-tools")]
+    #[cfg(greentic_dw_manifest_tools)]
     {
+        /// Capability literal a tool must declare to be usable by an agentic
+        /// worker. The manifest's own validation requires every
+        /// `ExtensionTool` to carry this.
+        const AGENTIC_WORKER_CAPABILITY: &str = "agentic_worker";
+
         let mut seen_pairs: Vec<(String, String)> = Vec::new();
         let mut tool_refs: Vec<ToolRef> = Vec::new();
 

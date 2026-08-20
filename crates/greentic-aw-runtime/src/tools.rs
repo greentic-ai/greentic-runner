@@ -432,7 +432,7 @@ mod tests {
     fn list_tools_for_llm_with_no_extensions_returns_empty() {
         // for_test runtime has no extensions loaded → list_tools errors
         // (NotFound) for every ext → all skipped → empty result.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
@@ -446,7 +446,7 @@ mod tests {
         // No extensions loaded → the declared tool cannot resolve and is
         // reported as missing with a load-failure reason (instead of being
         // dropped silently, which is what causes hallucinated tool results).
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn missing_tools_reports_mcp_tool_absent_from_catalog() {
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "mcp:github".into(),
             tool_name: "create_issue".into(),
@@ -562,7 +562,7 @@ mod tests {
         // A catalog-backed mcp: ref is emitted as an LlmToolSchema with the
         // catalog's description/parameters; the ext_runtime is never consulted
         // for it (the for_test runtime has no extensions loaded).
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -601,7 +601,7 @@ mod tests {
         // non-mcp extension id — if the mcp branch ever matched non-`mcp:`
         // ids and consulted the catalog, this entry would be emitted and the
         // empty assertion below would catch the regression.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let catalog = catalog_with(
             "greentic.tavily",
             "search",
@@ -659,7 +659,7 @@ mod tests {
             serde_json::json!({}),
             Some(&uri),
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(crate::test_support::extension_runtime());
 
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -710,7 +710,7 @@ mod tests {
     fn component_ref_listed_from_catalog() {
         // A catalog-backed component: ref is emitted as an LlmToolSchema with
         // the catalog's description/parameters; ext_runtime is never consulted.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "order_id": { "type": "string" } }
@@ -753,7 +753,7 @@ mod tests {
         // component catalog is present. The decoy entry is keyed by the FULL
         // non-prefixed id — if the component branch ever matched it, this entry
         // would leak into the list and the empty assertion would catch it.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
         let catalog = ComponentToolCatalog::for_tests(
             one_tool(
@@ -791,7 +791,7 @@ mod tests {
             ),
             invoker,
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(crate::test_support::extension_runtime());
 
         let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {

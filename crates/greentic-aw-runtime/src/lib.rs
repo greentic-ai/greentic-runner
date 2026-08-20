@@ -51,6 +51,11 @@ pub mod tools;
 #[cfg(feature = "test-mock")]
 pub mod mock;
 
+/// Test-only constructors. Available to this crate's own `#[cfg(test)]` code
+/// and, via `test-mock`, to integration tests and the `aw-serve` harness.
+#[cfg(any(test, feature = "test-mock"))]
+pub mod test_support;
+
 #[cfg(feature = "serve")]
 pub mod serve;
 

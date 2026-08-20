@@ -16,7 +16,7 @@ use greentic_mcp_exec::{ExecConfig, ExecRequest, RuntimePolicy, ToolStore, Verif
 // different thing, and `describe::describe_tool` returns a describe-v1
 // document that would need real adaptation. So local-wasm tool DISCOVERY is
 // gated; dispatch below still works, since `exec` is present.
-#[cfg(feature = "mcp-local-wasm")]
+#[cfg(greentic_mcp_local_wasm)]
 use greentic_mcp_exec::{ToolDef, list_tools};
 use serde_json::{Value, json};
 
@@ -125,7 +125,7 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 }
 
 /// List a local component's tools. Returns an empty vec and emits a `warn` on any failure.
-#[cfg(feature = "mcp-local-wasm")]
+#[cfg(greentic_mcp_local_wasm)]
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
     let config = exec_config_for(component_ref);

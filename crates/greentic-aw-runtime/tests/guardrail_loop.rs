@@ -4,7 +4,7 @@
 //! guardrail cannot be resolved from the capability registry, `run_step` must
 //! return `AgentError::GuardrailDenied` *before* any LLM call is attempted.
 //! This is achievable without a populated registry or a live LLM because the
-//! `ExtensionRuntime::for_test()` has an empty capability registry — perfect
+//! `greentic_aw_runtime::test_support::extension_runtime()` has an empty capability registry — perfect
 //! for triggering the fail-closed branch.
 
 #![cfg(feature = "test-mock")]
@@ -62,9 +62,9 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
     let cp = MockConfigProvider::new();
     cp.insert(&tc, "a", config);
 
-    // `ExtensionRuntime::for_test()` initialises an empty capability registry —
+    // `greentic_aw_runtime::test_support::extension_runtime()` initialises an empty capability registry —
     // any mandatory cap_id will fail to resolve, triggering the fail-closed path.
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
 
     let runtime = AgentRuntime::new(
         Arc::new(cp),
@@ -87,7 +87,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
 }
 
 /// When a mandatory guardrail cap_id has no offering in the (empty)
-/// `ExtensionRuntime::for_test()` registry, `assemble_chain` returns `Err` and
+/// `greentic_aw_runtime::test_support::extension_runtime()` registry, `assemble_chain` returns `Err` and
 /// `run_step` must fail closed with `AgentError::GuardrailDenied { direction:
 /// Inbound, code: "internal", .. }` *before* the LLM is invoked.
 #[tokio::test]
@@ -162,7 +162,7 @@ async fn no_mandatory_guardrails_passes_through() {
     let runtime = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_aw_runtime::test_support::extension_runtime()),
         Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
             content: Some("all good".into()),
             tool_calls: vec![],
@@ -191,7 +191,7 @@ async fn no_mandatory_guardrails_passes_through() {
 }
 
 /// When a mandatory guardrail cap_id has no offering in the (empty)
-/// `ExtensionRuntime::for_test()` registry, `assemble_chain` returns `Err`
+/// `greentic_aw_runtime::test_support::extension_runtime()` registry, `assemble_chain` returns `Err`
 /// and `run_step` must fail closed with `AgentError::GuardrailDenied {
 /// direction: Inbound, code: "internal", .. }` regardless of which evaluator
 /// is supplied — the evaluator is never reached because `assemble_chain` errors
@@ -307,7 +307,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         tokens_out: 1,
     })];
 
-    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = std::sync::Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let runtime = AgentRuntime::new(
         std::sync::Arc::new(cp),
         std::sync::Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),

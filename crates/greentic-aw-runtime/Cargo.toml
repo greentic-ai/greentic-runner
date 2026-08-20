@@ -8,20 +8,24 @@ description = "Enterprise Agentic Worker runtime — Plan-Act-Observe loop, Redi
 [features]
 default   = []
 test-mock = []
-# WASM-backed guardrail evaluation. Needs a greentic-ext-runtime carrying the
+# NOTE: the three gates below are bare `--cfg` flags, NOT cargo features, on
+# purpose. Each parks code that cannot build against the dependency versions
+# this lane pins, and CI builds `--all-features` — a cargo feature would be
+# switched on and break the build. Turn one on with
+# `RUSTFLAGS="--cfg <name>"` once its dependency catches up.
+#
+# greentic_guardrail_ext: WASM-backed guardrail evaluation. Needs a
+# greentic-ext-runtime carrying the
 # `greentic:extension-design@0.3.0` WIT surface (`evaluate_guardrail` +
 # `GuardrailVerdictWire`); the dev lane's runtime is on 0.2.0 and has neither,
 # so this stays off there and `UnavailableGuardrailEvaluator` fails closed
 # instead. Turn on once that surface lands.
-guardrail-ext = []
-# Local-wasm MCP tool DISCOVERY. Needs `greentic_mcp_exec::{ToolDef, list_tools}`,
+# greentic_mcp_local_wasm: local-wasm MCP tool DISCOVERY. Needs `greentic_mcp_exec::{ToolDef, list_tools}`,
 # which the mcp-exec line this lane carries does not have. Dispatch of an
 # already-known local tool still works without it (`exec` is present); only
 # discovery is gated. Remote (http) MCP servers are unaffected.
-mcp-local-wasm = []
-# Tool refs derived from a DigitalWorkerManifest. Needs `extension_tools` on
+# greentic_dw_manifest_tools: tool refs derived from a DigitalWorkerManifest. Needs `extension_tools` on
 # `DigitalWorkerManifest`, absent from this lane's greentic-dw-manifest.
-dw-manifest-tools = []
 # Multi-provider in-process LLM backend: routes the worker's LLM call through
 # greentic-llm (DeepSeek, Anthropic, Gemini, … — the full provider matrix)
 # instead of the hardwired OpenAI client. Pulls in rig-core, so it is opt-in.
@@ -38,6 +42,16 @@ serve     = ["dep:aw-event-bridge", "dep:async-nats"]
 name = "aw-serve"
 path = "src/bin/aw_serve.rs"
 required-features = ["serve", "test-mock"]
+
+# The three parked gates above are bare `--cfg` flags rather than cargo
+# features (see the note in [features]); tell check-cfg they are expected so
+# `-D warnings` does not fire `unexpected_cfgs` on every use.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(greentic_guardrail_ext)',
+    'cfg(greentic_mcp_local_wasm)',
+    'cfg(greentic_dw_manifest_tools)',
+] }
 
 [dependencies]
 anyhow              = { workspace = true }

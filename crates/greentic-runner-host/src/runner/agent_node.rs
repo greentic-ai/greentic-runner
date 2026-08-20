@@ -1236,7 +1236,7 @@ mod aw {
                 policy
             },
             {
-                #[cfg(feature = "guardrail-ext")]
+                #[cfg(greentic_guardrail_ext)]
                 {
                     Arc::new(
                         greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
@@ -1248,7 +1248,7 @@ mod aw {
                 // (extension-design is at 0.2.0). Fail closed rather than
                 // silently accepting: an agent that configured a guardrail
                 // stops loudly instead of running unprotected.
-                #[cfg(not(feature = "guardrail-ext"))]
+                #[cfg(not(greentic_guardrail_ext))]
                 {
                     Arc::new(greentic_aw_runtime::guardrail::UnavailableGuardrailEvaluator)
                 }
@@ -1485,7 +1485,7 @@ mod aw {
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(crate::runner::agent_node::test_extension_runtime());
 
             let runtime = Arc::new(AgentRuntime::new(
                 config_provider,
@@ -1571,7 +1571,7 @@ mod aw {
                 AgentRuntime::new(
                     Arc::new(config_provider),
                     Arc::new(MockAgentStateStore::new()),
-                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+                    Arc::new(crate::runner::agent_node::test_extension_runtime()),
                     llm,
                     Arc::new(MockTelemetry::new()),
                     Arc::new(MockTokenMeter::new(0)),
@@ -1747,7 +1747,7 @@ mod aw {
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(crate::runner::agent_node::test_extension_runtime());
 
             Arc::new(
                 AgentRuntime::new(
@@ -2493,3 +2493,20 @@ pub use aw::build_agent_node_handler_ephemeral;
 
 #[cfg(feature = "agentic-worker")]
 pub(crate) use aw::{EnvSecretsBackend, build_ext_runtime, build_llm_backend};
+
+/// Test-only stand-in for `ExtensionRuntime::for_test()`, which this lane's
+/// greentic-ext-runtime does not expose. Builds the equivalent: a runtime
+/// rooted at a discovery path holding no extensions, plus the crate's own test
+/// host overrides. Every lookup therefore returns an empty tool catalog, which
+/// is what the agent/graph node tests want — they drive canned LLM replies and
+/// never dispatch to a real extension.
+#[cfg(all(test, feature = "agentic-worker"))]
+pub(crate) fn test_extension_runtime() -> greentic_ext_runtime::ExtensionRuntime {
+    greentic_ext_runtime::ExtensionRuntime::new(greentic_ext_runtime::RuntimeConfig::from_paths(
+        greentic_ext_runtime::DiscoveryPaths::new(std::path::PathBuf::from(
+            "/nonexistent/greentic-runner-host-test-extensions",
+        )),
+    ))
+    .expect("wasmtime engine init for the runner-host test extension runtime")
+    .with_host_overrides(greentic_ext_runtime::HostOverrides::defaults_for_tests())
+}

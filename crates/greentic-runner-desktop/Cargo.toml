@@ -16,6 +16,15 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(feature, values("agentic-worker", "desktop-agent-ephemeral", "greentic-llm-backend"))',
 ] }
 
+[features]
+# `build_host_config` already gates `HostConfig`'s `agents`/`graphs` on this
+# flag, but the flag itself was never declared — so while the host's
+# `agentic-worker` was a stub the cfg was permanently false and nothing
+# noticed. Now that the host carries the feature by default, declare it here
+# and forward it, keeping the two crates' views of `HostConfig` in step.
+default = ["agentic-worker"]
+agentic-worker = ["greentic-runner-host/agentic-worker"]
+
 [dependencies]
 anyhow.workspace = true
 greentic-runner-host = { workspace = true }

@@ -36,6 +36,16 @@ greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(feature, values("desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
+    # Not a cargo feature on purpose: CI builds with `--all-features`, which
+    # would switch a feature on and break the build. Parks the conversational
+    # `dw.agent` park-loop test harness until this lane's engine grows the
+    # branch it exercises. Compile it with
+    # `RUSTFLAGS="--cfg conversational_dw_agent_port"`.
+    'cfg(conversational_dw_agent_port)',
+    # Mirrors greentic-aw-runtime's parked gate: selects the WASM-backed
+    # guardrail evaluator over the fail-closed stand-in. Same reason it is not
+    # a feature — CI builds `--all-features`.
+    'cfg(greentic_guardrail_ext)',
 ] }
 
 

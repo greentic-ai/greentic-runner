@@ -2413,7 +2413,7 @@ mod aw {
             AgentRuntime::new(
                 Arc::new(provider),
                 Arc::new(MockAgentStateStore::new()),
-                Arc::new(ExtensionRuntime::for_test()),
+                Arc::new(crate::runner::agent_node::test_extension_runtime()),
                 llm,
                 Arc::new(MockTelemetry::new()),
                 Arc::new(MockTokenMeter::new(0)),
@@ -2546,7 +2546,7 @@ mod aw {
 
             (
                 Arc::new(MockAgentStateStore::new()),
-                Arc::new(ExtensionRuntime::for_test()),
+                Arc::new(crate::runner::agent_node::test_extension_runtime()),
                 Arc::new(MockTelemetry::new()),
                 Arc::new(MockTokenMeter::new(0)),
                 Arc::new(NoopToolLedger),
