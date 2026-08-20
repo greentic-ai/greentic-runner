@@ -1855,6 +1855,12 @@ mod aw {
             assert_eq!(resolved.agent_id, "greeter");
         }
 
+        /// Requires `greentic_dw_manifest_tools`: without it this lane's
+        /// `DigitalWorkerManifest` has no `extension_tools` to parse, so
+        /// `manifest_to_tool_refs` yields an empty overlay and there is
+        /// nothing to replace. `a_tool_declaring_manifest_does_not_reach_the_agent`
+        /// below pins what happens here instead.
+        #[cfg(greentic_dw_manifest_tools)]
         #[tokio::test]
         async fn overlay_provider_replaces_tools_from_manifest() {
             use greentic_aw_runtime::ManifestToolOverlayProvider;
@@ -1889,6 +1895,47 @@ mod aw {
                     extension_id: "greentic.tavily".into(),
                     tool_name: "web_search".into()
                 }]
+            );
+        }
+
+        /// The agent-side mirror of
+        /// `manifest_provider::tests::a_tool_declaring_manifest_is_ignored_on_this_lane`:
+        /// a Digital Worker manifest may declare agentic-worker tools, but on
+        /// this lane none of them reach the agent's config. The overlay is
+        /// fail-soft, so this is silent — pin it so a future port has to
+        /// delete this test rather than discover the behaviour.
+        #[cfg(not(greentic_dw_manifest_tools))]
+        #[tokio::test]
+        async fn a_tool_declaring_manifest_does_not_reach_the_agent() {
+            use greentic_aw_runtime::ManifestToolOverlayProvider;
+            use greentic_aw_runtime::config_provider::ConfigProvider;
+
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("greeter.json"),
+                r#"{"id":"greeter","display_name":"G",
+                "tenancy":{"tenant":"t","team_policy":"disabled"},
+                "locale":{"worker_default_locale":"en-US","policy":"worker_default",
+                          "propagation":"current_task_only","output":"worker_default"},
+                "extension_tools":[{"extension_id":"greentic.tavily","extension_version":"1.0.0",
+                  "tool_name":"web_search","description":"d","input_schema_json":"{\"type\":\"object\"}",
+                  "capabilities":["agentic_worker"],"agentic_worker_metadata":{}}]}"#,
+            )
+            .unwrap();
+
+            let mut agents = HashMap::new();
+            agents.insert("greeter".to_string(), sample_agent_config("greeter"));
+            let base_tools = sample_agent_config("greeter").tools;
+            let provider = ManifestToolOverlayProvider::new(
+                HostConfigProvider::new(agents),
+                tmp.path().to_path_buf(),
+            );
+
+            let tenant = TenantContext::new("acme", "prod");
+            let cfg = provider.agent_config(&tenant, "greeter").await.unwrap();
+            assert_eq!(
+                cfg.tools, base_tools,
+                "the manifest's greentic.tavily/web_search must not reach the agent on this lane"
             );
         }
 
