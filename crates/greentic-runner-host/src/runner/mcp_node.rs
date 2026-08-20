@@ -50,35 +50,6 @@ pub mod aw {
         Some(Arc::new(McpToolSource::new(endpoint, token)))
     }
 
-    /// Build the secrets manager for the flow MCP path from the same
-    /// `SECRETS_BACKEND` environment the host uses. Pure builder — no caching —
-    /// so a unit test can exercise it directly. A failure returns `None` so an
-    /// MCP call degrades to "no credential" rather than failing the node.
-    fn build_secrets_manager() -> Option<crate::secrets::DynSecretsManager> {
-        match crate::secrets::SecretsBackend::from_env(std::env::var("SECRETS_BACKEND").ok())
-            .and_then(|backend| backend.build_manager())
-        {
-            Ok(manager) => Some(manager),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "flow MCP secrets manager unavailable; a pack-carried route cannot resolve \
-                     its credential"
-                );
-                None
-            }
-        }
-    }
-
-    /// Build the manager once per process and reuse it. Mirrors
-    /// [`source_from_env`]'s boot-once semantics; every call after the first
-    /// returns a cheap clone of the cached `Arc`.
-    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
-        static CACHED: std::sync::OnceLock<Option<crate::secrets::DynSecretsManager>> =
-            std::sync::OnceLock::new();
-        CACHED.get_or_init(build_secrets_manager).clone()
-    }
-
     /// Build a dispatchable route from a pack-carried record, resolving the
     /// credential from the secrets backend.
     ///
@@ -127,43 +98,17 @@ pub mod aw {
         ))
     }
 
-    /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
-    /// reusing the flow-editor MCP catalog.
+    /// Invoke `tool` on `server_id` with `arguments`, preferring a
+    /// pack-carried route and falling back to the flow-editor MCP catalog.
     ///
-    /// Infallible by contract: every failure path (source not configured,
-    /// server/tool not in the flow-editor catalog, transport error) returns a
-    /// structured `{"error": "..."}` value. The caller binds the value as-is.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn invoke(
-        source: Option<&Arc<McpToolSource>>,
-        pack_routes: Option<&PackMcpRoutes>,
-        tenant: &str,
-        env: &str,
-        team: Option<&str>,
-        server_id: &str,
-        tool: &str,
-        arguments: &Value,
-    ) -> Value {
-        invoke_with_secrets(
-            source,
-            pack_routes,
-            secrets_from_env().as_ref(),
-            tenant,
-            env,
-            team,
-            server_id,
-            tool,
-            arguments,
-        )
-        .await
-    }
-
-    /// [`invoke`] with the secrets manager supplied explicitly.
+    /// Infallible by contract: every failure path returns a structured
+    /// `{"error": ...}` value that the caller binds as-is.
     ///
-    /// Public because [`invoke`] reads a process-global memoized manager that a
-    /// test cannot substitute — and the pack-route path is defined by which
-    /// credential it resolves, so a test that cannot control the backend cannot
-    /// cover it at all.
+    /// `secrets` is the HOST's manager, passed in rather than derived from
+    /// `SECRETS_BACKEND`. That env names only `env` and `broker`, while an
+    /// operator booting a bundle runs on greentic-start's dev store — so a
+    /// manager built here could never read a pack route's credential, and the
+    /// node would dispatch without one.
     #[allow(clippy::too_many_arguments)]
     pub async fn invoke_with_secrets(
         source: Option<&Arc<McpToolSource>>,
@@ -270,7 +215,7 @@ pub mod aw {
 }
 
 #[cfg(feature = "agentic-worker")]
-pub(crate) use aw::{invoke, source_from_env};
+pub(crate) use aw::{invoke_with_secrets, source_from_env};
 
 use serde_json::Value;
 
@@ -344,10 +289,12 @@ mod failure_logging_tests {
             .finish();
 
         let bound = tracing::subscriber::with_default(subscriber, || {
-            futures::executor::block_on(super::aw::invoke(
+            futures::executor::block_on(super::aw::invoke_with_secrets(
                 None,
                 // no pack sidecar either: this is the "nothing configured
                 // anywhere" path, which must still warn rather than fail mute.
+                None,
+                // and no host secrets manager.
                 None,
                 "acme",
                 "prod",

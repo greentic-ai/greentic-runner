@@ -3033,6 +3033,19 @@ impl PackRuntime {
     /// a fallback. Returns `None` when the file is absent (or on a read error,
     /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
     /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
+    /// The secrets manager this pack was built with — the HOST's, not one
+    /// derived from the environment.
+    ///
+    /// The MCP flow node needs it to resolve a pack-carried route's credential.
+    /// Deriving its own from `SECRETS_BACKEND` cannot work: that only knows
+    /// `env` and `broker`, while an operator booting a bundle runs on
+    /// greentic-start's dev store, which the runner has no variant for. So the
+    /// only manager that can read the credential is the one the host already
+    /// handed us.
+    pub fn secrets(&self) -> &crate::secrets::DynSecretsManager {
+        &self.secrets
+    }
+
     /// The pack's own MCP route sidecar, if it carries one.
     ///
     /// A pack's `mcp` node names only an opaque `server` id; resolving it
