@@ -344,7 +344,21 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
 
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger: Arc<dyn ToolLedger> = Arc::new(NoopToolLedger);
-    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    // This lane's ext-runtime has no `for_test()`. Build the equivalent: an
+    // empty discovery root (nothing to load) plus the crate's own test
+    // overrides. `aw-serve` is the canned-reply harness, so it never dispatches
+    // to a real extension.
+    let ext_runtime = Arc::new(
+        greentic_ext_runtime::ExtensionRuntime::new(
+            greentic_ext_runtime::RuntimeConfig::from_paths(
+                greentic_ext_runtime::DiscoveryPaths::new(std::path::PathBuf::from(
+                    "/nonexistent/aw-serve-test-extensions",
+                )),
+            ),
+        )
+        .expect("wasmtime engine init for the aw-serve test runtime")
+        .with_host_overrides(greentic_ext_runtime::HostOverrides::defaults_for_tests()),
+    );
 
     Arc::new(AgentRuntime::new(
         config_provider,

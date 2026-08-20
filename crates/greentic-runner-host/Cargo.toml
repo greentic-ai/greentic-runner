@@ -117,6 +117,10 @@ wasmtime-wasi-tls = { workspace = true }
 greentic-telemetry = { workspace = true }
 
 [dev-dependencies]
+# `test-mock` supplies `greentic_aw_runtime::mock` and `cost::MockTokenMeter`,
+# which the agent-node tests import. A dev-dep, so published builds never
+# carry it.
+greentic-aw-runtime = { path = "../greentic-aw-runtime", features = ["test-mock"] }
 criterion.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true

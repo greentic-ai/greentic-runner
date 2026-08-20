@@ -46,32 +46,46 @@ const AGENTIC_WORKER_CAPABILITY: &str = "agentic_worker";
 /// # }
 /// ```
 pub fn manifest_to_tool_refs(manifest: &DigitalWorkerManifest) -> Vec<ToolRef> {
-    let mut seen_pairs: Vec<(String, String)> = Vec::new();
-    let mut tool_refs: Vec<ToolRef> = Vec::new();
-
-    for extension_tool in &manifest.extension_tools {
-        let supports_agentic_worker = extension_tool
-            .capabilities
-            .iter()
-            .any(|capability| capability == AGENTIC_WORKER_CAPABILITY);
-        if !supports_agentic_worker {
-            continue;
-        }
-
-        let pair = (
-            extension_tool.extension_id.clone(),
-            extension_tool.tool_name.clone(),
-        );
-        if seen_pairs.contains(&pair) {
-            continue;
-        }
-
-        seen_pairs.push(pair);
-        tool_refs.push(ToolRef {
-            extension_id: extension_tool.extension_id.clone(),
-            tool_name: extension_tool.tool_name.clone(),
-        });
+    // `DigitalWorkerManifest` on this lane's greentic-dw-manifest carries no
+    // `extension_tools` field, so a manifest here can never declare extension
+    // tools and the overlay is empty. That is the honest answer rather than a
+    // failure: `ManifestToolOverlayProvider` is fail-soft by contract, and an
+    // empty overlay leaves the base config's tools untouched.
+    #[cfg(not(feature = "dw-manifest-tools"))]
+    {
+        let _ = manifest;
+        return Vec::new();
     }
 
-    tool_refs
+    #[cfg(feature = "dw-manifest-tools")]
+    {
+        let mut seen_pairs: Vec<(String, String)> = Vec::new();
+        let mut tool_refs: Vec<ToolRef> = Vec::new();
+
+        for extension_tool in &manifest.extension_tools {
+            let supports_agentic_worker = extension_tool
+                .capabilities
+                .iter()
+                .any(|capability| capability == AGENTIC_WORKER_CAPABILITY);
+            if !supports_agentic_worker {
+                continue;
+            }
+
+            let pair = (
+                extension_tool.extension_id.clone(),
+                extension_tool.tool_name.clone(),
+            );
+            if seen_pairs.contains(&pair) {
+                continue;
+            }
+
+            seen_pairs.push(pair);
+            tool_refs.push(ToolRef {
+                extension_id: extension_tool.extension_id.clone(),
+                tool_name: extension_tool.tool_name.clone(),
+            });
+        }
+
+        tool_refs
+    }
 }

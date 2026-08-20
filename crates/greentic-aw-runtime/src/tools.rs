@@ -15,7 +15,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use greentic_ext_runtime::ExtensionRuntime;
-use greentic_ext_runtime::host_ports::HostCallContext;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -195,24 +194,14 @@ pub fn missing_tools(
     missing
 }
 
-/// Build a [`HostCallContext`] from the per-step [`TenantContext`].
-///
-/// The extension host (e.g. the designer's `DesignerLlmBridge`) uses
-/// `ctx.tenant` to resolve the LLM provider per-tenant and `ctx.user_email`
-/// for optional per-user override (present only in interactive test-chat steps;
-/// `None` for autonomous workers).
-pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
-    HostCallContext {
-        tenant: if t.tenant_id.is_empty() {
-            None
-        } else {
-            Some(t.tenant_id.clone())
-        },
-        user_email: t.user_email.clone(),
-    }
-}
+// NOTE: the research lane threads a `HostCallContext` (tenant + user_email)
+// into every tool call so an extension host can resolve the LLM provider
+// per-tenant. This lane's `greentic-ext-runtime` exposes only `invoke_tool`,
+// with no context parameter and no `HostCallContext` type, so tool calls here
+// carry no per-tenant routing hint. Restore the richer call once the host-port
+// surface lands on this lane.
 
-/// Dispatch a single tool call. Wraps the blocking `invoke_tool_ctx` in
+/// Dispatch a single tool call. Wraps the blocking `invoke_tool` in
 /// `tokio::task::spawn_blocking` so the async executor thread is never
 /// stalled. Returns the tool result as a JSON Value.
 ///
@@ -234,7 +223,9 @@ pub async fn dispatch_tool_call(
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
     call: ToolCallRecord,
-    tenant: &TenantContext,
+    // Unused on this lane: `invoke_tool` takes no HostCallContext. Kept in the
+    // signature so callers do not churn when the context-carrying call returns.
+    _tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
         let value = match mcp
@@ -285,9 +276,8 @@ pub async fn dispatch_tool_call(
     let args_json = call.args.to_string();
     let extension_id = call.extension_id.clone();
     let tool_name = call.tool_name.clone();
-    let ctx = host_ctx_from_tenant(tenant);
     let raw = tokio::task::spawn_blocking(move || {
-        ext_runtime.invoke_tool_ctx(&extension_id, &tool_name, &args_json, &ctx)
+        ext_runtime.invoke_tool(&extension_id, &tool_name, &args_json)
     })
     .await
     .map_err(|e| AgentError::ToolDispatch(format!("join: {e}")))?
@@ -393,28 +383,6 @@ impl ToolLedger for RedisToolLedger {
                 .map_err(|e| StateError::Redis(format!("ledger set_ex: {e}")))?;
             Ok(())
         })
-    }
-}
-
-#[cfg(test)]
-mod ctx_tests {
-    use super::*;
-    use crate::tenant::TenantContext;
-
-    #[test]
-    fn host_ctx_carries_tenant_and_optional_user() {
-        let c1 = host_ctx_from_tenant(&TenantContext::new("acme", "prod"));
-        assert_eq!(c1.tenant.as_deref(), Some("acme"));
-        assert_eq!(c1.user_email, None);
-        let c2 = host_ctx_from_tenant(
-            &TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into())),
-        );
-        assert_eq!(c2.user_email.as_deref(), Some("u@x.com"));
-        let c3 = host_ctx_from_tenant(&TenantContext::new("", ""));
-        assert_eq!(
-            c3.tenant, None,
-            "empty tenant_id must map to None, not Some(\"\")"
-        );
     }
 }
 

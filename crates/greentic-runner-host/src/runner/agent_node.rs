@@ -610,14 +610,23 @@ mod aw {
         // silently breaks any AW tool that needs either (e.g. tavily_search).
         // The per-tenant path passes a store-backed backend (zero-env); the
         // process-level serve paths pass the env-only backend.
+        // This lane's HostOverrides has no `Default`, and `with_host_overrides`
+        // is a builder on the runtime rather than on the config — so spell
+        // every field out and apply the overrides after construction. The
+        // non-obvious ones mirror the crate's own `defaults_for_tests`:
+        // `runtime_weak` stays unset until the cross-extension dispatch
+        // cascade lands, and `call_depth_start` is the recursion guard's floor.
         let overrides = HostOverrides {
+            translator: std::sync::Arc::new(greentic_ext_runtime::host_ports::KeyTranslator),
             secrets_backend,
             http_client: shared_blocking_http_client(),
-            ..HostOverrides::default()
+            url_matcher: greentic_ext_runtime::url_matcher::UrlMatcher::default(),
+            runtime_weak: std::sync::Weak::new(),
+            call_depth_start: 0,
         };
-        let config = RuntimeConfig::from_paths(paths).with_host_overrides(overrides);
+        let config = RuntimeConfig::from_paths(paths);
         let mut runtime = match ExtensionRuntime::new(config) {
-            Ok(runtime) => runtime,
+            Ok(runtime) => runtime.with_host_overrides(overrides),
             Err(error) => {
                 tracing::warn!(error = %error, "extension runtime init failed; DwAgent nodes disabled");
                 return None;
@@ -1226,11 +1235,24 @@ mod aw {
                     };
                 policy
             },
-            Arc::new(
-                greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
-                    ext_runtime: ext_runtime.clone(),
-                },
-            ),
+            {
+                #[cfg(feature = "guardrail-ext")]
+                {
+                    Arc::new(
+                        greentic_aw_runtime::guardrail::ExtRuntimeGuardrailEvaluator {
+                            ext_runtime: ext_runtime.clone(),
+                        },
+                    )
+                }
+                // This lane's greentic-ext-runtime has no guardrail interface
+                // (extension-design is at 0.2.0). Fail closed rather than
+                // silently accepting: an agent that configured a guardrail
+                // stops loudly instead of running unprotected.
+                #[cfg(not(feature = "guardrail-ext"))]
+                {
+                    Arc::new(greentic_aw_runtime::guardrail::UnavailableGuardrailEvaluator)
+                }
+            },
         );
         // Short-term ("working") memory: in-memory provider is always available
         // (no external deps); the remember/recall tools stay gated by
