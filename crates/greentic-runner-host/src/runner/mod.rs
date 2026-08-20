@@ -17,6 +17,7 @@ pub mod knowledge_mount;
 #[cfg(feature = "long-term-chronicle")]
 pub mod long_term_memory;
 pub mod mcp_node;
+pub mod mcp_pack_routes;
 #[cfg(feature = "agentic-worker")]
 pub mod mcp_warm_listener;
 pub mod mocks;

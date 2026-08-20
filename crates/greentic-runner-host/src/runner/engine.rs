@@ -1373,10 +1373,30 @@ impl FlowEngine {
             .cloned()
             .unwrap_or_else(|| Value::Object(JsonMap::new()));
 
+        // A route the pack carries itself, so a deployed runner with no admin
+        // credentials can dispatch at all; `None` (a pack predating the
+        // sidecar) falls back to the catalog exactly as before.
+        let pack_routes = self
+            .packs
+            .iter()
+            .find(|pack| pack.metadata().pack_id == ctx.pack_id)
+            .and_then(|pack| pack.mcp_routes());
+
+        // The team the AUTHORING session resolved this server's token under, as
+        // recorded in the sidecar. `FlowContext` carries no team and a deployed
+        // workload has no principled source for one, so this is the only place
+        // the value can come from. Absent yields `None`, and the credential
+        // read then tries the tenant-default `_` scope exactly as before.
+        let auth_team = pack_routes
+            .and_then(|routes| routes.get(server_id))
+            .and_then(|route| route.auth_team.as_deref());
+
         let result = crate::runner::mcp_node::invoke(
             self.mcp_tool_source.as_ref(),
+            pack_routes,
             ctx.tenant,
             &self.default_env,
+            auth_team,
             server_id,
             tool,
             &arguments,

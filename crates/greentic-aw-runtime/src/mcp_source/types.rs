@@ -112,6 +112,54 @@ pub struct McpRoute {
     pub component_digest: Option<String>,
 }
 
+impl McpRoute {
+    /// Build a route from parts supplied by an embedding host (a pack-carried
+    /// record), rather than from an admin row. The raw tool name is set per
+    /// call by the dispatcher, so it starts empty.
+    ///
+    /// This exists because [`McpRoute`]'s fields are `pub(super)`: a host that
+    /// resolves a route WITHOUT the admin catalog — a deployed runner reading
+    /// `assets/mcp-routes.json` out of its own pack — otherwise has no way to
+    /// express one.
+    ///
+    /// `auth_token` is sealed in a [`SecretString`] on the way in and stays
+    /// redacted from [`Debug`], exactly as it is for an admin-built route.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        server_id: &str,
+        transport_url: &str,
+        auth_header_name: Option<&str>,
+        auth_token: Option<&str>,
+        transport: &str,
+        component_ref: Option<&str>,
+        component_version: Option<&str>,
+        component_digest: Option<&str>,
+    ) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            transport_url: transport_url.to_string(),
+            auth_header_name: auth_header_name.map(str::to_string),
+            auth_token: auth_token.map(SecretString::from),
+            raw_tool_name: String::new(),
+            transport: if transport == "local-wasm" {
+                Transport::LocalWasm
+            } else {
+                Transport::Http
+            },
+            component_ref: component_ref.map(str::to_string),
+            component_version: component_version.map(str::to_string),
+            component_digest: component_digest.map(str::to_string),
+        }
+    }
+
+    /// Name the tool this route is about to call.
+    #[must_use]
+    pub fn with_tool(mut self, raw_tool_name: &str) -> Self {
+        self.raw_tool_name = raw_tool_name.to_string();
+        self
+    }
+}
+
 impl std::fmt::Debug for McpRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpRoute")
