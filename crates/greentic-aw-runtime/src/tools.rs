@@ -15,7 +15,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use greentic_ext_runtime::ExtensionRuntime;
-use greentic_ext_runtime::host_ports::HostCallContext;
 use redis::AsyncCommands;
 use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
@@ -195,24 +194,14 @@ pub fn missing_tools(
     missing
 }
 
-/// Build a [`HostCallContext`] from the per-step [`TenantContext`].
-///
-/// The extension host (e.g. the designer's `DesignerLlmBridge`) uses
-/// `ctx.tenant` to resolve the LLM provider per-tenant and `ctx.user_email`
-/// for optional per-user override (present only in interactive test-chat steps;
-/// `None` for autonomous workers).
-pub(crate) fn host_ctx_from_tenant(t: &TenantContext) -> HostCallContext {
-    HostCallContext {
-        tenant: if t.tenant_id.is_empty() {
-            None
-        } else {
-            Some(t.tenant_id.clone())
-        },
-        user_email: t.user_email.clone(),
-    }
-}
+// NOTE: the research lane threads a `HostCallContext` (tenant + user_email)
+// into every tool call so an extension host can resolve the LLM provider
+// per-tenant. This lane's `greentic-ext-runtime` exposes only `invoke_tool`,
+// with no context parameter and no `HostCallContext` type, so tool calls here
+// carry no per-tenant routing hint. Restore the richer call once the host-port
+// surface lands on this lane.
 
-/// Dispatch a single tool call. Wraps the blocking `invoke_tool_ctx` in
+/// Dispatch a single tool call. Wraps the blocking `invoke_tool` in
 /// `tokio::task::spawn_blocking` so the async executor thread is never
 /// stalled. Returns the tool result as a JSON Value.
 ///
@@ -234,7 +223,9 @@ pub async fn dispatch_tool_call(
     mcp: Option<Arc<McpToolCatalog>>,
     components: Option<Arc<ComponentToolCatalog>>,
     call: ToolCallRecord,
-    tenant: &TenantContext,
+    // Unused on this lane: `invoke_tool` takes no HostCallContext. Kept in the
+    // signature so callers do not churn when the context-carrying call returns.
+    _tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
         let value = match mcp
@@ -285,9 +276,8 @@ pub async fn dispatch_tool_call(
     let args_json = call.args.to_string();
     let extension_id = call.extension_id.clone();
     let tool_name = call.tool_name.clone();
-    let ctx = host_ctx_from_tenant(tenant);
     let raw = tokio::task::spawn_blocking(move || {
-        ext_runtime.invoke_tool_ctx(&extension_id, &tool_name, &args_json, &ctx)
+        ext_runtime.invoke_tool(&extension_id, &tool_name, &args_json)
     })
     .await
     .map_err(|e| AgentError::ToolDispatch(format!("join: {e}")))?
@@ -397,28 +387,6 @@ impl ToolLedger for RedisToolLedger {
 }
 
 #[cfg(test)]
-mod ctx_tests {
-    use super::*;
-    use crate::tenant::TenantContext;
-
-    #[test]
-    fn host_ctx_carries_tenant_and_optional_user() {
-        let c1 = host_ctx_from_tenant(&TenantContext::new("acme", "prod"));
-        assert_eq!(c1.tenant.as_deref(), Some("acme"));
-        assert_eq!(c1.user_email, None);
-        let c2 = host_ctx_from_tenant(
-            &TenantContext::new("acme", "prod").with_user_email(Some("u@x.com".into())),
-        );
-        assert_eq!(c2.user_email.as_deref(), Some("u@x.com"));
-        let c3 = host_ctx_from_tenant(&TenantContext::new("", ""));
-        assert_eq!(
-            c3.tenant, None,
-            "empty tenant_id must map to None, not Some(\"\")"
-        );
-    }
-}
-
-#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -464,7 +432,7 @@ mod tests {
     fn list_tools_for_llm_with_no_extensions_returns_empty() {
         // for_test runtime has no extensions loaded → list_tools errors
         // (NotFound) for every ext → all skipped → empty result.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
@@ -478,7 +446,7 @@ mod tests {
         // No extensions loaded → the declared tool cannot resolve and is
         // reported as missing with a load-failure reason (instead of being
         // dropped silently, which is what causes hallucinated tool results).
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
@@ -496,7 +464,7 @@ mod tests {
 
     #[test]
     fn missing_tools_reports_mcp_tool_absent_from_catalog() {
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let allowed = vec![ToolRef {
             extension_id: "mcp:github".into(),
             tool_name: "create_issue".into(),
@@ -594,7 +562,7 @@ mod tests {
         // A catalog-backed mcp: ref is emitted as an LlmToolSchema with the
         // catalog's description/parameters; the ext_runtime is never consulted
         // for it (the for_test runtime has no extensions loaded).
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -633,7 +601,7 @@ mod tests {
         // non-mcp extension id — if the mcp branch ever matched non-`mcp:`
         // ids and consulted the catalog, this entry would be emitted and the
         // empty assertion below would catch the regression.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let catalog = catalog_with(
             "greentic.tavily",
             "search",
@@ -691,7 +659,7 @@ mod tests {
             serde_json::json!({}),
             Some(&uri),
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(crate::test_support::extension_runtime());
 
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -742,7 +710,7 @@ mod tests {
     fn component_ref_listed_from_catalog() {
         // A catalog-backed component: ref is emitted as an LlmToolSchema with
         // the catalog's description/parameters; ext_runtime is never consulted.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "order_id": { "type": "string" } }
@@ -785,7 +753,7 @@ mod tests {
         // component catalog is present. The decoy entry is keyed by the FULL
         // non-prefixed id — if the component branch ever matched it, this entry
         // would leak into the list and the empty assertion would catch it.
-        let rt = ExtensionRuntime::for_test();
+        let rt = crate::test_support::extension_runtime();
         let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
         let catalog = ComponentToolCatalog::for_tests(
             one_tool(
@@ -823,7 +791,7 @@ mod tests {
             ),
             invoker,
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(crate::test_support::extension_runtime());
 
         let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {

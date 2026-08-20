@@ -11,8 +11,14 @@ keywords = ["greentic", "runner", "wasmtime", "mcp", "flows"]
 categories = ["asynchronous", "api-bindings", "command-line-utilities"]
 
 [features]
-default = ["verify"]
+default = ["verify", "agentic-worker"]
 verify = []
+# Restored on develop once every crate in the chain had a publish whose
+# `greentic-types` requirement fits this lane's `>=1.2.0-dev, <1.3.0-0`.
+# Carries the MCP flow-node runtime: without it `execute_mcp` is a stub that
+# returns Ok with an `{error: …}` payload, so an MCP node reports success
+# while doing nothing.
+agentic-worker = ["dep:greentic-aw-runtime", "dep:greentic-ext-runtime"]
 session-redis = ["greentic-session/redis"]
 fault-injection = []
 component-v0-6-introspection = []
@@ -22,21 +28,34 @@ component-v0-6-introspection = []
 telemetry = []
 greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
 
-# Feature values still referenced by #[cfg(feature = "…")] gates in the source but
-# whose declarations + deps were removed from the develop lane in d43ae4dd (main-only
-# agentic-worker wiring — greentic-aw-runtime / greentic-ext-runtime pin conflicting
-# 1.1.x deps). The gated code stays permanently dead here; we cannot re-declare these
-# as real features because the gated code references the removed crates and would break
-# `--all-features` builds. Tell check-cfg the values are expected so `-D warnings`
-# (unexpected_cfgs) does not fire. Re-declare as real features when the crates publish
-# on develop and the wiring is restored.
+# `agentic-worker` is a real feature again (see above). These four remain
+# main-only: the source still carries `#[cfg(feature = "…")]` gates for them but
+# their backing crates are not wired on this lane, so the gated code stays dead.
+# Tell check-cfg the values are expected so `-D warnings` (unexpected_cfgs) does
+# not fire. Re-declare as real features when their wiring is restored too.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("agentic-worker", "desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
+    'cfg(feature, values("desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
+    # Not a cargo feature on purpose: CI builds with `--all-features`, which
+    # would switch a feature on and break the build. Parks the conversational
+    # `dw.agent` park-loop test harness until this lane's engine grows the
+    # branch it exercises. Compile it with
+    # `RUSTFLAGS="--cfg conversational_dw_agent_port"`.
+    'cfg(conversational_dw_agent_port)',
+    # Mirrors greentic-aw-runtime's parked gate: selects the WASM-backed
+    # guardrail evaluator over the fail-closed stand-in. Same reason it is not
+    # a feature — CI builds `--all-features`.
+    'cfg(greentic_guardrail_ext)',
+    # Mirrors greentic-aw-runtime's parked gate: without `extension_tools` on
+    # `DigitalWorkerManifest` the tool overlay is always empty, so the test
+    # that asserts it applies is parked and its counterpart pins the silence.
+    'cfg(greentic_dw_manifest_tools)',
 ] }
 
 
 [dependencies]
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-dev, <1.3.0-0", features = ["serve"], optional = true }
+greentic-ext-runtime = { version = "=1.2.32323863980", optional = true }
 async-nats = "0.49"
 async-trait.workspace = true
 anyhow.workspace = true
@@ -112,6 +131,10 @@ wasmtime-wasi-tls = { workspace = true }
 greentic-telemetry = { workspace = true }
 
 [dev-dependencies]
+# `test-mock` supplies `greentic_aw_runtime::mock` and `cost::MockTokenMeter`,
+# which the agent-node tests import. A dev-dep, so published builds never
+# carry it.
+greentic-aw-runtime = { path = "../greentic-aw-runtime", version = ">=1.2.0-dev, <1.3.0-0", features = ["test-mock"] }
 criterion.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true

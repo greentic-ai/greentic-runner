@@ -80,7 +80,7 @@ fn build_runtime(
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(token_used));
     let ledger = Arc::new(NoopToolLedger);
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let rt = AgentRuntime::new(
         cp,
         store,
@@ -262,7 +262,7 @@ async fn llm_provider_unavailable_after_retries_returns_error() {
     let cp = Arc::new(cp);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger = Arc::new(NoopToolLedger);
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let rt = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
 
     let err = rt
@@ -307,7 +307,7 @@ fn build_lt_runtime(
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
     cp.insert(&tc, "a", cfg_inner);
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let rt = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
@@ -520,7 +520,7 @@ fn build_st_runtime(
     let cp = MockConfigProvider::new();
     let tc = TenantContext::new("acme", "prod");
     cp.insert(&tc, "a", cfg_inner);
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let rt = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),

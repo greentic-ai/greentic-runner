@@ -751,7 +751,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(crate::test_support::extension_runtime());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -810,7 +810,7 @@ mod tests {
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(crate::test_support::extension_runtime());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let kb = Arc::new(crate::mock::MockKnowledge::new(vec![
@@ -896,7 +896,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(crate::test_support::extension_runtime());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -956,7 +956,7 @@ mod tests {
         let tc = TenantContext::new("acme", "prod");
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(crate::test_support::extension_runtime());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);

@@ -9,9 +9,15 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use greentic_mcp_exec::{
-    ExecConfig, ExecRequest, RuntimePolicy, ToolDef, ToolStore, VerifyPolicy, exec, list_tools,
-};
+use greentic_mcp_exec::{ExecConfig, ExecRequest, RuntimePolicy, ToolStore, VerifyPolicy, exec};
+// `ToolDef` + `list_tools` — component introspection returning name /
+// description / input-schema — exist only on the mcp-exec line this lane does
+// not carry. Its `ToolInfo` is a store entry (name / path / sha256), a
+// different thing, and `describe::describe_tool` returns a describe-v1
+// document that would need real adaptation. So local-wasm tool DISCOVERY is
+// gated; dispatch below still works, since `exec` is present.
+#[cfg(greentic_mcp_local_wasm)]
+use greentic_mcp_exec::{ToolDef, list_tools};
 use serde_json::{Value, json};
 
 /// Directory holding cached local MCP `*.wasm` files.
@@ -119,6 +125,7 @@ fn read_pinned_digest(component_ref: &str) -> Option<String> {
 }
 
 /// List a local component's tools. Returns an empty vec and emits a `warn` on any failure.
+#[cfg(greentic_mcp_local_wasm)]
 pub async fn local_list_tools(component_ref: &str) -> Vec<ToolDef> {
     let component = component_ref.to_string();
     let config = exec_config_for(component_ref);

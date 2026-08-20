@@ -324,6 +324,9 @@ mod tests {
                 arguments: json!({"q": "rust"}),
             }],
             finish_reason: greentic_llm::FinishReason::ToolCalls,
+            // This test covers content/tool-call mapping only; usage is
+            // asserted by the metering tests.
+            usage: None,
         });
         assert!(resp.content.is_none(), "whitespace-only content → None");
         assert_eq!(resp.tool_calls.len(), 1);

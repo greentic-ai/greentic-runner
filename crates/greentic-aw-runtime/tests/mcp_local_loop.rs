@@ -194,7 +194,7 @@ fn build_runtime(
     let config_provider = Arc::new(config_provider);
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let tool_ledger = Arc::new(NoopToolLedger);
-    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext_runtime = Arc::new(greentic_aw_runtime::test_support::extension_runtime());
     let runtime = AgentRuntime::new(
         config_provider,
         state_store,

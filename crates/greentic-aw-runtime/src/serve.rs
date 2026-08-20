@@ -344,7 +344,9 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
 
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger: Arc<dyn ToolLedger> = Arc::new(NoopToolLedger);
-    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    // `aw-serve` is the canned-reply harness, so it never dispatches to a real
+    // extension; the shared empty-catalog test runtime is exactly right.
+    let ext_runtime = Arc::new(crate::test_support::extension_runtime());
 
     Arc::new(AgentRuntime::new(
         config_provider,
