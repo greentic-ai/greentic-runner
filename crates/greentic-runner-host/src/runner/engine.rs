@@ -1387,10 +1387,10 @@ impl FlowEngine {
         // the raw tool result becomes the node payload (still addressable via
         // the standard `node.<id>.payload` mechanism).
         let bound = match payload.get("output").and_then(Value::as_str) {
-            Some(key) if !key.is_empty() => json!({ key: result }),
-            _ => result,
+            Some(key) if !key.is_empty() => json!({ key: result.clone() }),
+            _ => result.clone(),
         };
-        Ok(NodeOutput::new(bound))
+        Ok(mcp_output(bound, &result))
     }
 
     /// Compile-time stub for the MCP flow node when the agentic-worker feature
@@ -6181,6 +6181,51 @@ mod tests {
         );
     }
 
+    /// A failed MCP call must mark the node not-ok so the already-wired
+    /// `lift_first_node_error_from_nodes` has something to find.
+    ///
+    /// `mcp_node::invoke` is infallible — every failure arrives as
+    /// `{"error": ...}` in the result — so the node used to report `ok: true`
+    /// and the flow completed clean. That is what made a Digital Worker run
+    /// show 33/33 green nodes with a blank quote.
+    #[test]
+    fn a_failed_mcp_call_marks_the_node_not_ok() {
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_output(bound.clone(), &result);
+
+        assert!(!out.ok, "a failed MCP call must not report ok");
+        assert_eq!(
+            out.meta.pointer("/error/message").and_then(Value::as_str),
+            Some("MCP is not configured on this runner"),
+            "the message must reach meta.error where the lift reads it, got {:?}",
+            out.meta
+        );
+        assert_eq!(
+            out.payload, bound,
+            "the bound payload must be untouched — routing and any flow \
+             reading the bound value must behave exactly as before"
+        );
+    }
+
+    /// The success path must stay exactly as it was.
+    #[test]
+    fn a_successful_mcp_call_stays_ok() {
+        let result = json!({ "annual_premium": 1234 });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_output(bound.clone(), &result);
+
+        assert!(out.ok, "a successful MCP call must report ok");
+        assert_eq!(out.payload, bound);
+        assert!(
+            out.meta.get("error").is_none(),
+            "a successful call must not stash an error, got {:?}",
+            out.meta
+        );
+    }
+
     #[test]
     fn lift_first_node_error_promotes_node_meta_to_output_metadata() {
         // Two nodes ran; the first failed, the second produced a default-
@@ -9715,6 +9760,40 @@ pub struct RetryConfig {
 /// `ExecutionState` because the callers have already consumed `state` via
 /// `state.finalize_with(...)`; we capture a cheap clone of `state.nodes` up
 /// front and pass it in here.
+/// Build an MCP node's output, marking it failed when the tool did not run.
+///
+/// `mcp_node::invoke` is infallible by contract: a runner without MCP
+/// credentials, a tool missing from the tenant catalog, and a dead endpoint all
+/// arrive as `{"error": ...}` inside `result`. Reporting `ok: true` for those
+/// left `lift_first_node_error_from_nodes` with nothing to find, so the flow
+/// completed clean — a Digital Worker run showed every node green and rendered
+/// its quote card with blank fields, because the MCP call had silently done
+/// nothing.
+///
+/// Only the status changes. `bound` is passed through untouched, so routing,
+/// `node.<id>.payload`, and any flow reading the bound value behave exactly as
+/// before; the node is simply no longer claiming success. `meta.error` uses the
+/// shape the lift reads (`kind` + `message`).
+fn mcp_output(bound: Value, result: &Value) -> NodeOutput {
+    let Some(message) = result.get("error") else {
+        return NodeOutput::new(bound);
+    };
+    let message = message
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| message.to_string());
+    NodeOutput {
+        ok: false,
+        payload: bound,
+        meta: json!({
+            "error": {
+                "kind": "mcp_call_failed",
+                "message": message,
+            }
+        }),
+    }
+}
+
 fn lift_first_node_error_from_nodes(output: Value, nodes: &HashMap<String, NodeOutput>) -> Value {
     let Some((node_id, failed)) = nodes.iter().find(|(_, out)| !out.ok) else {
         return output;
