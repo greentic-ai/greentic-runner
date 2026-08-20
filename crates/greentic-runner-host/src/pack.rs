@@ -127,6 +127,10 @@ pub struct PackRuntime {
     session_store: Option<DynSessionStore>,
     state_store: Option<DynStateStore>,
     wasi_policy: Arc<RunnerWasiPolicy>,
+    /// Lazily-parsed `assets/mcp-routes.json` sidecar — see
+    /// [`PackRuntime::mcp_routes`]. Read on first use rather than at load so a
+    /// pack with no MCP nodes never touches the archive for it.
+    mcp_routes: std::sync::OnceLock<Option<crate::runner::mcp_pack_routes::PackMcpRoutes>>,
     assets_tempdir: Option<TempDir>,
     provider_registry: RwLock<Option<ProviderRegistry>>,
     /// Per-revision lazy cache of `describe-identify-instance` results,
@@ -2158,6 +2162,7 @@ impl PackRuntime {
             session_store,
             state_store,
             wasi_policy,
+            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -3028,6 +3033,24 @@ impl PackRuntime {
     /// a fallback. Returns `None` when the file is absent (or on a read error,
     /// which is logged). Used for sidecar files (`agent-graph.json`) and bundled
     /// assets (`knowledge_corpus.json`, `assets/knowledge/*.txt`).
+    /// The pack's own MCP route sidecar, if it carries one.
+    ///
+    /// A pack's `mcp` node names only an opaque `server` id; resolving it
+    /// otherwise needs the tenant's admin catalog, which a deployed runner has
+    /// no credentials for. Parsed once and cached; every failure path yields
+    /// `None` so the caller falls back to the admin catalog rather than taking
+    /// the whole pack down.
+    pub fn mcp_routes(&self) -> Option<&crate::runner::mcp_pack_routes::PackMcpRoutes> {
+        self.mcp_routes
+            .get_or_init(|| {
+                self.read_pack_file(crate::runner::mcp_pack_routes::MCP_ROUTES_ENTRY)
+                    .and_then(|bytes| {
+                        crate::runner::mcp_pack_routes::PackMcpRoutes::from_sidecar_bytes(&bytes)
+                    })
+            })
+            .as_ref()
+    }
+
     pub fn read_pack_file(&self, name: &str) -> Option<Vec<u8>> {
         // Materialized pack directory (root holds manifest.cbor + sidecars/assets).
         if self.path.is_dir() {
@@ -3334,6 +3357,7 @@ impl PackRuntime {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(RunnerWasiPolicy::new()),
+            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),
@@ -5383,6 +5407,7 @@ mod tests {
             session_store: None,
             state_store: None,
             wasi_policy: Arc::new(crate::wasi::RunnerWasiPolicy::new()),
+            mcp_routes: std::sync::OnceLock::new(),
             assets_tempdir: None,
             provider_registry: RwLock::new(None),
             identify_hint_cache: RwLock::new(HashMap::new()),

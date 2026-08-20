@@ -17,12 +17,14 @@
 //! successful call, so downstream nodes can branch on the `error` key.
 
 #[cfg(feature = "agentic-worker")]
-mod aw {
+pub mod aw {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
 
     use greentic_aw_runtime::{MCP_ROLE_FLOW_EDITOR, McpToolSource, TenantContext, dispatch_route};
+
+    use crate::runner::mcp_pack_routes::{PackMcpRoute, PackMcpRoutes};
 
     /// Build an [`McpToolSource`] for the flow-execution path from the same
     /// admin credentials the agentic-worker registry uses
@@ -48,20 +50,167 @@ mod aw {
         Some(Arc::new(McpToolSource::new(endpoint, token)))
     }
 
+    /// Build the secrets manager for the flow MCP path from the same
+    /// `SECRETS_BACKEND` environment the host uses. Pure builder — no caching —
+    /// so a unit test can exercise it directly. A failure returns `None` so an
+    /// MCP call degrades to "no credential" rather than failing the node.
+    fn build_secrets_manager() -> Option<crate::secrets::DynSecretsManager> {
+        match crate::secrets::SecretsBackend::from_env(std::env::var("SECRETS_BACKEND").ok())
+            .and_then(|backend| backend.build_manager())
+        {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "flow MCP secrets manager unavailable; a pack-carried route cannot resolve \
+                     its credential"
+                );
+                None
+            }
+        }
+    }
+
+    /// Build the manager once per process and reuse it. Mirrors
+    /// [`source_from_env`]'s boot-once semantics; every call after the first
+    /// returns a cheap clone of the cached `Arc`.
+    pub(crate) fn secrets_from_env() -> Option<crate::secrets::DynSecretsManager> {
+        static CACHED: std::sync::OnceLock<Option<crate::secrets::DynSecretsManager>> =
+            std::sync::OnceLock::new();
+        CACHED.get_or_init(build_secrets_manager).clone()
+    }
+
+    /// Build a dispatchable route from a pack-carried record, resolving the
+    /// credential from the secrets backend.
+    ///
+    /// The token is NEVER carried by the pack — it is read from
+    /// `secrets://default/<tenant>/<team>/mcp/<server_id>`, the URI
+    /// greentic-designer-admin writes under the `mcp` category, built by
+    /// [`greentic_aw_runtime::mcp_secrets::mcp_secret_uri`]. That module is the
+    /// single builder for the shape; do not re-derive it here.
+    ///
+    /// Only an `http` route reads a token. A `local-wasm` route has no HTTP
+    /// credential — admin writes no `mcp/<server_id>` entry for one — so
+    /// reading unconditionally would fail every local-wasm route on a
+    /// credential that is not supposed to exist.
+    async fn route_from_pack(
+        route: &PackMcpRoute,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+        tenant: &str,
+        team: Option<&str>,
+    ) -> Result<greentic_aw_runtime::McpRoute, String> {
+        let is_http = route.transport != "local-wasm";
+
+        let token = match secrets.filter(|_| is_http) {
+            Some(manager) => match greentic_aw_runtime::mcp_secrets::read_mcp_secret(
+                manager.as_ref(),
+                tenant,
+                team,
+                &route.server_id,
+            )
+            .await
+            {
+                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(miss) => return Err(format!("mcp server '{}' has {miss}", route.server_id)),
+            },
+            None => None,
+        };
+
+        Ok(greentic_aw_runtime::McpRoute::from_parts(
+            &route.server_id,
+            route.transport_url.as_deref().unwrap_or_default(),
+            route.auth_header_name.as_deref(),
+            token.as_deref(),
+            &route.transport,
+            route.component_ref.as_deref(),
+            route.component_version.as_deref(),
+            route.component_digest.as_deref(),
+        ))
+    }
+
     /// Invoke `tool` on `server_id` for `tenant`/`env` with `arguments`,
     /// reusing the flow-editor MCP catalog.
     ///
     /// Infallible by contract: every failure path (source not configured,
     /// server/tool not in the flow-editor catalog, transport error) returns a
     /// structured `{"error": "..."}` value. The caller binds the value as-is.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn invoke(
         source: Option<&Arc<McpToolSource>>,
+        pack_routes: Option<&PackMcpRoutes>,
         tenant: &str,
         env: &str,
+        team: Option<&str>,
         server_id: &str,
         tool: &str,
         arguments: &Value,
     ) -> Value {
+        invoke_with_secrets(
+            source,
+            pack_routes,
+            secrets_from_env().as_ref(),
+            tenant,
+            env,
+            team,
+            server_id,
+            tool,
+            arguments,
+        )
+        .await
+    }
+
+    /// [`invoke`] with the secrets manager supplied explicitly.
+    ///
+    /// Public because [`invoke`] reads a process-global memoized manager that a
+    /// test cannot substitute — and the pack-route path is defined by which
+    /// credential it resolves, so a test that cannot control the backend cannot
+    /// cover it at all.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_with_secrets(
+        source: Option<&Arc<McpToolSource>>,
+        pack_routes: Option<&PackMcpRoutes>,
+        secrets: Option<&crate::secrets::DynSecretsManager>,
+        tenant: &str,
+        env: &str,
+        team: Option<&str>,
+        server_id: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Value {
+        let args_str = arguments.to_string();
+
+        // A pack-carried route wins. This is what lets a deployed runner with
+        // no admin credentials dispatch at all; falling through to the admin
+        // catalog leaves every existing deployment and Run Demo unchanged.
+        if let Some(route) = pack_routes.and_then(|routes| routes.get(server_id)) {
+            return match route_from_pack(route, secrets, tenant, team).await {
+                Ok(resolved) => {
+                    let result = dispatch_route(&resolved.with_tool(tool), &args_str).await;
+                    if let Some(error) = result.get("error") {
+                        tracing::warn!(
+                            tenant,
+                            env,
+                            server_id,
+                            tool,
+                            error = %error,
+                            "mcp node dispatch failed (pack-carried route)"
+                        );
+                    }
+                    result
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        tenant,
+                        env,
+                        server_id,
+                        tool,
+                        error = %e,
+                        "mcp node did not run: pack-carried route could not be resolved"
+                    );
+                    json!({ "error": e })
+                }
+            };
+        }
+
         // Every failure below is returned as a value, not an error, and the
         // node still reports `status=ok` — so without a log an operator sees a
         // clean run whose MCP call silently did nothing. Warn on each path.
@@ -71,11 +220,12 @@ mod aw {
                 env,
                 server_id,
                 tool,
-                "mcp node did not run: MCP is not configured on this runner \
-                 (set GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
+                "mcp node did not run: no route in the pack, and MCP is not configured \
+                 on this runner (GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
             );
             return json!({
-                "error": "MCP is not configured on this runner (set GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
+                "error": "MCP is not configured on this runner (no route in the pack, and no \
+                          GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
             });
         };
 
@@ -101,7 +251,6 @@ mod aw {
 
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
-        let args_str = arguments.to_string();
         let result = dispatch_route(route, &args_str).await;
         // `dispatch_route` is infallible too: bad args, connect failures and
         // timeouts all come back as `{"error": ...}`. Surface those as well,
@@ -197,8 +346,12 @@ mod failure_logging_tests {
         let bound = tracing::subscriber::with_default(subscriber, || {
             futures::executor::block_on(super::aw::invoke(
                 None,
+                // no pack sidecar either: this is the "nothing configured
+                // anywhere" path, which must still warn rather than fail mute.
+                None,
                 "acme",
                 "prod",
+                None,
                 "srv-1",
                 "create_quote",
                 &json!({ "company": "Acme" }),

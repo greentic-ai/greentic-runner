@@ -863,3 +863,325 @@ fn mcp_node_local_wasm_calls_echo_tool_in_process() -> Result<()> {
     );
     Ok(())
 }
+// ── pack-carried routes (no admin at all) ────────────────────────────────────
+//
+// The feature these cover: a deployed runner holds no admin credentials, so an
+// opaque `server` id used to be unresolvable and every MCP node in a deployed
+// bundle bound `{"error": "MCP is not configured on this runner"}`. The pack
+// now carries the non-secret half of the route in `assets/mcp-routes.json`, and
+// the credential is read from the secrets backend at dispatch time.
+//
+// These exercise `invoke_with_secrets` rather than a whole flow run because the
+// secrets manager `invoke` uses is a process-global memoized `OnceLock` that a
+// test cannot substitute; the seam takes it explicitly.
+
+/// Build `.gtpack` bytes carrying exactly one `http` route sidecar.
+fn pack_with_http_route(server_id: &str, transport_url: &str, auth_header_name: &str) -> Vec<u8> {
+    pack_with_http_route_scoped(server_id, transport_url, auth_header_name, None)
+}
+
+/// [`pack_with_http_route`] plus the `auth_team` the authoring session
+/// resolved the server's token under. `None` omits the field entirely, which is
+/// what a pack predating it looks like.
+fn pack_with_http_route_scoped(
+    server_id: &str,
+    transport_url: &str,
+    auth_header_name: &str,
+    auth_team: Option<&str>,
+) -> Vec<u8> {
+    let mut record = json!({
+        "server_id": server_id,
+        "name": server_id,
+        "transport": "http",
+        "transport_url": transport_url,
+        "auth_header_name": auth_header_name,
+    });
+    if let Some(team) = auth_team {
+        record["auth_team"] = json!(team);
+    }
+    let sidecar = json!([record]).to_string();
+
+    let mut out = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
+        zip.start_file::<_, ()>(
+            "assets/mcp-routes.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .expect("start entry");
+        zip.write_all(sidecar.as_bytes()).expect("write sidecar");
+        zip.finish().expect("finish zip");
+    }
+    out
+}
+
+/// A secrets backend holding exactly the `(uri, value)` pairs given. Anything
+/// else is `NotFound`, which is what the missing-credential test relies on.
+struct StubSecrets {
+    entries: Vec<(String, String)>,
+}
+
+#[async_trait::async_trait]
+impl greentic_secrets_lib::SecretsManager for StubSecrets {
+    async fn read(&self, path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+        self.entries
+            .iter()
+            .find(|(uri, _)| uri == path)
+            .map(|(_, value)| value.as_bytes().to_vec())
+            .ok_or_else(|| greentic_secrets_lib::SecretError::NotFound(path.to_string()))
+    }
+    async fn write(&self, _: &str, _: &[u8]) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self, _: &str) -> greentic_secrets_lib::Result<()> {
+        Ok(())
+    }
+}
+
+fn stub_secrets_manager(
+    entries: &[(String, String)],
+) -> greentic_runner_host::secrets::DynSecretsManager {
+    Arc::new(StubSecrets {
+        entries: entries.to_vec(),
+    })
+}
+
+/// Thin wrapper over the public `invoke_with_secrets` seam, so these tests read
+/// the way the plan describes them.
+#[allow(clippy::too_many_arguments)]
+async fn invoke_with_pack_routes(
+    source: Option<&Arc<greentic_aw_runtime::McpToolSource>>,
+    pack_routes: Option<&greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes>,
+    secrets: Option<greentic_runner_host::secrets::DynSecretsManager>,
+    tenant: &str,
+    env: &str,
+    team: Option<&str>,
+    server_id: &str,
+    tool: &str,
+    arguments: &Value,
+) -> Value {
+    greentic_runner_host::runner::mcp_node::aw::invoke_with_secrets(
+        source,
+        pack_routes,
+        secrets.as_ref(),
+        tenant,
+        env,
+        team,
+        server_id,
+        tool,
+        arguments,
+    )
+    .await
+}
+
+/// The whole point of the feature: a runner with NO admin credentials
+/// dispatches an MCP node using only what the pack carries plus a secret from
+/// its own secrets backend.
+#[tokio::test]
+async fn a_pack_route_dispatches_without_any_admin_source() {
+    let server = fake_mcp_server(json!({ "structuredContent": { "premium": 42 } })).await;
+
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route("srv-1", &server.uri(), "Authorization"),
+    )
+    .expect("routes");
+
+    let secrets = stub_secrets_manager(&[(
+        "secrets://default/acme/_/mcp/srv-1".to_string(),
+        "bearer-token".to_string(),
+    )]);
+
+    let value = invoke_with_pack_routes(
+        None, // no admin source at all
+        Some(&routes),
+        Some(secrets),
+        "acme",
+        "default",
+        None,
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    assert_eq!(
+        value["premium"], 42,
+        "expected a dispatched result, got {value}"
+    );
+}
+
+/// A missing credential must say which URI was looked for. The old failure
+/// mode -- an opaque NotFound -- is indistinguishable from a misconfigured
+/// server, and cost a full investigation once already.
+#[tokio::test]
+async fn a_missing_secret_names_the_uri_it_looked_for() {
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route("srv-1", "https://unused.example.com", "Authorization"),
+    )
+    .expect("routes");
+
+    let value = invoke_with_pack_routes(
+        None,
+        Some(&routes),
+        Some(stub_secrets_manager(&[])),
+        "acme",
+        "default",
+        None,
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    let error = value["error"].as_str().expect("an error string");
+    assert!(
+        error.contains("secrets://default/acme/_/mcp/srv-1"),
+        "error must name the URI it looked for, got: {error}"
+    );
+}
+
+/// The shipped flow path gains the team two-step. Admin seals an MCP token at
+/// the server ROW's team scope, and the deployed runtime carries no team of its
+/// own, so before this a team-scoped server's token was unreachable in EVERY
+/// lane — the node reported a missing credential and the cause looked like a
+/// misconfigured server.
+#[tokio::test]
+async fn a_team_scoped_secret_resolves_through_the_sidecars_auth_team() {
+    let server = fake_mcp_server(json!({ "structuredContent": { "premium": 7 } })).await;
+
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route_scoped("srv-1", &server.uri(), "Authorization", Some("sales")),
+    )
+    .expect("routes");
+    let team = routes
+        .get("srv-1")
+        .and_then(|route| route.auth_team.as_deref());
+    assert_eq!(team, Some("sales"), "the sidecar must round-trip auth_team");
+
+    let secrets = stub_secrets_manager(&[(
+        "secrets://default/acme/sales/mcp/srv-1".to_string(),
+        "bearer-token".to_string(),
+    )]);
+
+    let value = invoke_with_pack_routes(
+        None,
+        Some(&routes),
+        Some(secrets),
+        "acme",
+        "default",
+        team,
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    assert_eq!(value["premium"], 7, "expected a dispatch, got {value}");
+}
+
+/// The property the two-step must not break: a deployment whose token sits at
+/// the tenant-default `_` scope keeps resolving even when the sidecar names a
+/// team. There is no case where a previously-resolving token stops resolving.
+#[tokio::test]
+async fn a_tenant_default_secret_still_resolves_when_the_sidecar_names_a_team() {
+    let server = fake_mcp_server(json!({ "structuredContent": { "premium": 9 } })).await;
+
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route_scoped("srv-1", &server.uri(), "Authorization", Some("sales")),
+    )
+    .expect("routes");
+
+    let secrets = stub_secrets_manager(&[(
+        "secrets://default/acme/_/mcp/srv-1".to_string(),
+        "bearer-token".to_string(),
+    )]);
+
+    let value = invoke_with_pack_routes(
+        None,
+        Some(&routes),
+        Some(secrets),
+        "acme",
+        "default",
+        Some("sales"),
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    assert_eq!(value["premium"], 9, "expected a dispatch, got {value}");
+}
+
+/// With neither scope holding the token, the error must name BOTH URIs tried
+/// and the `SECRETS_BACKEND=broker` requirement — an opaque NotFound here is
+/// indistinguishable from an unregistered server.
+#[tokio::test]
+async fn a_missing_secret_names_every_scope_it_tried() {
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route_scoped(
+            "srv-1",
+            "https://unused.example.com",
+            "Authorization",
+            Some("sales"),
+        ),
+    )
+    .expect("routes");
+
+    let value = invoke_with_pack_routes(
+        None,
+        Some(&routes),
+        Some(stub_secrets_manager(&[])),
+        "acme",
+        "default",
+        Some("sales"),
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    let error = value["error"].as_str().expect("an error string");
+    assert!(
+        error.contains("secrets://default/acme/sales/mcp/srv-1")
+            && error.contains("secrets://default/acme/_/mcp/srv-1"),
+        "got: {error}"
+    );
+    assert!(error.contains("SECRETS_BACKEND=broker"), "got: {error}");
+}
+
+/// A sidecar predating `auth_team` omits the field, and the runner then behaves
+/// exactly as it did before: `_`-only.
+#[tokio::test]
+async fn a_sidecar_without_auth_team_reads_only_the_tenant_default_scope() {
+    let routes = greentic_runner_host::runner::mcp_pack_routes::PackMcpRoutes::from_pack_bytes(
+        &pack_with_http_route("srv-1", "https://unused.example.com", "Authorization"),
+    )
+    .expect("routes");
+    assert_eq!(
+        routes.get("srv-1").and_then(|r| r.auth_team.as_deref()),
+        None
+    );
+
+    let value = invoke_with_pack_routes(
+        None,
+        Some(&routes),
+        Some(stub_secrets_manager(&[])),
+        "acme",
+        "default",
+        None,
+        "srv-1",
+        "create_quote",
+        &json!({}),
+    )
+    .await;
+
+    let error = value["error"].as_str().expect("an error string");
+    assert!(
+        !error.contains("/sales/"),
+        "no team scope may be tried when the sidecar names none; got: {error}"
+    );
+    assert!(
+        error.contains("secrets://default/acme/_/mcp/srv-1"),
+        "got: {error}"
+    );
+}
