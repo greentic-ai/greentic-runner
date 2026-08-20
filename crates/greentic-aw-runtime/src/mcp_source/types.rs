@@ -318,19 +318,28 @@ impl McpToolCatalog {
         self.secrets.clone()
     }
 
-    /// Build a catalog directly from tool/route maps, bypassing the admin +
-    /// MCP probe. Test-only: lets downstream crates (e.g. `tools.rs`) exercise
-    /// the list/dispatch seams without standing up a wiremock pair.
-    #[cfg(test)]
-    pub(crate) fn for_tests(
+    /// Build a catalog directly from tool/route maps, bypassing the admin fetch
+    /// and the MCP probe.
+    ///
+    /// Public for the same reason [`McpRoute::from_parts`] is: an embedding host
+    /// that resolves its MCP surface WITHOUT the admin — a deployed runner
+    /// reading `assets/mcp-routes.json` out of its own pack — otherwise has no
+    /// way to express a catalog at all, because the fields are `pub(super)` and
+    /// the only other constructor performs a network fetch plus a per-server
+    /// probe.
+    ///
+    /// Tests use it for the same reason, so there is exactly one constructor
+    /// rather than a test twin with the same body.
+    pub fn from_parts(
         tools: HashMap<(String, String), McpToolEntry>,
         routes: HashMap<(String, String), McpRoute>,
+        secrets: Option<Arc<dyn SecretsManager>>,
     ) -> Self {
         Self {
             tools,
             routes,
             fetched_at: Instant::now(),
-            secrets: None,
+            secrets,
         }
     }
 }
