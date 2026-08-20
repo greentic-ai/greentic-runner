@@ -16,12 +16,19 @@ use std::time::Duration;
 pub struct ToolRef {
     pub extension_id: String,
     pub tool_name: String,
-    /// Author-defined LLM description (flow tools only). `None` falls back to
-    /// the runtime catalog. Ignored by the component/MCP tool branches.
+    /// Author-defined LLM description. Honoured by the `flow:` and `mcp:` tool
+    /// branches; ignored by the `component:`/`sorla:` branches and by plain
+    /// extension refs, whose runtimes are always locally introspectable.
+    ///
+    /// The two honouring branches use OPPOSITE precedence, deliberately. A
+    /// `flow:` ref prefers this author contract over the catalog. An `mcp:` ref
+    /// prefers the catalog and falls back to this, because the catalog entry was
+    /// probed from the live MCP server this run while this field is a snapshot
+    /// taken when the tool was bound — see `tools::list_tools_for_llm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Author-defined JSON-schema for the tool's input (flow tools only).
-    /// `None` falls back to the runtime catalog.
+    /// Author-defined JSON-schema for the tool's input. Same branches and same
+    /// precedence rules as [`ToolRef::description`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
     /// Author-defined LLM usage note, appended to the tool's resolved

@@ -95,8 +95,8 @@ pub use long_term::{
 };
 pub use manifest_provider::ManifestToolOverlayProvider;
 pub use mcp_source::{
-    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity, McpRoute, McpToolCatalog,
-    McpToolEntry, McpToolSource, dispatch_route,
+    MCP_ROLE_AGENTIC_WORKER, MCP_ROLE_FLOW_EDITOR, McpCallerIdentity, McpPackRoute, McpRoute,
+    McpToolCatalog, McpToolEntry, McpToolSource, dispatch_route,
 };
 pub use memory::{InMemoryMemoryProvider, MemoryProvider, MemoryQuery, MemoryRecord};
 pub use sorla_source::{

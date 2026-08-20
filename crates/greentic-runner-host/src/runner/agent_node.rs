@@ -516,6 +516,75 @@ mod aw {
         Some(Arc::new(source))
     }
 
+    /// Build the MCP tool source from the route material the operator's loaded
+    /// packs carry in `assets/mcp-routes.json`, for a deployed runner that has
+    /// no admin credentials.
+    ///
+    /// Mirrors [`component_source_from_packs`] and [`flow_source_from_packs`]:
+    /// discover from the packs rather than a remote admin. It is the FALLBACK
+    /// behind [`mcp_source_from_env`], never a replacement — see the precedence
+    /// note at the two construction sites.
+    ///
+    /// Honours the same `GREENTIC_AW_MCP=0` opt-out as [`mcp_source_from_env`]:
+    /// an operator who disabled outbound MCP must not have it re-enabled by a
+    /// pack. Returns `None` when disabled, when no pack is loaded, or when no
+    /// loaded pack declares any route — so `mcp:` tool refs then resolve from
+    /// their `ToolRef` contract for the LLM tool list and report an honest
+    /// "unknown mcp tool" if actually called.
+    ///
+    /// Route ids are deduplicated across packs, first pack wins. Server ids are
+    /// tenant-scoped in the admin, so a collision between two packs of the same
+    /// tenant means the same server; a collision across tenants in one host is
+    /// pre-existing and not made worse here (spec §11 O-3).
+    pub(crate) fn mcp_source_from_packs(
+        packs: &[Arc<crate::pack::PackRuntime>],
+        tenant: &str,
+        secrets: Option<crate::secrets::DynSecretsManager>,
+    ) -> Option<Arc<greentic_aw_runtime::McpToolSource>> {
+        if std::env::var("GREENTIC_AW_MCP").ok().as_deref() == Some("0") {
+            tracing::info!("GREENTIC_AW_MCP=0; pack-backed MCP tool source disabled");
+            return None;
+        }
+        if packs.is_empty() {
+            return None;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        for pack in packs {
+            let Some(routes) = pack.mcp_routes() else {
+                continue;
+            };
+            for route in routes.iter() {
+                if !seen.insert(route.server_id.clone()) {
+                    continue;
+                }
+                records.push(greentic_aw_runtime::McpPackRoute {
+                    server_id: route.server_id.clone(),
+                    transport: route.transport.clone(),
+                    transport_url: route.transport_url.clone(),
+                    auth_header_name: route.auth_header_name.clone(),
+                    auth_team: route.auth_team.clone(),
+                    component_ref: route.component_ref.clone(),
+                    component_version: route.component_version.clone(),
+                    component_digest: route.component_digest.clone(),
+                });
+            }
+        }
+
+        if records.is_empty() {
+            return None;
+        }
+        tracing::info!(
+            tenant = %tenant,
+            servers = records.len(),
+            "pack-backed MCP tool source constructed"
+        );
+        Some(Arc::new(
+            greentic_aw_runtime::McpToolSource::from_pack_routes(records, secrets),
+        ))
+    }
+
     /// Build the component tool source from the operator's loaded packs, gated
     /// by `GREENTIC_AW_COMPONENT_TOOLS` (set to "0" to disable). Returns `None`
     /// when disabled or when no packs are loaded, so `component:` tool refs then
@@ -1304,7 +1373,25 @@ mod aw {
             telemetry,
             token_meter,
             ledger,
-            mcp_source_from_env(Some(secrets.clone())),
+            // The env-configured ADMIN source wins; the pack-carried routes are
+            // the fallback. This is deliberately the OPPOSITE of the flow MCP
+            // node's precedence (`mcp_node::aw::invoke_with_secrets`, "A
+            // pack-carried route wins"), and the asymmetry is load-bearing:
+            //
+            // - A flow node's pack route strictly ADDS capability. The admin
+            //   catalog supplies the same route and nothing else, so preferring
+            //   the pack can only turn a failure into a success.
+            // - The agent catalog additionally carries LIVE tool schemas probed
+            //   from the server this run, and applies each server's
+            //   `allowed_tools`. Preferring the pack there would downgrade every
+            //   environment that has a working admin source — the designer's own
+            //   in-process host among them.
+            //
+            // A per-server merge (pack fills only the servers the admin catalog
+            // lacks) is a strictly better v2 and is out of scope: it needs a
+            // merge rule for a server present in both with different URLs.
+            mcp_source_from_env(Some(secrets.clone()))
+                .or_else(|| mcp_source_from_packs(&packs, &tenant, Some(secrets.clone()))),
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant))
@@ -1598,6 +1685,15 @@ mod aw {
             // env-built, tenant-agnostic secrets manager the flow-node path uses
             // (`mcp_node::aw::secrets_from_env`, memoized once per process); the
             // http transport ignores it, the local-wasm transport consumes it.
+            //
+            // NO pack-backed fallback here, unlike `build_runtime_with_stores`.
+            // This is the process-level serve path: its agents come from
+            // `GREENTIC_AGENT_MANIFESTS_DIR` and it holds no `PackRuntime` at
+            // all, so there is no `assets/mcp-routes.json` to read. A worker
+            // reached this way needs `GREENTIC_AW_ADMIN_ENDPOINT` +
+            // `GREENTIC_AW_ADMIN_TOKEN` for its `mcp:` tools to dispatch; its
+            // tools are still ADVERTISED to the LLM from the agent config's own
+            // `ToolRef` schemas.
             mcp_source_from_env(crate::runner::mcp_node::aw::secrets_from_env()),
         )
         .with_guardrails(
@@ -2881,6 +2977,67 @@ mod aw {
             assert!(
                 super::flow_source_from_packs(&[], "acme").is_none(),
                 "empty packs => None even when gate is unset"
+            );
+        }
+
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn pack_mcp_source_disabled_by_env_and_empty_packs() {
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention),
+            // so no concurrent test observes a torn env; vars cleaned up at the end.
+            unsafe {
+                std::env::set_var("GREENTIC_AW_MCP", "0");
+            }
+            assert!(
+                super::mcp_source_from_packs(&[], "acme", None).is_none(),
+                "an operator who disabled outbound MCP must not have it \
+                 re-enabled by a pack-carried sidecar"
+            );
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_MCP");
+            }
+            assert!(
+                super::mcp_source_from_packs(&[], "acme", None).is_none(),
+                "empty packs => None even when the gate is unset"
+            );
+        }
+
+        /// The agent path prefers the env-configured ADMIN source and uses the
+        /// pack routes only as a fallback — deliberately the opposite of the
+        /// flow node, because the admin catalog carries LIVE tool schemas and
+        /// `allowed_tools` that a pack cannot. `or_else` is what makes the
+        /// fallback lazy, so an admin-backed deployment never even reads its
+        /// packs' sidecars; this pins that shape.
+        #[test]
+        #[serial_test::serial]
+        #[allow(unsafe_code)]
+        fn the_admin_source_wins_and_the_pack_fallback_is_never_consulted() {
+            use std::cell::Cell;
+
+            // SAFETY: #[serial] serializes env-mutating tests (crate convention).
+            unsafe {
+                std::env::set_var("GREENTIC_AW_ADMIN_ENDPOINT", "https://admin.example");
+                std::env::set_var("GREENTIC_AW_ADMIN_TOKEN", "gtc_live_x");
+                std::env::remove_var("GREENTIC_AW_MCP");
+            }
+
+            let consulted = Cell::new(false);
+            let chosen = super::mcp_source_from_env(None).or_else(|| {
+                consulted.set(true);
+                super::mcp_source_from_packs(&[], "acme", None)
+            });
+
+            unsafe {
+                std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
+                std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
+            }
+
+            assert!(chosen.is_some(), "the admin source must be built");
+            assert!(
+                !consulted.get(),
+                "the pack fallback must not be consulted when the admin \
+                 credentials are present"
             );
         }
 

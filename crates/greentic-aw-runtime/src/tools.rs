@@ -57,9 +57,13 @@ pub fn is_tool_allowed(call: &ToolCallRecord, allowed: &[ToolRef]) -> bool {
 /// Tools whose `extension_id` starts with `"mcp:"` are resolved from the
 /// per-tenant [`McpToolCatalog`] (`mcp`) instead of the extension runtime: the
 /// suffix after `"mcp:"` is the MCP `server_id`, and the catalog supplies the
-/// LLM-facing `description`/`parameters`. An mcp ref with no matching catalog
-/// entry (or no catalog at all) is logged and dropped, mirroring the
-/// extension-runtime "tool not found" path.
+/// LLM-facing `description`/`parameters`. When the catalog has no entry, the
+/// ref's own `description`/`input_schema` are used — the schema the pack's
+/// `AgentConfig` snapshotted at authoring time — so a deployed runner with no
+/// admin credentials still advertises the tool. The catalog WINS whenever it has
+/// an entry: it was probed from the live server this run. An mcp ref with
+/// neither is logged and dropped, mirroring the extension-runtime "tool not
+/// found" path.
 ///
 /// Tools whose `extension_id` starts with `"component:"` are resolved the same
 /// way from the per-tenant [`ComponentToolCatalog`] (`components`): the suffix
@@ -89,16 +93,32 @@ pub fn list_tools_for_llm(
     let mut out = Vec::with_capacity(allowed.len());
     for t in allowed {
         if let Some(server_id) = t.extension_id.strip_prefix("mcp:") {
-            match mcp.and_then(|c| c.tool_entry(server_id, &t.tool_name)) {
-                Some(entry) => out.push(LlmToolSchema {
+            let entry = mcp.and_then(|c| c.tool_entry(server_id, &t.tool_name));
+            // Catalog FIRST, the author contract second — deliberately the
+            // OPPOSITE order from the `flow:` branch below. A catalog entry was
+            // probed from the live server this run, whereas `ToolRef` carries a
+            // schema snapshotted into the pack at authoring time; preferring the
+            // pack would downgrade every deployment that does have a working
+            // admin source to a staler schema. The fallback exists so a deployed
+            // runner with NO admin credentials still advertises the tool at all
+            // instead of dropping it (spec §4.2).
+            let description = entry
+                .map(|e| e.description.clone())
+                .or_else(|| t.description.clone());
+            let parameters = entry
+                .map(|e| e.parameters.clone())
+                .or_else(|| t.input_schema.clone());
+            match (description, parameters) {
+                (Some(description), Some(parameters)) => out.push(LlmToolSchema {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    description: with_usage_note(entry.description.clone(), &t.usage_note),
-                    parameters: entry.parameters.clone(),
+                    description: with_usage_note(description, &t.usage_note),
+                    parameters,
                 }),
-                None => tracing::warn!(
+                _ => tracing::warn!(
                     extension = %t.extension_id, tool = %t.tool_name,
-                    "mcp tool not found in catalog; dropping from LLM tool list"
+                    "mcp tool has neither a catalog entry nor an author contract; \
+                     dropping from LLM tool list"
                 ),
             }
             continue;
@@ -215,14 +235,22 @@ pub fn missing_tools(
     let mut missing = Vec::new();
     for t in allowed {
         if let Some(server_id) = t.extension_id.strip_prefix("mcp:") {
-            if mcp
+            // Mirrors `list_tools_for_llm`'s mcp branch exactly: a catalog entry
+            // resolves the tool, and so does a complete author contract
+            // (description AND input schema) on the `ToolRef` itself. Without
+            // this second arm `preflight_warn_tools` would warn loudly about a
+            // pack-schema'd tool that now works.
+            let resolvable = mcp
                 .and_then(|c| c.tool_entry(server_id, &t.tool_name))
-                .is_none()
-            {
+                .is_some()
+                || (t.description.is_some() && t.input_schema.is_some());
+            if !resolvable {
                 missing.push(MissingTool {
                     extension_id: t.extension_id.clone(),
                     tool_name: t.tool_name.clone(),
-                    reason: "MCP tool not found in the tenant catalog".to_string(),
+                    reason: "MCP tool not found in the tenant catalog, and the agent config \
+                             carries no description + input schema for it"
+                        .to_string(),
                 });
             }
             continue;
@@ -336,9 +364,13 @@ pub async fn dispatch_tool_call(
     tenant: &TenantContext,
 ) -> Result<serde_json::Value, AgentError> {
     if let Some(server_id) = call.extension_id.strip_prefix("mcp:") {
+        // `resolve_route` takes the catalog's exact `(server, tool)` entry when
+        // it has one and otherwise stamps the tool onto a pack-carried
+        // server-level route. An admin-built catalog registers no server-level
+        // routes, so its behaviour here is unchanged.
         let value = match mcp
             .as_deref()
-            .and_then(|c| c.route(server_id, &call.tool_name))
+            .and_then(|c| c.resolve_route(server_id, &call.tool_name))
         {
             Some(route) => {
                 let args = call.args.to_string();
@@ -348,7 +380,7 @@ pub async fn dispatch_tool_call(
                     }
                     None => crate::mcp_scope::McpCallScope::new(tenant.clone()),
                 };
-                crate::mcp_source::dispatch_route(route, &args, &scope).await
+                crate::mcp_source::dispatch_route(&route, &args, &scope).await
             }
             None => {
                 tracing::warn!(
@@ -356,8 +388,17 @@ pub async fn dispatch_tool_call(
                     tool = %call.tool_name,
                     "mcp call has no route in the tenant catalog; returning error value"
                 );
+                // A per-server diagnostic (only the pack path records one) names
+                // the real cause; without it a missing credential and an
+                // unregistered server are indistinguishable to the operator.
                 serde_json::json!({
-                    "error": format!("unknown mcp tool '{}/{}'", server_id, call.tool_name)
+                    "error": match mcp.as_deref().and_then(|c| c.server_error(server_id)) {
+                        Some(detail) => format!(
+                            "mcp tool '{}/{}' is unavailable: mcp server '{}' has {detail}",
+                            server_id, call.tool_name, server_id
+                        ),
+                        None => format!("unknown mcp tool '{}/{}'", server_id, call.tool_name),
+                    }
                 })
             }
         };
@@ -757,7 +798,7 @@ mod tests {
                 route_for_tests(server, tool, url),
             );
         }
-        McpToolCatalog::for_tests(tools, routes)
+        McpToolCatalog::from_parts(tools, routes, None)
     }
 
     /// Mount the minimal MCP JSON-RPC contract (initialize, initialized,
@@ -843,6 +884,136 @@ mod tests {
         assert_eq!(s.tool_name, "get_issue");
         assert_eq!(s.description, "Get an issue");
         assert_eq!(s.parameters, params);
+    }
+
+    /// The author contract a pack's `AgentConfig` carries for an `mcp:` binding.
+    fn mcp_ref_with_contract(server: &str, tool: &str) -> ToolRef {
+        ToolRef {
+            extension_id: format!("mcp:{server}"),
+            tool_name: tool.into(),
+            description: Some("Pack-carried description".into()),
+            input_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": { "pack_arg": { "type": "string" } }
+            })),
+            usage_note: None,
+        }
+    }
+
+    #[test]
+    fn mcp_ref_listed_from_tool_ref_when_catalog_has_no_entry() {
+        // The deployed-runner case: no admin credentials, so no catalog at all.
+        // The schema the designer snapshotted into the pack's `AgentConfig` is
+        // what reaches the LLM. Before this, the tool was silently dropped.
+        let rt = ExtensionRuntime::for_test();
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
+        assert_eq!(schemas.len(), 1, "the author contract resolves the tool");
+        assert_eq!(schemas[0].extension_id, "mcp:s1");
+        assert_eq!(schemas[0].tool_name, "get_issue");
+        assert_eq!(schemas[0].description, "Pack-carried description");
+        assert_eq!(
+            schemas[0].parameters["properties"]["pack_arg"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn mcp_catalog_entry_wins_over_tool_ref_contract() {
+        // REGRESSION GUARD for every existing admin-backed deployment: when the
+        // catalog has an entry it was probed from the live server this run, and
+        // it must be emitted byte-for-byte even though the ref also carries a
+        // (possibly stale) snapshot. Flipping the precedence would silently
+        // downgrade every deployment that has a working admin source.
+        let rt = ExtensionRuntime::for_test();
+        let live_params = serde_json::json!({
+            "type": "object",
+            "properties": { "live_arg": { "type": "number" } }
+        });
+        let catalog = catalog_with("s1", "get_issue", "Live description", live_params, None);
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+
+        let schemas = list_tools_for_llm(&rt, Some(&catalog), None, None, None, &allowed);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].description, "Live description");
+        assert_eq!(
+            schemas[0].parameters["properties"]["live_arg"]["type"], "number",
+            "the catalog's parameters must survive intact"
+        );
+        assert!(
+            schemas[0].parameters["properties"]
+                .get("pack_arg")
+                .is_none(),
+            "the pack snapshot must not leak into a catalog-resolved schema"
+        );
+    }
+
+    #[test]
+    fn mcp_ref_with_partial_contract_and_no_catalog_is_dropped() {
+        // Both halves are required, mirroring the `flow:` branch: a description
+        // with no schema cannot be offered to the LLM as a callable tool.
+        let rt = ExtensionRuntime::for_test();
+        let mut description_only = mcp_ref_with_contract("s1", "get_issue");
+        description_only.input_schema = None;
+        let mut schema_only = mcp_ref_with_contract("s1", "list_issues");
+        schema_only.description = None;
+        let bare = ToolRef {
+            extension_id: "mcp:s1".into(),
+            tool_name: "nothing".into(),
+            description: None,
+            input_schema: None,
+            usage_note: None,
+        };
+
+        let schemas = list_tools_for_llm(
+            &rt,
+            None,
+            None,
+            None,
+            None,
+            &[description_only, schema_only, bare],
+        );
+        assert!(schemas.is_empty(), "got: {schemas:?}");
+    }
+
+    #[test]
+    fn mcp_ref_contract_still_takes_the_usage_note() {
+        // The usage note is an author addendum to whichever description won; it
+        // must not be lost on the new fallback arm.
+        let rt = ExtensionRuntime::for_test();
+        let mut t = mcp_ref_with_contract("s1", "get_issue");
+        t.usage_note = Some("Only for open issues.".into());
+
+        let schemas = list_tools_for_llm(&rt, None, None, None, None, &[t]);
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(
+            schemas[0].description,
+            "Pack-carried description\n\nOnly for open issues."
+        );
+    }
+
+    #[test]
+    fn missing_tools_accepts_mcp_tool_resolved_by_its_author_contract() {
+        // `preflight_warn_tools` would otherwise warn loudly at startup about a
+        // tool that `list_tools_for_llm` now resolves and offers.
+        let rt = ExtensionRuntime::for_test();
+        let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
+        assert!(missing_tools(&rt, None, None, None, None, &allowed).is_empty());
+    }
+
+    #[test]
+    fn missing_tools_still_reports_mcp_tool_with_no_contract_and_no_catalog() {
+        let rt = ExtensionRuntime::for_test();
+        let mut half = mcp_ref_with_contract("s1", "get_issue");
+        half.input_schema = None;
+        let missing = missing_tools(&rt, None, None, None, None, &[half]);
+        assert_eq!(missing.len(), 1);
+        assert!(
+            missing[0].reason.contains("MCP tool not found"),
+            "got: {}",
+            missing[0].reason
+        );
     }
 
     #[test]

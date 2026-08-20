@@ -14,8 +14,8 @@ use crate::mcp_scope::McpCallScope;
 use crate::tenant::TenantContext;
 
 use super::types::{
-    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpRoute, McpToolCatalog,
-    McpToolEntry, PROBE_TIMEOUT, ParsedServer, Transport, WireBody, call_timeout,
+    CATALOG_TTL, MCP_ROLE_AGENTIC_WORKER, McpCallerIdentity, McpPackRoute, McpRoute,
+    McpToolCatalog, McpToolEntry, PROBE_TIMEOUT, ParsedServer, Transport, WireBody, call_timeout,
 };
 
 /// Per-tenant, TTL-gated source of agentic-worker MCP tool catalogs.
@@ -35,6 +35,10 @@ pub struct McpToolSource {
     client: reqwest::Client,
     cache: DashMap<String, Arc<McpToolCatalog>>,
     secrets: Option<Arc<dyn greentic_secrets_lib::SecretsManager>>,
+    /// When set, catalogs are built from these pack-carried records instead of
+    /// fetched from the admin. Mutually exclusive with `base_url`/`token`, which
+    /// are empty on this path — see [`McpToolSource::from_pack_routes`].
+    pack_routes: Option<Vec<McpPackRoute>>,
 }
 
 impl McpToolSource {
@@ -54,7 +58,42 @@ impl McpToolSource {
             client,
             cache: DashMap::new(),
             secrets: None,
+            pack_routes: None,
         }
+    }
+
+    /// Build a source backed by the route material a `.gtpack` carries in
+    /// `assets/mcp-routes.json`, for a deployed runner that has no admin
+    /// credentials at all.
+    ///
+    /// Differences from the admin path, each deliberate:
+    ///
+    /// - **No fetch, no probe.** The sidecar names the server; the tool NAME and
+    ///   SCHEMA arrive from the agent's own `ToolRef` (spec §4.2 S2). Probing
+    ///   would make the tool list depend on the server being reachable at step
+    ///   time, so a momentarily-down server would silently shrink the agent's
+    ///   tool set rather than fail a call honestly.
+    /// - **No role filter.** The sidecar's id set IS the authorization decision,
+    ///   already made twice upstream: the operator granted the server its role
+    ///   in the admin, and the author bound the tool in the composer.
+    /// - **The token still re-resolves per catalog build**, from the secrets
+    ///   backend, under the existing `CATALOG_TTL`. That is why this is a
+    ///   *source* and not a bare catalog: a catalog built once at construction
+    ///   would need a process restart to pick up a rotated token.
+    ///
+    /// `allowed_tools` is NOT re-checked here. The admin row can whitelist tool
+    /// names and the pack path consults no whitelist — true for flow nodes today
+    /// and for agent tools now. Bounded (the authored binding is already a
+    /// subset of what was allowed at authoring time) and tracked in spec §9 as a
+    /// fix for BOTH paths at once or neither.
+    pub fn from_pack_routes(
+        routes: Vec<McpPackRoute>,
+        secrets: Option<Arc<dyn greentic_secrets_lib::SecretsManager>>,
+    ) -> Self {
+        let mut source = Self::new(String::new(), String::new());
+        source.secrets = secrets;
+        source.pack_routes = Some(routes);
+        source
     }
 
     /// Name the tenant + user this source asks the admin on behalf of, so the
@@ -127,9 +166,94 @@ impl McpToolSource {
             }
         }
 
-        let built = Arc::new(self.build_catalog(&key, role).await);
+        let built = Arc::new(match &self.pack_routes {
+            Some(routes) => self.build_pack_catalog(routes, tenant).await,
+            None => self.build_catalog(&key, role).await,
+        });
         self.cache.insert(key, built.clone());
         built
+    }
+
+    /// Build a catalog from pack-carried records: resolve each `http` route's
+    /// token from the secrets backend, register one route per SERVER, and skip
+    /// the probe entirely. See [`McpToolSource::from_pack_routes`].
+    ///
+    /// Infallible by the same contract as the admin path: a server whose
+    /// credential will not resolve is recorded as a per-server diagnostic and
+    /// left routeless, so the eventual dispatch error names the URI and the
+    /// `SECRETS_BACKEND=broker` requirement instead of an opaque
+    /// "unknown mcp tool".
+    async fn build_pack_catalog(
+        &self,
+        routes: &[McpPackRoute],
+        tenant: &TenantContext,
+    ) -> McpToolCatalog {
+        let mut server_routes = std::collections::HashMap::new();
+        let mut server_errors = std::collections::HashMap::new();
+
+        for record in routes {
+            // Only an `http` route reads a token. A `local-wasm` route has no
+            // HTTP credential at all — admin writes no `mcp/<server_id>` entry
+            // for one — and the component reads its own secrets through the
+            // `McpCallScope` the caller attaches. Reading unconditionally would
+            // fail every local-wasm pack route on a credential that is not
+            // supposed to exist.
+            let is_http = record.transport != "local-wasm";
+            let token = match self.secrets.as_ref().filter(|_| is_http) {
+                Some(manager) => {
+                    match crate::mcp_secrets::read_mcp_secret(
+                        manager.as_ref(),
+                        &tenant.tenant_id,
+                        record.auth_team.as_deref(),
+                        &record.server_id,
+                    )
+                    .await
+                    {
+                        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                        Err(miss) => {
+                            let detail = miss.to_string();
+                            tracing::warn!(
+                                tenant = %tenant.tenant_id,
+                                server = %record.server_id,
+                                detail = %detail,
+                                "pack-carried mcp route has no resolvable credential; \
+                                 its tools will report the cause when called"
+                            );
+                            server_errors.insert(record.server_id.clone(), detail);
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+
+            server_routes.insert(
+                record.server_id.clone(),
+                McpRoute::from_parts(
+                    &record.server_id,
+                    record.transport_url.as_deref().unwrap_or_default(),
+                    record.auth_header_name.as_deref(),
+                    token.as_deref(),
+                    &record.transport,
+                    record.component_ref.as_deref(),
+                    record.component_version.as_deref(),
+                    record.component_digest.as_deref(),
+                ),
+            );
+        }
+
+        tracing::debug!(
+            tenant = %tenant.tenant_id,
+            servers = server_routes.len(),
+            unresolved = server_errors.len(),
+            "pack-backed MCP catalog built"
+        );
+        McpToolCatalog::from_parts(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            self.secrets(),
+        )
+        .with_server_routes(server_routes, server_errors)
     }
 
     /// Fetch the admin rows and probe each server carrying `role`. Always

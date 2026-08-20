@@ -1812,16 +1812,22 @@ impl FlowEngine {
             .find(|pack| pack.metadata().pack_id == ctx.pack_id)
             .and_then(|pack| pack.mcp_routes());
 
+        // The team the AUTHORING session resolved this server's token under, as
+        // recorded in the sidecar. `FlowContext` carries no team and a deployed
+        // workload has no principled source for one, so this is the only place
+        // the value can come from. Absent (a pack predating the field) yields
+        // `None`, and the credential read then tries the tenant-default `_`
+        // scope exactly as it did before.
+        let auth_team = pack_routes
+            .and_then(|routes| routes.get(server_id))
+            .and_then(|route| route.auth_team.as_deref());
+
         let result = crate::runner::mcp_node::invoke(
             self.mcp_tool_source.as_ref(),
             pack_routes,
             ctx.tenant,
             &self.default_env,
-            // No team on the flow path yet: `FlowContext` carries none, and
-            // `_` is the segment admin writes for a tenant-wide secret. A
-            // team-scoped MCP secret would resolve under a different URI —
-            // tracked as an open question in the design (§8.5).
-            None,
+            auth_team,
             server_id,
             tool,
             &arguments,
