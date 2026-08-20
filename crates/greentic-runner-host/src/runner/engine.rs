@@ -1376,11 +1376,11 @@ impl FlowEngine {
         // A route the pack carries itself, so a deployed runner with no admin
         // credentials can dispatch at all; `None` (a pack predating the
         // sidecar) falls back to the catalog exactly as before.
-        let pack_routes = self
+        let pack = self
             .packs
             .iter()
-            .find(|pack| pack.metadata().pack_id == ctx.pack_id)
-            .and_then(|pack| pack.mcp_routes());
+            .find(|pack| pack.metadata().pack_id == ctx.pack_id);
+        let pack_routes = pack.and_then(|pack| pack.mcp_routes());
 
         // The team the AUTHORING session resolved this server's token under, as
         // recorded in the sidecar. `FlowContext` carries no team and a deployed
@@ -1391,9 +1391,15 @@ impl FlowEngine {
             .and_then(|routes| routes.get(server_id))
             .and_then(|route| route.auth_team.as_deref());
 
-        let result = crate::runner::mcp_node::invoke(
+        // The HOST's secrets manager, not one derived from `SECRETS_BACKEND`.
+        // That env only names `env` and `broker`; an operator booting a bundle
+        // runs on greentic-start's dev store, which the runner has no variant
+        // for — so a manager built from the environment can never read the
+        // credential, and the node would dispatch without one.
+        let result = crate::runner::mcp_node::invoke_with_secrets(
             self.mcp_tool_source.as_ref(),
             pack_routes,
+            pack.map(|p| p.secrets()),
             ctx.tenant,
             &self.default_env,
             auth_team,
