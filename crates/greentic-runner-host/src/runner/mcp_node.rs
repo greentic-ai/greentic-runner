@@ -62,7 +62,18 @@ mod aw {
         tool: &str,
         arguments: &Value,
     ) -> Value {
+        // Every failure below is returned as a value, not an error, and the
+        // node still reports `status=ok` — so without a log an operator sees a
+        // clean run whose MCP call silently did nothing. Warn on each path.
         let Some(source) = source else {
+            tracing::warn!(
+                tenant,
+                env,
+                server_id,
+                tool,
+                "mcp node did not run: MCP is not configured on this runner \
+                 (set GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
+            );
             return json!({
                 "error": "MCP is not configured on this runner (set GREENTIC_AW_ADMIN_ENDPOINT + GREENTIC_AW_ADMIN_TOKEN)"
             });
@@ -74,6 +85,13 @@ mod aw {
             .await;
 
         let Some(route) = catalog.route(server_id, tool) else {
+            tracing::warn!(
+                tenant,
+                env,
+                server_id,
+                tool,
+                "mcp node did not run: tool is absent from the tenant's flow_editor catalog"
+            );
             return json!({
                 "error": format!(
                     "mcp tool '{server_id}/{tool}' not found in the tenant's flow_editor catalog"
@@ -84,7 +102,21 @@ mod aw {
         // `dispatch_route` takes the arguments as a JSON string and is itself
         // infallible (bad args / connect / timeout all become `{"error": ...}`).
         let args_str = arguments.to_string();
-        dispatch_route(route, &args_str).await
+        let result = dispatch_route(route, &args_str).await;
+        // `dispatch_route` is infallible too: bad args, connect failures and
+        // timeouts all come back as `{"error": ...}`. Surface those as well,
+        // otherwise a dead MCP endpoint is indistinguishable from a good call.
+        if let Some(error) = result.get("error") {
+            tracing::warn!(
+                tenant,
+                env,
+                server_id,
+                tool,
+                error = %error,
+                "mcp node dispatch failed"
+            );
+        }
+        result
     }
 }
 
@@ -112,6 +144,83 @@ pub(crate) fn server_tool_from_payload(payload: &Value) -> Option<(String, Strin
     let server = str_field(payload, "server")?;
     let tool = str_field(payload, "tool")?;
     Some((server, tool))
+}
+
+#[cfg(all(test, feature = "agentic-worker"))]
+mod failure_logging_tests {
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Collects subscriber output so a test can assert on what was logged.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// An MCP node on a runner without MCP credentials must say so in the log,
+    /// not only in the value it binds.
+    ///
+    /// The bound `{"error": ...}` is invisible to an operator: the node still
+    /// reports `status=ok`, so a flow whose MCP call did nothing looks like a
+    /// clean run. Until the node can report failure properly, a WARN is the
+    /// only signal that something went wrong.
+    #[tokio::test]
+    async fn an_unconfigured_mcp_node_warns_rather_than_failing_silently() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let bound = tracing::subscriber::with_default(subscriber, || {
+            futures::executor::block_on(super::aw::invoke(
+                None,
+                "acme",
+                "prod",
+                "srv-1",
+                "create_quote",
+                &json!({ "company": "Acme" }),
+            ))
+        });
+
+        // The contract is unchanged: the caller still gets a structured error.
+        assert!(
+            bound.get("error").is_some(),
+            "the bound value must still carry the error, got {bound}"
+        );
+
+        let logged = captured.text();
+        assert!(
+            logged.contains("WARN"),
+            "an unconfigured MCP node must log at WARN; captured: {logged:?}"
+        );
+        assert!(
+            logged.contains("create_quote"),
+            "the warning must name the tool that did not run; captured: {logged:?}"
+        );
+    }
 }
 
 #[cfg(test)]
