@@ -46,6 +46,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     # guardrail evaluator over the fail-closed stand-in. Same reason it is not
     # a feature — CI builds `--all-features`.
     'cfg(greentic_guardrail_ext)',
+    # Mirrors greentic-aw-runtime's parked gate: without `extension_tools` on
+    # `DigitalWorkerManifest` the tool overlay is always empty, so the test
+    # that asserts it applies is parked and its counterpart pins the silence.
+    'cfg(greentic_dw_manifest_tools)',
 ] }
 
 
