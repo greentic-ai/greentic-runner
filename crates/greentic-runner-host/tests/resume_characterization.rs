@@ -277,6 +277,7 @@ fn ingress_envelope() -> IngressEnvelope {
         channel: Some("chan".into()),
         conversation: Some("conv".into()),
         user: Some("user".into()),
+        entry_node: None,
         activity_id: Some("activity-1".into()),
         timestamp: None,
         messaging_endpoint_id: None,

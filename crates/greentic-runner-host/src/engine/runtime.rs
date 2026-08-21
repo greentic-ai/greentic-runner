@@ -237,6 +237,7 @@ mod tests {
             channel: Some("chan".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),
+            entry_node: None,
             activity_id: Some("act-1".into()),
             timestamp: None,
             payload: json!({ "text": "hi" }),
@@ -344,6 +345,7 @@ mod tests {
             channel: None,
             conversation: None,
             user: None,
+            entry_node: None,
             activity_id: Some("activity-1".into()),
             timestamp: None,
             payload: json!({}),
@@ -871,6 +873,8 @@ impl Adapter for PackFlowAdapter {
                 ..ctx
             };
             self.engine.resume(resume_ctx, snapshot, payload).await
+        } else if let Some(entry) = envelope.entry_node.as_deref() {
+            self.engine.execute_from(ctx, payload, entry).await
         } else {
             self.engine.execute(ctx, payload).await
         };
@@ -942,6 +946,14 @@ pub struct IngressEnvelope {
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Flow node this run must START at, lifted from a card-navigation target
+    /// that names a node rather than a card asset — see
+    /// [`crate::runner::card_nav`]. `None` starts at the flow's entrypoint.
+    ///
+    /// A parked snapshot still outranks it: resuming a waiting run is never
+    /// the same thing as re-entering the flow at a node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_node: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
