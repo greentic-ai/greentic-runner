@@ -564,9 +564,35 @@ impl RunnerHost {
                         .flow_by_key(&pack_id, &flow_id)
                         .map(|desc| desc.flow_type.clone())
                 });
-        let payload = activity.into_payload();
+        let mut payload = activity.into_payload();
+
+        // A card button says where to go next in `nextCardId` and friends.
+        // Usually that names another CARD, which the adaptive-card component
+        // renders. When it names a FLOW NODE the pack's graph continues there
+        // instead — and the target has to be lifted out of the payload, because
+        // the component prefers an inbound `nextCardId` over its node's own
+        // asset and would fail to resolve a node id as a card
+        // (`AC_ASSET_NOT_FOUND`, surfacing as a generic service error).
+        //
+        // greentic-start does this for the messaging path it owns; this is the
+        // same rule for the in-process path, which previously had none — card
+        // navigation worked and flow-node navigation did not.
+        let entry_node = {
+            let node_ids = runtime.engine().flow_node_ids(&pack_id, &flow_id).await;
+            let target = crate::runner::card_nav::entry_node_from_card_nav(
+                payload.get("metadata").unwrap_or(&serde_json::Value::Null),
+                &node_ids,
+            );
+            if target.is_some()
+                && let Some(metadata) = payload.get_mut("metadata")
+            {
+                crate::runner::card_nav::strip_card_nav_keys(metadata);
+            }
+            target
+        };
 
         let mut envelope = IngressEnvelope {
+            entry_node,
             tenant: tenant.to_string(),
             env: std::env::var("GREENTIC_ENV").ok(),
             pack_id: Some(pack_id.clone()),
@@ -1141,6 +1167,7 @@ mod welcome_flow_tests {
             channel: Some("chan".into()),
             conversation: Some(format!("conv-{user}")),
             user: Some(user.to_string()),
+            entry_node: None,
             activity_id: None,
             timestamp: None,
             payload: json!({}),

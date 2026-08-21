@@ -19,6 +19,7 @@ fn envelope_for(conversation: &str) -> IngressEnvelope {
         channel: Some(conversation.into()),
         conversation: Some(conversation.into()),
         user: Some("user".into()),
+        entry_node: None,
         activity_id: Some(format!("activity-{conversation}")),
         timestamp: None,
         payload: json!({ "text": "hi" }),

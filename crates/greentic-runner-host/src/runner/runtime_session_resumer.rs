@@ -164,6 +164,8 @@ impl RuntimeSessionResumer {
             channel,
             conversation: conversation.clone(),
             user,
+            // A session resume re-enters through its snapshot, not a card nav target.
+            entry_node: None,
             activity_id: None,
             timestamp: None,
             messaging_endpoint_id: None,

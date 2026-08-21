@@ -27,6 +27,7 @@ mod redis_lb {
             channel: Some("conv".into()),
             conversation: Some("conv".into()),
             user: Some("user".into()),
+            entry_node: None,
             activity_id: Some("activity-redis".into()),
             timestamp: None,
             payload: json!({ "text": "hi" }),

@@ -2323,6 +2323,32 @@ impl FlowEngine {
         &self.flows
     }
 
+    /// Node ids declared by a flow, for callers that must tell a flow node
+    /// apart from something else that shares the id space — a card asset, in
+    /// the case of [`crate::runner::card_nav`].
+    ///
+    /// Loads the flow if it is not cached yet; an unloadable flow yields an
+    /// empty list rather than an error, because the caller's question ("is
+    /// this a node?") has a sound negative answer either way.
+    pub async fn flow_node_ids(&self, pack_id: &str, flow_id: &str) -> Vec<String> {
+        match self.get_or_load_flow(pack_id, flow_id).await {
+            Ok(flow) => flow
+                .nodes
+                .keys()
+                .map(|id| id.as_str().to_string())
+                .collect(),
+            Err(error) => {
+                tracing::debug!(
+                    pack_id,
+                    flow_id,
+                    error = %error,
+                    "flow not loadable while listing node ids; treating as no nodes"
+                );
+                Vec::new()
+            }
+        }
+    }
+
     pub fn flow_by_key(&self, pack_id: &str, flow_id: &str) -> Option<&FlowDescriptor> {
         self.flows
             .iter()
