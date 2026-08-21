@@ -536,6 +536,87 @@ mod aw {
     /// tenant-scoped in the admin, so a collision between two packs of the same
     /// tenant means the same server; a collision across tenants in one host is
     /// pre-existing and not made worse here (spec §11 O-3).
+    /// The secrets manager an agent's `mcp:` tools resolve their credential
+    /// with — the injected host manager, UNLESS `SECRETS_BACKEND` explicitly
+    /// names one.
+    ///
+    /// # Why this is not simply the injected manager
+    ///
+    /// It was, and that made the pack-backed MCP path unreachable in the lane
+    /// it was built for. `greentic-start` injects its own manager
+    /// (`HostBuilder::with_secrets_manager`, `revision_boot.rs`) whose kind is
+    /// one of `dev-store` / `env` / `vault` — there is no broker variant — and
+    /// greentic-designer's `orchestrate::mcp_runtime` projects
+    /// `SECRETS_BACKEND=broker` + the two `SECRETS_BROKER_*` variables onto
+    /// exactly that child. So the operator asked for a broker, the projection
+    /// arrived intact, and the agent loop resolved against a manager that had
+    /// never heard of it: every `mcp:` tool failed with "no credential at
+    /// secrets://…", having sent no request to the broker at all. Verified end
+    /// to end on 2026-08-21 (greentic-designer `docs/superpowers/specs/
+    /// 2026-08-20-aw-mcp-in-deployed-bundles-design.md`, the Slice 8 note).
+    ///
+    /// The flow-node path never had this problem because it builds its own
+    /// manager from the same variable (`mcp_node::aw::secrets_from_env`). This
+    /// makes the agent path agree with it rather than inventing a third rule —
+    /// same env var, same builder, same memoized instance.
+    ///
+    /// # Why it is gated on the variable being SET
+    ///
+    /// An unset `SECRETS_BACKEND` must keep the injected manager, or every host
+    /// that deliberately supplies one — the designer's in-process host, a
+    /// greentic-start pod on Vault — would be silently downgraded to the `env`
+    /// backend, which `SecretsBackend::from_env` returns for an absent value.
+    /// That would break working deployments to fix a broken one. The variable
+    /// being present is the operator's explicit instruction, and only then does
+    /// it win.
+    ///
+    /// A failure to build from the variable falls back to the injected manager
+    /// rather than to nothing: a malformed broker endpoint should degrade to
+    /// the host's own resolution, not strip the agent of every credential.
+    fn mcp_secrets_manager(
+        injected: &crate::secrets::DynSecretsManager,
+    ) -> crate::secrets::DynSecretsManager {
+        let requested = std::env::var("SECRETS_BACKEND").ok();
+        choose_mcp_secrets(
+            requested.as_deref(),
+            crate::runner::mcp_node::aw::secrets_from_env(),
+            injected,
+        )
+    }
+
+    /// The decision behind [`mcp_secrets_manager`], split out so it is testable
+    /// without mutating the process-wide `SECRETS_BACKEND` — the same reason
+    /// `mcp_node::aw::build_secrets_manager` is separate from its memoized
+    /// caller, and the reason matters more here: `secrets_from_env` caches in a
+    /// `OnceLock`, so a test that drove this through the environment would pass
+    /// or fail on which test ran first.
+    fn choose_mcp_secrets(
+        requested: Option<&str>,
+        env_built: Option<crate::secrets::DynSecretsManager>,
+        injected: &crate::secrets::DynSecretsManager,
+    ) -> crate::secrets::DynSecretsManager {
+        let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+            return injected.clone();
+        };
+        match env_built {
+            Some(manager) => {
+                tracing::info!(
+                    backend = %requested,
+                    "agent MCP credentials resolve through the SECRETS_BACKEND manager"
+                );
+                manager
+            }
+            None => {
+                tracing::warn!(
+                    backend = %requested,
+                    "SECRETS_BACKEND is set but its manager could not be built; \
+                     agent MCP credentials fall back to the host's injected manager"
+                );
+                injected.clone()
+            }
+        }
+    }
+
     pub(crate) fn mcp_source_from_packs(
         packs: &[Arc<crate::pack::PackRuntime>],
         tenant: &str,
@@ -1390,8 +1471,11 @@ mod aw {
             // A per-server merge (pack fills only the servers the admin catalog
             // lacks) is a strictly better v2 and is out of scope: it needs a
             // merge rule for a server present in both with different URLs.
-            mcp_source_from_env(Some(secrets.clone()))
-                .or_else(|| mcp_source_from_packs(&packs, &tenant, Some(secrets.clone()))),
+            {
+                let mcp_secrets = mcp_secrets_manager(&secrets);
+                mcp_source_from_env(Some(mcp_secrets.clone()))
+                    .or_else(|| mcp_source_from_packs(&packs, &tenant, Some(mcp_secrets)))
+            },
         )
         .with_component_source(component_source_from_packs(&packs, &tenant))
         .with_flow_source(flow_source_from_packs(&packs, &tenant))
@@ -2632,6 +2716,78 @@ mod aw {
                 std::env::remove_var("GREENTIC_AW_ADMIN_ENDPOINT");
                 std::env::remove_var("GREENTIC_AW_ADMIN_TOKEN");
             }
+        }
+
+        /// A distinguishable no-op manager. The tests below assert WHICH
+        /// manager was chosen via `Arc::ptr_eq`, so all they need is two
+        /// separately-allocated instances of something implementing the trait.
+        struct StubSecrets;
+
+        #[async_trait::async_trait]
+        impl greentic_secrets_lib::SecretsManager for StubSecrets {
+            async fn read(&self, _path: &str) -> greentic_secrets_lib::Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+            async fn write(&self, _path: &str, _bytes: &[u8]) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _path: &str) -> greentic_secrets_lib::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A host that supplies its own secrets manager must keep it when the
+        /// operator named no backend. Downgrading it to the `env` backend —
+        /// which `SecretsBackend::from_env` returns for an absent value —
+        /// would strip credentials from every deployment that works today
+        /// (greentic-start on Vault, the designer's own in-process host) in
+        /// order to fix one that does not.
+        #[test]
+        fn an_unset_secrets_backend_keeps_the_injected_manager() {
+            let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+            let env_built: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+
+            for requested in [None, Some(""), Some("   ")] {
+                let chosen =
+                    super::choose_mcp_secrets(requested, Some(env_built.clone()), &injected);
+                assert!(
+                    std::sync::Arc::ptr_eq(&chosen, &injected),
+                    "requested={requested:?} must keep the injected manager"
+                );
+            }
+        }
+
+        /// The whole point: an operator who sets `SECRETS_BACKEND` gets THAT
+        /// backend for an agent's `mcp:` tools. Before this, the variable was
+        /// read only by the flow-node path, so greentic-designer could project
+        /// `SECRETS_BACKEND=broker` onto a greentic-start child — whose own
+        /// manager has no broker variant at all — and every agent MCP tool
+        /// failed with "no credential at secrets://…" having never contacted
+        /// the broker.
+        #[test]
+        fn a_named_secrets_backend_wins_over_the_injected_manager() {
+            let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+            let env_built: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+
+            let chosen =
+                super::choose_mcp_secrets(Some("broker"), Some(env_built.clone()), &injected);
+            assert!(
+                std::sync::Arc::ptr_eq(&chosen, &env_built),
+                "a named backend must win"
+            );
+        }
+
+        /// A malformed backend must degrade to the host's own resolution, not
+        /// to nothing: stripping every credential because one endpoint was
+        /// mistyped turns a narrow misconfiguration into a total outage.
+        #[test]
+        fn an_unbuildable_backend_falls_back_to_the_injected_manager() {
+            let injected: crate::secrets::DynSecretsManager = std::sync::Arc::new(StubSecrets);
+            let chosen = super::choose_mcp_secrets(Some("broker"), None, &injected);
+            assert!(
+                std::sync::Arc::ptr_eq(&chosen, &injected),
+                "an unbuildable backend must fall back, not strip credentials"
+            );
         }
 
         #[test]
