@@ -13,6 +13,41 @@ out to remove.
 
 Do not reconcile them by taking whichever branch merges last.
 
+## CORRECTION 2026-08-21 — the lanes are closer than this note first said
+
+The first version of this note framed the two PRs as the whole story. They are
+not, and the omission matters for anyone planning a lane merge, so it is
+corrected here rather than edited away.
+
+What each lane actually has:
+
+| | `research` | `develop` |
+|---|---|---|
+| flow node reads pack routes + `auth_team` | yes (#702) | **yes (#704)** |
+| flow node's secrets manager | from `SECRETS_BACKEND` | **injected host manager (#705)** |
+| agent loop reads pack routes | yes (#702) | **no** |
+| agent loop's secrets rule (`choose_mcp_secrets`) | yes (#706) | **no** |
+
+Two consequences the original framing hid:
+
+- **The flow-node pack path was built TWICE, independently** — #702 on research
+  and #704 on develop — and both landed `auth_team`. So the lanes already agree
+  about the sidecar and the team-scoped URI. The disagreement is narrower than
+  "how MCP credentials work": it is exactly one question, *where does the flow
+  node's secrets manager come from*.
+- **The agent loop's pack path exists only on research.** develop's agent loop
+  cannot resolve a worker's `mcp:` tool from the pack at all — it has neither
+  the fallback nor the credential rule. So a merge is not two equal halves
+  meeting; develop is missing a feature research has, on top of the one genuine
+  conflict.
+
+That makes the reconciliation smaller than it looked, and it changes what
+"whichever merges second wins" costs: for the flow node it silently swaps one
+working resolution for another that may not resolve in that lane, and for the
+agent loop a develop-first merge would simply delete the pack path.
+
+---
+
 ## The two sides
 
 | | `develop` — #705 | `research` — #706 |
