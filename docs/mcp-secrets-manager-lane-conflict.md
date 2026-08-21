@@ -13,6 +13,43 @@ out to remove.
 
 Do not reconcile them by taking whichever branch merges last.
 
+## SECOND CORRECTION 2026-08-21 — they do not actually conflict at run time
+
+The two corrections below narrowed this from "how MCP credentials work" to one
+question. This one closes it: **the two rules agree in every deployment that
+exists today**, and the title of this file overstates the problem.
+
+`#706`'s env override only fires when `SECRETS_BACKEND` is set in the child.
+greentic-designer is the only thing that sets it, via `child_env`, and only when
+`orchestrate::mcp_runtime::from_env` returns settings — which it does **only if
+`SECRETS_BROKER_ENDPOINT` is non-empty** (it returns `Ok(None)` otherwise, and
+`child_env` then emits nothing). So with no broker configured, a spawned child
+sees no `SECRETS_BACKEND`, `choose_mcp_secrets` returns the injected manager,
+and #706 behaves exactly as #705 wants.
+
+And there is no broker to configure. greentic-designer-admin carries zero
+`SECRETS_BROKER` references on `develop`, stores secrets through a local
+`FileBackend`, and names a network broker an explicit Non-Goal in its own spec.
+
+So:
+
+- **Behaviourally: compatible.** #706's override is dormant, not opposed.
+- **Structurally: still incompatible.** #705 DELETED `mcp_node::aw::secrets_from_env`,
+  which `choose_mcp_secrets` calls. A merge has to keep that function, or adapt
+  #706's call. That is the whole remaining merge work — it is a build break to
+  resolve, not a semantics argument to win.
+
+One more claim in the original note is wrong and worth striking explicitly:
+"greentic-start injects `{DevStore, Env, Vault}` — no broker variant, so the env
+route can never resolve". The premise is right and the conclusion does not
+follow. Only `env` cannot parse a `secrets://` URI. **Dev-store and Vault both
+read one** — greentic-start's own `src/llm/mod.rs` is documented as "Read a
+`secrets://…` reference from the bundle's dev-store". A dev-store host is not
+disqualified by lacking a broker; it resolves the URI through the manager it
+already injects, which is precisely #705's design.
+
+---
+
 ## CORRECTION 2026-08-21 — the lanes are closer than this note first said
 
 The first version of this note framed the two PRs as the whole story. They are
