@@ -479,6 +479,13 @@ async fn list_server_tools(server: &ParsedServer) -> Result<Vec<McpToolDef>, Str
                 .into_iter()
                 .map(|tool_def| McpToolDef {
                     name: tool_def.name,
+                    // A local component has no title to carry: `ToolDef` in
+                    // greentic-mcp-exec is name/description/schemas, and the WIT
+                    // behind it declares no display name. So `None` here is the
+                    // honest answer — this transport genuinely has nothing to
+                    // offer — not a field being dropped on the way through, which
+                    // is what it would be if the descriptor did carry one.
+                    title: None,
                     description: tool_def.description,
                     input_schema: tool_def.input_schema,
                     // Carried through from the component's own descriptor.
