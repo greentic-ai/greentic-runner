@@ -61,18 +61,23 @@ impl HttpTimeoutHooks {
     }
 }
 
+/// Clamp all three timeout phases to the given ceiling.
+fn clamp_config(config: OutgoingRequestConfig, ceiling: Duration) -> OutgoingRequestConfig {
+    OutgoingRequestConfig {
+        use_tls: config.use_tls,
+        connect_timeout: config.connect_timeout.min(ceiling),
+        first_byte_timeout: config.first_byte_timeout.min(ceiling),
+        between_bytes_timeout: config.between_bytes_timeout.min(ceiling),
+    }
+}
+
 impl WasiHttpHooks for HttpTimeoutHooks {
     fn send_request(
         &mut self,
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
     ) -> HttpResult<types::HostFutureIncomingResponse> {
-        let clamped = OutgoingRequestConfig {
-            use_tls: config.use_tls,
-            connect_timeout: config.connect_timeout.min(self.ceiling),
-            first_byte_timeout: config.first_byte_timeout.min(self.ceiling),
-            between_bytes_timeout: config.between_bytes_timeout.min(self.ceiling),
-        };
+        let clamped = clamp_config(config, self.ceiling);
         Ok(default_send_request(request, clamped))
     }
 }
@@ -106,10 +111,9 @@ mod tests {
         assert_eq!(ceiling_from(Some("  45  ")), Duration::from_secs(45));
     }
 
-    #[tokio::test]
-    async fn send_request_lowers_a_longer_or_absent_field() {
-        let mut hooks = HttpTimeoutHooks::with_ceiling(Duration::from_secs(10));
-        let req = test_request();
+    #[test]
+    fn send_request_lowers_a_longer_or_absent_field() {
+        let ceiling = Duration::from_secs(10);
         // The library's own 600s-per-phase default, unmodified — the "absent
         // guest override" case.
         let config = OutgoingRequestConfig {
@@ -118,21 +122,7 @@ mod tests {
             first_byte_timeout: Duration::from_secs(600),
             between_bytes_timeout: Duration::from_secs(600),
         };
-        let resp = hooks
-            .send_request(req, config)
-            .expect("send_request never itself errors — it always delegates");
-        // The response is `Pending` regardless of the clamp (the clamp only
-        // affects how long the pending future takes to resolve on a hung
-        // connection); Task 1's test proves the resolved-value shape, this
-        // test proves the CONFIG passed into `default_send_request` was
-        // actually clamped, by re-deriving what `send_request` computed.
-        drop(resp);
-        let clamped = OutgoingRequestConfig {
-            use_tls: false,
-            connect_timeout: Duration::from_secs(600).min(hooks.ceiling),
-            first_byte_timeout: Duration::from_secs(600).min(hooks.ceiling),
-            between_bytes_timeout: Duration::from_secs(600).min(hooks.ceiling),
-        };
+        let clamped = clamp_config(config, ceiling);
         assert_eq!(clamped.connect_timeout, Duration::from_secs(10));
         assert_eq!(clamped.first_byte_timeout, Duration::from_secs(10));
         assert_eq!(clamped.between_bytes_timeout, Duration::from_secs(10));
@@ -140,24 +130,40 @@ mod tests {
 
     #[test]
     fn a_guest_supplied_shorter_value_is_never_raised() {
-        let hooks = HttpTimeoutHooks::with_ceiling(Duration::from_secs(30));
+        let ceiling = Duration::from_secs(30);
         let guest_value = Duration::from_secs(3);
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: guest_value,
+            first_byte_timeout: guest_value,
+            between_bytes_timeout: guest_value,
+        };
+        let clamped = clamp_config(config, ceiling);
         assert_eq!(
-            guest_value.min(hooks.ceiling),
-            guest_value,
+            clamped.connect_timeout, guest_value,
             "a 3s guest value must survive unchanged against a 30s ceiling"
         );
+        assert_eq!(clamped.first_byte_timeout, guest_value);
+        assert_eq!(clamped.between_bytes_timeout, guest_value);
     }
 
     #[test]
     fn a_guest_supplied_longer_value_is_lowered() {
-        let hooks = HttpTimeoutHooks::with_ceiling(Duration::from_secs(30));
+        let ceiling = Duration::from_secs(30);
         let guest_value = Duration::from_secs(600);
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: guest_value,
+            first_byte_timeout: guest_value,
+            between_bytes_timeout: guest_value,
+        };
+        let clamped = clamp_config(config, ceiling);
         assert_eq!(
-            guest_value.min(hooks.ceiling),
-            hooks.ceiling,
+            clamped.connect_timeout, ceiling,
             "a 600s guest value must be lowered to the 30s ceiling"
         );
+        assert_eq!(clamped.first_byte_timeout, ceiling);
+        assert_eq!(clamped.between_bytes_timeout, ceiling);
     }
 
     fn test_request() -> hyper::Request<HyperOutgoingBody> {
