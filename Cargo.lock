@@ -4170,6 +4170,7 @@ dependencies = [
  "hmac 0.13.0",
  "http-body-util",
  "humantime",
+ "hyper",
  "indexmap 2.14.0",
  "jsonschema 0.45.1",
  "lru 0.16.4",

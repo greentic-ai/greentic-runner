@@ -1,12 +1,13 @@
-//! Characterizes how `wasmtime-wasi-http` surfaces a connect timeout, at the
-//! exact seam `HttpTimeoutHooks::send_request` (Task 2) will delegate to.
+//! Characterizes how `wasmtime-wasi-http` surfaces a connection failure, at
+//! the exact seam `HttpTimeoutHooks::send_request` (Task 2) delegates to.
 //! This is load-bearing for the rest of this plan: it confirms that a
-//! connection timeout produces a guest-visible inner `wasi:http` error-code
+//! connection failure produces a guest-visible inner `wasi:http` error-code
 //! (not a host-level `Err`), which is why no new detection code was added to
 //! `runner/engine.rs` — the existing `component_error` / `has_error_route`
 //! path (Phase 1-3) already routes whatever shape `component-http` reshapes
 //! this into. The specific error variant legitimately varies by network
-//! environment; what matters is the SHAPE (inner Err, guest-visible).
+//! environment; what matters is the SHAPE (inner Err, guest-visible), not
+//! the specific variant.
 
 use std::time::Duration;
 

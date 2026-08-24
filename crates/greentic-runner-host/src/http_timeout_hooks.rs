@@ -7,6 +7,13 @@
 //! phase down to [`ceiling()`] before delegating to the library's own
 //! [`default_send_request`], so a component's own shorter, explicitly-set
 //! timeout is never raised — only an absent or longer one is lowered.
+//!
+//! This bounds a hung connection, not total transfer time: `connect_timeout`
+//! and `first_byte_timeout` are each a single bound and this makes both
+//! effectively fire within the ceiling, but `between_bytes_timeout` resets on
+//! every chunk received, so a server that trickles one byte every N seconds
+//! (N < ceiling) never trips it and can hold the connection open
+//! indefinitely.
 
 use std::time::Duration;
 
@@ -112,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn send_request_lowers_a_longer_or_absent_field() {
+    fn clamp_config_lowers_a_longer_or_absent_field() {
         let ceiling = Duration::from_secs(10);
         // The library's own 600s-per-phase default, unmodified — the "absent
         // guest override" case.
@@ -166,15 +173,82 @@ mod tests {
         assert_eq!(clamped.between_bytes_timeout, ceiling);
     }
 
-    fn test_request() -> hyper::Request<HyperOutgoingBody> {
+    fn test_request(addr: std::net::SocketAddr) -> hyper::Request<HyperOutgoingBody> {
         use http_body_util::BodyExt;
         hyper::Request::builder()
-            .uri("http://192.0.2.1:9")
+            .uri(format!("http://{addr}"))
             .body(
                 http_body_util::Empty::<bytes::Bytes>::new()
                     .map_err(|_: std::convert::Infallible| unreachable!())
                     .boxed_unsync(),
             )
             .unwrap()
+    }
+
+    /// Proves both halves the review flagged: that `send_request` itself
+    /// (the trait impl, not just `clamp_config`) applies the ceiling, and
+    /// that it bounds real WALL-CLOCK time — not just eventually resolving.
+    ///
+    /// A TCP listener accepts the connection (so `connect_timeout` is not
+    /// what fires) and then never writes a response, holding it open so
+    /// `default_send_request` hangs waiting for a first byte. The `config`
+    /// passed in carries the library's own 600s-per-phase default for every
+    /// field, so if `send_request` ever forwarded `config` unclamped, this
+    /// test would hang for minutes rather than complete in well under the 5s
+    /// budget below — that gap is what makes this a real regression guard,
+    /// not just a smoke test.
+    #[tokio::test]
+    async fn send_request_bounds_wall_time_to_the_ceiling() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind an ephemeral localhost port");
+        let addr = listener
+            .local_addr()
+            .expect("failed to read the bound local address");
+
+        // Accept the connection and then hold it open forever without ever
+        // writing a response byte. Aborted implicitly when the test's
+        // #[tokio::test] runtime is torn down at the end of the test.
+        tokio::spawn(async move {
+            if let Ok((_stream, _peer)) = listener.accept().await {
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let ceiling = Duration::from_millis(300);
+        let mut hooks = HttpTimeoutHooks::with_ceiling(ceiling);
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::from_secs(600),
+            first_byte_timeout: Duration::from_secs(600),
+            between_bytes_timeout: Duration::from_secs(600),
+        };
+        let request = test_request(addr);
+
+        let start = std::time::Instant::now();
+        let response = hooks
+            .send_request(request, config)
+            .expect("send_request should not fail synchronously");
+        let types::HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("expected Pending — default_send_request always spawns");
+        };
+        let outer = handle.await;
+        let elapsed = start.elapsed();
+
+        // Generous enough to avoid flakiness in a slow sandbox, but two
+        // orders of magnitude below the library's 600s default, so this
+        // only passes if the 300ms ceiling — not the 600s config field —
+        // actually bounded wall time.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "expected the 300ms ceiling to bound wall time, took {elapsed:?}"
+        );
+
+        let inner =
+            outer.expect("expected a host-level Ok wrapping the guest-visible result, got a host-level Err");
+        assert!(
+            inner.is_err(),
+            "expected a first-byte-timeout failure, got a real response: {inner:?}"
+        );
     }
 }
