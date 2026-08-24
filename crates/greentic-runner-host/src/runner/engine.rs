@@ -3624,6 +3624,18 @@ fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeO
     let Some(error) = result.get("error") else {
         return NodeOutput::new(bound);
     };
+    // `error` is not always a plain string: greentic-mcp-generator's
+    // `tool_error_with_status` shape (`{"error":{"code","message","status"}}`,
+    // the same shape `mcp_tool_error` already parses for the component-error
+    // path around `execute_component_call`) puts an object there. Try that
+    // detector FIRST so this shape gets the real `tool_error` code and the
+    // status-qualified message it already computes, instead of falling
+    // through to the plain-string handling below — which would stuff the
+    // whole serialized error object into `message` and hardcode a generic
+    // `mcp_call_failed` code, discarding both.
+    if let Some((code, message)) = mcp_tool_error(result) {
+        return NodeOutput::errored(normalize_mcp_tool_error(&bound, &code, &message));
+    }
     let message = error
         .as_str()
         .map(str::to_string)
@@ -7625,6 +7637,55 @@ mod tests {
             errors[0]["message"], "MCP is not configured on this runner",
             "{{{{node.<id>.errors[0].message}}}} must surface the real message"
         );
+    }
+
+    /// The failure shape is not always a plain string: greentic-mcp-generator's
+    /// `tool_error_with_status` emits `{"error":{"code","message","status"}}`
+    /// (Phase 2's weatherapi-401 case, `mcp_tool_error_recognises_generator_error_shape`).
+    /// `mcp_node_output` must reuse `mcp_tool_error` for this shape rather than
+    /// falling into the plain-string arm, which would stuff the whole
+    /// serialized error object into `message` and discard the real
+    /// `tool_error` code for a hardcoded `mcp_call_failed`.
+    ///
+    /// Compared against calling `mcp_tool_error` directly on the same value —
+    /// not a hand-typed string — so this test cannot drift from the detector
+    /// it is supposed to match.
+    #[test]
+    fn mcp_node_output_uses_mcp_tool_error_for_the_object_shaped_error() {
+        let result = json!({
+            "error": {
+                "code": "tool_error",
+                "message": "API request returned status 401",
+                "status": 401
+            }
+        });
+        let bound = result.clone();
+
+        let (expected_code, expected_message) =
+            mcp_tool_error(&result).expect("the detector must recognise this shape");
+
+        let out = mcp_node_output(bound, &result, true);
+
+        assert!(
+            !out.ok,
+            "an object-shaped MCP tool error with an error route must not report ok"
+        );
+        assert_eq!(
+            component_error(&out.payload),
+            Some((expected_code.clone(), expected_message.clone())),
+            "the code/message must be exactly what mcp_tool_error derives, got {:?}",
+            out.payload
+        );
+        // Pin the values themselves too, so a future change to mcp_tool_error's
+        // formatting is visible here as well as in its own test.
+        assert_eq!(expected_code, "tool_error");
+        assert!(expected_message.contains("API request returned status 401"));
+        assert!(expected_message.contains("(status 401)"));
+
+        let view = node_output_view(&out.payload);
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors.len(), 1, "errors must be populated, got {view:?}");
+        assert_eq!(errors[0]["message"], expected_message);
     }
 
     /// The `output:` binding key wraps the tool result under a named field
