@@ -3216,11 +3216,33 @@ impl NodeOutput {
     /// A failure output (`ok == false`). `build_routing_context` derives the
     /// `error_event` from this, so a node with an `on_error`-family route lands
     /// on its failure branch; `node_output_view` exposes the `{errors}` envelope.
+    ///
+    /// `meta` is built by MERGING two things a failure payload can carry, not
+    /// by replacing one with the other: `outcome` (read by
+    /// `build_routing_context` so a component-distinguished failure like
+    /// `on_timeout` routes to its own branch instead of the generic error
+    /// branch — mirrors the success path's `outcome_meta`) and `error` (read
+    /// by `lift_first_node_error_from_nodes`, the same carrier
+    /// `NodeOutput::with_error` populates). A component can emit both at once
+    /// (`{"ok":false,"outcome":"on_timeout","error":{...}}`), and neither must
+    /// clobber the other.
     fn errored(payload: Value) -> Self {
+        let mut meta = JsonMap::new();
+        if let Some(outcome) = payload.get("outcome").and_then(Value::as_str) {
+            meta.insert("outcome".to_string(), Value::String(outcome.to_string()));
+        }
+        if let Some(error) = payload.get("error") {
+            meta.insert("error".to_string(), error.clone());
+        }
+        let meta = if meta.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(meta)
+        };
         Self {
             ok: false,
             payload,
-            meta: Value::Null,
+            meta,
         }
     }
 }
@@ -7794,6 +7816,74 @@ mod tests {
             CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err_node"),
             other => panic!("expected on_error route, got {other:?}"),
         }
+    }
+
+    /// A failure payload carrying its own `outcome` (e.g. a component that
+    /// distinguishes `on_timeout` from a generic `on_error`) must route to
+    /// THAT branch, not to the default error branch. `NodeOutput::errored`
+    /// must therefore surface `outcome` in `meta` exactly like the success
+    /// path's `outcome_meta` already does.
+    #[test]
+    fn errored_output_with_outcome_routes_to_that_branch() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" },
+            { "condition": "event == \"on_timeout\"", "to": "timeout_node" },
+            { "condition": "event == \"on_error\"", "to": "err_node" }
+        ]);
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "outcome": "on_timeout",
+            "error": { "code": "E", "message": "m" }
+        }));
+        match evaluate_custom_routing(&raw_routing, &errored, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "timeout_node"),
+            other => panic!("expected on_timeout route, got {other:?}"),
+        }
+    }
+
+    /// `meta.error` and `meta.outcome` are competing uses of the same `meta`
+    /// field (see `NodeOutput::with_error` vs the success path's
+    /// `outcome_meta`). `NodeOutput::errored` must merge them rather than let
+    /// one clobber the other: an outcome-carrying failure payload that ALSO
+    /// carries its own `error` object must still let
+    /// `lift_first_node_error_from_nodes` read a real error message from it,
+    /// not just fall back to the generic "flow node failed" default.
+    #[test]
+    fn errored_output_preserves_meta_error_alongside_outcome() {
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "outcome": "on_timeout",
+            "error": { "code": "E1", "message": "boom" }
+        }));
+        assert_eq!(
+            errored.meta.get("outcome").and_then(Value::as_str),
+            Some("on_timeout"),
+            "outcome must survive so routing can pick the on_timeout branch"
+        );
+        assert_eq!(
+            errored.meta["error"]["message"], "boom",
+            "error must survive alongside outcome, not be clobbered by it"
+        );
+
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert("run".to_string(), errored);
+        let lifted = lift_first_node_error_from_nodes(json!({}), &nodes);
+        assert_eq!(
+            lifted["metadata"]["error_message"], "boom",
+            "lift_first_node_error_from_nodes must read the real message, not the generic fallback"
+        );
+        assert_eq!(lifted["metadata"]["node_id"], "run");
     }
 
     #[test]
