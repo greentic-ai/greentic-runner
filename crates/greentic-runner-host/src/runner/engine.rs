@@ -1535,7 +1535,13 @@ impl FlowEngine {
                     .await
             }
             NodeKind::Mcp { server_id, tool } => self
-                .execute_mcp(ctx, server_id, tool, payload)
+                .execute_mcp(
+                    ctx,
+                    server_id,
+                    tool,
+                    payload,
+                    node_has_error_route(&node.routing),
+                )
                 .await
                 .map(DispatchOutcome::complete),
         }
@@ -1787,6 +1793,7 @@ impl FlowEngine {
         server_id: &str,
         tool: &str,
         payload: Value,
+        has_error_route: bool,
     ) -> Result<NodeOutput> {
         // Payload is the source of truth: prefer the rendered `server`/`tool`
         // from config, falling back to the values resolved at flow-load time
@@ -1838,10 +1845,10 @@ impl FlowEngine {
         // the raw tool result becomes the node payload (still addressable via
         // the standard `node.<id>.payload` mechanism).
         let bound = match payload.get("output").and_then(Value::as_str) {
-            Some(key) if !key.is_empty() => json!({ key: result }),
-            _ => result,
+            Some(key) if !key.is_empty() => json!({ key: result.clone() }),
+            _ => result.clone(),
         };
-        Ok(NodeOutput::new(bound))
+        Ok(mcp_node_output(bound, &result, has_error_route))
     }
 
     /// Compile-time stub for the MCP flow node when the agentic-worker feature
@@ -1854,6 +1861,7 @@ impl FlowEngine {
         server_id: &str,
         tool: &str,
         _payload: Value,
+        _has_error_route: bool,
     ) -> Result<NodeOutput> {
         Ok(NodeOutput::new(json!({
             "error": format!(
@@ -3572,6 +3580,71 @@ fn normalize_mcp_tool_error(value: &Value, code: &str, message: &str) -> Value {
     error.insert("message".to_string(), Value::String(message.to_string()));
     obj.insert("error".to_string(), Value::Object(error));
     Value::Object(obj)
+}
+
+/// Build an MCP node's output, marking it failed when the tool did not run —
+/// but only for a node that has somewhere to route the failure.
+///
+/// `mcp_node::invoke_with_secrets` is infallible by contract: a runner
+/// without MCP credentials, a tool missing from the tenant catalog, a dead
+/// endpoint, and bad arguments all arrive as `{"error": "..."}` inside
+/// `result`, with the WIT-level call itself having returned normally. Always
+/// reporting `ok: true` left the flow with nothing to route on: a Digital
+/// Worker run showed 33/33 green nodes and rendered its quote card with
+/// every field blank.
+///
+/// **`has_error_route` gates the whole thing.** `Routing::Next` and a
+/// `Routing::Custom` array with only success-family routes have nowhere to
+/// send a failure: `evaluate_custom_routing`'s fall-through for a routing
+/// array that has conditions but matched none of them is
+/// `CustomRoutingDecision::Wait`, which PARKS the run — a worse outcome for
+/// an operator who never wired up error handling than the pre-existing
+/// silent wrong answer (a parked run needs manual intervention to ever
+/// resolve; a silent wrong answer at least lets the flow finish). So a node
+/// with no error route keeps reporting `ok: true`, byte-for-byte the pre-R3
+/// behaviour — this mirrors the `has_error_route` gate
+/// `execute_component_call` already uses for the same reason (there:
+/// `bail!` vs `NodeOutput::errored`; here: `ok: true` vs `NodeOutput::errored`),
+/// keeping the change purely additive.
+///
+/// When the node DOES have an error route, the failure is normalized into
+/// the exact `{ok:false, error:{code,message}}` shape `component_error`
+/// already recognises, via `normalize_mcp_tool_error` — reusing Phase 2's
+/// single definition of what a failed node's `{errors}` output looks like,
+/// rather than inventing a second one for this code path. `bound` (the tool
+/// result, optionally wrapped under the node's `output:` binding key) is
+/// passed as the base object, so any field already on it — most importantly
+/// the `output:` binding key — survives alongside the new top-level
+/// `ok`/`error` fields: `node.<id>.<binding-key>` keeps resolving exactly as
+/// before, while `node.<id>.errors[0].message` now resolves too.
+fn mcp_node_output(bound: Value, result: &Value, has_error_route: bool) -> NodeOutput {
+    if !has_error_route {
+        return NodeOutput::new(bound);
+    }
+    let Some(error) = result.get("error") else {
+        return NodeOutput::new(bound);
+    };
+    // `error` is not always a plain string: greentic-mcp-generator's
+    // `tool_error_with_status` shape (`{"error":{"code","message","status"}}`,
+    // the same shape `mcp_tool_error` already parses for the component-error
+    // path around `execute_component_call`) puts an object there. Try that
+    // detector FIRST so this shape gets the real `tool_error` code and the
+    // status-qualified message it already computes, instead of falling
+    // through to the plain-string handling below — which would stuff the
+    // whole serialized error object into `message` and hardcode a generic
+    // `mcp_call_failed` code, discarding both.
+    if let Some((code, message)) = mcp_tool_error(result) {
+        return NodeOutput::errored(normalize_mcp_tool_error(&bound, &code, &message));
+    }
+    let message = error
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    NodeOutput::errored(normalize_mcp_tool_error(
+        &bound,
+        "mcp_call_failed",
+        &message,
+    ))
 }
 
 fn extract_wait_reason(payload: &Value) -> Option<String> {
@@ -7513,6 +7586,257 @@ mod tests {
         );
         // `status` on the original error object survives the reshape.
         assert_eq!(normalized["error"]["status"], json!(502));
+    }
+
+    /// `mcp_node::invoke_with_secrets` is infallible: every failure (no route,
+    /// missing credential, dead endpoint, bad args) comes back as
+    /// `{"error": "<string>"}` in `result`. `execute_mcp` used to report
+    /// `ok: true` regardless, so a Digital Worker run showed 33/33 green
+    /// nodes and rendered its quote card with every field blank.
+    ///
+    /// A node WITH an `on_error`-family route must now see `ok: false`, and
+    /// the failure must be normalized into `component_error`'s
+    /// `{ok:false, error:{code,message}}` shape (via `normalize_mcp_tool_error`)
+    /// so `to_node_output`/`node_output_view` populate `{errors}` exactly like
+    /// a failed component call does — one definition of what a failed node's
+    /// errors look like, not a second one for this code path.
+    ///
+    /// `bound` here has no `output:` binding key, so it degrades to the bare
+    /// tool result (`{"error": "..."}`); `mcp_node_output_preserves_the_output_binding_key`
+    /// below covers the wrapped case.
+    #[test]
+    fn mcp_node_output_reports_failure_when_the_node_has_an_error_route() {
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let bound = result.clone();
+
+        let out = mcp_node_output(bound, &result, true);
+
+        assert!(
+            !out.ok,
+            "a failed MCP call with an error route must not report ok"
+        );
+        assert_eq!(
+            component_error(&out.payload),
+            Some((
+                "mcp_call_failed".to_string(),
+                "MCP is not configured on this runner".to_string()
+            )),
+            "the payload must be recognised by component_error verbatim, got {:?}",
+            out.payload
+        );
+        assert_eq!(
+            out.meta.pointer("/error/message").and_then(Value::as_str),
+            Some("MCP is not configured on this runner"),
+            "the message must reach meta.error where lift_first_node_error_from_nodes reads it"
+        );
+
+        let view = node_output_view(&out.payload);
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors.len(), 1, "errors must be populated, got {view:?}");
+        assert_eq!(
+            errors[0]["message"], "MCP is not configured on this runner",
+            "{{{{node.<id>.errors[0].message}}}} must surface the real message"
+        );
+    }
+
+    /// The failure shape is not always a plain string: greentic-mcp-generator's
+    /// `tool_error_with_status` emits `{"error":{"code","message","status"}}`
+    /// (Phase 2's weatherapi-401 case, `mcp_tool_error_recognises_generator_error_shape`).
+    /// `mcp_node_output` must reuse `mcp_tool_error` for this shape rather than
+    /// falling into the plain-string arm, which would stuff the whole
+    /// serialized error object into `message` and discard the real
+    /// `tool_error` code for a hardcoded `mcp_call_failed`.
+    ///
+    /// Compared against calling `mcp_tool_error` directly on the same value —
+    /// not a hand-typed string — so this test cannot drift from the detector
+    /// it is supposed to match.
+    #[test]
+    fn mcp_node_output_uses_mcp_tool_error_for_the_object_shaped_error() {
+        let result = json!({
+            "error": {
+                "code": "tool_error",
+                "message": "API request returned status 401",
+                "status": 401
+            }
+        });
+        let bound = result.clone();
+
+        let (expected_code, expected_message) =
+            mcp_tool_error(&result).expect("the detector must recognise this shape");
+
+        let out = mcp_node_output(bound, &result, true);
+
+        assert!(
+            !out.ok,
+            "an object-shaped MCP tool error with an error route must not report ok"
+        );
+        assert_eq!(
+            component_error(&out.payload),
+            Some((expected_code.clone(), expected_message.clone())),
+            "the code/message must be exactly what mcp_tool_error derives, got {:?}",
+            out.payload
+        );
+        // Pin the values themselves too, so a future change to mcp_tool_error's
+        // formatting is visible here as well as in its own test.
+        assert_eq!(expected_code, "tool_error");
+        assert!(expected_message.contains("API request returned status 401"));
+        assert!(expected_message.contains("(status 401)"));
+
+        let view = node_output_view(&out.payload);
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors.len(), 1, "errors must be populated, got {view:?}");
+        assert_eq!(errors[0]["message"], expected_message);
+    }
+
+    /// The `output:` binding key wraps the tool result under a named field
+    /// (e.g. `quote_result_data`). Requirement 1 (keep the bound payload
+    /// untouched) and requirement 2 (populate `{errors}`) both hold at once:
+    /// `normalize_mcp_tool_error` is handed `bound` itself, so the wrapped
+    /// field survives verbatim alongside the new top-level `ok`/`error`
+    /// fields the errors envelope needs. `node.<id>.quote_result_data` and
+    /// `node.<id>.errors[0].message` must both resolve from the same output.
+    #[test]
+    fn mcp_node_output_preserves_the_output_binding_key_alongside_the_error_envelope() {
+        let result = json!({ "error": "connection refused" });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_node_output(bound.clone(), &result, true);
+
+        assert!(!out.ok);
+        assert_eq!(
+            out.payload["quote_result_data"], result,
+            "the output-key binding must survive untouched, got {:?}",
+            out.payload
+        );
+        assert_eq!(out.payload["ok"], json!(false));
+        assert_eq!(out.payload["error"]["code"], "mcp_call_failed");
+        assert_eq!(out.payload["error"]["message"], "connection refused");
+
+        let view = node_output_view(&out.payload);
+        assert_eq!(
+            view["quote_result_data"], result,
+            "{{{{node.<id>.quote_result_data}}}} must still resolve, got {view:?}"
+        );
+        let errors = view["errors"].as_array().expect("errors must be an array");
+        assert_eq!(errors[0]["message"], "connection refused");
+    }
+
+    /// R3's answer to the third routing shape: a node whose `Routing::Custom`
+    /// carries only success-family routes (or `Routing::Next`, which never
+    /// has an error route by construction — see
+    /// `node_has_error_route_detects_error_family_ports`) has nowhere to
+    /// route a failure. `evaluate_custom_routing`'s fall-through for a
+    /// routing array with conditions but no match is `CustomRoutingDecision::
+    /// Wait`, which PARKS the run — worse than the pre-R3 silent wrong
+    /// answer for an operator who never wired up error handling. So the
+    /// failure is surfaced only when `has_error_route` is true; a node
+    /// without one keeps reporting `ok: true`, byte-for-byte the pre-R3
+    /// behaviour.
+    #[test]
+    fn mcp_node_output_ignores_failure_when_the_node_has_no_error_route() {
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        let out = mcp_node_output(bound.clone(), &result, false);
+
+        assert!(
+            out.ok,
+            "a node with no error route must keep reporting ok, unchanged from pre-R3"
+        );
+        assert_eq!(
+            out.payload, bound,
+            "the payload must be exactly the bound value, no envelope reshaping"
+        );
+        assert_eq!(out.meta, Value::Null);
+    }
+
+    /// The success path must stay exactly as it was, regardless of
+    /// `has_error_route`: a node that opted into error routing but whose
+    /// call succeeded must not be affected.
+    #[test]
+    fn mcp_node_output_stays_ok_on_success_regardless_of_error_route() {
+        let result = json!({ "annual_premium": 1234 });
+        let bound = json!({ "quote_result_data": result.clone() });
+
+        for has_error_route in [true, false] {
+            let out = mcp_node_output(bound.clone(), &result, has_error_route);
+            assert!(out.ok, "a successful MCP call must report ok");
+            assert_eq!(out.payload, bound);
+            assert_eq!(out.meta, Value::Null);
+        }
+    }
+
+    /// Case 2 of the third-routing-shape analysis: a node WITH an `on_error`
+    /// route takes it — this is the point of R3.
+    #[test]
+    fn mcp_failure_with_on_error_route_routes_to_the_error_branch() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" },
+            { "condition": "event == \"on_error\"", "to": "err_node" }
+        ]);
+        let routing = Routing::Custom(raw_routing.clone());
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let has_error_route = node_has_error_route(&routing);
+        assert!(has_error_route);
+        let out = mcp_node_output(result.clone(), &result, has_error_route);
+
+        match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(nid.as_str(), "err_node"),
+            other => panic!("expected the on_error route, got {other:?}"),
+        }
+    }
+
+    /// Case 3 of the third-routing-shape analysis, pinned end to end through
+    /// `evaluate_custom_routing`: a node whose `Routing::Custom` array has
+    /// only success-family routes never flips to `ok: false`, so it stays on
+    /// the success path — never `CustomRoutingDecision::Wait` (parked).
+    #[test]
+    fn mcp_failure_with_success_only_routing_never_parks() {
+        let raw_routing = json!([
+            { "condition": "event == \"on_success\"", "to": "ok_node" }
+        ]);
+        let routing = Routing::Custom(raw_routing.clone());
+        let flow_ir = HostFlow {
+            id: "flow.test".to_string(),
+            start: None,
+            nodes: IndexMap::new(),
+            vars_init: JsonMap::new(),
+            required_vars: Vec::new(),
+            slot_schema: None,
+        };
+        let current = NodeId::from_str("current").unwrap();
+        let state = ExecutionState::new(json!({}));
+
+        let result = json!({ "error": "MCP is not configured on this runner" });
+        let has_error_route = node_has_error_route(&routing);
+        assert!(
+            !has_error_route,
+            "a success-only Custom routing has no error branch"
+        );
+        let out = mcp_node_output(result.clone(), &result, has_error_route);
+        assert!(out.ok, "no error route means the failure is not surfaced");
+
+        match evaluate_custom_routing(&raw_routing, &out, &state, &flow_ir, &current) {
+            CustomRoutingDecision::Next(nid) => assert_eq!(
+                nid.as_str(),
+                "ok_node",
+                "the flow must continue on the success path, not park"
+            ),
+            other => panic!(
+                "a node with no error route must never park on an MCP failure, got {other:?}"
+            ),
+        }
     }
 
     #[tokio::test]
