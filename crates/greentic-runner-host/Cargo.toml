@@ -220,6 +220,7 @@ wasmtime-wasi-tls = { workspace = true }
 # (via wasmtime-wasi-tls) are linked, so the runner must pick one explicitly.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 greentic-telemetry = { workspace = true }
+hyper = "1"
 
 [dev-dependencies]
 criterion.workspace = true

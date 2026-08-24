@@ -64,6 +64,7 @@ pub mod watcher;
 
 mod activity;
 mod host;
+mod http_timeout_hooks;
 pub mod oauth;
 
 pub use activity::{Activity, ActivityKind, WelcomeFlowHint};

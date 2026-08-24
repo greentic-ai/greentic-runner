@@ -1,7 +1,7 @@
 # A real HTTP timeout for outbound component calls
 
 **Date:** 2026-08-24
-**Status:** Design — approved, pending plan
+**Status:** 4a implemented. 4b resolved as not-reachable (confirmed 2026-08-24) — see the note at the end of this document.
 **Repo:** `greentic-runner` (runner-only)
 **Area:** `crates/greentic-runner-host/src/pack.rs` (WASI HTTP wiring), `crates/greentic-runner-host/src/runner/engine.rs` (failure detection)
 
@@ -205,3 +205,33 @@ HTTP node (canvas) → component.exec (ygtc) → component-http wasm
   separate repo. If 4b's investigation finds the timeout is only
   guest-visible and `component-http` does not currently distinguish it from
   other failures, closing that gap belongs to that repo, not this one.
+
+## 2026-08-24: Task 1's finding, and what it settled
+
+The discriminating test (`crates/greentic-runner-host/tests/http_timeout_shape.rs`)
+confirmed branch 2: a `wasi:http` connection failure resolves as
+`Ok(Err(types::ErrorCode::_))` — the *inner* `Result` of
+`HostFutureIncomingResponse`'s resolved value — never as the *outer*
+`wasmtime::Result::Err`. Per `wasmtime-wasi-http`'s own doc comment on
+`HostFutureIncomingResponse::Ready`: "An outer error will trap while the
+inner error gets returned to the guest." An inner `Err` is exactly that:
+returned to the guest as an ordinary `wasi:http` response-or-error value,
+not a trap. (The SPECIFIC variant is environment-dependent — both
+`ErrorCode::ConnectionTimeout` and `ErrorCode::ConnectionRefused` were
+observed for the identical RFC 5737 test address across different runs of
+Task 1's test; what is guaranteed, and what this finding rests on, is the
+SHAPE — inner, guest-visible `Err` — not which variant fires.)
+
+This settles 4b as designed: it is not reachable without inspecting and
+potentially modifying `component-http`'s own source (a separate repo, out
+of scope here — see "Explicitly not doing here" above). 4a alone converts
+"the flow hangs forever" into "the flow fails within the configured
+ceiling" — `HttpTimeoutHooks` (`crates/greentic-runner-host/src/http_timeout_hooks.rs`),
+wired into every `ComponentState` in `pack.rs`. Today's existing
+`component_error` / `has_error_route` routing (Phase 1-3) already routes
+whatever failure shape `component-http` produces from that guest-visible
+error code — including a timeout — to a node's `on_error` branch when one
+is wired, exactly as any other `component-http` failure does. It is
+reported and routed as `component_error`, not as a distinguishable
+`on_timeout` outcome; giving it a distinguishable tag is `component-http`'s
+decision to make, in `component-http`'s own repo.
