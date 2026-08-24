@@ -1448,6 +1448,7 @@ pub struct ComponentState {
     wasi_ctx: WasiCtx,
     wasi_tls_ctx: WasiTlsCtx,
     wasi_http_ctx: WasiHttpCtx,
+    http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks,
     resource_table: ResourceTable,
 }
 
@@ -1481,6 +1482,7 @@ impl ComponentState {
             wasi_ctx,
             wasi_tls_ctx: WasiTlsCtxBuilder::new().build(),
             wasi_http_ctx: WasiHttpCtx::new(),
+            http_timeout_hooks: crate::http_timeout_hooks::HttpTimeoutHooks::from_env(),
             resource_table: ResourceTable::new(),
         })
     }
@@ -1805,7 +1807,7 @@ impl WasiHttpView for ComponentState {
         WasiHttpCtxView {
             ctx: &mut self.wasi_http_ctx,
             table: &mut self.resource_table,
-            hooks: Default::default(),
+            hooks: &mut self.http_timeout_hooks,
         }
     }
 }
