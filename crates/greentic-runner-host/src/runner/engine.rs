@@ -2478,7 +2478,17 @@ impl FlowEngine {
         // node_io error routing.
         if let Some((code, message)) = mcp_tool_error(&value) {
             if call.has_error_route {
-                return Ok(NodeOutput::errored(value));
+                // Normalize into the same `{ok:false, error:{code,message}}` shape
+                // `component_error` recognises, rather than teaching `to_node_output`
+                // a second "what does a failed node's error look like" branch. This
+                // makes `to_node_output` (the `{errors}` envelope) and `meta.error`
+                // (read by `lift_first_node_error_from_nodes`) agree with each other
+                // AND with the `bail!` message below on the code/message pair —
+                // there is exactly one place, `mcp_tool_error`, that decides what
+                // an MCP tool error's code/message are.
+                return Ok(NodeOutput::errored(normalize_mcp_tool_error(
+                    &value, &code, &message,
+                )));
             }
             bail!(
                 "component {} returned tool error: {}: {}",
@@ -3534,6 +3544,34 @@ fn mcp_tool_error(value: &Value) -> Option<(String, String)> {
         None => raw_message.to_string(),
     };
     Some((code.to_string(), message))
+}
+
+/// Reshape an MCP-shaped tool-error payload (`{ "error": { "code", "message",
+/// "status" } }`, no `ok`/`result` key) into the `{ok:false, error:{code,message}}`
+/// shape `component_error` already recognises. `code`/`message` are the pair
+/// `mcp_tool_error` already computed (so `message` is the status-qualified string,
+/// identical to what the `bail!` branch would have said) and simply replace the
+/// raw `error.code`/`error.message` fields; any other field on `error` (e.g.
+/// `status`) and any other top-level field on the payload survive untouched.
+///
+/// This is the single normalization point: once a payload is in this shape,
+/// `to_node_output` (the `{{node.<id>.errors}}` template envelope) and
+/// `NodeOutput::errored`'s `meta.error` (read by
+/// `lift_first_node_error_from_nodes`) both read it exactly as they already read
+/// a genuine `component_error` failure — no second "what does a failed node's
+/// error look like" branch needed anywhere downstream.
+fn normalize_mcp_tool_error(value: &Value, code: &str, message: &str) -> Value {
+    let mut obj = value.as_object().cloned().unwrap_or_default();
+    obj.insert("ok".to_string(), Value::Bool(false));
+    let mut error = obj
+        .get("error")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    error.insert("code".to_string(), Value::String(code.to_string()));
+    error.insert("message".to_string(), Value::String(message.to_string()));
+    obj.insert("error".to_string(), Value::Object(error));
+    Value::Object(obj)
 }
 
 fn extract_wait_reason(payload: &Value) -> Option<String> {
@@ -7458,6 +7496,25 @@ mod tests {
         assert!(mcp_tool_error(&json!({"error": "oops"})).is_none());
     }
 
+    /// `normalize_mcp_tool_error` must produce exactly the shape
+    /// `component_error` recognises, carrying the already status-qualified
+    /// message (not the raw one), and must not drop unrelated fields (e.g.
+    /// `error.status`).
+    #[test]
+    fn normalize_mcp_tool_error_matches_component_error_shape() {
+        let value = json!({
+            "error": { "code": "tool_error", "message": "boom", "status": 502 }
+        });
+        let normalized = normalize_mcp_tool_error(&value, "tool_error", "boom (status 502)");
+        assert_eq!(
+            component_error(&normalized),
+            Some(("tool_error".to_string(), "boom (status 502)".to_string())),
+            "the normalized payload must be recognised by component_error verbatim"
+        );
+        // `status` on the original error object survives the reshape.
+        assert_eq!(normalized["error"]["status"], json!(502));
+    }
+
     #[tokio::test]
     async fn execute_non_user_facing_flow_failure_still_propagates() {
         // No session_id => internal job. Errors still propagate as Err so
@@ -7882,6 +7939,30 @@ mod tests {
         assert_eq!(
             lifted["metadata"]["error_message"], "boom",
             "lift_first_node_error_from_nodes must read the real message, not the generic fallback"
+        );
+        assert_eq!(lifted["metadata"]["node_id"], "run");
+    }
+
+    /// The plain, common `component_error` shape — `{ok:false, error:{code,message}}`,
+    /// no `outcome` — is exactly what `execute_component_call`'s `component_error`
+    /// branch actually hands to `NodeOutput::errored`. Before R2, `errored` hardcoded
+    /// `meta = Value::Null`, so this exact routed failure always surfaced the generic
+    /// "flow node failed" default here regardless of what the component said.
+    /// `errored_output_preserves_meta_error_alongside_outcome` above only covers the
+    /// outcome+error combination; this covers the far more common outcome-less one.
+    #[test]
+    fn component_error_routed_failure_surfaces_real_message_via_lift() {
+        let errored = NodeOutput::errored(json!({
+            "ok": false,
+            "error": { "code": "E1", "message": "disk full" }
+        }));
+        let mut nodes: HashMap<String, NodeOutput> = HashMap::new();
+        nodes.insert("run".to_string(), errored);
+        let lifted = lift_first_node_error_from_nodes(json!({}), &nodes);
+        assert_eq!(
+            lifted["metadata"]["error_message"], "disk full",
+            "a component_error-routed failure must surface its real message, \
+             not the generic \"flow node failed\" default"
         );
         assert_eq!(lifted["metadata"]["node_id"], "run");
     }

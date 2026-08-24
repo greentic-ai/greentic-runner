@@ -1025,7 +1025,10 @@ fn envelope_payload(value: &Value) -> Result<Value> {
 // function.
 
 fn mcp_tool_error_payload() -> Value {
-    json!({ "error": { "code": "E1", "message": "boom" } })
+    // `status` is included deliberately: `mcp_tool_error` folds it into the
+    // message ("boom (status 502)"), and the routed and bailed paths must
+    // agree on that formatted message, not just on the bare "boom".
+    json!({ "error": { "code": "E1", "message": "boom", "status": 502 } })
 }
 
 /// Builds a flow whose `run` node calls `qa.process` with an MCP-shaped tool
@@ -1235,6 +1238,43 @@ fn mcp_tool_error_with_route_completes_instead_of_bailing() -> Result<()> {
             );
         }
     }
+
+    // Completing is not enough on its own — an empty `{errors}` envelope would
+    // complete too. Assert the on_error branch (not on_success) is the one
+    // that actually ran, and that the `run` node's own output carries a
+    // populated `{errors}` envelope with the real code/message, status included.
+    assert!(
+        execution.node_outputs.contains_key("err"),
+        "the on_error branch (err node) must have run: {:?}",
+        execution.node_outputs
+    );
+    assert!(
+        !execution.node_outputs.contains_key("ok"),
+        "the on_success branch (ok node) must NOT have run: {:?}",
+        execution.node_outputs
+    );
+
+    let run_output = execution
+        .node_outputs
+        .get("run")
+        .context("the run node itself must be recorded in node_outputs")?;
+    let errors = run_output["errors"].as_array().with_context(|| {
+        format!(
+            "a routed MCP tool error must populate the {{errors}} envelope, \
+             not leave it empty (read as success data): {run_output:?}"
+        )
+    })?;
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected exactly one error in the envelope: {run_output:?}"
+    );
+    assert_eq!(errors[0]["code"], "E1");
+    assert_eq!(
+        errors[0]["message"], "boom (status 502)",
+        "the routed error must carry the same status-qualified message the \
+         bail! path would have used, not the bare message"
+    );
     Ok(())
 }
 
