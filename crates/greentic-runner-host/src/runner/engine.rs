@@ -2469,7 +2469,17 @@ impl FlowEngine {
         // value with the WIT envelope still ok=true (because the wasm guest
         // returned normally). Treat them the same as a component_error so the
         // engine error-envelope lift path surfaces the failure to the user.
+        //
+        // This mirrors the `component_error` branch above: the asymmetry (this
+        // branch bailing unconditionally while `component_error` checked
+        // `has_error_route` first) was chronological, not deliberate — the
+        // unconditional bail predates `has_error_route`/`NodeOutput::errored`
+        // entirely, and nothing about the MCP wire shape makes it exempt from
+        // node_io error routing.
         if let Some((code, message)) = mcp_tool_error(&value) {
+            if call.has_error_route {
+                return Ok(NodeOutput::errored(value));
+            }
             bail!(
                 "component {} returned tool error: {}: {}",
                 call.component_ref,
