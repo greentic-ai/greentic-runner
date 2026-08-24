@@ -244,8 +244,9 @@ mod tests {
             "expected the 300ms ceiling to bound wall time, took {elapsed:?}"
         );
 
-        let inner =
-            outer.expect("expected a host-level Ok wrapping the guest-visible result, got a host-level Err");
+        let inner = outer.expect(
+            "expected a host-level Ok wrapping the guest-visible result, got a host-level Err",
+        );
         assert!(
             inner.is_err(),
             "expected a first-byte-timeout failure, got a real response: {inner:?}"
