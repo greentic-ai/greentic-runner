@@ -3149,11 +3149,55 @@ fn alias_input_to_entry(mut entry: Value) -> Value {
     entry
 }
 
+/// Merge the submitted form fields into the entry object's own ROOT, so a node
+/// parameter can read `{{entry.<field>}}` on either delivery path.
+///
+/// One submit is normalised in three independent places, and until this merge
+/// existed `template_context` was the only one of them doing none of it:
+///
+/// * [`attach_pending_card_answers`] calls [`submitted_fields`] and exposes the
+///   flat view as `node.<card>.answers.<field>`;
+/// * [`build_routing_context`] does **not** call it — `response.*` is built
+///   straight from [`resolve_entry_metadata`] (the metadata object, plus the
+///   envelope `text`), which is exactly why `response.action` survives there;
+/// * node parameters received the envelope verbatim. So `{{entry.<field>}}`
+///   rendered the empty string on the wrapped `greentic-start` path while the
+///   same card resolved under Run Demo, whose inputs already sit at the entry
+///   root — one card, correct in the editor preview and blank in production.
+///
+/// Additive only, and **a key already present at the entry root wins**: `input`,
+/// `tenant`, `team`, `correlation_id` and every other envelope key keep their
+/// exact meaning, so no digest-pinned pack reading `entry.input.metadata.*` or
+/// `in.input.metadata.*` can observe a change.
+///
+/// The keys [`submitted_fields`] drops stay dropped, and for node config the
+/// reason is its own rather than inherited from the answers map: **each one is
+/// still reachable by its raw path, so dropping it costs nothing.** `metadata`
+/// and `text` are the envelope's bookkeeping and its message body, still at
+/// `entry.metadata` / `entry.input.metadata` and `entry.text` /
+/// `entry.input.text`. `action` is dropped only from INSIDE the metadata, where
+/// it is the route discriminator — `entry.input.metadata.action` still resolves
+/// and `response.action` is untouched — while a key named `action` at the
+/// envelope ROOT is a real keystroke on the demo path and merges like any other
+/// field.
+fn merge_submitted_fields_into_entry(mut entry: Value, fields: JsonMap<String, Value>) -> Value {
+    if let Value::Object(map) = &mut entry {
+        for (key, value) in fields {
+            map.entry(key).or_insert(value);
+        }
+    }
+    entry
+}
+
 fn template_context(state: &ExecutionState, prev: Value) -> Value {
     let entry = if state.entry.is_null() {
         Value::Object(JsonMap::new())
     } else {
-        alias_input_to_entry(state.entry.clone())
+        // `submitted_fields` is defined over the RAW envelope — the same value
+        // the other two normalisations read — so compute it before aliasing,
+        // then alias so `in.input.*` keeps resolving on the bare-message path.
+        let fields = submitted_fields(&state.entry);
+        merge_submitted_fields_into_entry(alias_input_to_entry(state.entry.clone()), fields)
     };
     let mut ctx = JsonMap::new();
     ctx.insert("entry".into(), entry.clone());
@@ -4819,6 +4863,151 @@ mod tests {
     fn alias_input_to_entry_ignores_non_objects() {
         assert_eq!(alias_input_to_entry(json!("hi")), json!("hi"));
         assert_eq!(alias_input_to_entry(json!(null)), json!(null));
+    }
+
+    /// Render one template string against the context a node parameter sees.
+    fn render_entry(entry: Value, expr: &str) -> Value {
+        let st = ExecutionState::new(entry);
+        let ctx = template_context(&st, Value::Null);
+        render_template_value(&json!(expr), &ctx, TemplateOptions::default())
+            .expect("template renders")
+    }
+
+    #[test]
+    fn entry_root_exposes_submitted_fields_on_the_wrapped_path() {
+        // greentic-start wraps the activity, so the submitted field lands at
+        // entry.input.metadata.* and `{{entry.company_size}}` used to render
+        // the empty string with no warning at any layer.
+        let entry = json!({
+            "input": {
+                "metadata": { "action": "submit", "company_size": "11-50" },
+                "text": "hi"
+            },
+            "tenant": "acme",
+            "correlation_id": "c-1"
+        });
+
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.company_size}}"),
+            json!("11-50")
+        );
+        // `in` is an alias of `entry`, so it must resolve identically.
+        assert_eq!(
+            render_entry(entry.clone(), "{{in.company_size}}"),
+            json!("11-50")
+        );
+        // The raw paths a digest-pinned pack already reads keep working.
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.input.metadata.company_size}}"),
+            json!("11-50")
+        );
+        assert_eq!(
+            render_entry(entry.clone(), "{{in.input.metadata.company_size}}"),
+            json!("11-50")
+        );
+        // The envelope's own keys are untouched.
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.tenant}}"),
+            json!("acme")
+        );
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.correlation_id}}"),
+            json!("c-1")
+        );
+        // `text` and `action` are not merged as fields, but stay reachable raw.
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.input.text}}"),
+            json!("hi")
+        );
+        assert_eq!(
+            render_entry(entry, "{{entry.input.metadata.action}}"),
+            json!("submit")
+        );
+    }
+
+    #[test]
+    fn entry_root_exposes_submitted_fields_on_the_demo_path() {
+        // Run Demo puts input ids at the entry ROOT beside `metadata`, so the
+        // root field already resolved — but a metadata-only field did not.
+        // Both lanes must now agree.
+        let entry = json!({
+            "company_size": "11-50",
+            "metadata": { "action": "submit", "email": "a@b.c" },
+            "text": "hi"
+        });
+
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.company_size}}"),
+            json!("11-50")
+        );
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.email}}"),
+            json!("a@b.c")
+        );
+        // Raw paths still resolve on this shape too.
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.metadata.email}}"),
+            json!("a@b.c")
+        );
+        // The envelope body keeps its own meaning rather than being overwritten.
+        assert_eq!(render_entry(entry, "{{entry.text}}"), json!("hi"));
+    }
+
+    #[test]
+    fn entry_merge_never_clobbers_an_existing_root_key() {
+        // A submitted field colliding with an envelope key must lose: `tenant`
+        // is the caller's identity, not a form input.
+        let entry = json!({
+            "input": {
+                "metadata": { "tenant": "evil", "company_size": "11-50" }
+            },
+            "tenant": "acme"
+        });
+
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.tenant}}"),
+            json!("acme")
+        );
+        assert_eq!(
+            render_entry(entry.clone(), "{{entry.company_size}}"),
+            json!("11-50")
+        );
+        // `input` itself must survive as the envelope object.
+        assert_eq!(
+            render_entry(entry, "{{entry.input.metadata.company_size}}"),
+            json!("11-50")
+        );
+    }
+
+    #[test]
+    fn entry_and_in_stay_identical_after_the_merge() {
+        let entry = json!({
+            "input": { "metadata": { "action": "submit", "email": "a@b.c" } },
+            "tenant": "acme"
+        });
+        let st = ExecutionState::new(entry);
+        let ctx = template_context(&st, Value::Null);
+        assert_eq!(
+            ctx.pointer("/entry"),
+            ctx.pointer("/in"),
+            "`in` is an alias of `entry` and must not drift from it"
+        );
+    }
+
+    #[test]
+    fn entry_merge_leaves_a_non_object_entry_untouched() {
+        // A bare string/null entry has no root to merge into; it must pass
+        // through exactly as `alias_input_to_entry` leaves it.
+        assert_eq!(
+            merge_submitted_fields_into_entry(json!("hi"), JsonMap::new()),
+            json!("hi")
+        );
+        let mut fields = JsonMap::new();
+        fields.insert("x".into(), json!(1));
+        assert_eq!(
+            merge_submitted_fields_into_entry(json!(null), fields),
+            json!(null)
+        );
     }
 
     #[test]
