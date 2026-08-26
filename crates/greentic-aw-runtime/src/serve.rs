@@ -357,7 +357,14 @@ pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime>
 
     let token_meter = Arc::new(MockTokenMeter::new(0));
     let ledger: Arc<dyn ToolLedger> = Arc::new(NoopToolLedger);
-    let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    // ext-runtime v1.3.2 (SDK contract research.4 bump) made `for_test()`
+    // fallible. It only fails on real construction errors (e.g. a malformed
+    // extensions root); the trivial no-extensions test double built here
+    // cannot hit that path, so `expect` is safe.
+    let ext_runtime = Arc::new(
+        greentic_ext_runtime::ExtensionRuntime::for_test()
+            .expect("ExtensionRuntime::for_test() must construct a no-extensions test double"),
+    );
 
     Arc::new(AgentRuntime::new(
         config_provider,
