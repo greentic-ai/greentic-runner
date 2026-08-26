@@ -146,6 +146,18 @@ pub trait Knowledge: Send + Sync {
     fn wrapped_backend(&self) -> Option<Arc<dyn Knowledge>> {
         None
     }
+
+    /// A stable identifier for this backend IMPLEMENTATION, so a host walking a
+    /// wrapper chain can tell one layer from another.
+    ///
+    /// Never for dispatch — nothing in this crate reads it. It exists because
+    /// [`Self::wrapped_backend`] returning `Some` says only "something is
+    /// underneath", which a second delegating wrapper satisfies exactly as well
+    /// as a corpus backend does; a host asking "did my corpus mount actually
+    /// run" needs to tell those apart.
+    fn backend_id(&self) -> &'static str {
+        "unidentified"
+    }
 }
 
 /// Convert the runtime's [`TenantContext`] into the `greentic-types`

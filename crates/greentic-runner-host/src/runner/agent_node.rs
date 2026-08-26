@@ -2990,18 +2990,15 @@ mod aw {
             /// Is a CORPUS backend mounted under the always-present extension
             /// adapter? `has_knowledge()` cannot tell — see the doc comment.
             fn corpus_backend_mounted(runtime: &AgentRuntime) -> bool {
-                runtime
-                    .knowledge_backend()
-                    .and_then(|k| k.wrapped_backend())
-                    .is_some()
+                crate::runner::knowledge_ext::corpus_backend(runtime).is_some()
             }
 
             // Embedding env present + surreal-memory backend => knowledge mounts.
             let runtime = build_runtime().await.expect("runtime should build");
             assert!(
                 corpus_backend_mounted(&runtime),
-                "in-process dw.agent runtime must mount the knowledge (RAG) seam so \
-                 search_knowledge is reachable"
+                "in-process dw.agent runtime must mount a knowledge CORPUS backend \
+                 under the extension adapter, so an ingested corpus is retrievable"
             );
 
             // Control: with the embedding endpoint unset the operator has opted
@@ -3015,7 +3012,8 @@ mod aw {
             let runtime_optout = build_runtime().await.expect("runtime should build");
             assert!(
                 !corpus_backend_mounted(&runtime_optout),
-                "knowledge must stay unmounted when the embedding endpoint env is unset"
+                "no corpus backend may be mounted when the embedding endpoint env \
+                 is unset"
             );
 
             unsafe {

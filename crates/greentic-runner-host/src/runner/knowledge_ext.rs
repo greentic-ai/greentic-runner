@@ -76,9 +76,26 @@ const MAX_CHUNK_CHARS: usize = 4_000;
 ///
 /// `augment_system_prompt` bullets everything it is handed straight into the
 /// system prompt, so an unbounded response is our token bill, not the
-/// customer's. The extension is expected to cap too; this is defence in depth
-/// at the one place third-party bytes enter the runtime.
+/// customer's. The extension is expected to cap too; this is defence in depth at
+/// the boundary that is always crossed.
+///
+/// **This is a bound on PROMPT size, not on memory.** By the time either cap
+/// applies the response has already been materialised twice: the host's
+/// `http::fetch` reads the body with `resp.bytes()` and applies no size cap at
+/// the pinned ext-runtime rev, and the tool result reaches this module as an
+/// owned `String`. A multi-gigabyte response is therefore a host memory problem
+/// these constants do not touch. Neither introduced here nor fixable here — it
+/// needs a cap on the host's HTTP port — but the distinction has to be written
+/// down, because a reader who takes these for a memory guard will not go looking.
 const MAX_TOTAL_CHARS: usize = 24_000;
+
+/// Identifies this backend within a wrapper chain.
+///
+/// [`Knowledge::wrapped_backend`] unwraps one layer and cannot tell a corpus
+/// backend from a second delegating wrapper, so a host asking "is a corpus
+/// mounted" has to walk the chain past every layer that is this adapter. See
+/// [`corpus_backend`].
+const BACKEND_ID: &str = "runner-host.knowledge_ext";
 
 /// Mount extension-delegated knowledge retrieval, wrapping whatever backend is
 /// already mounted (see the module docs — this must not replace it).
@@ -90,6 +107,36 @@ const MAX_TOTAL_CHARS: usize = 24_000;
 pub fn attach(base: AgentRuntime, ext: Arc<ExtensionRuntime>) -> AgentRuntime {
     let inner = base.knowledge_backend();
     base.with_knowledge(Arc::new(ExtensionKnowledge::new(ext, inner)))
+}
+
+/// What one agent's knowledge binding means to this adapter.
+///
+/// The third arm is the reason this is an enum rather than an `Option`. A
+/// binding that NAMES [`EXTENSION_PROVIDER_ID`] but whose delegation target does
+/// not read — key absent, blank, or misspelled — must not be treated the same as
+/// a binding for some other provider. Falling through was quiet in two
+/// directions, and the second is the worse one:
+///
+/// - default build (nothing wrapped) it reached `NotConfigured`, logged at
+///   `debug`, and the worker answered ungrounded;
+/// - with `knowledge-chronicle` on it reached `KnowledgeBridge`, which ignores
+///   the binding entirely and searches its own env-configured corpus — so the
+///   worker retrieved from **the wrong source** and reported success.
+///
+/// The provider id is an explicit operator declaration, so an unreadable target
+/// under it is an error, not a normal state. [`Claim::Malformed`] carries the
+/// offending key and becomes a `Backend` error, which the loop already turns
+/// into a warning plus a distinguishable trace step.
+enum Claim {
+    /// Some other provider — the wrapped backend's business, not ours.
+    NotOurs,
+    /// This provider, with a usable delegation target.
+    Delegate {
+        extension_id: String,
+        tool_name: String,
+    },
+    /// This provider, but the named `params` key is missing or blank.
+    Malformed(&'static str),
 }
 
 /// Retrieval performed by a design-extension tool named in the agent's binding.
@@ -106,19 +153,25 @@ impl ExtensionKnowledge {
         Self { ext, inner }
     }
 
-    /// Read `(extension_id, tool_name)` out of a binding that names this
-    /// provider. `None` for any other provider, or for one whose params are
-    /// missing or blank — a blank id would otherwise reach the runtime as a
-    /// `NotFound` on an empty extension name.
-    fn ids_from(binding: &MemoryProviderRef) -> Option<(String, String)> {
+    /// What a binding says about this adapter.
+    fn claim_of(binding: &MemoryProviderRef) -> Claim {
         if binding.provider != EXTENSION_PROVIDER_ID {
-            return None;
+            return Claim::NotOurs;
         }
         let read = |key: &str| -> Option<String> {
             let value = binding.params.get(key)?.as_str()?.trim();
             (!value.is_empty()).then(|| value.to_string())
         };
-        Some((read(EXTENSION_ID_PARAM)?, read(TOOL_NAME_PARAM)?))
+        let Some(extension_id) = read(EXTENSION_ID_PARAM) else {
+            return Claim::Malformed(EXTENSION_ID_PARAM);
+        };
+        let Some(tool_name) = read(TOOL_NAME_PARAM) else {
+            return Claim::Malformed(TOOL_NAME_PARAM);
+        };
+        Claim::Delegate {
+            extension_id,
+            tool_name,
+        }
     }
 
     async fn delegate_search(
@@ -174,8 +227,18 @@ impl Knowledge for ExtensionKnowledge {
         query: KnowledgeQuery,
         binding: Option<&MemoryProviderRef>,
     ) -> KnowledgeResult<Vec<RetrievedChunk>> {
-        let Some((extension_id, tool_name)) = binding.and_then(Self::ids_from) else {
-            return self.delegate_search(tenant, query, binding).await;
+        let (extension_id, tool_name) = match binding.map_or(Claim::NotOurs, Self::claim_of) {
+            Claim::NotOurs => return self.delegate_search(tenant, query, binding).await,
+            Claim::Malformed(key) => {
+                return Err(KnowledgeError::Backend(format!(
+                    "knowledge binding names `{EXTENSION_PROVIDER_ID}` but its `{key}` param is \
+                     missing or blank, so there is no retrieval target to invoke"
+                )));
+            }
+            Claim::Delegate {
+                extension_id,
+                tool_name,
+            } => (extension_id, tool_name),
         };
 
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).max(1);
@@ -187,9 +250,23 @@ impl Knowledge for ExtensionKnowledge {
         })
         .to_string();
 
-        // The extension's host ports resolve per-tenant (its credential among
-        // them), so the call carries the caller's tenant rather than the
-        // process default.
+        // The caller's tenant travels with the call rather than the process
+        // default, so a tenant-aware host port sees it.
+        //
+        // Do NOT read that as "the extension's credential resolves per tenant".
+        // At the pinned ext-runtime rev (29b9cc5) `HostCallContext` is consulted
+        // at exactly ONE site — the LLM port, `host_state.rs:417`.
+        // `secrets::Host::get` forwards to `SecretsBackend::get(&uri)`, which
+        // takes no tenant at all, and the OAuth port reads its tenant from
+        // runtime-level config. So on the out-of-process serve path — the very
+        // path that serves many agents from one runtime, and the reason the
+        // binding has to travel per turn — the runtime is built with
+        // `build_ext_runtime(Arc::new(EnvSecretsBackend), None)`
+        // (`agent_node.rs:1736`) and EVERY tenant's retrieval resolves the same
+        // env credential. Passing the tenant is correct and free once the port
+        // grows tenant awareness; today it is not a multi-tenancy guarantee, and
+        // a comment claiming otherwise is what would stop the next reader
+        // checking.
         let ctx = HostCallContext {
             tenant: Some(tenant.tenant.as_str().to_string()),
             user_email: None,
@@ -197,6 +274,13 @@ impl Knowledge for ExtensionKnowledge {
 
         // `invoke_tool_ctx` is synchronous (wasmtime sync) and instantiates a
         // component, so it must never run on the async executor.
+        //
+        // The cost of that, spelled out because §6.2 records only its cause: the
+        // guest cannot bound its own call (`extension-host/http@0.1.0` carries
+        // no timeout field), so the ceiling is the host's 30 s. A hung customer
+        // service therefore pins one blocking-pool thread AND one turn for up to
+        // 30 s per retrieval — and `spawn_blocking` is not cancellable, so an
+        // abandoned turn does not release the thread any sooner.
         let ext = Arc::clone(&self.ext);
         let called = {
             let extension_id = extension_id.clone();
@@ -231,6 +315,37 @@ impl Knowledge for ExtensionKnowledge {
     fn wrapped_backend(&self) -> Option<Arc<dyn Knowledge>> {
         self.inner.clone()
     }
+
+    fn backend_id(&self) -> &'static str {
+        BACKEND_ID
+    }
+}
+
+/// The first backend in the runtime's wrapper chain that is NOT this adapter —
+/// i.e. the corpus backend, if one was mounted underneath.
+///
+/// Walks the whole chain rather than unwrapping one layer:
+/// [`Knowledge::wrapped_backend`] returning `Some` only says "something is
+/// underneath", which a second delegating wrapper would satisfy just as well as
+/// a corpus. Since [`attach`] is unconditional, `AgentRuntime::has_knowledge()`
+/// cannot answer this question at all any more — every runner-host path has a
+/// backend mounted whether or not a corpus was.
+#[must_use]
+pub fn corpus_backend(runtime: &AgentRuntime) -> Option<Arc<dyn Knowledge>> {
+    corpus_in_chain(runtime.knowledge_backend())
+}
+
+/// The walk itself, split from [`corpus_backend`] so it can be exercised over a
+/// hand-built chain without standing up a whole `AgentRuntime`.
+fn corpus_in_chain(top: Option<Arc<dyn Knowledge>>) -> Option<Arc<dyn Knowledge>> {
+    let mut current = top;
+    while let Some(backend) = current {
+        if backend.backend_id() != BACKEND_ID {
+            return Some(backend);
+        }
+        current = backend.wrapped_backend();
+    }
+    None
 }
 
 /// Parse a retrieval tool's result into ranked chunks.
@@ -285,8 +400,12 @@ fn parse_chunks(raw: &str, limit: usize) -> KnowledgeResult<Vec<RetrievedChunk>>
         let text = truncate_chars(text, MAX_CHUNK_CHARS.min(budget));
         budget = budget.saturating_sub(text.chars().count());
 
-        // A missing score is 0.0 — the service ranked by position, and a
-        // fabricated score would misreport that in the trace.
+        // A missing — or non-numeric — score is 0.0, while a missing or
+        // non-string `text` above is a hard `Backend` error. The asymmetry is
+        // chosen, not an oversight: response ORDER is the ranking, so a score
+        // this function cannot read costs nothing but a trace field, whereas a
+        // chunk with no readable text is an empty bullet in the system prompt
+        // and there is no honest value to substitute for it.
         let score = item
             .get("score")
             .and_then(serde_json::Value::as_f64)
@@ -450,13 +569,11 @@ mod tests {
                 TOOL_NAME_PARAM: "search_knowledge",
             }),
         );
-        assert_eq!(
-            ExtensionKnowledge::ids_from(&b),
-            Some((
-                "greentic.rag-http".to_string(),
-                "search_knowledge".to_string()
-            ))
-        );
+        assert!(matches!(
+            ExtensionKnowledge::claim_of(&b),
+            Claim::Delegate { extension_id, tool_name }
+                if extension_id == "greentic.rag-http" && tool_name == "search_knowledge"
+        ));
     }
 
     #[test]
@@ -469,7 +586,7 @@ mod tests {
             }),
         );
         assert!(
-            ExtensionKnowledge::ids_from(&b).is_none(),
+            matches!(ExtensionKnowledge::claim_of(&b), Claim::NotOurs),
             "a Chronicle binding must fall through to the wrapped backend"
         );
     }
@@ -480,13 +597,56 @@ mod tests {
             EXTENSION_PROVIDER_ID,
             serde_json::json!({ EXTENSION_ID_PARAM: "greentic.rag-http" }),
         );
-        assert!(ExtensionKnowledge::ids_from(&no_tool).is_none());
+        assert!(matches!(
+            ExtensionKnowledge::claim_of(&no_tool),
+            Claim::Malformed(TOOL_NAME_PARAM)
+        ));
 
         let blank = binding(
             EXTENSION_PROVIDER_ID,
             serde_json::json!({ EXTENSION_ID_PARAM: "  ", TOOL_NAME_PARAM: "search_knowledge" }),
         );
-        assert!(ExtensionKnowledge::ids_from(&blank).is_none());
+        assert!(matches!(
+            ExtensionKnowledge::claim_of(&blank),
+            Claim::Malformed(EXTENSION_ID_PARAM)
+        ));
+    }
+
+    /// The companion to the test above, and the more important half: NOT
+    /// invoking is right, but doing it quietly is what made a drifted param key
+    /// dangerous. With a corpus backend wrapped, the old fall-through reached
+    /// `KnowledgeBridge`, which ignores the binding and searches its own
+    /// env-configured corpus — so the worker retrieved from the WRONG source and
+    /// reported success. A `Backend` error is what routes this through the
+    /// loop's warning and its distinguishable trace step.
+    #[tokio::test]
+    async fn a_binding_whose_target_does_not_read_is_reported_not_fallen_through() {
+        let inner = Arc::new(RecordingInner {
+            ingested: std::sync::Mutex::new(Vec::new()),
+        });
+        let broken = binding(
+            EXTENSION_PROVIDER_ID,
+            serde_json::json!({ EXTENSION_ID_PARAM: "greentic.rag-http" }),
+        );
+        let err = adapter(Some(inner))
+            .search_bound(
+                &tenant(),
+                KnowledgeQuery {
+                    query: "q".into(),
+                    limit: Some(3),
+                },
+                Some(&broken),
+            )
+            .await
+            .expect_err("a declared provider with no readable target is an error");
+
+        let KnowledgeError::Backend(message) = &err else {
+            panic!("expected a Backend error the loop will warn about, got {err:?}");
+        };
+        assert!(
+            message.contains(TOOL_NAME_PARAM),
+            "the diagnostic must name the key that did not read: {message}"
+        );
     }
 
     struct RecordingInner {
@@ -599,21 +759,46 @@ mod tests {
     }
 
     /// `attach` is unconditional, so `has_knowledge()` can no longer tell a host
-    /// whether a CORPUS backend was mounted. `wrapped_backend` is what answers
+    /// whether a CORPUS backend was mounted. [`corpus_backend`] is what answers
     /// that now, and the in-process `dw.agent` regression guard depends on it —
     /// so it has to report both cases, not merely be present.
+    ///
+    /// The doubled case is the point: `wrapped_backend()` alone says only
+    /// "something is underneath", which a SECOND copy of this adapter satisfies
+    /// exactly as well as a corpus does. Mounting twice is not hypothetical —
+    /// [`attach`] is called once per construction path and a fourth site could
+    /// stack one — and the guard must not read that as a corpus.
     #[test]
-    fn wrapped_backend_reports_whether_a_corpus_backend_sits_underneath() {
+    fn corpus_backend_walks_past_every_layer_of_this_adapter() {
+        fn corpus_recorder() -> Arc<dyn Knowledge> {
+            Arc::new(RecordingInner {
+                ingested: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn layer(inner: Option<Arc<dyn Knowledge>>) -> Option<Arc<dyn Knowledge>> {
+            Some(Arc::new(adapter(inner)))
+        }
+
         assert!(
-            adapter(None).wrapped_backend().is_none(),
-            "nothing wrapped => no corpus backend"
+            corpus_in_chain(None).is_none(),
+            "nothing mounted at all => no corpus backend"
         );
-        let inner = Arc::new(RecordingInner {
-            ingested: std::sync::Mutex::new(Vec::new()),
-        });
         assert!(
-            adapter(Some(inner)).wrapped_backend().is_some(),
-            "a Chronicle mount under this adapter must stay visible to its host"
+            corpus_in_chain(layer(None)).is_none(),
+            "this adapter alone is not a corpus"
+        );
+        assert!(
+            corpus_in_chain(layer(layer(None))).is_none(),
+            "two stacked adapters must not read as a mounted corpus — this is \
+             exactly what a one-level `wrapped_backend()` check got wrong"
+        );
+        assert!(
+            corpus_in_chain(layer(Some(corpus_recorder()))).is_some(),
+            "a corpus directly under the adapter must stay visible to its host"
+        );
+        assert!(
+            corpus_in_chain(layer(layer(Some(corpus_recorder())))).is_some(),
+            "and must stay visible however many adapter layers sit above it"
         );
     }
 
@@ -635,7 +820,8 @@ mod tests {
     }
 }
 
-/// Ratchet: every site that mounts a knowledge backend must mount this one too.
+/// Ratchet: no `AgentRuntime` may be constructed without a decision about
+/// extension-delegated retrieval.
 ///
 /// The mount is a bare statement whose omission compiles, boots, and serves —
 /// the runtime simply has no extension-delegated retrieval, `knowledge_active`
@@ -645,20 +831,65 @@ mod tests {
 /// model hallucinated instead of retrieving from the corpus that had already
 /// been ingested at boot."*
 ///
-/// So this scans the source rather than trusting three call sites to stay in
-/// step: any file that calls `knowledge_mount::attach` must call
-/// [`attach`] the same number of times.
+/// So this scans the source instead of trusting the call sites to stay in step,
+/// and it does so through TWO anchors, because neither catches the other's
+/// regression:
+///
+/// - [`constructor_anchor`] — every file constructing an `AgentRuntime` must
+///   mount this adapter as many times, minus an explicit, reasoned
+///   [`EXEMPT`] allowance. This is the one that catches the incident shape
+///   quoted above: **a brand-new construction path that mounts nothing at
+///   all**. Such a file names neither mount, so a mount-anchored scan never
+///   even looks at it. Modelled on the designer's
+///   `dw_test_chat/mcp_source.rs`, which anchors on the constructor with an
+///   exemption list precisely so that each site is a decision rather than an
+///   inference.
+/// - [`mount_anchor`] — a file that mounts a Chronicle corpus must mount this
+///   adapter too. This catches the likelier near-term regression: a knowledge
+///   mount copied to a new site with only half the pair.
 #[cfg(test)]
 mod call_site_ratchet {
     use std::path::Path;
 
-    /// The Chronicle mount, whose call sites are the knowledge mount sites.
+    /// The Chronicle mount, whose call sites are the corpus mount sites.
     const CHRONICLE_MOUNT: &str = "knowledge_mount::attach(";
     /// This module's mount.
     const EXTENSION_MOUNT: &str = "knowledge_ext::attach(";
+    /// Every runtime construction, mounted or not.
+    const CONSTRUCTOR: &str = "AgentRuntime::new(";
+
+    /// Files that construct an `AgentRuntime` WITHOUT mounting this adapter, and
+    /// how many such constructions each is allowed.
+    ///
+    /// Every entry is a decision, and adding one means writing down why that
+    /// runtime must have no extension-delegated retrieval. A new constructor in
+    /// an exempt file changes its count and fails this test, so the exemption
+    /// covers the sites reasoned about here and never the next one.
+    const EXEMPT: &[(&str, usize, &str)] = &[
+        (
+            "src/runner/graph_node.rs",
+            2,
+            "the supervisor ROUTING runtime, whose synthesised config is \
+             `knowledge: None` with an empty tool list — it picks a branch and \
+             never answers from a corpus — plus one test constructor. Note the \
+             `agent_ref: None` inline path is NOT one of these: it shares the \
+             graph-agent constructor and skips the mount at run time, so it \
+             costs no allowance here",
+        ),
+        (
+            "src/runner/agent_node.rs",
+            3,
+            "three test constructors; both production paths mount",
+        ),
+        (
+            "src/runner/engine.rs",
+            1,
+            "one test constructor; engine.rs builds no production AW runtime",
+        ),
+    ];
 
     /// Count non-comment occurrences of `needle`, so a doc comment naming a
-    /// mount is never mistaken for one.
+    /// mount or a constructor is never mistaken for one.
     fn count_calls(text: &str, needle: &str) -> usize {
         text.lines()
             .filter(|l| {
@@ -669,10 +900,16 @@ mod call_site_ratchet {
             .sum()
     }
 
-    /// `(path, chronicle_mounts, extension_mounts)` for every source file that
-    /// mounts either.
-    fn mount_sites() -> Vec<(String, usize, usize)> {
-        fn walk(dir: &Path, out: &mut Vec<(String, usize, usize)>) {
+    struct Site {
+        path: String,
+        chronicle: usize,
+        extension: usize,
+        constructors: usize,
+    }
+
+    /// Every source file that mounts either backend or constructs a runtime.
+    fn sites() -> Vec<Site> {
+        fn walk(dir: &Path, out: &mut Vec<Site>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 return;
             };
@@ -686,52 +923,119 @@ mod call_site_ratchet {
                     };
                     let rel = path.to_string_lossy().replace('\\', "/");
                     if rel.ends_with("src/runner/knowledge_ext.rs") {
-                        continue; // this file, which defines both names
+                        continue; // this file, which defines all three names
                     }
-                    let chronicle = count_calls(&text, CHRONICLE_MOUNT);
-                    let extension = count_calls(&text, EXTENSION_MOUNT);
-                    if chronicle > 0 || extension > 0 {
-                        out.push((rel, chronicle, extension));
+                    let site = Site {
+                        path: rel,
+                        chronicle: count_calls(&text, CHRONICLE_MOUNT),
+                        extension: count_calls(&text, EXTENSION_MOUNT),
+                        constructors: count_calls(&text, CONSTRUCTOR),
+                    };
+                    if site.chronicle > 0 || site.extension > 0 || site.constructors > 0 {
+                        out.push(site);
                     }
                 }
             }
         }
         let mut out = Vec::new();
         walk(Path::new("src"), &mut out);
-        out.sort();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
         out
     }
 
+    fn exempted(path: &str) -> usize {
+        EXEMPT
+            .iter()
+            .find(|(p, _, _)| *p == path)
+            .map_or(0, |(_, n, _)| *n)
+    }
+
+    /// The anchor that catches a NEW construction path mounting nothing: such a
+    /// file names neither mount, so [`mount_anchor`] never sees it.
     #[test]
-    fn every_knowledge_mount_site_also_mounts_the_extension_adapter() {
-        let offenders: Vec<_> = mount_sites()
+    fn constructor_anchor() {
+        let offenders: Vec<_> = sites()
             .into_iter()
-            .filter(|(_, chronicle, extension)| chronicle != extension)
+            .filter(|s| s.constructors > 0)
+            .filter(|s| s.constructors != s.extension + exempted(&s.path))
+            .map(|s| {
+                format!(
+                    "{}: {} `AgentRuntime::new(`, {} `knowledge_ext::attach(`, {} exempted",
+                    s.path,
+                    s.constructors,
+                    s.extension,
+                    exempted(&s.path)
+                )
+            })
             .collect();
         assert!(
             offenders.is_empty(),
-            "these mount a knowledge backend without also mounting \
-             `knowledge_ext::attach`, so a worker binding \
-             `provider.knowledge.extension` silently retrieves nothing and the \
-             model answers from nothing instead: {offenders:?}"
+            "each of these builds an `AgentRuntime` without deciding about \
+             extension-delegated retrieval. Mount `knowledge_ext::attach`, or add \
+             the site to `EXEMPT` with a reason — a runtime that silently has no \
+             retrieval is how the model came to answer from nothing before: {offenders:#?}"
         );
     }
 
-    /// Guards the guard: if either mount is renamed, the scan above would pass
-    /// vacuously forever over a file set of zero.
+    /// The anchor that catches half a copied pair: a corpus mount without this
+    /// adapter beside it. One-directional on purpose — the reverse (this
+    /// adapter alone) is the DEFAULT build's shape, since the Chronicle mount is
+    /// feature-gated and this one is not.
     #[test]
-    fn the_scanned_mounts_still_exist() {
-        let sites = mount_sites();
+    fn mount_anchor() {
+        let offenders: Vec<_> = sites()
+            .into_iter()
+            .filter(|s| s.chronicle > s.extension)
+            .map(|s| {
+                format!(
+                    "{}: {} chronicle, {} extension",
+                    s.path, s.chronicle, s.extension
+                )
+            })
+            .collect();
         assert!(
-            sites.len() >= 2,
+            offenders.is_empty(),
+            "these mount a knowledge corpus without also mounting \
+             `knowledge_ext::attach`, so a worker binding \
+             `provider.knowledge.extension` silently retrieves nothing and the \
+             model answers from nothing instead: {offenders:#?}"
+        );
+    }
+
+    /// Guards the guards. Both scans are textual, so a rename would leave them
+    /// passing vacuously over a file set of zero — and an `EXEMPT` entry for a
+    /// path that no longer constructs anything is debt hiding the next
+    /// regression behind it, exactly as `ci/file_size_ratchet.py` treats a
+    /// baselined file that is no longer over its cap.
+    #[test]
+    fn the_scanned_anchors_still_exist() {
+        let sites = sites();
+        let mounts: usize = sites.iter().map(|s| s.extension).sum();
+        let corpora: usize = sites.iter().map(|s| s.chronicle).sum();
+        let constructors: usize = sites.iter().map(|s| s.constructors).sum();
+        assert!(
+            mounts >= 3,
             "expected the in-process `dw.agent`, out-of-process serve and \
-             graph-node mounts to be found; the scan matched {sites:?} — has a \
-             mount been renamed?"
+             graph-node mounts; found {mounts} `knowledge_ext::attach` call sites"
         );
-        let total: usize = sites.iter().map(|(_, _, ext)| ext).sum();
         assert!(
-            total >= 3,
-            "expected at least three `knowledge_ext::attach` call sites, found {total}"
+            corpora >= 3,
+            "expected three Chronicle mounts beside them; found {corpora} — has \
+             `knowledge_mount::attach` been renamed?"
         );
+        assert!(
+            constructors >= mounts,
+            "found {constructors} `AgentRuntime::new(` against {mounts} mounts — \
+             has the constructor been renamed?"
+        );
+        for (path, _, _) in EXEMPT {
+            let found = sites.iter().find(|s| s.path == *path);
+            assert!(
+                found.is_some_and(|s| s.constructors > 0),
+                "`EXEMPT` names {path}, which constructs no `AgentRuntime`. A \
+                 stale allowance hides the next unmounted construction added to \
+                 that file — remove it."
+            );
+        }
     }
 }
