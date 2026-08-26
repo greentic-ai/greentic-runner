@@ -713,7 +713,7 @@ mod tests {
     fn list_tools_for_llm_with_no_extensions_returns_empty() {
         // for_test runtime has no extensions loaded → list_tools errors
         // (NotFound) for every ext → all skipped → empty result.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "http".into(),
             tool_name: "fetch".into(),
@@ -730,7 +730,7 @@ mod tests {
         // No extensions loaded → the declared tool cannot resolve and is
         // reported as missing with a load-failure reason (instead of being
         // dropped silently, which is what causes hallucinated tool results).
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "greentic.hubspot".into(),
             tool_name: "hubspot_contacts".into(),
@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn missing_tools_reports_mcp_tool_absent_from_catalog() {
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "mcp:github".into(),
             tool_name: "create_issue".into(),
@@ -852,7 +852,7 @@ mod tests {
         // A catalog-backed mcp: ref is emitted as an LlmToolSchema with the
         // catalog's description/parameters; the ext_runtime is never consulted
         // for it (the for_test runtime has no extensions loaded).
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -905,7 +905,7 @@ mod tests {
         // The deployed-runner case: no admin credentials, so no catalog at all.
         // The schema the designer snapshotted into the pack's `AgentConfig` is
         // what reaches the LLM. Before this, the tool was silently dropped.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
 
         let schemas = list_tools_for_llm(&rt, None, None, None, None, &allowed);
@@ -926,7 +926,7 @@ mod tests {
         // it must be emitted byte-for-byte even though the ref also carries a
         // (possibly stale) snapshot. Flipping the precedence would silently
         // downgrade every deployment that has a working admin source.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let live_params = serde_json::json!({
             "type": "object",
             "properties": { "live_arg": { "type": "number" } }
@@ -953,7 +953,7 @@ mod tests {
     fn mcp_ref_with_partial_contract_and_no_catalog_is_dropped() {
         // Both halves are required, mirroring the `flow:` branch: a description
         // with no schema cannot be offered to the LLM as a callable tool.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let mut description_only = mcp_ref_with_contract("s1", "get_issue");
         description_only.input_schema = None;
         let mut schema_only = mcp_ref_with_contract("s1", "list_issues");
@@ -981,7 +981,7 @@ mod tests {
     fn mcp_ref_contract_still_takes_the_usage_note() {
         // The usage note is an author addendum to whichever description won; it
         // must not be lost on the new fallback arm.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let mut t = mcp_ref_with_contract("s1", "get_issue");
         t.usage_note = Some("Only for open issues.".into());
 
@@ -997,14 +997,14 @@ mod tests {
     fn missing_tools_accepts_mcp_tool_resolved_by_its_author_contract() {
         // `preflight_warn_tools` would otherwise warn loudly at startup about a
         // tool that `list_tools_for_llm` now resolves and offers.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![mcp_ref_with_contract("s1", "get_issue")];
         assert!(missing_tools(&rt, None, None, None, None, &allowed).is_empty());
     }
 
     #[test]
     fn missing_tools_still_reports_mcp_tool_with_no_contract_and_no_catalog() {
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let mut half = mcp_ref_with_contract("s1", "get_issue");
         half.input_schema = None;
         let missing = missing_tools(&rt, None, None, None, None, &[half]);
@@ -1027,7 +1027,7 @@ mod tests {
         // non-mcp extension id — if the mcp branch ever matched non-`mcp:`
         // ids and consulted the catalog, this entry would be emitted and the
         // empty assertion below would catch the regression.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let catalog = catalog_with(
             "greentic.tavily",
             "search",
@@ -1091,7 +1091,7 @@ mod tests {
             serde_json::json!({}),
             Some(&uri),
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
 
         let call = ToolCallRecord {
             call_id: "c1".into(),
@@ -1176,7 +1176,7 @@ mod tests {
     }
 
     fn ext_runtime_stub() -> ExtensionRuntime {
-        ExtensionRuntime::for_test()
+        ExtensionRuntime::for_test().unwrap()
     }
 
     fn test_flow_invoker() -> FakeFlowInvoker {
@@ -1276,7 +1276,7 @@ mod tests {
     #[tokio::test]
     async fn flow_prefixed_tool_is_listed_and_dispatched() {
         let flows = Arc::new(FlowToolCatalog::from_invoker(Arc::new(FakeFlowInvoker)));
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let allowed = vec![ToolRef {
             extension_id: "flow:lookup".into(),
             tool_name: "look_up".into(),
@@ -1298,7 +1298,7 @@ mod tests {
             tool_name: "look_up".into(),
             args: serde_json::json!({ "q": 1 }),
         };
-        let rt_arc = Arc::new(ExtensionRuntime::for_test());
+        let rt_arc = Arc::new(ExtensionRuntime::for_test().unwrap());
         let tc = TenantContext::new("t", "e");
         let out = dispatch_tool_call(rt_arc, None, None, Some(flows), None, call, &tc)
             .await
@@ -1313,7 +1313,7 @@ mod tests {
     fn component_ref_listed_from_catalog() {
         // A catalog-backed component: ref is emitted as an LlmToolSchema with
         // the catalog's description/parameters; ext_runtime is never consulted.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "order_id": { "type": "string" } }
@@ -1362,7 +1362,7 @@ mod tests {
         // component catalog is present. The decoy entry is keyed by the FULL
         // non-prefixed id — if the component branch ever matched it, this entry
         // would leak into the list and the empty assertion would catch it.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let invoker = Arc::new(FakeInvoker::new(vec![], Ok(serde_json::json!({}))));
         let catalog = ComponentToolCatalog::for_tests(
             one_tool(
@@ -1403,7 +1403,7 @@ mod tests {
             ),
             invoker,
         ));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
 
         let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {
@@ -1455,7 +1455,7 @@ mod tests {
     fn list_includes_sorla_ref() {
         // A catalog-backed sorla: ref is emitted as an LlmToolSchema with the
         // catalog's description/parameters; ext_runtime is never consulted.
-        let rt = ExtensionRuntime::for_test();
+        let rt = ExtensionRuntime::for_test().unwrap();
         let params = serde_json::json!({
             "type": "object",
             "properties": { "amount": { "type": "number" } }
@@ -1514,7 +1514,7 @@ mod tests {
             },
         );
         let catalog = Arc::new(SorlaToolCatalog::for_tests(tools, invoker));
-        let rt = Arc::new(ExtensionRuntime::for_test());
+        let rt = Arc::new(ExtensionRuntime::for_test().unwrap());
 
         let tc = TenantContext::new("t", "e");
         let call = ToolCallRecord {

@@ -67,7 +67,7 @@ fn build_runtime_with_mandatory_guardrail(mandatory_cap_id: &str) -> (AgentRunti
 
     // `ExtensionRuntime::for_test()` initialises an empty capability registry —
     // any mandatory cap_id will fail to resolve, triggering the fail-closed path.
-    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
     let runtime = AgentRuntime::new(
         Arc::new(cp),
@@ -168,7 +168,7 @@ async fn no_mandatory_guardrails_passes_through() {
     let runtime = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         Arc::new(MockLlmBackend::new(vec![Ok(LlmResponse {
             content: Some("all good".into()),
             tool_calls: vec![],
@@ -319,7 +319,7 @@ async fn failing_policy_fails_closed_with_guardrail_denied() {
         tokens_out: 1,
     })];
 
-    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+    let ext = std::sync::Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
     let runtime = AgentRuntime::new(
         std::sync::Arc::new(cp),
         std::sync::Arc::new(greentic_aw_runtime::mock::MockAgentStateStore::new()),

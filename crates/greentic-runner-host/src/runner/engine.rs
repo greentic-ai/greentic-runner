@@ -6536,7 +6536,7 @@ mod tests {
         let config_provider = Arc::new(config_provider);
         let token_meter = Arc::new(MockTokenMeter::new(0));
         let ledger = Arc::new(NoopToolLedger);
-        let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let runtime = Arc::new(AgentRuntime::new(
             config_provider,
             store,
