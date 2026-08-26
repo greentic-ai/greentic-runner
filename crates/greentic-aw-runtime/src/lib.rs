@@ -383,24 +383,48 @@ impl AgentRuntime {
     /// [`knowledge::knowledge_active`] applies against `runtime.knowledge` in the
     /// agentic loop, exposed so hosts and tests can confirm the seam is wired
     /// without issuing a (network-bound) [`Self::search_knowledge`] call.
+    ///
+    /// This answers "can retrieval be attempted at all", NOT "is a corpus
+    /// mounted": a host may mount a backend that delegates elsewhere per turn,
+    /// in which case this is true with no corpus behind it. Ask
+    /// [`knowledge::Knowledge::wrapped_backend`] for that, via
+    /// [`Self::knowledge_backend`].
     #[must_use]
     pub fn has_knowledge(&self) -> bool {
         self.knowledge.is_some()
     }
 
+    /// The mounted knowledge backend, if any.
+    ///
+    /// Exposed so a host that mounts a SECOND backend can wrap the first
+    /// instead of replacing it: [`Self::with_knowledge`] overwrites the field,
+    /// and two mounts that each assume they are the only one would silently
+    /// disable whichever ran first.
+    #[must_use]
+    pub fn knowledge_backend(&self) -> Option<Arc<dyn knowledge::Knowledge>> {
+        self.knowledge.clone()
+    }
+
     /// Hybrid retrieval over the agent's knowledge corpus. Returns
     /// [`knowledge::KnowledgeError::NotConfigured`] when no backend is wired.
+    ///
+    /// `binding` is the agent's own `config.knowledge.knowledge` provider ref
+    /// for this turn. It is threaded through because a backend may delegate to
+    /// a target named in the binding's `params` — see
+    /// [`knowledge::Knowledge::search_bound`] for why that cannot ride on the
+    /// runtime-level field or inside [`knowledge::KnowledgeQuery`].
     pub async fn search_knowledge(
         &self,
         tenant: &TenantContext,
         query: knowledge::KnowledgeQuery,
+        binding: Option<&config::MemoryProviderRef>,
     ) -> knowledge::KnowledgeResult<Vec<knowledge::RetrievedChunk>> {
         let kb = self
             .knowledge
             .as_ref()
             .ok_or(knowledge::KnowledgeError::NotConfigured)?;
         let ctx = knowledge::to_types_tenant(tenant)?;
-        kb.search(&ctx, query).await
+        kb.search_bound(&ctx, query, binding).await
     }
 
     /// Execute one agentic step against the given session.

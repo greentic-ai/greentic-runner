@@ -247,19 +247,57 @@ pub async fn run_step(
     // Retrieval failures degrade to no injection rather than failing the turn.
     let kn_active = crate::knowledge::knowledge_active(runtime.knowledge.is_some(), &config);
     let system_prompt = if kn_active {
-        let chunks = runtime
+        // The agent's own knowledge binding, threaded through so a backend that
+        // delegates retrieval to a per-worker target can read its ids from the
+        // binding's `params` (see `Knowledge::search_bound`).
+        let binding = config.knowledge.as_ref().and_then(|k| k.knowledge.as_ref());
+        let outcome = runtime
             .search_knowledge(
                 &tenant,
                 crate::knowledge::KnowledgeQuery {
                     query: user_message.clone(),
                     limit: Some(crate::knowledge::auto_top_k(&config)),
                 },
+                binding,
             )
-            .await
-            .unwrap_or_default();
-        // Surface the retrieval in the live trace (test-chat "Tools used") so the
-        // operator sees which chunks were pulled in. Observer-only — not the trail.
-        crate::knowledge::emit_retrieval_trace(observer.as_ref(), &user_message, &chunks);
+            .await;
+        // A retrieval failure still degrades to no injection — a dead backend
+        // must not fail the turn — but it is no longer SILENT. This used to end
+        // `.unwrap_or_default()`, which turned every `Err` into an empty vector
+        // with no log, no trace, and nothing to tell "the corpus held nothing
+        // relevant" apart from "the backend did not answer". The worker then
+        // answered confidently from nothing, and with a third-party retrieval
+        // service — which can be down, rate-limited, or holding a rotated
+        // credential — that case stops being rare.
+        let chunks = match outcome {
+            Ok(chunks) => {
+                // Surface the retrieval in the live trace (test-chat "Tools used")
+                // so the operator sees which chunks were pulled in. Observer-only
+                // — not the trail.
+                crate::knowledge::emit_retrieval_trace(observer.as_ref(), &user_message, &chunks);
+                chunks
+            }
+            // The normal state of every worker without a knowledge backend
+            // wired, so it must not warn — `knowledge_active` can be true from
+            // config alone while the host mounted nothing.
+            Err(e @ crate::knowledge::KnowledgeError::NotConfigured) => {
+                tracing::debug!(agent_id = %config.agent_id, error = %e, "knowledge retrieval skipped");
+                Vec::new()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %config.agent_id,
+                    error = %e,
+                    "knowledge retrieval failed; the turn proceeds with no retrieved context"
+                );
+                crate::knowledge::emit_retrieval_failure_trace(
+                    observer.as_ref(),
+                    &user_message,
+                    &e,
+                );
+                Vec::new()
+            }
+        };
         crate::knowledge::augment_system_prompt(&system_prompt, &chunks)
     } else {
         system_prompt
