@@ -1247,6 +1247,12 @@ mod aw {
             {
                 runtime = crate::runner::knowledge_mount::attach(runtime).await;
             }
+            // Knowledge delegated to a design-extension tool. Not feature-gated
+            // (see `knowledge_ext`); it wraps whatever the Chronicle mount above
+            // left in place. Inside the `agent_ref.is_some()` arm with the rest
+            // of the full-fidelity attachment sequence, so the `agent_ref: None`
+            // inline path stays byte-unchanged.
+            runtime = crate::runner::knowledge_ext::attach(runtime, ext_runtime.clone());
         }
 
         // The latest user turn is the most recent user message in the seeded log

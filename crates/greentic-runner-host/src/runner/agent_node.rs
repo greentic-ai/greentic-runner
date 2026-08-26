@@ -1449,7 +1449,7 @@ mod aw {
         let base = AgentRuntime::new(
             config_provider,
             state_store,
-            ext_runtime,
+            ext_runtime.clone(),
             llm,
             telemetry,
             token_meter,
@@ -1496,6 +1496,11 @@ mod aw {
         let base = crate::runner::long_term_memory::attach(base).await;
         #[cfg(feature = "knowledge-chronicle")]
         let base = crate::runner::knowledge_mount::attach(base).await;
+        // Knowledge delegated to a design-extension tool. Unconditional and not
+        // feature-gated (see `knowledge_ext`): it wraps whatever the Chronicle
+        // mount above left in place and acts only on a worker whose knowledge
+        // binding names `provider.knowledge.extension`.
+        let base = crate::runner::knowledge_ext::attach(base, ext_runtime);
         let runtime = Arc::new(base);
 
         tracing::info!(agent_count, tenant = %tenant, "AW runtime constructed");
@@ -1824,6 +1829,11 @@ mod aw {
         // feature off (default).
         #[cfg(feature = "knowledge-chronicle")]
         let base = crate::runner::knowledge_mount::attach(base).await;
+        // Knowledge delegated to a design-extension tool — the out-of-process
+        // serve path's copy of the mount above. See `knowledge_ext` for why the
+        // adapter reads its target per turn rather than per runtime: THIS is the
+        // path that serves many agents from one runtime.
+        let base = crate::runner::knowledge_ext::attach(base, ext_runtime.clone());
         let runtime = Arc::new(base);
 
         tracing::info!(agent_count, "AW runtime constructed");
@@ -2922,6 +2932,14 @@ mod aw {
         /// lock and no network: `KnowledgeChronicle::from_config` only constructs
         /// the embedder/LLM clients (their endpoint is consulted at call time),
         /// so the seam mounts without any live embedding API call.
+        ///
+        /// Asserted through [`greentic_aw_runtime::knowledge::Knowledge::wrapped_backend`]
+        /// rather than `has_knowledge()`, and that is not cosmetic:
+        /// [`crate::runner::knowledge_ext::attach`] mounts unconditionally, so
+        /// `has_knowledge()` is now true on this path whether the Chronicle mount
+        /// ran or not. Left as it was, this guard would have passed forever over
+        /// a deleted `knowledge_mount::attach` — which is precisely the failure
+        /// it was written to catch.
         #[cfg(feature = "knowledge-chronicle")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial_test::serial]
@@ -2969,17 +2987,26 @@ mod aw {
                 .await
             }
 
+            /// Is a CORPUS backend mounted under the always-present extension
+            /// adapter? `has_knowledge()` cannot tell — see the doc comment.
+            fn corpus_backend_mounted(runtime: &AgentRuntime) -> bool {
+                runtime
+                    .knowledge_backend()
+                    .and_then(|k| k.wrapped_backend())
+                    .is_some()
+            }
+
             // Embedding env present + surreal-memory backend => knowledge mounts.
             let runtime = build_runtime().await.expect("runtime should build");
             assert!(
-                runtime.has_knowledge(),
+                corpus_backend_mounted(&runtime),
                 "in-process dw.agent runtime must mount the knowledge (RAG) seam so \
                  search_knowledge is reachable"
             );
 
             // Control: with the embedding endpoint unset the operator has opted
-            // out, so the seam stays unmounted — proving the positive case is the
-            // attach call doing its job, not a tautology.
+            // out, so the corpus seam stays unmounted — proving the positive case
+            // is the attach call doing its job, not a tautology.
             unsafe {
                 std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_BASE_URL");
                 std::env::remove_var("GREENTIC_KNOWLEDGE_EMBED_API_KEY");
@@ -2987,7 +3014,7 @@ mod aw {
             }
             let runtime_optout = build_runtime().await.expect("runtime should build");
             assert!(
-                !runtime_optout.has_knowledge(),
+                !corpus_backend_mounted(&runtime_optout),
                 "knowledge must stay unmounted when the embedding endpoint env is unset"
             );
 
