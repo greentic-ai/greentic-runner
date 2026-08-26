@@ -292,7 +292,7 @@ fn build_runtime(endpoint: &str) -> Arc<ExtensionRuntime> {
         ext_dir.display()
     );
 
-    let mut secrets = InMemorySecrets::new();
+    let secrets = InMemorySecrets::new();
     secrets.insert("secret://client-rag/endpoint", endpoint);
     // The conformance stub keys on the literal `Authorization` header, so the
     // header name is part of the contract being exercised, not an arbitrary

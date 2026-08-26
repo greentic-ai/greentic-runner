@@ -2058,7 +2058,7 @@ mod aw {
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
             let runtime = Arc::new(AgentRuntime::new(
                 config_provider,
@@ -2151,7 +2151,7 @@ mod aw {
                 AgentRuntime::new(
                     Arc::new(config_provider),
                     Arc::new(MockAgentStateStore::new()),
-                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+                    Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
                     llm,
                     Arc::new(MockTelemetry::new()),
                     Arc::new(MockTokenMeter::new(0)),
@@ -2252,7 +2252,7 @@ mod aw {
 
             let token_meter = Arc::new(MockTokenMeter::new(0));
             let ledger = Arc::new(NoopToolLedger);
-            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext_runtime = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
 
             Arc::new(
                 AgentRuntime::new(

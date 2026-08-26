@@ -1001,7 +1001,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -1057,7 +1057,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -1113,7 +1113,7 @@ mod tests {
         c.opening_message = Some("Welcome to support!".into());
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
@@ -1154,7 +1154,7 @@ mod tests {
             let mut c = cfg();
             c.opening_message = Some("Welcome!".into());
             cp.insert(&tc, "a", c);
-            let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+            let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
             let runtime = AgentRuntime::new(
                 Arc::new(cp),
                 store,
@@ -1209,7 +1209,7 @@ mod tests {
         c.tools = tools;
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
@@ -1394,7 +1394,7 @@ mod tests {
         cp.insert(&tc, "a", c);
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let kb = Arc::new(crate::mock::MockKnowledge::new(vec![
@@ -1481,7 +1481,7 @@ mod tests {
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
 
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(
@@ -1542,7 +1542,7 @@ mod tests {
         let tc = TenantContext::new("acme", "prod");
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);
@@ -1634,7 +1634,7 @@ mod tests {
         // `cfg()` has an empty tools allow-list, so the tool call is blocked.
         cp.insert(&tc, "a", cfg());
         let cp = Arc::new(cp);
-        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test());
+        let ext = Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap());
         let token_meter = Arc::new(crate::cost::MockTokenMeter::new(0));
         let ledger = Arc::new(crate::mock::NoopToolLedger);
         let runtime = AgentRuntime::new(cp, store, ext, llm, telemetry, token_meter, ledger, None);

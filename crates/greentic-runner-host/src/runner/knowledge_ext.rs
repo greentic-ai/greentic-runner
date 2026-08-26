@@ -689,7 +689,7 @@ mod tests {
 
     fn adapter(inner: Option<Arc<dyn Knowledge>>) -> ExtensionKnowledge {
         ExtensionKnowledge {
-            ext: Arc::new(ExtensionRuntime::for_test()),
+            ext: Arc::new(ExtensionRuntime::for_test().unwrap()),
             inner,
         }
     }

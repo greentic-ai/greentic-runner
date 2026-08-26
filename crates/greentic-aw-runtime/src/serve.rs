@@ -297,6 +297,10 @@ pub async fn serve(nats_url: &str, runtime: Arc<AgentRuntime>) -> Result<()> {
 /// LLM. `reply` is repeated so a session can take several steps.
 #[cfg(feature = "test-mock")]
 #[must_use]
+// A test-double builder returning `Arc<AgentRuntime>`: it has no error channel,
+// and its one fallible call cannot fail here (see the comment at the call site).
+// Matches how `mock.rs` and `dispatch_ledger.rs` treat the same situation.
+#[allow(clippy::expect_used)]
 pub fn build_test_mock_runtime(agent_id: &str, reply: &str) -> Arc<AgentRuntime> {
     use crate::cost::MockTokenMeter;
     use crate::llm::LlmResponse;

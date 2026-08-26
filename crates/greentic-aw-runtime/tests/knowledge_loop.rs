@@ -159,7 +159,7 @@ fn runtime(kb: Arc<dyn Knowledge>) -> (AgentRuntime, Arc<MockLlmBackend>, Tenant
     let rt = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         llm.clone(),
         Arc::new(MockTelemetry::new()),
         Arc::new(MockTokenMeter::new(0)),

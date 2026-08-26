@@ -101,7 +101,7 @@ async fn loop_emits_billing_with_the_configured_model() {
     let runtime = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))])),
         Arc::new(MockTelemetry::new()),
         Arc::new(MockTokenMeter::new(0)),
@@ -143,7 +143,7 @@ async fn record_one_emit(tenant: TenantContext) -> EmitCall {
     let runtime = AgentRuntime::new(
         Arc::new(cp),
         Arc::new(MockAgentStateStore::new()),
-        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test()),
+        Arc::new(greentic_ext_runtime::ExtensionRuntime::for_test().unwrap()),
         Arc::new(MockLlmBackend::new(vec![Ok(final_reply("hi"))])),
         Arc::new(MockTelemetry::new()),
         Arc::new(MockTokenMeter::new(0)),
