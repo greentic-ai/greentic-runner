@@ -3075,6 +3075,84 @@ impl PackRuntime {
         self.read_pack_file("agent-graph.json")
     }
 
+    /// Archive-relative entry names of the design-extension `.gtxpack` archives
+    /// this pack carries, sorted and deduplicated.
+    ///
+    /// Reads the materialized pack directory and the `.gtpack` archive, the
+    /// same two sources — in the same order — as [`PackRuntime::read_pack_file`],
+    /// so an entry this returns is one that call can then read.
+    ///
+    /// The `.gtxpack` suffix, not membership of `extensions/`, is what makes an
+    /// entry an extension: that directory already carries the wizard's
+    /// `extensions/*.json` manifest sidecars, which predate this feature and are
+    /// not extensions. The rule lives in
+    /// [`crate::runner::pack_extensions::is_extension_archive_entry`], beside
+    /// the contract it comes from.
+    ///
+    /// An empty result is the normal reading of a pack built before the feature,
+    /// and of any pack whose worker binds no extension tools.
+    #[cfg(feature = "agentic-worker")]
+    pub fn extension_archive_entries(&self) -> Vec<String> {
+        use crate::runner::pack_extensions::{EXTENSIONS_PREFIX, is_extension_archive_entry};
+
+        let mut names = std::collections::BTreeSet::new();
+
+        if self.path.is_dir() {
+            let dir = self.path.join(EXTENSIONS_PREFIX.trim_end_matches('/'));
+            match std::fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        if !entry
+                            .file_type()
+                            .map(|kind| kind.is_file())
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let Some(file_name) = entry.file_name().to_str().map(str::to_string) else {
+                            continue;
+                        };
+                        let candidate = format!("{EXTENSIONS_PREFIX}{file_name}");
+                        if is_extension_archive_entry(&candidate) {
+                            names.insert(candidate);
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "failed to list the pack's extensions directory"
+                ),
+            }
+        }
+
+        if let Some(archive_path) = self
+            .archive_path
+            .as_ref()
+            .or_else(|| path_is_gtpack(&self.path).then_some(&self.path))
+        {
+            match File::open(archive_path)
+                .map_err(anyhow::Error::from)
+                .and_then(|file| ZipArchive::new(file).map_err(anyhow::Error::from))
+            {
+                Ok(archive) => names.extend(
+                    archive
+                        .file_names()
+                        .filter(|name| is_extension_archive_entry(name))
+                        .map(str::to_string),
+                ),
+                Err(error) => tracing::warn!(
+                    path = %archive_path.display(),
+                    error = %error,
+                    "failed to read the pack archive while listing extensions"
+                ),
+            }
+        }
+
+        names.into_iter().collect()
+    }
+
     /// MCP route material from the optional `assets/mcp-routes.json` sidecar.
     ///
     /// `None` when the pack carries none — which is how a pack built before
@@ -5396,7 +5474,7 @@ async fn load_components_from_archive(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use greentic_flow::model::{FlowDoc, NodeDoc};
     use indexmap::IndexMap;
@@ -5432,7 +5510,15 @@ mod tests {
     /// resolves files from that directory via `self.path.is_dir()`.
     /// Mirrors the `for_component_test` constructor but sets `path` to the
     /// caller-supplied directory instead of `PathBuf::new()`.
-    fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
+    ///
+    /// `pub(crate)` so sibling modules whose subject is what a pack CARRIES —
+    /// `runner::pack_extensions` — can drive the real reader rather than a
+    /// stand-in that could disagree with it.
+    ///
+    /// Passing a path to a `.gtpack` file rather than a directory exercises the
+    /// archive branch of the same readers: `self.path.is_dir()` is false, and
+    /// `path_is_gtpack(&self.path)` then supplies the archive.
+    pub(crate) fn pack_runtime_for_dir(dir: &std::path::Path) -> PackRuntime {
         let engine = Engine::default();
         let engine_profile =
             EngineProfile::from_engine(&engine, CpuPolicy::Native, "default".to_string());
@@ -5511,6 +5597,75 @@ mod tests {
         let blobs = pack.dw_agents_sidecar_blobs();
         assert!(blobs.contains_key("greeter"));
         assert_eq!(blobs["greeter"]["agent_id"], "greeter");
+    }
+
+    /// The contract's rule 2, exercised against a real pack directory: the
+    /// `.gtxpack` suffix decides, not membership of `extensions/`.
+    ///
+    /// The `.json` sidecar here is not hypothetical — the pack wizard writes
+    /// `extensions/*.json` manifest sidecars and they are walked into the
+    /// archive verbatim, so treating that directory as homogeneous would hand
+    /// the extension loader a file that has never been an extension.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_pack_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let extensions = dir.path().join("extensions");
+        std::fs::create_dir_all(extensions.join("nested")).unwrap();
+        std::fs::write(extensions.join("acme.tool.gtxpack"), b"archive").unwrap();
+        std::fs::write(extensions.join("wizard-answers.json"), b"{}").unwrap();
+        std::fs::write(extensions.join("nested/deep.gtxpack"), b"archive").unwrap();
+        std::fs::write(dir.path().join("manifest.cbor"), b"").unwrap();
+
+        let pack = pack_runtime_for_dir(dir.path());
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+        assert_eq!(
+            pack.read_pack_file("extensions/acme.tool.gtxpack")
+                .as_deref(),
+            Some(b"archive".as_slice()),
+            "every listed entry must be readable by the same reader"
+        );
+    }
+
+    /// The same rule over a real `.gtpack` ZIP, which is the shape a deployed
+    /// runner actually sees — a container never has the pack materialised.
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_lists_only_gtxpack_files_from_a_gtpack_archive() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive_path = dir.path().join("worker.gtpack");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive_path).unwrap());
+        let options: zip::write::FileOptions<'_, ()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("extensions/acme.tool.gtxpack", b"archive".as_slice()),
+            ("extensions/wizard-answers.json", b"{}".as_slice()),
+            ("extensions/design/kinded.gtxpack", b"archive".as_slice()),
+            ("assets/mcp-routes.json", b"{}".as_slice()),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap();
+
+        let pack = pack_runtime_for_dir(&archive_path);
+        assert_eq!(
+            pack.extension_archive_entries(),
+            vec!["extensions/acme.tool.gtxpack".to_string()]
+        );
+    }
+
+    #[cfg(feature = "agentic-worker")]
+    #[test]
+    fn extension_archive_entries_is_empty_for_a_pack_built_before_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = pack_runtime_for_dir(dir.path());
+        assert!(pack.extension_archive_entries().is_empty());
     }
 
     #[test]

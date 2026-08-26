@@ -88,9 +88,31 @@ i18n is handled inline in runner-host (`crates/greentic-runner-host/src/runner/i
 A flow node keyed `dw.agent.<agent_id>` (component `dw.agent`, operation = agent_id)
 dispatches to the agentic-worker runtime (`crates/greentic-aw-runtime`, Plan-Act-Observe
 loop). Gated behind the `agentic-worker` feature (default-on). Tools come from
-`.gtxpack` design-extensions loaded from `GREENTIC_EXTENSIONS_DIR/design/` at boot
-(`agent_node::build_ext_runtime` scans + registers them) and from per-tenant MCP servers;
-the OpenAI backend encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
+`.gtxpack` design-extensions and from per-tenant MCP servers; the OpenAI backend
+encodes tool function names as `<ext>_FN_<tool>` (OpenAI rejects dots).
+
+Design extensions load from **two** sources, in this order
+(`agent_node::build_ext_runtime`):
+
+1. `GREENTIC_EXTENSIONS_DIR/design/` on disk (`discovery::scan_kind_dir`).
+2. The loaded packs' own `extensions/*.gtxpack` entries
+   (`runner::pack_extensions::register_from_packs`).
+
+**Disk wins**; the pack is the fallback, same direction as
+`mcp_source_from_env().or_else(mcp_source_from_packs(..))`. The order of the two
+passes is what enforces it — `register_loaded_from_dir` inserts by
+`ExtensionId`, so running the pack pass first would overwrite an operator's
+installed copy with one frozen at pack-build time. See
+`pack_extensions::is_shadowed` for the reasoning and the cost.
+
+The pack source exists because nothing writes `GREENTIC_EXTENSIONS_DIR` inside a
+k8s or Cloud Run container: the directory scanned there is empty, so every
+extension tool an operator bound used to be dropped with a `warn` after the
+deploy reported success and after they had already supplied its credential.
+Pack-carried archives go through the SAME `register_loaded_from_dir` gate
+(signature + `manifest.json` ledger) — the pack is a delivery route, not a
+verification bypass. The in-pack layout is a cross-repo contract with
+greentic-pack and is recorded at the top of `runner::pack_extensions`.
 Needs a state backend — `memory` (default, ephemeral) / `disk` (redb) / `redis` (durable +
 multi-instance), selected via `GREENTIC_AW_STATE_BACKEND` — plus an LLM key
 (`GREENTIC_LLM_API_KEY`/`OPENAI_API_KEY`). When nothing is set the runtime auto-selects an
@@ -359,6 +381,7 @@ greentic_runner::start_embedded_host(HostBuilder) -> Result<RunnerHost>
 | `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables `sorla.call`/`operala.call`/`agentic.call`/`telco-x.call` dispatch + in-proc agentic serve. The runner registers response listeners for `sorla`/`operala`/`agentic`/`telco-x`; the `telco-x-event-bridge` crate serves `greentic.telco-x.request.v1` (Phase 2 transport scaffold). A credit-free `telco-x-serve` bin runs the bridge with the built-in `EchoInvoker` (`cargo run -p telco-x-event-bridge --bin telco-x-serve`); real Telco-X operations need a production `TelcoXDispatchInvoker` impl. Until then `telco-x.call` only echoes. See `docs/superpowers/specs/2026-06-21-telco-x-runtime-dispatch-design.md` in the workspace root |
 | `GREENTIC_AGENTIC_SERVE_INPROC` | Opt-in (default OFF): co-host the agentic-worker NATS service in-process; truthy (`1`/`true`/`yes`/`on`) + `GREENTIC_EVENTS_NATS_URL` set |
 | `GREENTIC_AGENT_MANIFESTS_DIR` | Dir of `<agent_id>.json` full `AgentConfig` files; process-level agent source for in-proc serve |
+| `GREENTIC_AW_PACK_EXTENSIONS` | Set to `0` to ignore design extensions carried inside a `.gtpack` (`extensions/*.gtxpack`) and keep the on-disk scan as the only source. Mirrors `GREENTIC_AW_MCP` / `GREENTIC_AW_COMPONENT_TOOLS` / `GREENTIC_AW_FLOW_TOOLS`. |
 | `GREENTIC_AW_STATE_BACKEND` | AW state backend selector: `redis` \| `memory` \| `disk`. Unset → `redis` if `GREENTIC_AW_REDIS_URL` is set, else `memory` (ephemeral, in-process). `memory`/`disk` give single-process locking only — multi-instance HA needs `redis`. |
 | `GREENTIC_AW_STATE_PATH` | On-disk (redb) file path when `GREENTIC_AW_STATE_BACKEND=disk` (default `~/.greentic/aw-state.redb`, falling back to `/var/lib/greentic/aw-state.redb`). |
 | `GREENTIC_AW_REDIS_URL` | Agentic-worker Redis state store. **Optional** — the worker defaults to an in-memory backend when unset; set this (or `GREENTIC_AW_STATE_BACKEND=disk`) for durable / multi-instance state. |

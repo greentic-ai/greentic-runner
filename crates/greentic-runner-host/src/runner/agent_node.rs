@@ -1045,6 +1045,7 @@ mod aw {
     pub(crate) fn build_ext_runtime(
         secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend>,
         host_llm_port: Option<Arc<dyn greentic_ext_runtime::host_ports::LlmPort>>,
+        packs: &[Arc<crate::pack::PackRuntime>],
     ) -> Option<Arc<greentic_ext_runtime::ExtensionRuntime>> {
         use greentic_ext_runtime::{
             DiscoveryPaths, ExtensionRuntime, HostOverrides, RuntimeConfig, discovery,
@@ -1122,38 +1123,57 @@ mod aw {
         // Initial load of on-disk design extensions (agentic-worker tools live
         // in `<root>/design/<ext>/`).
         let design_dir = root.join("design");
+        let mut on_disk = 0usize;
         match discovery::scan_kind_dir(&design_dir) {
             Ok(ext_dirs) => {
-                let mut loaded = 0usize;
                 for ext_dir in ext_dirs {
                     match runtime.register_loaded_from_dir(&ext_dir) {
-                        Ok(()) => loaded += 1,
+                        Ok(()) => on_disk += 1,
                         Err(error) => tracing::warn!(
                             error = %error, dir = %ext_dir.display(),
                             "skipping extension that failed to load"
                         ),
                     }
                 }
-                // Log the cap ids, not just a count: an unresolved mandatory
-                // guardrail cap blocks every agent turn, and until now the only
-                // way to see which caps a runner has was to trigger that failure.
-                let mut cap_ids: Vec<String> = runtime
-                    .capability_registry()
-                    .offerings()
-                    .map(|offering| offering.cap_id.to_string())
-                    .collect();
-                cap_ids.sort();
-                tracing::info!(
-                    loaded,
-                    dir = %design_dir.display(),
-                    caps = %cap_ids.join(","),
-                    "loaded design extensions"
-                );
             }
             Err(error) => {
                 tracing::warn!(error = %error, dir = %design_dir.display(), "scanning design extensions failed")
             }
         }
+
+        // Then the extensions the loaded packs carry at `extensions/*.gtxpack`.
+        //
+        // This runs SECOND on purpose: `register_loaded_from_dir` inserts by
+        // `ExtensionId`, so a pack pass ahead of the disk scan would let a
+        // pack-frozen copy overwrite the one an operator installed. See
+        // `pack_extensions::is_shadowed` for why disk wins and what that costs.
+        //
+        // In a k8s or Cloud Run container the directory above is empty — nothing
+        // writes `GREENTIC_EXTENSIONS_DIR` there — so this is the only source
+        // the worker has, and before it existed every extension tool an operator
+        // bound was dropped with a warn after the deploy reported success.
+        let from_packs = crate::runner::pack_extensions::register_from_packs(&mut runtime, packs);
+
+        // Log the cap ids, not just a count: an unresolved mandatory guardrail
+        // cap blocks every agent turn, and until now the only way to see which
+        // caps a runner has was to trigger that failure. Emitted after both
+        // sources so the line describes the registry the agent will actually
+        // dispatch against.
+        let mut cap_ids: Vec<String> = runtime
+            .capability_registry()
+            .offerings()
+            .map(|offering| offering.cap_id.to_string())
+            .collect();
+        cap_ids.sort();
+        tracing::info!(
+            loaded = on_disk,
+            from_packs = from_packs.loaded,
+            shadowed_by_disk = from_packs.shadowed,
+            pack_failures = from_packs.failed,
+            dir = %design_dir.display(),
+            caps = %cap_ids.join(","),
+            "loaded design extensions"
+        );
 
         Some(Arc::new(runtime))
     }
@@ -1374,7 +1394,7 @@ mod aw {
         let secrets_backend: Arc<dyn greentic_ext_runtime::SecretsBackend> = Arc::new(
             StoreToolSecretsBackend::new(secrets.clone(), tenant.clone()),
         );
-        let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port)?;
+        let ext_runtime = build_ext_runtime(secrets_backend, ext_llm_port, &packs)?;
 
         // When the LLM bridge extension is configured, resolve credentials
         // per-tenant from the secrets broker rather than from global env vars.
@@ -1733,7 +1753,11 @@ mod aw {
         // Process-level serve path has no per-tenant secrets context, so tool
         // secrets resolve from the env only. It likewise has no embedding host,
         // so the ext LLM port falls back to the env-keyed `EnvLlmPort`.
-        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None)?;
+        // NO pack-carried extensions here, for the same reason this path has no
+        // pack-backed MCP fallback (see the `mcp_source_from_env` call below):
+        // it is the process-level serve path, its agents come from
+        // `GREENTIC_AGENT_MANIFESTS_DIR`, and it holds no `PackRuntime` at all.
+        let ext_runtime = build_ext_runtime(Arc::new(EnvSecretsBackend), None, &[])?;
 
         // Prefer the LLM bridge extension when configured (LLM-as-extension);
         // fall back to the env-keyed in-process OpenAI client otherwise.

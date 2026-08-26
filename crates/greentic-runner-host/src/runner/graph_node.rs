@@ -360,6 +360,7 @@ mod aw {
         let ext_runtime = super::super::agent_node::build_ext_runtime(
             std::sync::Arc::new(super::super::agent_node::EnvSecretsBackend),
             None,
+            &packs,
         )?;
         let llm = super::super::agent_node::build_llm_backend(&ext_runtime);
         let telemetry = Arc::new(OtelTelemetry);
