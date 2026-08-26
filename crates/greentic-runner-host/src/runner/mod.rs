@@ -16,6 +16,8 @@ pub mod i18n;
 pub mod invocation;
 #[cfg(feature = "knowledge-chronicle")]
 pub mod knowledge_corpus;
+#[cfg(feature = "agentic-worker")]
+pub mod knowledge_ext;
 #[cfg(feature = "knowledge-chronicle")]
 pub mod knowledge_mount;
 #[cfg(feature = "long-term-chronicle")]
