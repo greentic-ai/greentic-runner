@@ -244,7 +244,7 @@ greentic-aw-runtime = { path = "../greentic-aw-runtime", version = "=1.3.0-resea
 # entry (root Cargo.toml:248-249) redirecting the crates.io requirement to the
 # git tag. Pinned the same way greentic-aw-runtime itself depends on it
 # (its Cargo.toml:55), so the patch applies and both resolve to one version.
-greentic-extension-sdk-contract = "=1.3.0-research.3"
+greentic-extension-sdk-contract = "=1.3.0-research.4"
 
 [[bench]]
 name = "perf"
