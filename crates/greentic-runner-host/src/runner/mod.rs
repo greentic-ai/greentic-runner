@@ -29,6 +29,8 @@ pub mod mcp_warm_listener;
 pub mod mocks;
 pub mod operala_node;
 pub mod operator;
+#[cfg(feature = "agentic-worker")]
+pub mod pack_extensions;
 pub mod remote_dispatch;
 pub mod runtime_session_resumer;
 pub mod schema_validator;
@@ -109,10 +111,15 @@ impl HostServer {
             // at all until this returns. Measured: ~80s to readiness with 81
             // extensions installed, on top of whatever the per-tenant load
             // already costs. A deployment health-gate must tolerate that delay.
+            //
+            // No packs are passed: pack-carried extensions are per-tenant, so
+            // there is no process-wide answer for them (see the field's doc
+            // comment).
             #[cfg(feature = "agentic-worker")]
             ext_runtime: crate::runner::agent_node::build_ext_runtime(
                 std::sync::Arc::new(crate::runner::agent_node::EnvSecretsBackend),
                 None,
+                &[],
             ),
             host,
             sql,
@@ -193,8 +200,15 @@ pub struct ServerState {
     /// Built once at server-build time. This is a *separate* instance from the
     /// per-tenant runtimes in `agent_node::build_ext_runtime`, which need
     /// per-tenant secrets backends — so it costs one extra set of WASM loads at
-    /// boot. All tenants scan the same `GREENTIC_EXTENSIONS_DIR/design/`, so the
-    /// registries are identical and a process-level answer is correct.
+    /// boot. All tenants scan the same `GREENTIC_EXTENSIONS_DIR/design/`, so a
+    /// process-level answer is correct for the ON-DISK half.
+    ///
+    /// It is NOT correct for the pack-carried half: extensions travelling inside
+    /// a `.gtpack` (`crate::runner::pack_extensions`) belong to the tenant whose
+    /// pack carries them, so this instance is built with no packs and reports
+    /// only what the host has installed. An operator reading
+    /// `GET /admin/capabilities` sees the host's floor, not any one tenant's
+    /// total.
     ///
     /// `None` only when `ExtensionRuntime::new` itself fails. A missing/absent
     /// extension directory does NOT produce `None`: `scan_kind_dir` errors,
