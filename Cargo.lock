@@ -3360,7 +3360,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-context"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3370,7 +3370,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-context-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-dw-context",
  "greentic-dw-workspace",
@@ -3381,7 +3381,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-core"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-dw-manifest",
  "greentic-dw-types",
@@ -3391,7 +3391,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-delegation"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3401,7 +3401,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-delegation-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3440,7 +3440,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-engine"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-dw-core",
  "greentic-dw-types",
@@ -3509,7 +3509,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-manifest"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-planning",
@@ -3559,7 +3559,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-operala-bridge"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -3574,7 +3574,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-operala-invoker"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3598,7 +3598,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-pack"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-cap-resolver",
  "greentic-cap-schema",
@@ -3612,7 +3612,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3623,7 +3623,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-planning-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3655,7 +3655,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-reflection"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3665,7 +3665,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-reflection-llm"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -3680,7 +3680,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-runtime"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-cap-types",
  "greentic-dw-context",
@@ -3700,7 +3700,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-types"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "greentic-cap-types",
  "schemars 1.2.1",
@@ -3712,7 +3712,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-workspace"
 version = "1.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "schemars 1.2.1",
  "serde",
@@ -3722,7 +3722,7 @@ dependencies = [
 [[package]]
 name = "greentic-dw-workspace-mem"
 version = "0.1.0"
-source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#c99991f2a4e17a11c1b5ebc89b628d4e3c2f16f7"
+source = "git+https://github.com/greenticai/greentic-dw.git?branch=research#a4dad5ec1e4b757cbbf94c8f0a63da8d10c57ce0"
 dependencies = [
  "blake3",
  "greentic-dw-workspace",
@@ -3732,7 +3732,7 @@ dependencies = [
 [[package]]
 name = "greentic-ext-runtime"
 version = "1.3.2"
-source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=f082521a7ea2f4857b4f9b4788b990119f65eeb5#f082521a7ea2f4857b4f9b4788b990119f65eeb5"
+source = "git+https://github.com/greentic-biz/greentic-designer-extensions?rev=74e5926fc900b260ae805d973aedee887d61313f#74e5926fc900b260ae805d973aedee887d61313f"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3760,8 +3760,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-contract"
-version = "1.3.0-research.4"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.4#ba8e4052e203f9ebaf7ec49535ba4ebf5da20f98"
+version = "1.3.0-research.5"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.5#d39cfdbc64f328586b1e5d64b53fa4b23901276f"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3780,8 +3780,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-registry"
-version = "1.3.0-research.4"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.4#ba8e4052e203f9ebaf7ec49535ba4ebf5da20f98"
+version = "1.3.0-research.5"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.5#d39cfdbc64f328586b1e5d64b53fa4b23901276f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3810,8 +3810,8 @@ dependencies = [
 
 [[package]]
 name = "greentic-extension-sdk-state"
-version = "1.3.0-research.4"
-source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.4#ba8e4052e203f9ebaf7ec49535ba4ebf5da20f98"
+version = "1.3.0-research.5"
+source = "git+https://github.com/greenticai/greentic-designer-sdk.git?tag=v1.3.0-research.5#d39cfdbc64f328586b1e5d64b53fa4b23901276f"
 dependencies = [
  "fs2",
  "semver",
