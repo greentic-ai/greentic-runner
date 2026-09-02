@@ -13,6 +13,7 @@ examples/packs/*.gtpack
 tests/assets/provider-core-dummy/target/
 tests/assets/component-v0-6-dummy/target/
 crates/tests/trace.json
+temp_auto_push.bat
 
 # CI workflow artifacts (codex-security-fix, dependency-review, codex-semver-fix)
 all-dependabot-alerts.json
@@ -28,3 +29,5 @@ DEPENDENCY_FIX_REPORT.md
 semver-output.txt
 SEMVER_FIX_REPORT.md
 .superpowers/
+.gitignore
+branch_structure.json
