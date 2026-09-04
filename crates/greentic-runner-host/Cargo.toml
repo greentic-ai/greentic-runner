@@ -27,15 +27,39 @@ component-v0-6-introspection = []
 # activates explicit span annotation (greentic-telemetry is always linked).
 telemetry = []
 greentic-x-provider = ["dep:greentic-x-runtime", "dep:greentic-x-types"]
+# Multi-provider in-process LLM backend for dw.agent (DeepSeek/Anthropic/…),
+# routing the worker LLM call through greentic-llm. Opt-in (pulls rig-core).
+#
+# Restored on develop: the declaration was dropped in d43ae4dd as main-only
+# wiring, which left `agent_node.rs`'s `#[cfg(feature = "greentic-llm-backend")]`
+# block permanently false. Every published binary therefore routed EVERY dw.agent
+# LLM call to api.openai.com regardless of the agent's configured `llm.provider`,
+# with nothing reporting it. Off by default, exactly as on main.
+greentic-llm-backend = ["agentic-worker", "greentic-aw-runtime?/greentic-llm-backend"]
+# Adds the ephemeral (in-memory) agent builder for desktop/local runs, so a
+# single-process runner serves dw.agent turns with no Redis. Enables the
+# test-mock types from greentic-aw-runtime; must NOT be enabled in the server
+# binary — the server always uses the Redis path.
+#
+# Restored on develop for the same reason as `greentic-llm-backend` above:
+# without it `runtime.rs`'s no-Redis branch falls through to the Redis builder
+# and `dw.agent` nodes are silently disabled when GREENTIC_AW_REDIS_URL is unset.
+desktop-agent-ephemeral = [
+    "agentic-worker",
+    "greentic-aw-runtime?/test-mock",
+    "greentic-aw-runtime?/dev-allow-unsigned",
+]
 
-# `agentic-worker` is a real feature again (see above). These four remain
-# main-only: the source still carries `#[cfg(feature = "…")]` gates for them but
-# their backing crates are not wired on this lane, so the gated code stays dead.
-# Tell check-cfg the values are expected so `-D warnings` (unexpected_cfgs) does
-# not fire. Re-declare as real features when their wiring is restored too.
+# `agentic-worker`, `greentic-llm-backend` and `desktop-agent-ephemeral` are all
+# real features again (see above). These two remain research-only: the source
+# still carries `#[cfg(feature = "…")]` gates for them but their backing crates
+# (chronicle-*) are git deps on a cross-org private repo this lane holds no
+# credentials for, so the gated code stays dead. Tell check-cfg the values are
+# expected so `-D warnings` (unexpected_cfgs) does not fire. Re-declare as real
+# features when their wiring is restored too.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(feature, values("desktop-agent-ephemeral", "greentic-llm-backend", "knowledge-chronicle", "long-term-chronicle"))',
+    'cfg(feature, values("knowledge-chronicle", "long-term-chronicle"))',
     # Not a cargo feature on purpose: CI builds with `--all-features`, which
     # would switch a feature on and break the build. Parks the conversational
     # `dw.agent` park-loop test harness until this lane's engine grows the
