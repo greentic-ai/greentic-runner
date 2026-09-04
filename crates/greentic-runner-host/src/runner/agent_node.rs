@@ -1076,7 +1076,12 @@ mod aw {
         let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
             Ok(url) if !url.is_empty() => url,
             _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                tracing::warn!(
+                    "GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled — every dw.agent \
+                     turn will fail with `flow_execution_failed`. Set GREENTIC_AW_REDIS_URL, \
+                     or run a runner built with --features desktop-agent-ephemeral for \
+                     in-memory state (local single-process use only)"
+                );
                 return None;
             }
         };
@@ -1195,7 +1200,12 @@ mod aw {
         let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
             Ok(url) if !url.is_empty() => url,
             _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                tracing::warn!(
+                    "GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled — every dw.agent \
+                     turn will fail with `flow_execution_failed`. Set GREENTIC_AW_REDIS_URL, \
+                     or run a runner built with --features desktop-agent-ephemeral for \
+                     in-memory state (local single-process use only)"
+                );
                 return None;
             }
         };
