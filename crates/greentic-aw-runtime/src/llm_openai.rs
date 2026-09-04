@@ -20,6 +20,20 @@ use crate::state::{ChatMessage, ToolCallRecord};
 /// indefinitely. Overridable only in tests for fast, deterministic checks.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Endpoint used when [`ENV_BASE_URL`] names none.
+const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+
+/// Names an OpenAI-compatible endpoint (Ollama, vLLM, LiteLLM, a gateway, …).
+///
+/// This is the ORIGIN, not the API root: the request paths below append
+/// `/v1/chat/completions` themselves, so the value is `http://127.0.0.1:11434`
+/// and not `http://127.0.0.1:11434/v1`.
+///
+/// Already read by the `greentic-llm-backend` path in greentic-runner-host;
+/// honouring it here too is what lets a STOCK default build reach a non-OpenAI
+/// endpoint with no feature flag.
+const ENV_BASE_URL: &str = "GREENTIC_LLM_BASE_URL";
+
 pub struct OpenAiLlmBackend {
     api_key: String,
     base_url: String,
@@ -27,10 +41,25 @@ pub struct OpenAiLlmBackend {
 }
 
 impl OpenAiLlmBackend {
+    /// Build a backend against the endpoint named by [`ENV_BASE_URL`], falling
+    /// back to OpenAI's own host when that variable is unset or blank.
+    ///
+    /// Reading the env HERE rather than only at the call sites is deliberate.
+    /// This type is what `in_process_llm_backend_with_key` constructs on the
+    /// default build, where the `greentic-llm-backend` block that reads the same
+    /// variable is not compiled in — so until this change an Ollama or other
+    /// OpenAI-compatible endpoint was unreachable from a stock binary no matter
+    /// how it was configured, and every dw.agent call went to api.openai.com.
+    /// The two paths now agree on one variable.
+    ///
+    /// [`with_base_url`](Self::with_base_url) still takes an explicit endpoint
+    /// and ignores the env, for callers that must pin one (tests included).
     pub fn new(api_key: impl Into<String>) -> Self {
-        Self::with_base_url(api_key, "https://api.openai.com")
+        Self::with_base_url(api_key, base_url_from_env())
     }
 
+    /// Build a backend against an explicitly supplied endpoint, ignoring
+    /// [`ENV_BASE_URL`].
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -41,6 +70,25 @@ impl OpenAiLlmBackend {
                 .unwrap_or_else(|_| Client::new()),
         }
     }
+}
+
+/// Resolve the endpoint from [`ENV_BASE_URL`], falling back to [`DEFAULT_BASE_URL`].
+fn base_url_from_env() -> String {
+    normalize_base_url(std::env::var(ENV_BASE_URL).ok())
+}
+
+/// The pure half of [`base_url_from_env`], split out so it is testable without
+/// mutating process-global env (which races every other test in the binary).
+///
+/// An unset, blank or whitespace-only value means "the operator configured
+/// nothing", not "use the empty string" — both fall back to OpenAI's host. A
+/// trailing slash is trimmed because the request paths append `/v1/...`, and
+/// `https://host//v1/chat/completions` is a 404 on several gateways.
+fn normalize_base_url(configured: Option<String>) -> String {
+    configured
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 #[derive(Serialize)]
@@ -575,6 +623,37 @@ fn build_tool(t: &LlmToolSchema) -> OaTool<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_url_falls_back_to_openai_when_unconfigured() {
+        // Unset, empty and whitespace-only all mean "operator configured
+        // nothing" — none of them may produce an empty base URL, which would
+        // build the request path `/v1/chat/completions` against no host.
+        assert_eq!(normalize_base_url(None), "https://api.openai.com");
+        assert_eq!(
+            normalize_base_url(Some(String::new())),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            normalize_base_url(Some("   ".to_string())),
+            "https://api.openai.com"
+        );
+    }
+
+    #[test]
+    fn base_url_honours_a_configured_endpoint_and_trims_it() {
+        assert_eq!(
+            normalize_base_url(Some("http://127.0.0.1:11434".to_string())),
+            "http://127.0.0.1:11434"
+        );
+        // Surrounding whitespace and a trailing slash are operator typos, not
+        // part of the host: `https://host//v1/chat/completions` 404s on several
+        // OpenAI-compatible gateways.
+        assert_eq!(
+            normalize_base_url(Some("  http://127.0.0.1:11434/  ".to_string())),
+            "http://127.0.0.1:11434"
+        );
+    }
 
     #[test]
     fn tool_name_round_trips_and_is_openai_safe() {
