@@ -33,6 +33,7 @@ jobs:
     with:
       package: greentic-runner
       version: ${{ needs.dev-prepare.outputs.binary-version }}
+      features: "desktop-agent-ephemeral,greentic-llm-backend"
 
   dev-publish:
     needs: [dev-prepare, dev-binaries-greentic-runner]
