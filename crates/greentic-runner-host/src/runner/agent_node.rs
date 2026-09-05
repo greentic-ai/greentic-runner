@@ -772,6 +772,34 @@ mod aw {
             .filter(|key| !key.trim().is_empty())
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .unwrap_or_default();
+
+        // Fall-through: the single-provider OpenAI-protocol client. Reached
+        // either because `greentic-llm-backend` is not compiled in (the block
+        // above does not exist at all), or because it is compiled in and no key
+        // resolved. Both mean the agent's `AgentConfig.llm.provider` is IGNORED
+        // and every request goes to one OpenAI-shaped endpoint — which is a
+        // silent, total misroute if the agent declared DeepSeek/Anthropic/… So
+        // say so. This runs once per backend construction, not per token: the
+        // returned `Arc` is reused for the whole agent handler's lifetime.
+        #[cfg(feature = "greentic-llm-backend")]
+        let reason = "no LLM API key resolved (tried the agent's llm.credential_ref, \
+                      GREENTIC_LLM_API_KEY, then OPENAI_API_KEY)";
+        #[cfg(not(feature = "greentic-llm-backend"))]
+        let reason = "this binary was built WITHOUT the `greentic-llm-backend` feature, \
+                      so the multi-provider backend is not compiled in";
+        tracing::warn!(
+            reason,
+            endpoint = %std::env::var("GREENTIC_LLM_BASE_URL")
+                .ok()
+                .filter(|url| !url.trim().is_empty())
+                .unwrap_or_else(|| "https://api.openai.com".to_string()),
+            fix = "rebuild with `--features greentic-llm-backend` and supply a key via \
+                   GREENTIC_LLM_API_KEY or the agent's llm.credential_ref; or point \
+                   GREENTIC_LLM_BASE_URL at an OpenAI-compatible endpoint",
+            "AW LLM falling back to the single-provider OpenAI client: the agent's \
+             configured llm.provider is IGNORED and every request goes to this endpoint"
+        );
+
         Arc::new(RetryingLlmBackend::new(
             OpenAiLlmBackend::new(openai_key),
             3,
@@ -1048,7 +1076,12 @@ mod aw {
         let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
             Ok(url) if !url.is_empty() => url,
             _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                tracing::warn!(
+                    "GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled — every dw.agent \
+                     turn will fail with `flow_execution_failed`. Set GREENTIC_AW_REDIS_URL, \
+                     or run a runner built with --features desktop-agent-ephemeral for \
+                     in-memory state (local single-process use only)"
+                );
                 return None;
             }
         };
@@ -1167,7 +1200,12 @@ mod aw {
         let redis_url = match std::env::var("GREENTIC_AW_REDIS_URL") {
             Ok(url) if !url.is_empty() => url,
             _ => {
-                tracing::info!("GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled");
+                tracing::warn!(
+                    "GREENTIC_AW_REDIS_URL unset; DwAgent nodes disabled — every dw.agent \
+                     turn will fail with `flow_execution_failed`. Set GREENTIC_AW_REDIS_URL, \
+                     or run a runner built with --features desktop-agent-ephemeral for \
+                     in-memory state (local single-process use only)"
+                );
                 return None;
             }
         };

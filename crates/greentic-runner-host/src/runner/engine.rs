@@ -1208,10 +1208,13 @@ impl FlowEngine {
         agent_id: &str,
         payload: Value,
     ) -> Result<NodeOutput> {
-        let handler = self
-            .agent_node_handler
-            .as_ref()
-            .context("DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine")?;
+        let handler = self.agent_node_handler.as_ref().context(
+            "DwAgent node dispatched but no AgentNodeHandler configured on FlowEngine: \
+             agentic-worker state is unavailable, so dw.agent nodes are disabled — set \
+             GREENTIC_AW_REDIS_URL, or run a runner built with \
+             --features desktop-agent-ephemeral for in-memory state (local single-process \
+             use only)",
+        )?;
         let session_id = ctx.session_id.unwrap_or("");
         let result = handler
             .execute(
