@@ -616,13 +616,19 @@ mod aw {
         // non-obvious ones mirror the crate's own `defaults_for_tests`:
         // `runtime_weak` stays unset until the cross-extension dispatch
         // cascade lands, and `call_depth_start` is the recursion guard's floor.
+        // `llm_port` and `oauth_config` are both left unset: this host wires
+        // neither an in-runtime LLM port nor an OAuth broker for design
+        // extensions, so `None` is the same behaviour these two carried before
+        // the fields existed.
         let overrides = HostOverrides {
             translator: std::sync::Arc::new(greentic_ext_runtime::host_ports::KeyTranslator),
             secrets_backend,
             http_client: shared_blocking_http_client(),
+            llm_port: None,
             url_matcher: greentic_ext_runtime::url_matcher::UrlMatcher::default(),
             runtime_weak: std::sync::Weak::new(),
             call_depth_start: 0,
+            oauth_config: None,
         };
         let config = RuntimeConfig::from_paths(paths);
         let mut runtime = match ExtensionRuntime::new(config) {
